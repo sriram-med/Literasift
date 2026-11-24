@@ -211,7 +211,150 @@ async function checkRetraction(env, article) {
   const worst = [flagged, ...notices.map(n => n.label)].filter(Boolean).sort((a,b) => noticeRank.indexOf(a) - noticeRank.indexOf(b))[0];
   return { ...checked, retractionStatus:worst || "None found", retractionNotices:notices.slice(0,10) };
 }
+// ---- PDF export (dependency-free): a cover page, then one section per article with its PubMed screenshot ----
+const pdfPage = [595.28, 841.89], pdfMargin = 36, pdfMaxSlices = 4, pdfMaxArticles = 40;
+const latin = value => String(value ?? "").replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[–—]/g, "-")
+  .replace(/…/g, "...").replace(/[^\x20-\x7e\xa0-\xff]/g, "?");
+const pdfEscape = value => latin(value).replace(/[\\()]/g, "\\$&");
+const textBytes = value => Uint8Array.from(value, c => c.charCodeAt(0) & 255);
+function textWidth(value, size, bold) {
+  let units = 0;
+  for (const c of latin(value)) units += "ijl.,;:'|!()[] tfI".includes(c) ? 0.28 : "mwMW@%".includes(c) ? 0.85 : /[A-Z]/.test(c) ? 0.68 : /[0-9]/.test(c) ? 0.556 : 0.5;
+  return units * size * (bold ? 1.06 : 1);
+}
+function wrap(value, size, bold, width) {
+  const lines = []; let line = "";
+  for (const word of latin(value).split(/\s+/).filter(Boolean)) {
+    const test = line ? line + " " + word : word;
+    if (line && textWidth(test, size, bold) > width) { lines.push(line); line = word; } else line = test;
+  }
+  if (line) lines.push(line);
+  return lines.length ? lines : [""];
+}
+async function pipeBytes(bytes, stream) { return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer()); }
+// Reads an 8-bit non-interlaced PNG and returns data ready for a PDF FlateDecode image (alpha is flattened onto white).
+async function readPng(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (bytes.length < 33 || view.getUint32(0) !== 0x89504e47) throw new Error("Not a PNG image.");
+  let pos = 8, header, parts = [];
+  while (pos + 8 <= bytes.length) {
+    const length = view.getUint32(pos), type = String.fromCharCode(...bytes.subarray(pos + 4, pos + 8)), data = bytes.subarray(pos + 8, pos + 8 + length);
+    if (type === "IHDR") header = { width:view.getUint32(pos + 8), height:view.getUint32(pos + 12), depth:data[8], color:data[9], interlace:data[12] };
+    if (type === "IDAT") parts.push(data);
+    if (type === "IEND") break;
+    pos += 12 + length;
+  }
+  if (!header || header.depth !== 8 || header.interlace || ![0, 2, 6].includes(header.color)) throw new Error("Unsupported PNG format.");
+  const joined = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  parts.reduce((offset, p) => (joined.set(p, offset), offset + p.length), 0);
+  const { width, height, color } = header;
+  if (color !== 6) return { width, height, space:color === 2 ? "/DeviceRGB" : "/DeviceGray", columns:width, colors:color === 2 ? 3 : 1, data:joined, predictor:true };
+  const raw = await pipeBytes(joined, new DecompressionStream("deflate")), stride = width * 4, rgb = new Uint8Array(width * height * 3);
+  const prior = new Uint8Array(stride), row = new Uint8Array(stride);
+  for (let y = 0; y < height; y++) {
+    const filter = raw[y * (stride + 1)], line = raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1));
+    for (let i = 0; i < stride; i++) {
+      const a = i >= 4 ? row[i - 4] : 0, b = prior[i], c = i >= 4 ? prior[i - 4] : 0;
+      const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+      const predict = filter === 0 ? 0 : filter === 1 ? a : filter === 2 ? b : filter === 3 ? (a + b) >> 1 : (pa <= pb && pa <= pc ? a : pb <= pc ? b : c);
+      row[i] = (line[i] + predict) & 255;
+    }
+    for (let x = 0; x < width; x++) {
+      const alpha = row[x * 4 + 3] / 255;
+      for (let k = 0; k < 3; k++) rgb[(y * width + x) * 3 + k] = Math.round(row[x * 4 + k] * alpha + 255 * (1 - alpha));
+    }
+    prior.set(row);
+  }
+  return { width, height, space:"/DeviceRGB", columns:width, colors:3, data:await pipeBytes(rgb, new CompressionStream("deflate")), predictor:false };
+}
+async function buildPdf(title, subtitle, sections) {
+  const objects = [null, null]; // 1 = catalog, 2 = page tree
+  const add = parts => objects.push(parts) && objects.length;
+  const regular = add(["<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"]);
+  const bold = add(["<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>"]);
+  const pages = [], images = [];
+  const newPage = () => { const page = { ops:[], xobjects:[] }; pages.push(page); return page; };
+  const text = (page, x, y, value, size, isBold = false, gray = 0.1) =>
+    page.ops.push(`BT ${gray} ${gray} ${gray} rg /F${isBold ? 2 : 1} ${size} Tf ${x.toFixed(2)} ${y.toFixed(2)} Td (${pdfEscape(value)}) Tj ET`);
+  const [pw, ph] = pdfPage, inner = pw - 2 * pdfMargin;
+  const cover = newPage();
+  text(cover, pdfMargin, ph - 90, title, 26, true);
+  let y = ph - 122;
+  for (const line of wrap(subtitle, 12, false, inner)) { text(cover, pdfMargin, y, line, 12, false, 0.35); y -= 17; }
+  text(cover, pdfMargin, y - 10, sections.length + " article" + (sections.length === 1 ? "" : "s") + " · generated " + new Date().toISOString().slice(0, 10), 11, false, 0.35);
+  for (const section of sections) {
+    let page = newPage(), top = ph - pdfMargin;
+    for (const line of wrap(section.title, 14, true, inner)) { text(page, pdfMargin, top - 14, line, 14, true); top -= 18; }
+    top -= 4;
+    for (const entry of section.lines) for (const line of wrap(entry, 9, false, inner)) { text(page, pdfMargin, top - 9, line, 9, false, 0.3); top -= 12.5; }
+    top -= 8;
+    let image;
+    if (section.png) { try { image = await readPng(section.png); } catch { image = null; } }
+    if (!image) { text(page, pdfMargin, top - 12, section.png ? "(Screenshot could not be embedded.)" : "(Screenshot not captured yet.)", 10, false, 0.5); continue; }
+    const id = images.length; images.push(image);
+    const scale = inner / image.width, fullHeight = image.height * scale;
+    let offset = 0, slices = 0;
+    while (offset < fullHeight && slices < pdfMaxSlices) {
+      const windowHeight = Math.min(top - pdfMargin - 14, fullHeight - offset), bottom = top - windowHeight;
+      page.ops.push(`q ${pdfMargin} ${bottom.toFixed(2)} ${inner.toFixed(2)} ${windowHeight.toFixed(2)} re W n ${inner.toFixed(2)} 0 0 ${fullHeight.toFixed(2)} ${pdfMargin} ${(top + offset - fullHeight).toFixed(2)} cm /Im${id} Do Q`);
+      page.ops.push(`0.8 G ${pdfMargin} ${bottom.toFixed(2)} ${inner.toFixed(2)} ${windowHeight.toFixed(2)} re S`);
+      if (!page.xobjects.includes(id)) page.xobjects.push(id);
+      offset += windowHeight; slices++;
+      if (offset < fullHeight && slices < pdfMaxSlices) { page = newPage(); top = ph - pdfMargin; }
+    }
+    if (offset < fullHeight) text(page, pdfMargin, pdfMargin - 4, "(Screenshot continues on PubMed; remaining part omitted.)", 8, false, 0.5);
+  }
+  const imageIds = images.map(image => {
+    const dict = `<< /Type /XObject /Subtype /Image /Width ${image.width} /Height ${image.height} /ColorSpace ${image.space} /BitsPerComponent 8 /Filter /FlateDecode` +
+      (image.predictor ? ` /DecodeParms << /Predictor 15 /Colors ${image.colors} /BitsPerComponent 8 /Columns ${image.columns} >>` : "") + ` /Length ${image.data.length} >>`;
+    return add([dict + "\nstream\n", image.data, "\nendstream"]);
+  });
+  const pageIds = pages.map((page, index) => {
+    text(page, pw - pdfMargin - 40, 18, "Page " + (index + 1), 8, false, 0.5);
+    const content = textBytes(page.ops.join("\n"));
+    const contentId = add([`<< /Length ${content.length} >>\nstream\n`, content, "\nendstream"]);
+    const xobjects = page.xobjects.map(id => `/Im${id} ${imageIds[id]} 0 R`).join(" ");
+    return add([`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pw} ${ph}] /Resources << /Font << /F1 ${regular} 0 R /F2 ${bold} 0 R >> /XObject << ${xobjects} >> >> /Contents ${contentId} 0 R >>`]);
+  });
+  objects[0] = ["<< /Type /Catalog /Pages 2 0 R >>"];
+  objects[1] = [`<< /Type /Pages /Kids [${pageIds.map(id => id + " 0 R").join(" ")}] /Count ${pageIds.length} >>`];
+  const chunks = [], offsets = []; let length = 0;
+  const push = piece => { const bytes = typeof piece === "string" ? textBytes(piece) : piece; chunks.push(bytes); length += bytes.length; };
+  push("%PDF-1.4\n");
+  objects.forEach((parts, index) => { offsets.push(length); push(`${index + 1} 0 obj\n`); parts.forEach(push); push("\nendobj\n"); });
+  const xref = length;
+  push(`xref\n0 ${objects.length + 1}\n0000000000 65535 f \n` + offsets.map(o => String(o).padStart(10, "0") + " 00000 n \n").join("") +
+    `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+  const out = new Uint8Array(length); let at = 0;
+  for (const chunk of chunks) { out.set(chunk, at); at += chunk.length; }
+  return out;
+}
+async function exportPdf(env, state, viewer, manager, body) {
+  const wanted = [...new Set(Array.isArray(body.pmids) ? body.pmids.map(String) : [])].slice(0, pdfMaxArticles);
+  const sections = [];
+  for (const id of wanted) {
+    const article = state.articles[id];
+    const item = state.assignments.find(a => a.pmid === id && (manager || a.reviewer === viewer.email));
+    if (!article || !item) continue;
+    let png = null;
+    if (article.screenshotKey) { const object = await env.BUCKET.get(article.screenshotKey); if (object) png = new Uint8Array(await object.arrayBuffer()); }
+    const lines = ["PMID " + id + " · " + [article.journal, article.date].filter(Boolean).join(" · "),
+      "DOI: " + (article.doi || "-") + " · " + article.url,
+      "Portfolio: " + item.portfolio + ((item.molecules || []).length ? " · Molecules: " + item.molecules.join(", ") : ""),
+      "Reviewer: " + (item.reviewer || "Unassigned") + " · Status: " + item.status + (item.note ? " · Note: " + item.note : ""),
+      "Retraction check: " + (article.retractionStatus || "Pending") + " · Access: " + (article.oaStatus || "Pending") + " · Full text: " + (article.fullTextStatus || "Pending")];
+    sections.push({ title:article.title, lines, png });
+  }
+  if (!sections.length) return null;
+  return buildPdf(String(body.title || "LiteraSift export").slice(0, 100), String(body.subtitle || "PubMed citations with page screenshots.").slice(0, 300), sections);
+}
 async function captureScreenshot(env, article) {
+  if (env.SCREENSHOT_FN) {
+    const bytes = await env.SCREENSHOT_FN(article.url);
+    const key = "evidence/" + article.id + "/pubmed.png";
+    await env.BUCKET.put(key, bytes, {httpMetadata:{contentType:"image/png"}});
+    return { screenshotKey:key, screenshotStatus:"Captured", screenshotAt:new Date().toISOString() };
+  }
   const endpoint = new URL(env.SCREENSHOT_ENDPOINT);
   if (endpoint.protocol !== "https:") throw new Error("Screenshot endpoint must use HTTPS.");
   endpoint.searchParams.set("token",env.SCREENSHOT_TOKEN);
@@ -228,7 +371,7 @@ async function collectEvidence(baseEnv, ids) {
   const {state} = await load(baseEnv);
   const env = Object.assign(Object.create(baseEnv), { UNPAYWALL_EMAIL:baseEnv.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail || "" });
   const articles = ids ? ids.map(id=>state.articles[id]).filter(Boolean) : Object.values(state.articles);
-  const enabled = Boolean(env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN);
+  const enabled = Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN));
   const needsFullText = a => !a.fullTextStatus || a.fullTextStatus === "Retry needed" ||
     (Boolean(env.UNPAYWALL_EMAIL) && ["No PMC record","No eligible PMC file"].includes(a.fullTextStatus));
   const needsScreen = a => enabled && !a.screenshotKey;
@@ -259,7 +402,8 @@ async function collectEvidence(baseEnv, ids) {
     }
     await write(env, data => Object.assign(data.articles[article.id],status));
   }
-  return {processed:pending.length, unattempted:articles.filter(a=>!a.evidenceAttempt).length,
+  const queued = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a)).length;
+  return {processed:pending.length, queued, unattempted:articles.filter(a=>!a.evidenceAttempt).length,
     screenshotConfigured:enabled, unpaywallConfigured:Boolean(env.UNPAYWALL_EMAIL)};
 }
 
@@ -280,7 +424,7 @@ async function api(request, env, path) {
   if (!viewer && !service) return json({ error:"Your account needs a Literature Bench profile." }, 403);
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email);
-    return json({ viewer, config:{ unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+    return json({ viewer, config:{ screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -310,6 +454,12 @@ async function api(request, env, path) {
       (item.history ||= []).push({ status:item.status, note:item.note, by:email, at:new Date().toISOString() });
     });
     return json({ ok:true });
+  }
+  if (path === "/api/export" && viewer) {
+    const pdf = await exportPdf(env, state, viewer, manager, body);
+    if (!pdf) return json({ error:"No exportable articles in the selection." }, 400);
+    return new Response(pdf, { headers:{ "Content-Type":"application/pdf", "Cache-Control":"private, no-store", "X-Content-Type-Options":"nosniff",
+      "Content-Disposition":'attachment; filename="literasift-' + day() + '.pdf"' } });
   }
   if (path === "/api/scheduled" && (service || manager)) {
     const results = [];
@@ -485,6 +635,21 @@ const paths = {
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
 const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks."};
+async function exportPdf(pmids,title,subtitle){
+  pmids=[...new Set(pmids)];
+  if(!pmids.length)throw new Error("Nothing to export.");
+  const parts=Math.ceil(pmids.length/40);
+  for(let i=0;i<parts;i++){
+    message("Building PDF "+(i+1)+" of "+parts+"…");
+    const res=await fetch("/api/export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pmids:pmids.slice(i*40,i*40+40),title:title+(parts>1?" (part "+(i+1)+" of "+parts+")":""),subtitle})});
+    if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||"Export failed.");}
+    const link=document.createElement("a");link.href=URL.createObjectURL(await res.blob());
+    const slug=title.toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"").slice(0,40);
+    link.download=(slug.startsWith("literasift")?"":"literasift-")+slug+(parts>1?"-part"+(i+1):"")+".pdf";
+    link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
+  }
+  message(pmids.length+" articles exported in "+parts+" PDF"+(parts>1?"s":"")+".");
+}
 let data, tab, active, filt={q:"",status:"",portfolio:"",oa:""}, shown=[];
 const oaColor={gold:"green",diamond:"green",hybrid:"blue",green:"blue",bronze:"amber",closed:""};
 const oaLabel=a=>a.oaStatus?(a.oaStatus==="closed"?"Closed access":["No DOI","Not in Unpaywall"].includes(a.oaStatus)?a.oaStatus:"OA · "+a.oaStatus):"";
@@ -531,6 +696,7 @@ function queueView(items){
   return '<section><div class="filters"><input data-filter="q" placeholder="Search title, PMID, molecule…" value="'+esc(filt.q)+'" aria-label="Search">'+
     '<select data-filter="status" aria-label="Status"><option value="">All statuses</option>'+["Pending","In review","Full text needed","Complete"].map(s=>'<option'+(filt.status===s?" selected":"")+'>'+s+"</option>").join("")+"</select>"+
     '<select data-filter="oa" aria-label="Access"><option value="">All access</option>'+[["open","Open access"],["closed","Closed access"],["unchecked","Not yet checked"]].map(([v,l])=>'<option value="'+v+'"'+(filt.oa===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
+    '<button class="btn outline" data-pdf="queue" title="Download the filtered list as a PDF with a screenshot of each article">Export PDF</button>'+
     '<select data-filter="portfolio" aria-label="Portfolio"><option value="">All portfolios</option>'+portfolios.map(p=>'<option'+(filt.portfolio===p?" selected":"")+'>'+esc(p)+"</option>").join("")+"</select></div>"+
     '<div id="qtable">'+queueRows(applyFilter(items))+"</div></section>";
 }
@@ -573,7 +739,7 @@ function render() {
   if(tab==="Search & Pull"){
     const today=new Date().toISOString().slice(0,10), start=new Date(Date.now()-30*864e5).toISOString().slice(0,10);
     html=panel("Pull articles for a molecule",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Pull articles</button></div></form>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+
-      panel("Recent pulls",table(["Watchlist","Date range","Citations","Status"],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red")]),"No pulls yet."),"",true);
+      panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>':""]),"No pulls yet."),"",true);
   }
   if(tab==="My Queue") html=queueView(mine);
   if(tab==="All Assignments") html=queueView(items);
@@ -584,13 +750,14 @@ function render() {
       '<div class="row"><span>Status</span>'+(data.config.unpaywall?badge("Active","green"):badge("Not configured","amber"))+'</div>'+
       '<form data-route="recheck-access" style="margin-top:10px"><button class="btn outline">Re-check open access for all articles</button></form>',
       "Unpaywall requires a contact email on each request; it is sent to Unpaywall only. Every article with a DOI gets an open-access status (gold, hybrid, green, bronze or closed). Permissively licensed PDFs are stored, other open copies are linked. Closed articles are re-checked every 30 days."+(data.config.unpaywallFromEnv?" The email is set by the server environment (UNPAYWALL_EMAIL).":""))+
+    panel("Article screenshots",'<div class="row"><span>Status</span>'+(data.config.screenshots?badge("Active","green"):badge("Not configured","amber"))+'</div>',data.config.screenshots?"Every article's PubMed page is captured and embedded in PDF exports.":"PDF exports include a screenshot of each article once capture is enabled. On the VPS, run: bash /opt/literasift-src/deploy/enable-screenshots.sh")+
     panel("What Unpaywall adds across the site",'<div class="row"><span>Overview</span><span class="sub">Open-access share and breakdown</span></div><div class="row"><span>Queues</span><span class="sub">OA badge on every citation and an access filter</span></div><div class="row"><span>Full text</span><span class="sub">Fallback when PubMed Central has no eligible copy</span></div><div class="row"><span>CSV export</span><span class="sub">OA status, licence and link columns</span></div>');
   if(tab==="Team") html=panel("Add or update a reviewer",'<form class="grid" data-route="profile"><label>Name<input name="name" required></label><label>Sign-in email<input type="email" name="email" required></label><label>Portfolio<input name="portfolio" placeholder="All portfolios"></label><label>Open assignment limit<input type="number" name="capacity" min="1" max="500" value="25" required></label><label>Availability<select name="active"><option value="true">Active</option><option value="false">Unavailable</option></select></label><div><button class="btn">Save reviewer</button></div></form>')+
     panel("Reviewers",table(["Name","Email","Role","Portfolio","Open"],data.profiles.map(p=>[esc(p.name),esc(p.email),badge(p.role,p.role==="manager"?"blue":""),esc(p.portfolio||"All"),items.filter(a=>a.reviewer===p.email&&a.status!=="Complete").length]),"No profiles."),"",true);
   if(tab==="Batches") html=panel("Backfill a date range",watchOptions?
     '<form class="grid" data-route="import"><label>Watchlist<select name="watch">'+watchOptions+'</select></label><label>From<input name="from" type="date" required></label><label>Through<input name="to" type="date" required></label><div><button class="btn">Import citations</button></div></form>':
     '<div class="empty">Save a watchlist before importing a batch.</div>')+
-    panel("Batch archive",'<form data-route="evidence" style="margin:0 0 8px"><button class="btn outline">Process pending evidence</button></form>'+table(["Watchlist","Date range","Citations","Status","Manifest"],data.runs.map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-export="'+esc(r.id)+'">CSV</button>':""]),"No batches yet."));
+    panel("Batch archive",'<form data-route="evidence" style="margin:0 0 8px"><button class="btn outline">Process pending evidence</button></form>'+table(["Watchlist","Date range","Citations","Status","Manifest"],data.runs.map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-export="'+esc(r.id)+'">CSV</button> <button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF</button>':""]),"No batches yet."));
   $("content").innerHTML=html;
   animate();
 }
@@ -632,8 +799,17 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-tab],[data-export],[data-review]");
+  const target=event.target.closest("[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun]");
   if(!target)return;
+  if(target.dataset.pdf||target.dataset.pdfrun){
+    const run=target.dataset.pdfrun&&data.runs.find(r=>r.id===target.dataset.pdfrun);
+    const mine=new Set(data.assignments.map(a=>a.pmid));
+    const ids=run?run.ids.filter(id=>mine.has(id)):applyFilter(shown).map(a=>a.pmid);
+    const title=run?(run.molecule||run.portfolio)+" "+run.from+" to "+run.to:"LiteraSift "+(filt.portfolio||"all portfolios");
+    target.disabled=true;
+    exportPdf(ids,title,run?"Articles pulled for "+(run.molecule||run.portfolio)+", "+run.from+" to "+run.to+".":"Filtered list from the screening queue.").catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    return;
+  }
   if(target.dataset.tab){tab=target.dataset.tab;render();}
   if(target.dataset.export)download(target.dataset.export);
   if(target.dataset.review){

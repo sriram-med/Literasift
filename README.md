@@ -53,3 +53,9 @@ Run `dist/install-literasift.sh` as root on a fresh Ubuntu VPS (or supply it as 
 ### Automatic deploys
 
 On the VPS, run once (as root): `curl -fsSL https://raw.githubusercontent.com/sriram-med/Literasift/claude/vigilant-planck-42pjio/deploy/enable-autoupdate.sh | bash`. It installs `literasift-update` and a systemd timer that checks the branch every 3 minutes. A new commit is syntax-checked, swapped in, restarted and health-checked; if it does not become healthy it is rolled back and not retried. Logs: `journalctl -u literasift-update`. The script also prints a read-only deploy key, so the repository can be made private again (add it under the repository's Deploy keys). `literasift-update --force` redeploys the current commit.
+
+## PDF export with screenshots
+
+"Export PDF" on the queue (current filter) and the "PDF" buttons on Batches and Search & Pull build a document with a cover page and, for each article, its details (PMID, journal, DOI, portfolio, molecules, reviewer, status, retraction/access status) plus a screenshot of its PubMed page. Exports are split into parts of 40 articles. Reviewers can export only their own assignments. The PDF writer is built into the Worker and needs no libraries.
+
+Screenshots come from a Browserless-compatible endpoint (`SCREENSHOT_ENDPOINT`/`SCREENSHOT_TOKEN`) or, on the VPS, from a local Chromium: run `bash /opt/literasift-src/deploy/enable-screenshots.sh` once. Articles without a screenshot are exported with a placeholder.

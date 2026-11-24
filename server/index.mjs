@@ -5,6 +5,7 @@ import { Readable } from "node:stream";
 import worker from "../worker/index.js";
 import { FileBucket } from "./storage.mjs";
 import { checkPassword, readUsers } from "./users.mjs";
+import { makeScreenshotFn } from "./screenshots.mjs";
 
 const e = process.env;
 const port = Number(e.PORT || 8787), dataDir = e.DATA_DIR || "/var/lib/literasift";
@@ -13,6 +14,10 @@ if (secret.length < 32 || runToken.length < 32) { console.error("SESSION_SECRET 
 const secureCookie = e.COOKIE_SECURE !== "false";
 const env = { BUCKET: new FileBucket(dataDir + "/objects"), RUN_TOKEN: runToken, UNPAYWALL_EMAIL: e.UNPAYWALL_EMAIL, CROSSREF_EMAIL: e.CROSSREF_EMAIL,
   SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN };
+
+const screenshotFn = await makeScreenshotFn();
+if (screenshotFn) env.SCREENSHOT_FN = screenshotFn;
+console.log(screenshotFn ? "Local screenshots: on" : "Local screenshots: off (run deploy/enable-screenshots.sh to turn on)");
 
 const sign = value => createHmac("sha256", secret).update(value).digest("base64url");
 const makeSession = email => { const body = Buffer.from(JSON.stringify({ e: email, x: Date.now() + 7 * 86400000 })).toString("base64url"); return body + "." + sign(body); };
@@ -104,14 +109,17 @@ http.createServer((req, res) => handler(req, res).catch(error => {
 
 // In-process scheduler (replaces the cron-driven run-watchlists.mjs used with Sites).
 async function runScheduled() {
-  const results = []; let last;
+  const results = []; let last, previousQueued, stalled = 0;
   for (let call = 0; call < 300; call++) {
     const response = await worker.fetch(new Request("http://localhost/api/scheduled", { method: "POST", headers: { Authorization: "Bearer " + runToken }, body: "{}" }), env);
     last = await response.json();
     if (!response.ok || !Array.isArray(last.results)) throw new Error(last?.error || "Scheduler call failed.");
     results.push(...last.results);
-    const progressed = last.results.some(r => !r.error) || last.evidence?.processed > 0;
-    if ((!last.remaining && !last.evidence?.unattempted) || !progressed) break;
+    // Keep going while watchlists or evidence work remain, and stop if the evidence queue stops shrinking (e.g. repeated failures).
+    const queued = last.evidence?.queued ?? 0;
+    stalled = queued >= (previousQueued ?? Infinity) && !last.results.some(r => !r.error) ? stalled + 1 : 0;
+    previousQueued = queued;
+    if ((!last.remaining && !queued) || stalled >= 3) break;
   }
   console.log(JSON.stringify({ time: new Date().toISOString(), batches: results.length, failed: results.filter(r => r.error).length, remaining: last?.remaining || 0, evidence: last?.evidence }));
 }
