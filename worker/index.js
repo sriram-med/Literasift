@@ -345,16 +345,86 @@ async function api(request, env, path) {
   return json({ ok:true });
 }
 const html = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Literature Bench</title><style>
-*{box-sizing:border-box}body{margin:0;background:#f3f5f9;color:#182739;font:16px system-ui,sans-serif}header{background:#10283f;color:white;padding:22px max(5vw,18px);display:flex;justify-content:space-between;align-items:center;gap:15px}header strong{font-size:20px}header span{font-size:14px;color:#b9d4dd}main{max-width:1320px;margin:auto;padding:38px max(4vw,16px)}h1{font-size:clamp(32px,5vw,50px);margin:0;letter-spacing:-.045em}h2{font-size:22px;margin:0 0 18px}p{line-height:1.55;color:#485d71}nav{display:flex;gap:8px;flex-wrap:wrap;margin:26px 0}button,input,select,textarea{font:inherit}button{background:#126359;color:#fff;border:0;border-radius:8px;padding:10px 15px;cursor:pointer;font-weight:600}button:disabled{opacity:.55;cursor:wait}nav button{background:white;color:#234047;border:1px solid #d5dfe5}nav button[aria-current]{background:#126359;color:white}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px}.card,section{background:#fff;border:1px solid #dce4eb;border-radius:14px;padding:20px}.card b{font-size:34px;display:block}.card span{color:#485d71}section{margin:18px 0;overflow:auto}table{border-collapse:collapse;width:100%;text-align:left}td,th{padding:13px 9px;vertical-align:top;border-bottom:1px solid #e6edf1}th{font-size:14px;color:#485d71}a{color:#116158}label{display:flex;flex-direction:column;gap:6px;font-weight:600}input,select,textarea{padding:9px;border:1px solid #b6c7d3;border-radius:7px;background:white;color:#182739;max-width:100%}form{display:grid;gap:13px;align-items:end;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));margin-bottom:20px}form .wide{grid-column:1/-1}.msg{color:#8e331e}small{font-size:14px;color:#485d71}dialog{border:1px solid #b6c7d3;border-radius:14px;width:min(560px,94vw);padding:24px}dialog::backdrop{background:#10283f80}.alert{display:inline-block;background:#f8dcd5;color:#8e331e;font-weight:600;padding:3px 8px;border-radius:7px;margin-bottom:4px}.tag{display:inline-block;background:#e3f0ee;padding:4px 9px;border-radius:7px;white-space:nowrap}
-</style><header><strong>Literature Bench</strong><span id="identity"></span></header>
-<main><h1>Literature screening</h1><p>PubMed batches, reviewer assignments, and screening decisions.</p><nav id="nav" aria-label="Literature Bench"></nav><p id="message" role="status"></p><div id="content"></div></main>
-<dialog id="dialog"><h2>Screen citation</h2><p id="citation"></p><form id="review"><label>Status<select name="status"><option>Pending</option><option>In review</option><option>Full text needed</option><option>Complete</option></select></label><label class="wide">Decision notes<textarea name="note" rows="4"></textarea></label><button>Save decision</button><button type="button" id="close">Cancel</button></form></dialog>
+<title>LiteraSift</title><style>
+:root{--bg:#fafafa;--fg:#09090b;--muted:#71717a;--card:#fff;--border:#e4e4e7;--accent:#f4f4f5;--primary:#18181b;--primary-fg:#fafafa;--brand:#0f766e;--brand-soft:#ccfbf1;--ring:#a1a1aa;--red:#dc2626;--red-soft:#fee2e2;--amber:#b45309;--amber-soft:#fef3c7;--green:#15803d;--green-soft:#dcfce7;--blue:#1d4ed8;--blue-soft:#dbeafe;--radius:10px;--shadow:0 1px 2px #0000000d}
+[data-theme=dark]{--bg:#09090b;--fg:#fafafa;--muted:#a1a1aa;--card:#111113;--border:#27272a;--accent:#18181b;--primary:#fafafa;--primary-fg:#18181b;--brand:#2dd4bf;--brand-soft:#134e4a;--ring:#52525b;--red:#f87171;--red-soft:#450a0a;--amber:#fbbf24;--amber-soft:#451a03;--green:#4ade80;--green-soft:#052e16;--blue:#93c5fd;--blue-soft:#172554;--shadow:none}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+button,input,select,textarea{font:inherit;color:inherit}a{color:var(--brand);text-decoration:none}a:hover{text-decoration:underline}
+.shell{display:grid;grid-template-columns:240px 1fr;min-height:100vh}
+aside{border-right:1px solid var(--border);background:var(--card);padding:18px 12px;display:flex;flex-direction:column;gap:6px;position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 10px 18px;font-weight:700;font-size:17px;letter-spacing:-.02em}
+.logo{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#0f766e,#14b8a6);display:grid;place-items:center;color:#fff}
+.ic{width:16px;height:16px;flex:none}
+.navbtn{display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;border:0;background:none;border-radius:8px;color:var(--muted);cursor:pointer;font-weight:500;text-align:left;transition:background .15s,color .15s}
+.navbtn:hover{background:var(--accent);color:var(--fg)}.navbtn[aria-current]{background:var(--accent);color:var(--fg);box-shadow:inset 2px 0 0 var(--brand)}
+.navbtn .n{margin-left:auto;font-size:12px;background:var(--brand-soft);color:var(--brand);border-radius:99px;padding:0 7px}
+.spacer{flex:1}
+.who{border-top:1px solid var(--border);padding:12px 10px 0;font-size:13px}.who small{display:block;color:var(--muted)}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 28px;border-bottom:1px solid var(--border);background:var(--card);position:sticky;top:0;z-index:5}
+.top h1{margin:0;font-size:18px;letter-spacing:-.02em}.top p{margin:0;color:var(--muted);font-size:13px}
+main{padding:24px 28px 60px;max-width:1280px;animation:fade .3s ease}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;background:var(--primary);color:var(--primary-fg);border:1px solid var(--primary);border-radius:8px;padding:7px 14px;font-weight:500;cursor:pointer;transition:opacity .15s,transform .05s}
+.btn:hover{opacity:.9}.btn:active{transform:scale(.98)}.btn:disabled{opacity:.5;cursor:wait}
+.btn.outline{background:transparent;color:var(--fg);border-color:var(--border)}.btn.outline:hover{background:var(--accent)}.btn.sm{padding:4px 10px;font-size:13px}
+.icon-btn{padding:7px 9px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:18px}
+.card,section{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}
+.card{padding:16px 18px;position:relative;overflow:hidden;transition:border-color .2s,transform .2s}.card:hover{border-color:var(--ring);transform:translateY(-1px)}
+.card .lbl{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:13px}
+.card b{display:block;font-size:30px;letter-spacing:-.03em;margin-top:6px;font-variant-numeric:tabular-nums}
+.card.warn b{color:var(--red)}
+section{margin:0 0 18px;overflow:hidden}
+section>header{padding:16px 18px 0}section>header h2{margin:0;font-size:15px}section>header p{margin:2px 0 0;color:var(--muted)}
+.body{padding:16px 18px 18px;overflow:auto}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+table{border-collapse:collapse;width:100%;text-align:left}th{font-size:12px;font-weight:500;color:var(--muted);padding:10px 14px;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:12px 14px;vertical-align:top;border-bottom:1px solid var(--border)}tbody tr{transition:background .12s}tbody tr:hover{background:var(--accent)}tbody tr:last-child td{border-bottom:0}
+.tablewrap{overflow:auto}
+.badge{display:inline-flex;align-items:center;gap:4px;border-radius:99px;padding:1px 9px;font-size:12px;font-weight:500;white-space:nowrap;background:var(--accent);color:var(--muted);border:1px solid var(--border)}
+.badge.blue{background:var(--blue-soft);color:var(--blue);border-color:transparent}.badge.amber{background:var(--amber-soft);color:var(--amber);border-color:transparent}
+.badge.green{background:var(--green-soft);color:var(--green);border-color:transparent}.badge.red{background:var(--red-soft);color:var(--red);border-color:transparent}
+.title{font-weight:500;color:var(--fg)}.sub{color:var(--muted);font-size:12px}.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.bar{height:8px;border-radius:99px;background:var(--accent);overflow:hidden;border:1px solid var(--border)}.bar i{display:block;height:100%;background:linear-gradient(90deg,#0f766e,#2dd4bf);width:0;transition:width .9s cubic-bezier(.2,.8,.2,1)}
+.row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 0}.row+.row{border-top:1px solid var(--border)}
+.filters{display:flex;gap:10px;flex-wrap:wrap;padding:14px 18px;border-bottom:1px solid var(--border)}
+input,select,textarea{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:7px 10px;max-width:100%;outline:none;transition:box-shadow .15s,border-color .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--ring);box-shadow:0 0 0 3px #71717a33}input[type=checkbox]{width:auto}
+.filters input{flex:1;min-width:200px}
+form.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));align-items:end}form.grid .wide{grid-column:1/-1}
+label{display:flex;flex-direction:column;gap:5px;font-weight:500;font-size:13px}label.check{flex-direction:row;align-items:center;font-weight:400}
+.empty{text-align:center;color:var(--muted);padding:34px 10px}
+dialog{border:1px solid var(--border);border-radius:14px;width:min(560px,94vw);padding:22px;background:var(--card);color:var(--fg);box-shadow:0 20px 50px #00000040}dialog::backdrop{background:#09090b99;backdrop-filter:blur(2px)}
+dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
+#toast{position:fixed;right:20px;bottom:20px;z-index:20;max-width:380px;padding:11px 16px;border-radius:10px;background:var(--primary);color:var(--primary-fg);box-shadow:0 10px 30px #0004;transform:translateY(20px);opacity:0;pointer-events:none;transition:all .25s}
+#toast.show{transform:none;opacity:1}#toast.err{background:var(--red);color:#fff}
+.skel{height:14px;border-radius:6px;background:linear-gradient(90deg,var(--accent),var(--border),var(--accent));background-size:200% 100%;animation:sh 1.2s infinite;margin:12px 0}@keyframes sh{to{background-position:-200% 0}}
+@media(max-width:860px){.shell{grid-template-columns:1fr}aside{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center}.brand{padding:4px 10px}.who,.spacer{display:none}.navbtn{width:auto}.grid2{grid-template-columns:1fr}.top,main{padding-left:16px;padding-right:16px}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+<div class="shell"><aside><div class="brand"><span class="logo"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18M6 12h12M10 19h4"/></svg></span>LiteraSift</div><nav id="nav" aria-label="LiteraSift"></nav><div class="spacer"></div><div class="who" id="identity"></div></aside>
+<div><div class="top"><div><h1 id="heading">LiteraSift</h1><p id="subhead"></p></div><button class="btn outline icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button></div>
+<main id="content"><div class="skel"></div><div class="skel"></div><div class="skel"></div></main></div></div>
+<div id="toast" role="status"></div>
+<dialog id="dialog"><h2>Screen citation</h2><p id="citation" class="sub"></p><form id="review"><label>Status<select name="status"><option>Pending</option><option>In review</option><option>Full text needed</option><option>Complete</option></select></label><label>Decision notes<textarea name="note" rows="4"></textarea></label><div style="display:flex;gap:8px"><button class="btn">Save decision</button><button type="button" class="btn outline" id="close">Cancel</button></div></form></dialog>
 <script>
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-let data, tab, active;
-const message = (value, error=false) => { $("message").textContent=value; $("message").className=error?"msg":""; };
+const paths = {
+  Overview:'<rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>',
+  "My Queue":'<path d="M3 6h.01M3 12h.01M3 18h.01M8 6h13M8 12h13M8 18h13"/>',
+  "All Assignments":'<path d="M3 6h18M3 12h18M3 18h12"/>',
+  Batches:'<path d="m12 3 9 5-9 5-9-5 9-5z"/><path d="m3 13 9 5 9-5"/>',
+  Watchlists:'<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  Team:'<circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0M17 4a4 4 0 0 1 0 8M22 21a7 7 0 0 0-4-6"/>',
+  moon:'<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>', sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
+};
+const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
+const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity."};
+let data, tab, active, filt={q:"",status:"",portfolio:""}, shown=[];
+let toastTimer;
+const message = (value, error=false) => { const t=$("toast"); t.textContent=value; t.className="show"+(error?" err":""); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.className="",error?6000:2800); };
 async function api(route, body) {
   const res = await fetch("/api/"+route, body === undefined ? {} : {
     method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)
@@ -364,41 +434,99 @@ async function api(route, body) {
   return result;
 }
 const table=(headers,rows,empty)=>rows.length?
-  "<table><thead><tr>"+headers.map(h=>"<th>"+h+"</th>").join("")+"</tr></thead><tbody>"+
-  rows.map(row=>"<tr>"+row.map(cell=>"<td>"+cell+"</td>").join("")+"</tr>").join("")+"</tbody></table>":
-  "<p>"+empty+"</p>";
-const panel=(title,body)=>"<section><h2>"+title+"</h2>"+body+"</section>";
-function queue(items) {
-  return table(["Article","Portfolio","Reviewer","Status",""],items.map(a=>{
-    const item=data.articles[a.pmid];
-    return [(["Retracted","Expression of concern"].includes(item.retractionStatus)?'<span class="alert">'+esc(item.retractionStatus)+'</span><br>':'')+'<a target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><br><small>PMID '+esc(a.pmid)+' · '+esc(item.journal)+'</small><br>'+(item.fullTextKey?'<a href="/api/full-text/'+esc(a.pmid)+'">Download full text</a>':(item.fullTextLink?'<a target="_blank" rel="noopener" href="'+esc(item.fullTextLink)+'">Open-access link</a>':'<small>'+esc(item.fullTextStatus || "Full text pending")+'</small>'))+' · '+(item.screenshotKey?'<a href="/api/screenshot/'+esc(a.pmid)+'">Screenshot</a>':'<small>'+esc(item.screenshotStatus || "Screenshot pending")+'</small>'),
-      esc(a.portfolio)+((a.molecules||[]).length?'<br><small>'+esc(a.molecules.join(", "))+'</small>':''),esc(a.reviewer || "Unassigned"),'<span class="tag">'+esc(a.status)+'</span>',
-      '<button data-review="'+esc(a.id)+'">Review</button>'];
-  }),"No articles in this queue.");
+  '<div class="tablewrap"><table><thead><tr>'+headers.map(h=>"<th>"+h+"</th>").join("")+"</tr></thead><tbody>"+
+  rows.map(row=>"<tr>"+row.map(cell=>"<td>"+cell+"</td>").join("")+"</tr>").join("")+"</tbody></table></div>":
+  '<div class="empty">'+empty+"</div>";
+const panel=(title,body,sub,flush)=>"<section><header><h2>"+title+"</h2>"+(sub?"<p>"+sub+"</p>":"")+"</header><div class='body'"+(flush?" style='padding:8px 0 0'":"")+">"+body+"</div></section>";
+const statusColor={"Pending":"","In review":"blue","Full text needed":"amber","Complete":"green"};
+const badge=(text,color="")=>'<span class="badge '+color+'">'+esc(text)+'</span>';
+const flagged=item=>["Retracted","Expression of concern"].includes(item?.retractionStatus);
+function evidenceChips(item){
+  const chips=[];
+  if(flagged(item))chips.push(badge(item.retractionStatus,"red"));
+  else if(item.retractionStatus==="Correction")chips.push(badge("Correction","amber"));
+  chips.push(item.fullTextKey?'<a class="badge green" href="/api/full-text/'+esc(item.id)+'">Full text</a>':item.fullTextLink?'<a class="badge blue" target="_blank" rel="noopener" href="'+esc(item.fullTextLink)+'">Open-access link</a>':badge(item.fullTextStatus||"Full text pending"));
+  chips.push(item.screenshotKey?'<a class="badge green" href="/api/screenshot/'+esc(item.id)+'">Screenshot</a>':badge(item.screenshotStatus||"Screenshot pending"));
+  return '<div class="chips">'+chips.join("")+"</div>";
 }
+function queueRows(items){
+  return table(["Article","Portfolio","Reviewer","Status",""],items.slice(0,200).map(a=>{
+    const item=data.articles[a.pmid]||{};
+    return ['<a class="title" target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><div class="sub">PMID '+esc(a.pmid)+' · '+esc(item.journal)+' · '+esc(item.date)+'</div>'+evidenceChips({...item,id:a.pmid}),
+      esc(a.portfolio)+((a.molecules||[]).length?'<div class="chips">'+a.molecules.map(m=>badge(m)).join("")+"</div>":""),
+      a.reviewer?esc(a.reviewer):badge("Unassigned","amber"),badge(a.status,statusColor[a.status]),
+      '<button class="btn outline sm" data-review="'+esc(a.id)+'">Review</button>'];
+  }),"No articles match.")+(items.length>200?'<p class="sub" style="padding:10px 14px">Showing 200 of '+items.length+". Refine the filters to narrow the list.</p>":"");
+}
+function queueView(items){
+  shown=items;
+  const portfolios=[...new Set(items.map(a=>a.portfolio))].sort();
+  return '<section><div class="filters"><input data-filter="q" placeholder="Search title, PMID, molecule…" value="'+esc(filt.q)+'" aria-label="Search">'+
+    '<select data-filter="status" aria-label="Status"><option value="">All statuses</option>'+["Pending","In review","Full text needed","Complete"].map(s=>'<option'+(filt.status===s?" selected":"")+'>'+s+"</option>").join("")+"</select>"+
+    '<select data-filter="portfolio" aria-label="Portfolio"><option value="">All portfolios</option>'+portfolios.map(p=>'<option'+(filt.portfolio===p?" selected":"")+'>'+esc(p)+"</option>").join("")+"</select></div>"+
+    '<div id="qtable">'+queueRows(applyFilter(items))+"</div></section>";
+}
+function applyFilter(items){
+  const q=filt.q.trim().toLowerCase();
+  return items.filter(a=>(!filt.status||a.status===filt.status)&&(!filt.portfolio||a.portfolio===filt.portfolio)&&
+    (!q||(a.pmid+" "+(data.articles[a.pmid]?.title||"")+" "+(a.molecules||[]).join(" ")).toLowerCase().includes(q)));
+}
+function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=manager?["Overview","My Queue","Batches","Watchlists","Team"]:["My Queue"];
-  tab ||= tabs[0];
-  $("identity").textContent=data.viewer.name+" · "+data.viewer.role;
-  $("nav").innerHTML=tabs.map(x=>'<button data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+x+'</button>').join("");
-  const items=data.assignments;
+  const tabs=manager?["Overview","My Queue","All Assignments","Batches","Watchlists","Team"]:["My Queue"];
+  if(!tabs.includes(tab))tab=tabs[0];
+  const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
+  const open=mine.filter(a=>a.status!=="Complete").length;
+  $("identity").innerHTML="<b>"+esc(data.viewer.name)+"</b><small>"+esc(data.viewer.email)+" · "+esc(data.viewer.role)+"</small>";
+  $("nav").innerHTML=tabs.map(x=>'<button class="navbtn" data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+ic(x)+x+(x==="My Queue"&&open?'<span class="n">'+open+"</span>":"")+'</button>').join("");
+  $("heading").textContent=tab; $("subhead").textContent=subtitles[tab];
   const watchOptions=data.watches.map(w=>'<option value="'+esc(encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||""))+'">'+esc(w.portfolio+(w.molecule?" · "+w.molecule:""))+'</option>').join("");
+  let html="";
   if(tab==="Overview"){
-    const metrics=[["Unique citations",Object.keys(data.articles).length],["Assigned",items.filter(a=>a.reviewer).length],["Unassigned",items.filter(a=>!a.reviewer).length],["Complete",items.filter(a=>a.status==="Complete").length]];
-    $("content").innerHTML='<div class="cards">'+metrics.map(([label,num])=>'<div class="card"><b>'+num+'</b><span>'+label+'</span></div>').join("")+'</div>'+panel("All assignments",queue(items));
+    const done=items.filter(a=>a.status==="Complete").length, pct=items.length?Math.round(done/items.length*100):0;
+    const arts=Object.values(data.articles);
+    const alerts=arts.filter(flagged).length, retry=arts.filter(a=>a.fullTextStatus==="Retry needed").length;
+    const portfolios=[...new Set(items.map(a=>a.portfolio))].sort();
+    html='<div class="cards">'+stat("Unique citations",arts.length,"Batches")+stat("Assigned",items.filter(a=>a.reviewer).length,"Team")+stat("Unassigned",items.filter(a=>!a.reviewer).length,"alert",true)+stat("Complete",done,"My Queue")+stat("Retraction alerts",alerts,"alert",true)+'</div>'+
+      '<div class="grid2">'+panel("Screening progress",'<div class="row"><span>'+done+" of "+items.length+' complete</span><b>'+pct+'%</b></div><div class="bar"><i data-width="'+pct+'"></i></div>'+
+        portfolios.map(p=>{const list=items.filter(a=>a.portfolio===p),d=list.filter(a=>a.status==="Complete").length;return '<div class="row"><span>'+esc(p)+'</span><span class="sub">'+d+" / "+list.length+"</span></div>";}).join(""))+
+      panel("Needs attention",
+        '<div class="row"><span>Unassigned citations</span>'+badge(items.filter(a=>!a.reviewer).length,items.some(a=>!a.reviewer)?"amber":"")+'</div>'+
+        '<div class="row"><span>Retracted or expression of concern</span>'+badge(alerts,alerts?"red":"")+'</div>'+
+        '<div class="row"><span>Full-text fetch needs retry</span>'+badge(retry,retry?"amber":"")+'</div>'+
+        '<div class="row"><span>Flagged “Full text needed” by reviewers</span>'+badge(items.filter(a=>a.status==="Full text needed").length,"blue")+'</div>')+'</div>'+
+      panel("Recent batches",table(["Watchlist","Range","Citations","Status"],data.runs.slice(0,6).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red")]),"No batches yet."),"",true);
   }
-  if(tab==="My Queue") $("content").innerHTML=panel("My assignments",queue(items.filter(a=>a.reviewer===data.viewer.email)));
-  if(tab==="Watchlists") $("content").innerHTML=panel("PubMed watchlists",'<form data-route="watch"><label>Portfolio<input name="portfolio" required></label><label>Molecule<input name="molecule" placeholder="Optional"></label><label class="wide">PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><button>Save watchlist</button></form>')+panel("Add molecules in bulk",'<p>One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs. A PubMed query is built for each line.</p><form data-route="watches"><label>Portfolio<input name="portfolio" required></label><label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label><span><input type="checkbox" name="safety"> Safety-related articles only</span></label><button>Save molecules</button></form>')+panel("Saved watchlists ("+data.watches.length+")",table(["Portfolio","Molecule","Query"],data.watches.map(w=>[esc(w.portfolio),esc(w.molecule||""),'<small>'+esc(w.query)+'</small>']),"Add a product or portfolio watchlist to start."));
-  if(tab==="Team") $("content").innerHTML=panel("Reviewer profiles",'<form data-route="profile"><label>Name<input name="name" required></label><label>Sign-in email<input type="email" name="email" required></label><label>Portfolio<input name="portfolio" placeholder="All portfolios"></label><label>Open assignment limit<input type="number" name="capacity" min="1" max="500" value="25" required></label><label>Availability<select name="active"><option value="true">Active</option><option value="false">Unavailable</option></select></label><button>Save reviewer</button></form>'+table(["Name","Email","Role","Portfolio","Open"],data.profiles.map(p=>[esc(p.name),esc(p.email),esc(p.role),esc(p.portfolio||"All"),items.filter(a=>a.reviewer===p.email&&a.status!=="Complete").length]),"No profiles."));
-  if(tab==="Batches") $("content").innerHTML=panel("Backfill a date range",watchOptions?
-    '<form data-route="import"><label>Watchlist<select name="watch">'+watchOptions+'</select></label><label>From<input name="from" type="date" required></label><label>Through<input name="to" type="date" required></label><button>Import citations</button></form>':
-    '<p>Save a watchlist before importing a batch.</p>')+panel("Batch archive",'<form data-route="evidence"><button>Process pending evidence</button></form>'+table(["Portfolio","Create Date range","Citations","Status","Manifest"],data.runs.map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" to "+esc(r.to),r.count,esc(r.error||r.status),r.status==="Imported"?'<button data-export="'+esc(r.id)+'">CSV</button>':""]),"No batches yet."));
+  if(tab==="My Queue") html=queueView(mine);
+  if(tab==="All Assignments") html=queueView(items);
+  if(tab==="Watchlists") html=panel("Add a watchlist",'<form class="grid" data-route="watch"><label>Portfolio<input name="portfolio" required></label><label>Molecule<input name="molecule" placeholder="Optional"></label><label class="wide">PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><div><button class="btn">Save watchlist</button></div></form>')+
+    panel("Add molecules in bulk",'<form class="grid" data-route="watches"><label>Portfolio<input name="portfolio" required></label><label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Save molecules</button></div></form>',"One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs.")+
+    panel("Saved watchlists ("+data.watches.length+")",table(["Portfolio","Molecule","Query"],data.watches.map(w=>[esc(w.portfolio),esc(w.molecule||"—"),'<span class="sub">'+esc(w.query)+"</span>"]),"Add a molecule or portfolio watchlist to start."),"",true);
+  if(tab==="Team") html=panel("Add or update a reviewer",'<form class="grid" data-route="profile"><label>Name<input name="name" required></label><label>Sign-in email<input type="email" name="email" required></label><label>Portfolio<input name="portfolio" placeholder="All portfolios"></label><label>Open assignment limit<input type="number" name="capacity" min="1" max="500" value="25" required></label><label>Availability<select name="active"><option value="true">Active</option><option value="false">Unavailable</option></select></label><div><button class="btn">Save reviewer</button></div></form>')+
+    panel("Reviewers",table(["Name","Email","Role","Portfolio","Open"],data.profiles.map(p=>[esc(p.name),esc(p.email),badge(p.role,p.role==="manager"?"blue":""),esc(p.portfolio||"All"),items.filter(a=>a.reviewer===p.email&&a.status!=="Complete").length]),"No profiles."),"",true);
+  if(tab==="Batches") html=panel("Backfill a date range",watchOptions?
+    '<form class="grid" data-route="import"><label>Watchlist<select name="watch">'+watchOptions+'</select></label><label>From<input name="from" type="date" required></label><label>Through<input name="to" type="date" required></label><div><button class="btn">Import citations</button></div></form>':
+    '<div class="empty">Save a watchlist before importing a batch.</div>')+
+    panel("Batch archive",'<form data-route="evidence" style="margin:0 0 8px"><button class="btn outline">Process pending evidence</button></form>'+table(["Watchlist","Date range","Citations","Status","Manifest"],data.runs.map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-export="'+esc(r.id)+'">CSV</button>':""]),"No batches yet."));
+  $("content").innerHTML=html;
+  animate();
+}
+function animate(){
+  const reduce=matchMedia("(prefers-reduced-motion: reduce)").matches;
+  document.querySelectorAll("[data-count]").forEach(el=>{
+    const end=Number(el.dataset.count);
+    if(reduce||end<2){el.textContent=end.toLocaleString();return;}
+    const start=performance.now();
+    const step=now=>{const t=Math.min(1,(now-start)/700);el.textContent=Math.round(end*(1-Math.pow(1-t,3))).toLocaleString();if(t<1)requestAnimationFrame(step);};
+    requestAnimationFrame(step);
+  });
+  requestAnimationFrame(()=>document.querySelectorAll("[data-width]").forEach(el=>el.style.width=el.dataset.width+"%"));
 }
 async function refresh(){data=await api("state");render();}
 function download(id) {
   const run=data.runs.find(r=>r.id===id);
-  const cell=value=>'"'+String(value??"").replace(/^[=+@\-]/,"'$&").replaceAll('"','""')+'"';
+  const cell=value=>'"'+String(value??"").replace(/^[=+@\\-]/,"'$&").replaceAll('"','""')+'"';
   const rows=[["PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Molecules","Reviewer","Status","Full text","Screenshot","Retraction check"]];
   run.ids.forEach(pmid=>{
     const a=data.articles[pmid], item=data.assignments.find(x=>x.pmid===pmid&&x.portfolio===run.portfolio);
@@ -408,9 +536,23 @@ function download(id) {
   const link=document.createElement("a");link.href=url;link.download="pubmed-"+run.from+"-"+run.to+".csv";link.click();
   setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
+function setTheme(mode){
+  document.documentElement.dataset.theme=mode;
+  try{localStorage.setItem("literasift-theme",mode);}catch{}
+  $("theme").innerHTML=ic(mode==="dark"?"sun":"moon");
+}
+setTheme((()=>{try{return localStorage.getItem("literasift-theme");}catch{}})()||(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"));
+$("theme").onclick=()=>setTheme(document.documentElement.dataset.theme==="dark"?"light":"dark");
+document.addEventListener("input",event=>{
+  const key=event.target.dataset?.filter;
+  if(!key)return;
+  filt[key]=event.target.value;
+  $("qtable").innerHTML=queueRows(applyFilter(shown));
+});
 document.addEventListener("click",event=>{
-  const target=event.target.closest("button");if(!target)return;
-  if(target.dataset.tab){tab=target.dataset.tab;message("");render();}
+  const target=event.target.closest("[data-tab],[data-export],[data-review]");
+  if(!target)return;
+  if(target.dataset.tab){tab=target.dataset.tab;render();}
   if(target.dataset.export)download(target.dataset.export);
   if(target.dataset.review){
     active=data.assignments.find(a=>a.id===target.dataset.review);

@@ -1,4 +1,4 @@
-# Literature Bench
+# LiteraSift
 
 A standalone PubMed screening website. It imports date-range batches from approved watchlists, assigns citations to eligible reviewers, and tracks decisions in a manager dashboard.
 
