@@ -222,3 +222,57 @@ test("articles without detected events or full text are not added", async () => 
   const r = (await t.call(REVIEWER, "/api/icsr-intake")).body;
   assert.equal(r.created.length, 0); assert.equal(r.noEvents, 1);
 });
+
+const ageOf = abstract => worker.applyDetection({ id: "9", title: "Case", abstract, entities: {}, pubTypes: ["Case Reports"] }, ["aciclovir"], null, []).caseFacts.patient;
+test("patient age is picked from the usual ways articles write it", () => {
+  assert.equal(ageOf("A 54-year-old man took aciclovir.").age, "54");
+  assert.equal(ageOf("A 54 year old woman took aciclovir.").age, "54");
+  assert.equal(ageOf("A 54-yr-old man took aciclovir.").age, "54");
+  assert.equal(ageOf("A 54 y/o man took aciclovir.").age, "54");
+  assert.equal(ageOf("A man aged 54 years took aciclovir.").age, "54");
+  assert.equal(ageOf("A 54 years of age man took aciclovir.").age, "54");
+  const baby = ageOf("A 3-month-old girl received aciclovir.");
+  assert.equal(baby.age, "3"); assert.equal(baby.age_unit, "months");
+  assert.equal(ageOf("A man in his 60s took aciclovir.").age_group, "60s");
+});
+
+test("a case from an article identifies the patient by age and sex and is valid without a name", async () => {
+  const t = await setup();
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
+  Object.assign(bench.articles["1"], { fullTextStatus: "Captured", fullTextKey: "k", entities: { diseases: ["hepatic failure"] }, journal: "J", ...worker.applyDetection({ ...bench.articles["1"], entities: { diseases: ["hepatic failure"] } }, ["aciclovir"], null, [], FULL_TEXT) });
+  await t.BUCKET.put("bench.json", JSON.stringify(bench));
+  const made = (await t.call(MANAGER, "/api/case-create", { pmid: "1" })).body;
+  assert.match(made.case.data.patient.identifier.value, /54-year-old male \(name withheld in the publication\)/);
+  assert.equal(made.assessment.validity.identifiable_patient, true);
+});
+
+test("a date the article does not give can be confirmed as not reported", async () => {
+  const t = await setup();
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
+  Object.assign(bench.articles["1"], { fullTextStatus: "Captured", fullTextKey: "k", journal: "J", ...worker.applyDetection({ ...bench.articles["1"], entities: { diseases: ["hepatic failure"] } }, ["aciclovir"], null, [], FULL_TEXT) });
+  await t.BUCKET.put("bench.json", JSON.stringify(bench));
+  const made = (await t.call(MANAGER, "/api/case-create", { pmid: "1" })).body;
+  const before = made.assessment;
+  assert.ok(before.qc.findings.some(f => f.severity === "major" && /start date/i.test(f.title)));
+  assert.ok(before.follow_up.questions.some(q => /start date/i.test(q.question)));
+  const data = made.case.data;
+  data.products[0].start_not_reported = true; data.events[0].onset_not_reported = true;
+  data.events[0].time_to_onset = { value: "10 days after starting", state: "edited", evidence: [], normalized_value: null };
+  const after = (await t.call(MANAGER, "/api/case-assess", { id: made.case.id, data })).body.assessment;
+  assert.ok(!after.qc.findings.some(f => f.severity === "major" && /start date|onset date/i.test(f.title)));
+  assert.ok(after.qc.findings.some(f => f.severity === "info" && /not reported in the article/.test(f.title)));
+  assert.ok(!after.follow_up.questions.some(q => /start date|onset date/i.test(q.question)));
+  assert.notEqual(after.causality.category, "Unassessable / Unclassifiable");
+  assert.ok(after.qc.score > before.qc.score);
+});
+
+test("event coding picker offers the IME list and earlier reviewed codings", async () => {
+  const t = await setup();
+  const made = (await t.call(MANAGER, "/api/case-create", { pmid: "1" })).body;
+  const c = made.case; c.data.events[0] = { ...c.data.events[0], verbatim: { value: "Liver failure", state: "edited", evidence: [] }, pt: { value: "Hepatic failure", state: "edited", evidence: [] }, soc: { value: "Hepatobiliary disorders", state: "edited", evidence: [] }, coding_status: { value: "Reviewed", state: "edited", evidence: [] } };
+  await t.call(MANAGER, "/api/case-save", { id: c.id, status: "Draft", data: c.data, notes: "" });
+  const second = (await t.call(MANAGER, "/api/case-create", { pmid: "1" })).body.case;
+  const r = (await t.call(MANAGER, "/api/case-coding", { id: second.id, verbatim: "liver failure" })).body;
+  assert.equal(r.memory[0].pt, "Hepatic failure"); assert.equal(r.memory[0].score, 1);
+  assert.deepEqual(r.ime, []);
+});

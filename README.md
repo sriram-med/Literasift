@@ -149,3 +149,12 @@ automatically as evidence is processed (Settings can turn this off) or with **Ad
 from the abstract plus the case section of the full text (or the sentences about the patient or drug when the paper has no such section).
 The verbatim phraser records, for each event, the exact wording used in the paper, the sentence around it and the section, and these
 go into the case as the reported term and its source evidence. Full texts that are PDFs without a GROBID service have no extractable text, so those cases use the abstract.
+
+## Patient identity, dates and event coding in literature cases
+
+Published articles do not name patients, so a case identifies the patient by age and sex (for example "54-year-old male (name withheld in the publication)"),
+which satisfies the identifiable-patient criterion. Age is read from the usual wordings (54-year-old, 54 y/o, aged 54, 3-month-old, "in his 60s").
+Therapy start dates and onset dates are rarely given. If the article does not give one, tick "not reported in the article (confirmed)": the gap then stops counting
+against QC and follow-up, and a stated time to onset (for example "10 days after starting") is used for the temporal assessment.
+The event picker adds MedDRA fields (LLT, PT, HLT, HLGT, SOC, version, status) with suggestions from the EMA IME list and from earlier reviewed codings (the PV Nexus coding-memory approach).
+Always confirm codes in a licensed MedDRA source.
