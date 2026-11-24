@@ -131,18 +131,38 @@ async function captureFromPmc(env, article) {
   await env.BUCKET.put(key, response.body, {httpMetadata:{contentType:format === "pdf" ? "application/pdf" : "application/xml"}});
   return {fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:item.license_code, fullTextSource:url, fullTextOrigin:"PMC"};
 }
-// Unpaywall fallback: only stores PDFs under the same permissive licences accepted for PMC; otherwise keeps the link only.
+// Unpaywall: one lookup per article gives open-access status for the whole site and, where the licence allows, a stored PDF.
 const openLicenses = ["cc0","cc-by","cc-by-sa","cc-by-nd"];
 const maxPdfBytes = 25 * 1024 * 1024;
-async function captureFromUnpaywall(env, article, reason) {
-  if (!env.UNPAYWALL_EMAIL) return { fullTextStatus:reason };
-  if (!/^10\.\d{4,9}\/\S+$/.test(article.doi)) return { fullTextStatus:"No DOI for open-access lookup" };
+const oaRecheckMs = 30 * 86400000;
+const validDoi = doi => /^10\.\d{4,9}\/\S+$/.test(doi || "");
+async function unpaywallLookup(env, article) {
+  if (!env.UNPAYWALL_EMAIL) return { state:"unconfigured" };
+  if (!validDoi(article.doi)) return { state:"nodoi" };
   const lookup = new URL("https://api.unpaywall.org/v2/" + encodeURIComponent(article.doi));
   lookup.searchParams.set("email", env.UNPAYWALL_EMAIL);
   const response = await fetch(lookup, { signal:AbortSignal.timeout(15000) });
-  if (response.status === 404) return { fullTextStatus:"Not in Unpaywall" };
+  if (response.status === 404) return { state:"notfound" };
   if (!response.ok) throw new Error("Unpaywall returned HTTP " + response.status);
-  const data = await response.json();
+  return { state:"ok", data:await response.json() };
+}
+// Fields shown across the site (badges, filters, overview, CSV) from one Unpaywall result.
+function oaFields(result) {
+  const checked = { oaCheckedAt:new Date().toISOString() };
+  if (result.state === "nodoi") return { ...checked, oaStatus:"No DOI" };
+  if (result.state === "notfound") return { ...checked, oaStatus:"Not in Unpaywall" };
+  if (result.state !== "ok") return {};
+  const data = result.data, best = data.best_oa_location;
+  return { ...checked, oaStatus:data.oa_status || (data.is_oa ? "open" : "closed"), oaIsOpen:Boolean(data.is_oa),
+    oaJournalIsOa:Boolean(data.journal_is_oa), oaLicense:best?.license || "", oaVersion:best?.version || "",
+    oaHostType:best?.host_type || "", oaUrl:/^https:\/\//.test(best?.url_for_pdf || best?.url || "") ? (best.url_for_pdf || best.url) : "" };
+}
+async function captureFromUnpaywall(env, article, reason, lookupOnce) {
+  const result = await lookupOnce();
+  if (result.state === "unconfigured") return { fullTextStatus:reason };
+  if (result.state === "nodoi") return { fullTextStatus:"No DOI for open-access lookup" };
+  if (result.state === "notfound") return { fullTextStatus:"Not in Unpaywall" };
+  const data = result.data;
   if (!data.is_oa) return { fullTextStatus:"No open-access copy" };
   const locations = [data.best_oa_location, ...(data.oa_locations || [])].filter(Boolean);
   const license = l => String(l.license || "").toLowerCase();
@@ -163,10 +183,10 @@ async function captureFromUnpaywall(env, article, reason) {
   const link = locations.map(l => l.url_for_landing_page || l.url).find(u => /^https:\/\//.test(u || ""));
   return link ? { fullTextStatus:"Open access link only", fullTextLink:link } : { fullTextStatus:"No downloadable open-access copy" };
 }
-async function captureFullText(env, article) {
+async function captureFullText(env, article, lookupOnce) {
   const pmc = await captureFromPmc(env, article);
   if (pmc.fullTextStatus === "Captured") return pmc;
-  return captureFromUnpaywall(env, article, pmc.fullTextStatus);
+  return captureFromUnpaywall(env, article, pmc.fullTextStatus, lookupOnce);
 }
 // Crossref update notices (publisher and Retraction Watch sources) for the article's DOI.
 const noticeTypes = { retraction:"Retracted", withdrawal:"Retracted", removal:"Retracted",
@@ -204,25 +224,34 @@ async function captureScreenshot(env, article) {
   await env.BUCKET.put(key,response.body,{httpMetadata:{contentType:"image/png"}});
   return { screenshotKey:key, screenshotStatus:"Captured", screenshotAt:new Date().toISOString() };
 }
-async function collectEvidence(env, ids) {
-  const {state} = await load(env);
+async function collectEvidence(baseEnv, ids) {
+  const {state} = await load(baseEnv);
+  const env = Object.assign(Object.create(baseEnv), { UNPAYWALL_EMAIL:baseEnv.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail || "" });
   const articles = ids ? ids.map(id=>state.articles[id]).filter(Boolean) : Object.values(state.articles);
   const enabled = Boolean(env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN);
   const needsFullText = a => !a.fullTextStatus || a.fullTextStatus === "Retry needed" ||
     (Boolean(env.UNPAYWALL_EMAIL) && ["No PMC record","No eligible PMC file"].includes(a.fullTextStatus));
   const needsScreen = a => enabled && !a.screenshotKey;
+  const needsOa = a => Boolean(env.UNPAYWALL_EMAIL) && (!a.oaCheckedAt ||
+    (!a.oaIsOpen && Date.now() - Date.parse(a.oaCheckedAt) > oaRecheckMs));
   const needsRetraction = a => !a.retractionCheckedAt || Date.now() - Date.parse(a.retractionCheckedAt) > retractionRecheckMs;
-  const pending = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a))
+  const pending = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a))
     .sort((a,b)=>String(a.evidenceAttempt || "").localeCompare(String(b.evidenceAttempt || ""))).slice(0,4);
   for (const article of pending) {
     const status = {evidenceAttempt:new Date().toISOString()};
+    let lookup; // at most one Unpaywall request per article per pass
+    const lookupOnce = async () => (lookup ||= await unpaywallLookup(env,article));
     if (needsFullText(article)) {
-      try { Object.assign(status,await captureFullText(env,article)); }
+      try { Object.assign(status,await captureFullText(env,article,lookupOnce)); }
       catch (error) { Object.assign(status,{fullTextStatus:"Retry needed",fullTextError:error.message}); }
     }
     if (needsScreen(article)) {
       try { Object.assign(status,await captureScreenshot(env,article)); }
       catch { status.screenshotStatus="Retry needed"; }
+    }
+    if (needsOa(article)) {
+      try { Object.assign(status,oaFields(await lookupOnce())); }
+      catch (error) { status.oaError = error.message; }
     }
     if (needsRetraction(article)) {
       try { Object.assign(status,await checkRetraction(env,article)); }
@@ -231,7 +260,7 @@ async function collectEvidence(env, ids) {
     await write(env, data => Object.assign(data.articles[article.id],status));
   }
   return {processed:pending.length, unattempted:articles.filter(a=>!a.evidenceAttempt).length,
-    screenshotConfigured:enabled};
+    screenshotConfigured:enabled, unpaywallConfigured:Boolean(env.UNPAYWALL_EMAIL)};
 }
 
 async function api(request, env, path) {
@@ -251,7 +280,9 @@ async function api(request, env, path) {
   if (!viewer && !service) return json({ error:"Your account needs a Literature Bench profile." }, 403);
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email);
-    return json({ viewer, profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
+    return json({ viewer, config:{ unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
+      profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
       articles:manager ? state.articles : Object.fromEntries(assignments.map(a => [a.pmid, state.articles[a.pmid]])) });
   }
@@ -295,6 +326,16 @@ async function api(request, env, path) {
     return json({ results, remaining:Math.max(0, due.length - maxWatchesPerRun), evidence:await collectEvidence(env) });
   }
   if (!manager) return json({ error:"Manager access required." },403);
+  if (path === "/api/settings") {
+    const email = String(body.unpaywallEmail || "").trim();
+    if (email && (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || email.length > 200)) return json({error:"Enter a valid contact email for Unpaywall."},400);
+    await write(env, data => { (data.settings ||= {}).unpaywallEmail = email; });
+    return json({ ok:true });
+  }
+  if (path === "/api/recheck-access") {
+    await write(env, data => { for (const a of Object.values(data.articles)) { delete a.oaCheckedAt; delete a.evidenceAttempt; if (/^(No PMC record|No eligible PMC file|No open-access copy|Not in Unpaywall|No downloadable open-access copy)$/.test(a.fullTextStatus || "")) delete a.fullTextStatus; } });
+    return json({ ok:true });
+  }
   if (path === "/api/evidence") return json(await collectEvidence(env));
   if (path === "/api/profile") {
     const profile = { email:String(body.email || "").trim().toLowerCase(), name:String(body.name || "").trim(),
@@ -437,13 +478,17 @@ const paths = {
   "Search & Pull":'<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
   Batches:'<path d="m12 3 9 5-9 5-9-5 9-5z"/><path d="m3 13 9 5 9-5"/>',
   Watchlists:'<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  Settings:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
   Team:'<circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0M17 4a4 4 0 0 1 0 8M22 21a7 7 0 0 0-4-6"/>',
   moon:'<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>', sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity."};
-let data, tab, active, filt={q:"",status:"",portfolio:""}, shown=[];
+const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks."};
+let data, tab, active, filt={q:"",status:"",portfolio:"",oa:""}, shown=[];
+const oaColor={gold:"green",diamond:"green",hybrid:"blue",green:"blue",bronze:"amber",closed:""};
+const oaLabel=a=>a.oaStatus?(a.oaStatus==="closed"?"Closed access":["No DOI","Not in Unpaywall"].includes(a.oaStatus)?a.oaStatus:"OA · "+a.oaStatus):"";
+const oaGroup=a=>!a.oaCheckedAt?"unchecked":a.oaIsOpen?"open":"closed";
 let toastTimer;
 const message = (value, error=false) => { const t=$("toast"); t.textContent=value; t.className="show"+(error?" err":""); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.className="",error?6000:2800); };
 async function api(route, body) {
@@ -466,6 +511,7 @@ function evidenceChips(item){
   const chips=[];
   if(flagged(item))chips.push(badge(item.retractionStatus,"red"));
   else if(item.retractionStatus==="Correction")chips.push(badge("Correction","amber"));
+  if(item.oaStatus)chips.push('<span class="badge '+(oaColor[item.oaStatus]||"")+'" title="'+esc((item.oaLicense?"Licence: "+item.oaLicense+". ":"")+(item.oaVersion?"Version: "+item.oaVersion+". ":"")+(item.oaHostType?"Host: "+item.oaHostType+".":""))+'">'+esc(oaLabel(item))+'</span>');
   chips.push(item.fullTextKey?'<a class="badge green" href="/api/full-text/'+esc(item.id)+'">Full text</a>':item.fullTextLink?'<a class="badge blue" target="_blank" rel="noopener" href="'+esc(item.fullTextLink)+'">Open-access link</a>':badge(item.fullTextStatus||"Full text pending"));
   chips.push(item.screenshotKey?'<a class="badge green" href="/api/screenshot/'+esc(item.id)+'">Screenshot</a>':badge(item.screenshotStatus||"Screenshot pending"));
   return '<div class="chips">'+chips.join("")+"</div>";
@@ -484,18 +530,19 @@ function queueView(items){
   const portfolios=[...new Set(items.map(a=>a.portfolio))].sort();
   return '<section><div class="filters"><input data-filter="q" placeholder="Search title, PMID, molecule…" value="'+esc(filt.q)+'" aria-label="Search">'+
     '<select data-filter="status" aria-label="Status"><option value="">All statuses</option>'+["Pending","In review","Full text needed","Complete"].map(s=>'<option'+(filt.status===s?" selected":"")+'>'+s+"</option>").join("")+"</select>"+
+    '<select data-filter="oa" aria-label="Access"><option value="">All access</option>'+[["open","Open access"],["closed","Closed access"],["unchecked","Not yet checked"]].map(([v,l])=>'<option value="'+v+'"'+(filt.oa===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
     '<select data-filter="portfolio" aria-label="Portfolio"><option value="">All portfolios</option>'+portfolios.map(p=>'<option'+(filt.portfolio===p?" selected":"")+'>'+esc(p)+"</option>").join("")+"</select></div>"+
     '<div id="qtable">'+queueRows(applyFilter(items))+"</div></section>";
 }
 function applyFilter(items){
   const q=filt.q.trim().toLowerCase();
-  return items.filter(a=>(!filt.status||a.status===filt.status)&&(!filt.portfolio||a.portfolio===filt.portfolio)&&
+  return items.filter(a=>(!filt.status||a.status===filt.status)&&(!filt.portfolio||a.portfolio===filt.portfolio)&&(!filt.oa||oaGroup(data.articles[a.pmid]||{})===filt.oa)&&
     (!q||(a.pmid+" "+(data.articles[a.pmid]?.title||"")+" "+(a.molecules||[]).join(" ")).toLowerCase().includes(q)));
 }
 function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=manager?["Overview","Search & Pull","My Queue","All Assignments","Batches","Watchlists","Team"]:["My Queue"];
+  const tabs=manager?["Overview","Search & Pull","My Queue","All Assignments","Batches","Watchlists","Team","Settings"]:["My Queue"];
   if(!tabs.includes(tab))tab=tabs[0];
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
   const open=mine.filter(a=>a.status!=="Complete").length;
@@ -509,12 +556,16 @@ function render() {
     const arts=Object.values(data.articles);
     const alerts=arts.filter(flagged).length, retry=arts.filter(a=>a.fullTextStatus==="Retry needed").length;
     const portfolios=[...new Set(items.map(a=>a.portfolio))].sort();
-    html='<div class="cards">'+stat("Unique citations",arts.length,"Batches")+stat("Assigned",items.filter(a=>a.reviewer).length,"Team")+stat("Unassigned",items.filter(a=>!a.reviewer).length,"alert",true)+stat("Complete",done,"My Queue")+stat("Retraction alerts",alerts,"alert",true)+'</div>'+
+    const checkedOa=arts.filter(a=>a.oaCheckedAt), openOa=checkedOa.filter(a=>a.oaIsOpen);
+    const oaCounts={};checkedOa.forEach(a=>{oaCounts[a.oaStatus]=(oaCounts[a.oaStatus]||0)+1;});
+    html='<div class="cards">'+stat("Unique citations",arts.length,"Batches")+stat("Assigned",items.filter(a=>a.reviewer).length,"Team")+stat("Unassigned",items.filter(a=>!a.reviewer).length,"alert",true)+stat("Complete",done,"My Queue")+stat("Retraction alerts",alerts,"alert",true)+stat("Open access %",checkedOa.length?Math.round(openOa.length/checkedOa.length*100):0,"Watchlists")+'</div>'+
       '<div class="grid2">'+panel("Screening progress",'<div class="row"><span>'+done+" of "+items.length+' complete</span><b>'+pct+'%</b></div><div class="bar"><i data-width="'+pct+'"></i></div>'+
         portfolios.map(p=>{const list=items.filter(a=>a.portfolio===p),d=list.filter(a=>a.status==="Complete").length;return '<div class="row"><span>'+esc(p)+'</span><span class="sub">'+d+" / "+list.length+"</span></div>";}).join(""))+
+      panel("Open access (Unpaywall)",data.config.unpaywall?(checkedOa.length?Object.entries(oaCounts).sort((x,y)=>y[1]-x[1]).map(([k,v])=>'<div class="row"><span>'+badge(oaLabel({oaStatus:k}),oaColor[k]||"")+'</span><span class="sub">'+v+" · "+Math.round(v/checkedOa.length*100)+'%</span></div>').join("")+'<div class="row"><span class="sub">'+(arts.length-checkedOa.length)+' not yet checked</span></div>':'<div class="empty">Checks start with the next evidence run.</div>'):'<div class="empty">Add a contact email under Settings to turn on Unpaywall.</div>')+
       panel("Needs attention",
         '<div class="row"><span>Unassigned citations</span>'+badge(items.filter(a=>!a.reviewer).length,items.some(a=>!a.reviewer)?"amber":"")+'</div>'+
         '<div class="row"><span>Retracted or expression of concern</span>'+badge(alerts,alerts?"red":"")+'</div>'+
+        (data.config.unpaywall?'':'<div class="row"><span>Unpaywall is not configured</span>'+badge("Settings","amber")+'</div>')+
         '<div class="row"><span>Full-text fetch needs retry</span>'+badge(retry,retry?"amber":"")+'</div>'+
         '<div class="row"><span>Flagged “Full text needed” by reviewers</span>'+badge(items.filter(a=>a.status==="Full text needed").length,"blue")+'</div>')+'</div>'+
       panel("Recent batches",table(["Watchlist","Range","Citations","Status"],data.runs.slice(0,6).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red")]),"No batches yet."),"",true);
@@ -529,6 +580,11 @@ function render() {
   if(tab==="Watchlists") html=panel("Add a watchlist",'<form class="grid" data-route="watch"><label>Portfolio<input name="portfolio" required></label><label>Molecule<input name="molecule" placeholder="Optional"></label><label class="wide">PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><div><button class="btn">Save watchlist</button></div></form>')+
     panel("Add molecules in bulk",'<form class="grid" data-route="watches"><label>Portfolio<input name="portfolio" required></label><label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Save molecules</button></div></form>',"One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs.")+
     panel("Saved watchlists ("+data.watches.length+")",table(["Portfolio","Molecule","Query"],data.watches.map(w=>[esc(w.portfolio),esc(w.molecule||"—"),'<span class="sub">'+esc(w.query)+"</span>"]),"Add a molecule or portfolio watchlist to start."),"",true);
+  if(tab==="Settings") html=panel("Unpaywall (open access)",'<form class="grid" data-route="settings"><label class="wide">Contact email for Unpaywall<input type="email" name="unpaywallEmail" value="'+esc(data.config.unpaywallEmail)+'" placeholder="you@example.com"'+(data.config.unpaywallFromEnv?' disabled':'')+'></label><div><button class="btn"'+(data.config.unpaywallFromEnv?' disabled':'')+'>Save</button></div></form>'+
+      '<div class="row"><span>Status</span>'+(data.config.unpaywall?badge("Active","green"):badge("Not configured","amber"))+'</div>'+
+      '<form data-route="recheck-access" style="margin-top:10px"><button class="btn outline">Re-check open access for all articles</button></form>',
+      "Unpaywall requires a contact email on each request; it is sent to Unpaywall only. Every article with a DOI gets an open-access status (gold, hybrid, green, bronze or closed). Permissively licensed PDFs are stored, other open copies are linked. Closed articles are re-checked every 30 days."+(data.config.unpaywallFromEnv?" The email is set by the server environment (UNPAYWALL_EMAIL).":""))+
+    panel("What Unpaywall adds across the site",'<div class="row"><span>Overview</span><span class="sub">Open-access share and breakdown</span></div><div class="row"><span>Queues</span><span class="sub">OA badge on every citation and an access filter</span></div><div class="row"><span>Full text</span><span class="sub">Fallback when PubMed Central has no eligible copy</span></div><div class="row"><span>CSV export</span><span class="sub">OA status, licence and link columns</span></div>');
   if(tab==="Team") html=panel("Add or update a reviewer",'<form class="grid" data-route="profile"><label>Name<input name="name" required></label><label>Sign-in email<input type="email" name="email" required></label><label>Portfolio<input name="portfolio" placeholder="All portfolios"></label><label>Open assignment limit<input type="number" name="capacity" min="1" max="500" value="25" required></label><label>Availability<select name="active"><option value="true">Active</option><option value="false">Unavailable</option></select></label><div><button class="btn">Save reviewer</button></div></form>')+
     panel("Reviewers",table(["Name","Email","Role","Portfolio","Open"],data.profiles.map(p=>[esc(p.name),esc(p.email),badge(p.role,p.role==="manager"?"blue":""),esc(p.portfolio||"All"),items.filter(a=>a.reviewer===p.email&&a.status!=="Complete").length]),"No profiles."),"",true);
   if(tab==="Batches") html=panel("Backfill a date range",watchOptions?
@@ -553,10 +609,10 @@ async function refresh(){data=await api("state");render();}
 function download(id) {
   const run=data.runs.find(r=>r.id===id);
   const cell=value=>'"'+String(value??"").replace(/^[=+@\\-]/,"'$&").replaceAll('"','""')+'"';
-  const rows=[["PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Molecules","Reviewer","Status","Full text","Screenshot","Retraction check"]];
+  const rows=[["PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Molecules","Reviewer","Status","Full text","Screenshot","Retraction check","OA status","OA licence","OA link"]];
   run.ids.forEach(pmid=>{
     const a=data.articles[pmid], item=data.assignments.find(x=>x.pmid===pmid&&x.portfolio===run.portfolio);
-    rows.push([pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,(item?.molecules||[]).join("; "),item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending",a.retractionStatus||"Pending"]);
+    rows.push([pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,(item?.molecules||[]).join("; "),item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending",a.retractionStatus||"Pending",a.oaStatus||"Pending",a.oaLicense||"",a.oaUrl||""]);
   });
   const url=URL.createObjectURL(new Blob([rows.map(row=>row.map(cell).join(",")).join("\\r\\n")],{type:"text/csv"}));
   const link=document.createElement("a");link.href=url;link.download="pubmed-"+run.from+"-"+run.to+".csv";link.click();
@@ -602,7 +658,7 @@ document.addEventListener("submit",async event=>{
   }
   button.disabled=true;message(route==="import"||route==="pull"?"Retrieving PubMed citations…":"Saving…");
   try {const result=await api(route,body);if(route==="review")$("dialog").close();await refresh();
-    message(route==="import"?"Batch imported.":route==="pull"?result.count+" articles pulled for "+(result.molecule||result.portfolio)+".":route==="watches"?result.created+" molecule watchlists saved."+(result.skipped.length?" Skipped (invalid or too long): "+result.skipped.join(", "):""):"Saved.");}
+    message(route==="recheck-access"?"Open-access check queued for all articles.":route==="import"?"Batch imported.":route==="pull"?result.count+" articles pulled for "+(result.molecule||result.portfolio)+".":route==="watches"?result.created+" molecule watchlists saved."+(result.skipped.length?" Skipped (invalid or too long): "+result.skipped.join(", "):""):"Saved.");}
   catch(error){message(error.message,true);if(route==="review")$("dialog").close();if(route==="import"||route==="pull")await refresh().catch(()=>{});}
   finally{button.disabled=false;}
 });
