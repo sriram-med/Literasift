@@ -8,6 +8,7 @@ import { FileBucket } from "./storage.mjs";
 import { addPendingUser, checkPassword, consumeToken, createToken, peekToken, readUsers, removeUser, setPassword, strongEnough, validEmail } from "./accounts.mjs";
 import { mailConfigured, sendMail } from "./mail.mjs";
 import { makeScreenshotFn } from "./screenshots.mjs";
+import { makePdfTextFn } from "./pdftext.mjs";
 import { mirrorLibrary } from "./library.mjs";
 
 const e = process.env;
@@ -19,6 +20,9 @@ const publicUrl = String(e.PUBLIC_URL || "").replace(/\/+$/, "");
 const env = { BUCKET: new FileBucket(dataDir + "/objects"), RUN_TOKEN: runToken, UNPAYWALL_EMAIL: e.UNPAYWALL_EMAIL, CROSSREF_EMAIL: e.CROSSREF_EMAIL,
   SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN, HOST_ACCOUNTS: true, AUDIT_ANCHOR_KEY: e.AUDIT_ANCHOR_KEY || createHmac("sha256", secret).update("literasift-audit-anchor").digest("hex"), LIBRARY_PATH: dataDir + "/library" };
 
+const pdfTextFn = await makePdfTextFn();
+if (pdfTextFn) env.PDF_TEXT_FN = pdfTextFn;
+console.log(pdfTextFn ? "PDF text: on" : "PDF text: off (run deploy/enable-pdf-text.sh to read PDF full texts)");
 const screenshotFn = await makeScreenshotFn();
 if (screenshotFn) env.SCREENSHOT_FN = screenshotFn;
 console.log(screenshotFn ? "Local screenshots: on" : "Local screenshots: off (run deploy/enable-screenshots.sh to turn on)");

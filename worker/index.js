@@ -376,7 +376,7 @@ function keyPassages(text, molecules) {
 }
 // Optional GROBID service (Apache-2.0, self-hosted): turns a stored PDF into structured text.
 async function pdfToText(env, bytes) {
-  if (!env.GROBID_URL) return "";
+  if (!env.GROBID_URL) return env.PDF_TEXT_FN ? String(await env.PDF_TEXT_FN(bytes)) : "";
   const form = new FormData();
   form.append("input", new Blob([bytes], { type:"application/pdf" }), "article.pdf");
   const response = await fetch(String(env.GROBID_URL).replace(/\/+$/, "") + "/api/processFulltextDocument", { method:"POST", body:form, signal:AbortSignal.timeout(120000) });
@@ -752,7 +752,25 @@ async function loadIme(env) {
   return value;
 }
 const imeInvalidate = () => { imeCache = { at:0, value:null }; };
-const negationWords = /\b(no|not|without|denied|denies|absence|absent|negative|free|ruled|never|none|nor|neither)\b/;
+// ---- Negation (NegEx algorithm). Trigger lists are the English clinical term sets from negspacy (MIT, Copyright (c) 2019 Jeno Pizarro; see THIRD_PARTY_NOTICES.md). ----
+const NEGEX = { pseudo:["gram negative", "might not", "no change", "no definite change", "no further", "no increase", "no interval change", "no significant change", "no significant interval change", "no suspicious change", "not able to be", "not been ruled out", "not cause", "not certain if", "not certain whether", "not drain", "not extend", "not necessarily", "not only", "not rule out", "not ruled out", "without any further", "without difficulty", "without further"],
+  pre:["absence of", "aren't", "arent", "can't", "cannot", "cant", "couldn't", "couldnt", "declined", "denied", "denies", "denying", "did not exhibit", "didn't", "didnt", "doesn't", "doesnt", "don't", "dont", "doubt", "evaluate for", "fails to reveal", "free of", "isn't", "isnt", "negative for", "never", "never developed", "never had", "no", "no cause of", "no complaints of", "no evidence of", "no sign of", "no signs of", "not", "not demonstrate", "patient was not", "r/o", "ro", "rule her out", "rule him out", "rule out", "rule patient out", "rule the patient out", "ruled her out", "ruled him out", "ruled out", "ruled patient out", "ruled the patient out", "rules out", "symptoms atypical", "versus", "wasn't", "wasnt", "weren't", "werent", "without", "without any reactions or signs of", "without indication of", "without sign of", "without signs of"],
+  post:["declined", "free", "unlikely", "was not", "was ruled out", "wasn't", "wasnt", "were not", "were ruled out", "weren't", "werent"],
+  stop:["although", "apart from", "as there are", "aside from", "but", "cause for", "cause of", "causes for", "causes of", "etiology for", "etiology of", "except", "however", "involving", "nevertheless", "origin for", "origin of", "origins for", "origins of", "other possibilities of", "reason for", "reason of", "reasons for", "reasons of", "secondary to", "source for", "source of", "sources for", "sources of", "still", "though", "trigger event for", "which", "yet"] };
+const negexRe = list => new RegExp("(?:^| )(" + [...new Set(list.map(imeNorm).filter(Boolean))].sort((a, b) => b.length - a.length).map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")(?= |$)", "g");
+const NEGEX_RE = { pseudo:negexRe(NEGEX.pseudo), pre:negexRe(NEGEX.pre), post:negexRe(NEGEX.post), stop:negexRe(NEGEX.stop) };
+const negexScan = (text, re) => [...text.matchAll(re)].map(m => ({ at:m.index + (m[0].startsWith(" ") ? 1 : 0), len:m[1].length }));
+const overlaps = (a, b) => a.at < b.at + b.len && b.at < a.at + a.len;
+// True when the words [start, end) of a normalised sentence are negated: a trigger before or after them, with no scope-ending word in between.
+function isNegated(words, start, end) {
+  const before = words.slice(Math.max(0, start - 6), start).join(" "), after = words.slice(end, end + 4).join(" ");
+  const pseudoBefore = negexScan(before, NEGEX_RE.pseudo), pre = negexScan(before, NEGEX_RE.pre).filter(t => !pseudoBefore.some(p => overlaps(t, p)));
+  if (pre.length) { const last = pre[pre.length - 1]; if (!negexScan(before.slice(last.at + last.len), NEGEX_RE.stop).length) return true; }
+  const pseudoAfter = negexScan(after, NEGEX_RE.pseudo), post = negexScan(after, NEGEX_RE.post).filter(t => !pseudoAfter.some(p => overlaps(t, p)));
+  if (post.length && !negexScan(after.slice(0, post[0].at), NEGEX_RE.stop).length) return true;
+  return false;
+}
+
 const EVENT_VERSION = 5;
 // Candidate adverse events in the title and abstract, each with the sentence that supports it. IME terms come first.
 // ---- Verbatim phraser: finds the exact words the article used for an event, the sentence around them and the section they sit in ----
@@ -821,7 +839,7 @@ function detectEvents(article, molecules, ime, promotions, exclude) {
         const hit = ime?.byName.get(phrase), promo = promoted.get(phrase), demoted = ime?.demoted.get(phrase);
         if (!hit && !promo && !demoted) continue;
         if (names.has(phrase) || prior.has(phrase)) { i += n - 1; break; }
-        if (negationWords.test(words.slice(Math.max(0, i - 6), i).join(" "))) { i += n - 1; break; }
+        if (isNegated(words, i, i + n)) { i += n - 1; break; }
         add(hit?.name || phrase, "IME", sentence, { ime:hit ? { code:hit.code, soc:hit.soc, added:hit.added || undefined, provenance:ime.info.label } : promo ? { provenance:"Reviewer-promoted" + (promo.note ? ": " + promo.note : "") } : { code:demoted.code, soc:demoted.soc, provenance:ime.info.label + ': "' + demoted.name + '" is demoted under the listed PT "' + demoted.parent + '"' } });
         i += n - 1;
         break;
@@ -832,8 +850,8 @@ function detectEvents(article, molecules, ime, promotions, exclude) {
   for (const d of article.entities?.diseases || []) {
     if (found.has(imeNorm(d)) || names.has(imeNorm(d)) || prior.has(imeNorm(d))) continue;
     const sentence = text.split(/(?<=[.!?])\s+/).find(s => imeNorm(s).includes(imeNorm(d))) || "";
-    const index = imeNorm(sentence).indexOf(imeNorm(d));
-    if (sentence && !negationWords.test(imeNorm(sentence).slice(Math.max(0, index - 40), index))) add(d, "PubTator condition", sentence);
+    const norm = imeNorm(sentence), index = norm.indexOf(imeNorm(d)), first = index < 0 ? 0 : norm.slice(0, index).split(" ").filter(Boolean).length;
+    if (sentence && !isNegated(norm.split(" ").filter(Boolean), first, first + imeNorm(d).split(" ").length)) add(d, "PubTator condition", sentence);
   }
   const rank = e => (e.ime ? 0 : 4) + (e.withDrug ? 0 : 2) + (e.kinds.includes("MeSH adverse-effect indexing") ? 0 : 1);
   return [...found.values()].sort((a, b) => rank(a) - rank(b)).slice(0, 12);
@@ -864,6 +882,18 @@ const TREATMENT_TEST = new RegExp(TREATMENT_ITEM.source, "i"); // non-global cop
 const sentencesOf = text => String(text || "").replace(/\s+/g, " ").split(/(?<=[.!?])\s+(?=[A-Z0-9(])/).map(s => s.trim()).filter(Boolean);
 const cleanItem = v => String(v).replace(/^(?:the|a|an)\s+/i, "").replace(/[()]/g, "").replace(/\s+/g, " ").trim();
 function splitList(value) { return String(value).replace(/^(?:medications?|drugs?|treatments?|therapies|agents?|other)\s+(?:included|include|were|was|are|such as|including)\s+/i, "").split(/,|;|\band\b|\bplus\b|\bas well as\b/i).map(cleanItem).filter(x => x.length > 2 && x.length < 70); }
+const MONTHS = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, sept:9, oct:10, nov:11, dec:12 };
+const MONTH_RE = "(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)";
+// "3 March 2021", "March 3, 2021" and "2021-03-03". Day/month/year numbers such as 03/04/2021 are ambiguous and are left for the reviewer.
+const DATE_RE = new RegExp("\\b(?:(\\d{1,2})(?:st|nd|rd|th)?\\s+" + MONTH_RE + "\\.?,?\\s+(\\d{4})|" + MONTH_RE + "\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?,?\\s+(\\d{4})|(\\d{4})-(\\d{2})-(\\d{2}))\\b", "gi");
+function isoFromParts(m) {
+  let y, mo, d;
+  if (m[1]) { d = Number(m[1]); mo = MONTHS[m[2].slice(0, 3).toLowerCase()]; y = Number(m[3]); }
+  else if (m[4]) { mo = MONTHS[m[4].slice(0, 3).toLowerCase()]; d = Number(m[5]); y = Number(m[6]); }
+  else { y = Number(m[7]); mo = Number(m[8]); d = Number(m[9]); }
+  if (!(y >= 1950 && y <= 2100 && mo >= 1 && mo <= 12 && d >= 1 && d <= new Date(Date.UTC(y, mo, 0)).getUTCDate())) return "";
+  return y + "-" + String(mo).padStart(2, "0") + "-" + String(d).padStart(2, "0");
+}
 function extractCaseFacts(article, molecules, pubTypes) {
   const title = String(article.title || ""), abstract = String(article.abstract || ""), text = title + ". " + abstract, sents = sentencesOf(abstract || title);
   const names = (molecules || []).map(m => String(m).toLowerCase()).filter(Boolean), isDrug = s => names.some(n => s.toLowerCase().includes(n));
@@ -948,6 +978,12 @@ function extractCaseFacts(article, molecules, pubTypes) {
   const LATENCY_RE = /\b(?:(?:within|after|following)\s+(?:about\s+|approximately\s+|nearly\s+)?(?:\d+(?:\s*(?:-|to)\s*\d+)?|a|an|one|two|three|four|five|six|seven|eight|nine|ten|several|a few)\s*(?:hours?|days?|weeks?|months?)(?:\s+(?:of|after|from|on)\s+(?:starting|initiation|treatment|therapy|the first dose|admission|administration|commencing|beginning)[^.;,]{0,40})?|(?:on|at)\s+(?:day|week)\s+\d+\s+of\s+(?:treatment|therapy|admission)|(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:hours?|days?|weeks?|months?)\s+(?:after|following)\s+(?:starting|initiation|the start|the first dose|commencing|beginning)[^.;,]{0,40})/i;
   const latent = sents.map(x => ({ x, m:LATENCY_RE.exec(x) })).find(r => r.m && (isDrug(r.x) || /treat|therap|dose|start|initiat|admin|infus|began|commenc/i.test(r.x)));
   facts.latency = latent ? { value:latent.m[0].trim().slice(0, 80), evidence:latent.x.slice(0, 240) } : null;
+  // Calendar dates the article gives for starting the drug and for the event (only full dates: day, month and year).
+  const dateIn = text => { const found = []; for (const m of String(text).matchAll(DATE_RE)) { const iso = isoFromParts(m); if (iso) found.push({ iso, at:m.index }); } return found; };
+  const startSent = sents.find(x => /\b(start\w*|initiat\w*|commenc\w*|began|prescribed|introduced|treatment with|admission)\b/i.test(x) && isDrug(x) && dateIn(x).length);
+  if (startSent) facts.startDate = { value:dateIn(startSent)[0].iso, evidence:startSent.slice(0, 240) };
+  const onsetSent = sents.find(x => x !== startSent && /\b(develop\w*|onset|presented|admitted|experienced|noted|occurred|appeared)\b/i.test(x) && dateIn(x).length);
+  if (onsetSent) facts.onsetDate = { value:dateIn(onsetSent)[0].iso, evidence:onsetSent.slice(0, 240) };
   facts.temporal = /\b(after|following|within)\s+(?:\d+|one|two|three|several|a few)?\s*(?:days?|weeks?|months?|hours?|doses?|cycles?)\b|\b(after|following)\s+(?:the\s+)?(?:initiation|start|starting|administration|first dose|infusion|treatment with)\b/i.test(text);
   facts.caseReport = (pubTypes || []).some(t => /case report/i.test(t)) || /\bcase (report|presentation|description|series)\b|\bwe (report|describe|present)\b/i.test(text);
   const single = patient.count != null && patient.count <= 1;
@@ -1137,9 +1173,9 @@ function caseFromArticle(article, assignment) {
       weight:fe(facts?.patient?.weight, { evidence:facts?.patient?.evidence }), medical_history:history },
     reporter:{ identifier:icsrField(authors[0] ? authors[0] + " (first author)" : "", "proposed", ev(cite)), qualification:icsrField("Health professional (published literature)", "proposed", ev(cite)),
       country:icsrField(article.affiliationCountry || "", "proposed", article.affiliation ? ev(article.affiliation) : []) },
-    products:[{ role:"suspect", name:icsrField(molecule, "proposed", ev(cite)), action_taken:fe(facts?.actionTaken?.value, facts?.actionTaken), dechallenge:fe(facts?.dechallenge?.value, facts?.dechallenge), rechallenge:fe(facts?.rechallenge?.value, facts?.rechallenge) },
+    products:[{ role:"suspect", name:icsrField(molecule, "proposed", ev(cite)), start_date:fe(facts?.startDate?.value, facts?.startDate), action_taken:fe(facts?.actionTaken?.value, facts?.actionTaken), dechallenge:fe(facts?.dechallenge?.value, facts?.dechallenge), rechallenge:fe(facts?.rechallenge?.value, facts?.rechallenge) },
       ...(facts?.concomitants || []).slice(0, 6).map(c => ({ role:"concomitant", name:icsrField(c.name, "proposed", ev(c.evidence)) }))],
-    events:events.map((e, i) => i === 0 && facts?.latency && !hasVal(e.time_to_onset) ? { ...e, time_to_onset:icsrField(facts.latency.value, "proposed", ev(facts.latency.value, facts.latency.evidence)) } : e).map((e, i) => i === 0 && facts?.outcome && !hasVal(e.outcome) ? { ...e, outcome:icsrField(facts.outcome, "proposed", facts.patient?.evidence ? ev(facts.patient.evidence) : []) } : e),
+    events:events.map((e, i) => i === 0 && facts?.latency && !hasVal(e.time_to_onset) ? { ...e, time_to_onset:icsrField(facts.latency.value, "proposed", ev(facts.latency.value, facts.latency.evidence)) } : e).map((e, i) => i === 0 && facts?.onsetDate && !hasVal(e.onset_date) ? { ...e, onset_date:icsrField(facts.onsetDate.value, "proposed", ev(facts.onsetDate.value, facts.onsetDate.evidence)) } : e).map((e, i) => i === 0 && facts?.outcome && !hasVal(e.outcome) ? { ...e, outcome:icsrField(facts.outcome, "proposed", facts.patient?.evidence ? ev(facts.patient.evidence) : []) } : e),
     treatment_given:(facts?.treatment || []).map(t => t.text), confounders:facts?.confounders || [],
     source_documents:[{ filename:article.fullTextKey ? "PMID_" + article.id + "." + (/\.(\w+)$/.exec(article.fullTextKey)?.[1] || "pdf") : "PMID " + article.id + " citation and abstract", media_type:article.fullTextKey ? "application/pdf" : "text/plain", source_type:article.fullTextKey ? "pdf" : "text" }],
     source_summary:cite + (article.abstract ? "\n\nAbstract: " + article.abstract : ""),
@@ -1333,6 +1369,8 @@ async function collectEvidence(baseEnv, ids) {
     (!a.fullTextKey && (a.fullTextTier || 0) < fullTextTier) || (Boolean(a.doi) && /^No DOI/.test(a.fullTextStatus || ""));
   // Local captures made before screenshotKind existed may be saved error pages, so they are taken again.
   const needsScreen = a => enabled && (!a.screenshotKey || (Boolean(env.SCREENSHOT_FN) && !a.screenshotKind));
+  // PDFs stored before a text reader was available are read once (pdf.js on the host, or GROBID).
+  const needsPdfText = a => Boolean(env.PDF_TEXT_FN || env.GROBID_URL) && Boolean(a.fullTextKey) && /\.pdf$/i.test(a.fullTextKey) && !a.fullTextTextKey && !a.pdfTextTried;
   const needsEnrich = a => !a.enrichedAt || (a.enrichVersion || 0) < 2;
   const needsEntities = a => !a.entitiesCheckedAt;
   const needsLinks = a => !a.linksCheckedAt;
@@ -1351,7 +1389,7 @@ async function collectEvidence(baseEnv, ids) {
     results.forEach(([id, r]) => Object.assign(state.articles[id], r));
     await write(env, data => results.forEach(([id, r]) => data.articles[id] && Object.assign(data.articles[id], r)));
   }
-  const pending = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a) || needsEnrich(a) || needsEntities(a) || needsLinks(a))
+  const pending = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a) || needsEnrich(a) || needsEntities(a) || needsLinks(a) || needsPdfText(a))
     .sort((a,b)=>String(a.evidenceAttempt || "").localeCompare(String(b.evidenceAttempt || ""))).slice(0,4);
   for (let article of pending) {
     const status = {evidenceAttempt:new Date().toISOString()};
@@ -1388,6 +1426,11 @@ async function collectEvidence(baseEnv, ids) {
       try { Object.assign(status,await captureScreenshot(env,{...article,...status})); }
       catch { status.screenshotStatus="Retry needed"; }
     }
+    if (needsPdfText(article) && !status._text) {
+      status.pdfTextTried = new Date().toISOString();
+      try { const object = await env.BUCKET.get(article.fullTextKey); if (object) status._text = await pdfToText(env, await object.arrayBuffer()); }
+      catch (error) { status.pdfTextError = String(error.message || error).slice(0, 200); }
+    }
     if (status._text) {
       const molecules = [...new Set(state.assignments.filter(a => a.pmid === article.id).flatMap(a => a.molecules || []))];
       try {
@@ -1407,7 +1450,7 @@ async function collectEvidence(baseEnv, ids) {
     const intake = await write(env, data => icsrIntake(data, "system", () => true, 50));
     if (intake.created.length) await audit(env, { by:"system", action:"case.intake", target:intake.created.length + " cases", detail:{ cases:intake.created.join(", "), source:"automatic, articles with stored full text" } });
   }
-  const queued = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a) || needsEntities(a) || needsLinks(a) || needsDetect(a)).length;
+  const queued = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a) || needsEntities(a) || needsLinks(a) || needsPdfText(a) || needsDetect(a)).length;
   return {processed:pending.length, queued, unattempted:articles.filter(a=>!a.evidenceAttempt).length,
     screenshotConfigured:enabled, unpaywallConfigured:Boolean(env.UNPAYWALL_EMAIL), grobidConfigured:Boolean(env.GROBID_URL)};
 }

@@ -66,3 +66,20 @@ The exact response shapes of PubTator3, RxNorm (`drugs.json`), PubChem synonyms 
 this environment; the code only stores Europe PMC full text when the record reports `isOpenAccess: "Y"` and a permissive
 `license`, and otherwise falls through to Unpaywall. None of these services were reachable from the build sandbox, so the
 integrations are tested against mocked responses only; check a few real articles after deploying.
+
+## Ten GitHub repositories reviewed and cloned (November 2026)
+
+Cloned shallowly for study into a folder outside this repository (they are large: GROBID alone is about 2 GB). Pinned commits are listed so the review can be repeated.
+
+| Repository | Licence | Commit | Result |
+|---|---|---|---|
+| [jenojp/negspacy](https://github.com/jenojp/negspacy) | MIT | `39125b0` | **Integrated.** Its English clinical negation term lists drive `isNegated` (NegEx scope rules) in event detection, replacing the older six-word check. Attribution in `THIRD_PARTY_NOTICES.md`. |
+| [mozilla/pdf.js](https://github.com/mozilla/pdf.js) | Apache-2.0 | `32fb05b` | **Integrated (optional).** `server/pdftext.mjs` reads the text of PDF full texts through `pdfjs-dist`, installed by `deploy/enable-pdf-text.sh`. Previously PDF-only full texts had no searchable text unless GROBID was running. Stored PDFs are read once on the next evidence run. |
+| [wanasit/chrono](https://github.com/wanasit/chrono) | MIT | `59d0b2b` | **Idea used, code not copied.** Full dates ("3 March 2021", "March 3, 2021", ISO) are now picked for therapy start and event onset; ambiguous numeric dates are deliberately left to the reviewer. |
+| [kermitt2/grobid](https://github.com/kermitt2/grobid) | Apache-2.0 | `10aaa14` | Already supported as an optional service (`GROBID_URL`); no change. |
+| [citation-js/citation-js](https://github.com/citation-js/citation-js) | MIT | `d2d0691` | Not integrated: RIS and BibTeX export already exist natively. |
+| [titipata/pubmed_parser](https://github.com/titipata/pubmed_parser) | MIT | `b493fb9` | Not integrated: built for bulk MEDLINE dumps; single-article parsing is covered. |
+| [jannisborn/paperscraper](https://github.com/jannisborn/paperscraper) | MIT | `4fae7f6` | Not integrated: scrapes publisher sites; our PMC, Europe PMC and Unpaywall tiers cover the PubMed side. |
+| [allenai/scispacy](https://github.com/allenai/scispacy) | Apache-2.0 | `eacccd4` | Not integrated: needs a Python runtime and model downloads. A candidate for a separate optional service. |
+| [devopam/icsrmaker](https://github.com/devopam/icsrmaker) | Apache-2.0 | `4824f11` | Reference for a future E2B(R3) XML export (not built yet). |
+| [KarelDO/BioDEX](https://github.com/KarelDO/BioDEX) | MIT | `f6e4f49` | Reference: a labelled corpus of adverse-event reports from articles, useful for measuring extraction accuracy later. |

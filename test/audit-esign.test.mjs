@@ -276,3 +276,45 @@ test("event coding picker offers the IME list and earlier reviewed codings", asy
   assert.equal(r.memory[0].pt, "Hepatic failure"); assert.equal(r.memory[0].score, 1);
   assert.deepEqual(r.ime, []);
 });
+
+const evTerms = (abstract, diseases) => worker.applyDetection({ id: "7", title: "T", abstract, entities: { diseases }, pubTypes: [] }, ["aciclovir"], null, []).events.map(e => e.term);
+test("negated events are not picked (NegEx rules from negspacy)", () => {
+  assert.deepEqual(evTerms("The patient had no seizures after aciclovir.", ["seizures"]), []);
+  assert.deepEqual(evTerms("Seizures were not observed after aciclovir.", ["seizures"]), []);
+  assert.deepEqual(evTerms("Aciclovir was started. Hepatic failure was ruled out.", ["hepatic failure"]), []);
+  assert.deepEqual(evTerms("He was seizure free on aciclovir.", ["seizure"]), []);
+  assert.deepEqual(evTerms("Aciclovir was given, but he developed seizures.", ["seizures"]), ["seizures"]);   // scope ends at "but"
+  assert.deepEqual(evTerms("He developed seizures after aciclovir.", ["seizures"]), ["seizures"]);
+  assert.deepEqual(evTerms("Tests did not rule out seizures after aciclovir.", ["seizures"]), ["seizures"]);   // pseudo-negation
+});
+
+test("therapy start and onset dates are picked when the article gives full dates", () => {
+  const f = worker.applyDetection({ id: "8", title: "Case", abstract: "A 54-year-old man started aciclovir on 3 March 2021. On March 9, 2021 he developed seizures. Dates like 03/04/2021 are not guessed.", entities: { diseases: ["seizures"] }, pubTypes: ["Case Reports"] }, ["aciclovir"], null, []).caseFacts;
+  assert.equal(f.startDate.value, "2021-03-03");
+  assert.equal(f.onsetDate.value, "2021-03-09");
+  const none = worker.applyDetection({ id: "8", title: "Case", abstract: "A man started aciclovir on 03/04/2021 and developed seizures.", entities: {}, pubTypes: [] }, ["aciclovir"], null, []).caseFacts;
+  assert.equal(none.startDate, undefined);
+  const bad = worker.applyDetection({ id: "8", title: "Case", abstract: "A man started aciclovir on 31 February 2021.", entities: {}, pubTypes: [] }, ["aciclovir"], null, []).caseFacts;
+  assert.equal(bad.startDate, undefined);
+});
+
+// Minimal one-page PDF with the given lines of text (no external tools needed).
+function tinyPdf(lines) {
+  const stream = "BT /F1 12 Tf 14 TL 50 700 Td " + lines.map(l => "(" + l.replace(/[()\\]/g, "") + ") Tj T*").join(" ") + " ET";
+  const objs = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"];
+  let out = "%PDF-1.4\n"; const offsets = [];
+  objs.forEach((o, i) => { offsets.push(out.length); out += `${i + 1} 0 obj\n${o}\nendobj\n`; });
+  const xref = out.length;
+  out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n` + offsets.map(o => String(o).padStart(10, "0") + " 00000 n \n").join("") + `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return new TextEncoder().encode(out);
+}
+test("PDF full texts are read with pdf.js when it is installed, and the events come from that text", async (t) => {
+  const { makePdfTextFn } = await import("../server/pdftext.mjs");
+  const read = await makePdfTextFn();
+  if (!read) return t.skip("pdfjs-dist is not installed (optional: deploy/enable-pdf-text.sh)");
+  const text = await read(tinyPdf(["Case presentation", "A 54-year-old man was admitted with jaundice.", "Hepatic failure developed after aciclovir."]));
+  assert.match(text, /Case presentation/); assert.match(text, /Hepatic failure developed after aciclovir\./);
+  const r = worker.applyDetection({ id: "5", title: "Aciclovir", abstract: "", entities: { diseases: ["hepatic failure"] }, pubTypes: [] }, ["aciclovir"], null, [], text);
+  assert.ok(r.events.some(e => /hepatic failure/i.test(e.term)));
+});

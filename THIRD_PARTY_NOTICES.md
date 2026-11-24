@@ -23,3 +23,20 @@ THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRI
 AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## negspacy
+
+The negation trigger lists (pseudo-negation, preceding, following and termination terms for English clinical text) used by `isNegated`
+in `worker/index.js` come from https://github.com/jenojp/negspacy (`src/negspacy/termsets.py`, `en_clinical`). LiteraSift re-implements the NegEx
+scope rules in JavaScript; no negspacy code is run.
+
+MIT License. Copyright (c) 2019 Jeno Pizarro
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, subject to the above copyright notice and this permission notice being included in all copies or substantial
+portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+## pdf.js (optional, installed separately)
+
+`deploy/enable-pdf-text.sh` installs `pdfjs-dist` from npm (Mozilla pdf.js, Apache License 2.0, https://github.com/mozilla/pdf.js). It is not copied into this repository.
