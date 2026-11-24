@@ -125,3 +125,7 @@ Every article and pull carries a `source` (PubMed by default). Queues show a sou
 ## ICSR cases (PV Nexus)
 
 Articles that report a patient with an adverse event can become ICSR cases: Review dialog, "Create ICSR case". The case editor pre-fills proposals from the article and assesses the four minimum criteria, QC, causality suggestion and follow-up questions with a port of PV Nexus's own rules (checked for identical results), or with a PV Nexus backend if one is configured in Settings. Cases export as PV Nexus ICSR JSON or a ZIP package. Details, limits and what is not built yet: `docs/PV_NEXUS.md`. Not a validated safety database.
+
+## Events, country, IME and case facts
+
+Articles get automatic event detection (IME list, MeSH drug-induced headings, PubTator), a country (patient, author or journal) with marketing-authorisation status and regulator, and case facts (patient, action taken, dechallenge, rechallenge, treatment, concomitants, confounders). The IME list must be uploaded in Settings (it is licensed MedDRA content and is not in the repo). Details and limits: `docs/EVENTS_COUNTRY_ICSR.md`.

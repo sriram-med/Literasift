@@ -1,2 +1,6 @@
 dist/
 site.tar.gz
+
+# MedDRA-derived content (IME lists) is licensed: never commit it
+*ime-meddra*.json
+ime/
