@@ -39,3 +39,13 @@ A portfolio can hold many watchlists, one per molecule. On the Watchlists tab, p
 Run `node --env-file=/path/to/private.env scripts/run-watchlists.mjs`. Confirm exit status zero and check the site's Batches tab before scheduling it with cron or a systemd timer. Each invocation processes up to four pending evidence records, so run it periodically to clear the evidence queue. The importer uses the last complete India calendar day and skips portfolio/date windows already imported. Use the Batches tab for historical backfills.
 
 Never commit runtime secrets. This runner does not move the website, authentication, or storage to the VPS.
+
+## Self-hosting on a VPS (Hostinger)
+
+`server/` runs the same `worker/index.js` on Node 22: file storage under `/var/lib/literasift`, cookie sign-in (scrypt-hashed passwords in `users.json`), and an in-process hourly scheduler, so no cron job is needed. Caddy provides HTTPS.
+
+```sh
+DOMAIN=literasift.tech ADMIN_EMAIL=you@example.com bash deploy/build-installer.sh   # writes dist/install-literasift.sh
+```
+
+Run `dist/install-literasift.sh` as root on a fresh Ubuntu VPS (or supply it as a Hostinger post-install script; it must stay under 48 KB). It installs Node, Caddy and the service, generates `SESSION_SECRET` and `RUN_TOKEN` into `/etc/literasift.env`, and writes the first password to `/root/literasift-admin.txt`. The first person to sign in becomes the manager; add reviewers on the Team tab, then give each a password with `literasift-user set reviewer@example.com`. Point the domain's A record at the VPS before the first start so Caddy can obtain its certificate.
