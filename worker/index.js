@@ -491,6 +491,55 @@ async function exportPdf(env, state, viewer, manager, body) {
   if (!sections.length) return null;
   return buildPdf(String(body.title || "LiteraSift export").slice(0, 100), String(body.subtitle || "PubMed citations with page screenshots.").slice(0, 300), sections);
 }
+// ---- ZIP (stored, no compression) for bulk full-text download ----
+const crcTable = (() => { const table = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; table[n] = c >>> 0; } return table; })();
+const crc32 = bytes => { let c = 0xffffffff; for (let i = 0; i < bytes.length; i++) c = crcTable[(c ^ bytes[i]) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+function zipFiles(files) {
+  const encoder = new TextEncoder(), now = new Date(), parts = [], central = [];
+  const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1), dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  let offset = 0, centralSize = 0;
+  for (const file of files) {
+    const name = encoder.encode(file.name), crc = crc32(file.data), local = new DataView(new ArrayBuffer(30));
+    [[0, 0x04034b50, 4], [4, 20, 2], [6, 0x0800, 2], [8, 0, 2], [10, dosTime, 2], [12, dosDate, 2], [14, crc, 4], [18, file.data.length, 4], [22, file.data.length, 4], [26, name.length, 4]]
+      .forEach(([at, value, size]) => size === 4 && at !== 26 ? local.setUint32(at, value, true) : local.setUint16(at, value, true));
+    parts.push(new Uint8Array(local.buffer), name, file.data);
+    const entry = new DataView(new ArrayBuffer(46));
+    entry.setUint32(0, 0x02014b50, true); entry.setUint16(4, 20, true); entry.setUint16(6, 20, true); entry.setUint16(8, 0x0800, true); entry.setUint16(10, 0, true);
+    entry.setUint16(12, dosTime, true); entry.setUint16(14, dosDate, true); entry.setUint32(16, crc, true); entry.setUint32(20, file.data.length, true);
+    entry.setUint32(24, file.data.length, true); entry.setUint16(28, name.length, true); entry.setUint32(42, offset, true);
+    central.push(new Uint8Array(entry.buffer), name);
+    offset += 30 + name.length + file.data.length; centralSize += 46 + name.length;
+  }
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, centralSize, true); end.setUint32(16, offset, true);
+  const all = [...parts, ...central, new Uint8Array(end.buffer)], out = new Uint8Array(all.reduce((n, p) => n + p.length, 0));
+  all.reduce((at, piece) => (out.set(piece, at), at + piece.length), 0);
+  return out;
+}
+const csvCell = value => '"' + String(value ?? "").replace(/^[=+@\-]/, "'$&").replaceAll('"', '""') + '"';
+async function exportFullTexts(env, state, viewer, manager, body) {
+  const ids = [...new Set(Array.isArray(body.pmids) ? body.pmids.map(String) : [])].slice(0, pdfMaxArticles);
+  const files = [], rows = [["PMID", "Title", "DOI", "Full text status", "Source", "Licence", "Source URL", "Access", "Files"]];
+  let total = 0;
+  for (const id of ids) {
+    const article = state.articles[id];
+    if (!article || !state.assignments.some(a => a.pmid === id && (manager || a.reviewer === viewer.email))) continue;
+    const names = [];
+    for (const [key, name] of [[article.fullTextKey, "PMID_" + id + "." + (/\.(\w+)$/.exec(article.fullTextKey || "")?.[1] || "bin")], [article.fullTextTextKey, "PMID_" + id + "_text.txt"]]) {
+      if (!key) continue;
+      const object = await env.BUCKET.get(key);
+      if (!object) continue;
+      const data = new Uint8Array(await object.arrayBuffer());
+      total += data.length;
+      if (total > 150 * 1024 * 1024) throw new Error("Selection too large for one ZIP; export fewer articles.");
+      files.push({ name, data }); names.push(name);
+    }
+    rows.push([id, article.title, article.doi, article.fullTextStatus || "Pending", article.fullTextOrigin || "", article.fullTextLicense || "", article.fullTextSource || article.fullTextLink || "", article.oaStatus || "", names.join(" ")]);
+  }
+  if (!files.length) return null;
+  files.push({ name:"manifest.csv", data:new TextEncoder().encode(rows.map(r => r.map(csvCell).join(",")).join("\r\n")) });
+  return zipFiles(files);
+}
 async function captureScreenshot(env, article) {
   if (env.SCREENSHOT_FN) {
     const shot = await env.SCREENSHOT_FN(article);
@@ -617,6 +666,12 @@ async function api(request, env, path) {
     });
     return json({ ok:true });
   }
+  if (path === "/api/export-fulltext" && viewer) {
+    const zip = await exportFullTexts(env, state, viewer, manager, body);
+    if (!zip) return json({ error:"No stored full texts in this selection yet." }, 400);
+    return new Response(zip, { headers:{ "Content-Type":"application/zip", "Cache-Control":"private, no-store", "X-Content-Type-Options":"nosniff",
+      "Content-Disposition":'attachment; filename="literasift-fulltext-' + day() + '.zip"' } });
+  }
   if (path === "/api/export" && viewer) {
     const pdf = await exportPdf(env, state, viewer, manager, body);
     if (!pdf) return json({ error:"No exportable articles in the selection." }, 400);
@@ -648,7 +703,7 @@ async function api(request, env, path) {
     await write(env, data => { for (const a of Object.values(data.articles)) { delete a.oaCheckedAt; delete a.evidenceAttempt; if (/^(No PMC record|No eligible PMC file|No open-access copy|Not in Unpaywall|No downloadable open-access copy)$/.test(a.fullTextStatus || "")) delete a.fullTextStatus; } });
     return json({ ok:true });
   }
-  if (path === "/api/evidence") return json(await collectEvidence(env));
+  if (path === "/api/evidence") return json(await collectEvidence(env, Array.isArray(body.ids) ? body.ids.map(String).slice(0, 5000) : undefined));
   if (path === "/api/profile") {
     const profile = { email:String(body.email || "").trim().toLowerCase(), name:String(body.name || "").trim(),
       role:"reviewer", portfolio:String(body.portfolio || "").trim(), capacity:Number(body.capacity), active:body.active !== false };
@@ -816,9 +871,64 @@ async function exportPdf(pmids,title,subtitle){
   }
   message(pmids.length+" articles exported in "+parts+" PDF"+(parts>1?"s":"")+".");
 }
-let data, tab, active, filt={q:"",status:"",portfolio:"",oa:""}, shown=[];
+async function exportFile(route,ext,pmids,title,subtitle,label){
+  pmids=[...new Set(pmids)];
+  if(!pmids.length)throw new Error("Nothing to export.");
+  const parts=Math.ceil(pmids.length/40);
+  for(let i=0;i<parts;i++){
+    message("Building "+label+" "+(i+1)+" of "+parts+"…");
+    const res=await fetch("/api/"+route,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pmids:pmids.slice(i*40,i*40+40),title:title+(parts>1?" (part "+(i+1)+" of "+parts+")":""),subtitle})});
+    if(!res.ok){const e=await res.json().catch(()=>({}));if(parts>1&&res.status===400)continue;throw new Error(e.error||"Export failed.");}
+    const link=document.createElement("a");link.href=URL.createObjectURL(await res.blob());
+    const slug=title.toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"").slice(0,40);
+    link.download=(slug.startsWith("literasift")?"":"literasift-")+slug+(parts>1?"-part"+(i+1):"")+"."+ext;
+    link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
+  }
+  message("Export finished.");
+}
+const runStats=run=>{
+  const arts=run.ids.map(id=>data.articles[id]).filter(Boolean), n=run.ids.length, c=f=>arts.filter(f).length;
+  return {n,abstracts:c(a=>a.abstract),oaChecked:c(a=>a.oaCheckedAt),oaOpen:c(a=>a.oaIsOpen),pmc:c(a=>a.fullTextOrigin==="PMC"&&a.fullTextKey),epmc:c(a=>a.fullTextOrigin==="Europe PMC"&&a.fullTextKey),
+    unpaywall:c(a=>a.fullTextOrigin==="Unpaywall"&&a.fullTextKey),linkOnly:c(a=>a.fullTextStatus==="Open access link only"),closed:c(a=>a.oaStatus==="closed"),texts:c(a=>a.fullTextTextKey),passages:c(a=>(a.keyPassages||[]).length),retr:c(a=>a.retractionCheckedAt)};
+};
+let extracting=null, pullRun="";
+function drawProgress(){
+  const box=$("progress");if(!box)return;
+  const runs=data.runs.filter(r=>r.status==="Imported"&&r.ids.length);
+  if(!runs.length){box.innerHTML="";return;}
+  const run=runs.find(r=>r.id===pullRun)||runs[0], st=runStats(run), got=st.pmc+st.epmc+st.unpaywall;
+  const bar=(label,value,color)=>'<div class="row"><span>'+label+'</span><span class="sub">'+value+" / "+st.n+'</span></div><div class="bar"><i style="width:'+(st.n?Math.round(value/st.n*100):0)+'%"></i></div>';
+  box.innerHTML=panel("Full-text extraction",'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px"><select id="runpick" aria-label="Pull">'+runs.slice(0,15).map(r=>'<option value="'+esc(r.id)+'"'+(r.id===run.id?" selected":"")+'>'+esc((r.molecule||r.portfolio)+" · "+r.from+" → "+r.to+" ("+r.count+")")+'</option>').join("")+'</select>'+
+    (extracting?'<button class="btn outline" id="extractstop">Stop</button><span class="sub" style="align-self:center">Working… '+got+' full texts so far</span>':'<button class="btn" id="extractgo">Extract full text now</button>')+
+    '<button class="btn outline" data-zip="'+esc(run.id)+'">Download full texts (ZIP)</button><button class="btn outline" data-pdfrun="'+esc(run.id)+'">PDF with snapshots</button></div>'+
+    bar("Abstracts and metadata",st.abstracts)+bar("Open access checked (Unpaywall)",st.oaChecked)+bar("Retraction checked",st.retr)+
+    '<div class="row"><span>Full text stored</span><b>'+got+'</b></div><div class="row"><span class="sub">PubMed Central '+st.pmc+' · Europe PMC '+st.epmc+' · Unpaywall '+st.unpaywall+'</span></div>'+
+    '<div class="row"><span>Open access, link only (licence does not allow storing)</span><b>'+st.linkOnly+'</b></div><div class="row"><span>Closed access</span><b>'+st.closed+'</b></div><div class="row"><span>With key passages extracted</span><b>'+st.passages+'</b></div>',
+    "Starts automatically after a pull. For each article: PubMed Central, then Europe PMC, then Unpaywall, stored only under open licences.");
+  $("runpick").onchange=e=>{pullRun=e.target.value;drawProgress();};
+  if($("extractgo"))$("extractgo").onclick=()=>extractRun(run.id);
+  if($("extractstop"))$("extractstop").onclick=()=>{if(extracting)extracting.stop=true;};
+}
+async function extractRun(runId){
+  if(extracting)return;
+  const run=data.runs.find(r=>r.id===runId);if(!run)return;
+  extracting={stop:false};drawProgress();
+  let previous=Infinity,stalled=0;
+  try{
+    for(let i=0;i<1000&&!extracting.stop;i++){
+      const r=await api("evidence",{ids:run.ids});
+      const st=await api("state");data.articles=st.articles;data.assignments=st.assignments;data.runs=st.runs;drawProgress();
+      if(!r.queued)break;
+      stalled=r.queued>=previous?stalled+1:0;previous=r.queued;
+      if(stalled>=4)break;
+    }
+  }catch(e){message(e.message,true);}
+  extracting=null;drawProgress();
+}
+let data, tab, active, filt={q:"",status:"",portfolio:"",oa:"",ft:""}, shown=[];
 const oaColor={gold:"green",diamond:"green",hybrid:"blue",green:"blue",bronze:"amber",closed:""};
 const oaLabel=a=>a.oaStatus?(a.oaStatus==="closed"?"Closed access":["No DOI","Not in Unpaywall"].includes(a.oaStatus)?a.oaStatus:"OA · "+a.oaStatus):"";
+const ftGroup=a=>a.fullTextKey?"stored":a.fullTextLink?"link":"none";
 const oaGroup=a=>!a.oaCheckedAt?"unchecked":a.oaIsOpen?"open":"closed";
 let toastTimer;
 const message = (value, error=false) => { const t=$("toast"); t.textContent=value; t.className="show"+(error?" err":""); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.className="",error?6000:2800); };
@@ -870,13 +980,14 @@ function queueView(items){
   return '<section><div class="filters"><input data-filter="q" placeholder="Search title, PMID, molecule…" value="'+esc(filt.q)+'" aria-label="Search">'+
     '<select data-filter="status" aria-label="Status"><option value="">All statuses</option>'+["Pending","In review","Full text needed","Complete"].map(s=>'<option'+(filt.status===s?" selected":"")+'>'+s+"</option>").join("")+"</select>"+
     '<select data-filter="oa" aria-label="Access"><option value="">All access</option>'+[["open","Open access"],["closed","Closed access"],["unchecked","Not yet checked"]].map(([v,l])=>'<option value="'+v+'"'+(filt.oa===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
-    '<button class="btn outline" data-pdf="queue" title="Download the filtered list as a PDF with a screenshot of each article">Export PDF</button>'+
+    '<select data-filter="ft" aria-label="Full text"><option value="">All full-text states</option>'+[["stored","Full text stored"],["link","Open-access link only"],["none","No full text"]].map(([v,l])=>'<option value="'+v+'"'+(filt.ft===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
+    '<button class="btn outline" data-pdf="queue" title="Download the filtered list as a PDF with a snapshot of each article">Export PDF</button><button class="btn outline" data-zip="queue" title="Download stored full texts for the filtered list as a ZIP">Full texts (ZIP)</button>'+
     '<select data-filter="portfolio" aria-label="Portfolio"><option value="">All portfolios</option>'+portfolios.map(p=>'<option'+(filt.portfolio===p?" selected":"")+'>'+esc(p)+"</option>").join("")+"</select></div>"+
     '<div id="qtable">'+queueRows(applyFilter(items))+"</div></section>";
 }
 function applyFilter(items){
   const q=filt.q.trim().toLowerCase();
-  return items.filter(a=>(!filt.status||a.status===filt.status)&&(!filt.portfolio||a.portfolio===filt.portfolio)&&(!filt.oa||oaGroup(data.articles[a.pmid]||{})===filt.oa)&&
+  return items.filter(a=>(!filt.status||a.status===filt.status)&&(!filt.portfolio||a.portfolio===filt.portfolio)&&(!filt.oa||oaGroup(data.articles[a.pmid]||{})===filt.oa)&&(!filt.ft||ftGroup(data.articles[a.pmid]||{})===filt.ft)&&
     (!q||(a.pmid+" "+(data.articles[a.pmid]?.title||"")+" "+(a.molecules||[]).join(" ")).toLowerCase().includes(q)));
 }
 function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
@@ -912,7 +1023,7 @@ function render() {
   }
   if(tab==="Search & Pull"){
     const today=new Date().toISOString().slice(0,10), start=new Date(Date.now()-30*864e5).toISOString().slice(0,10);
-    html=panel("Pull articles for a molecule",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Pull articles</button></div></form>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+
+    html=panel("Pull articles for a molecule",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Pull articles</button></div></form>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+'<div id="progress"></div>'+
       panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>':""]),"No pulls yet."),"",true);
   }
   if(tab==="My Queue") html=queueView(mine);
@@ -947,9 +1058,10 @@ function render() {
   if(tab==="Batches") html=panel("Backfill a date range",watchOptions?
     '<form class="grid" data-route="import"><label>Watchlist<select name="watch">'+watchOptions+'</select></label><label>From<input name="from" type="date" required></label><label>Through<input name="to" type="date" required></label><div><button class="btn">Import citations</button></div></form>':
     '<div class="empty">Save a watchlist before importing a batch.</div>')+
-    panel("Batch archive",'<form data-route="evidence" style="margin:0 0 8px"><button class="btn outline">Process pending evidence</button></form>'+table(["Watchlist","Date range","Citations","Status","Manifest"],data.runs.map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-export="'+esc(r.id)+'">CSV</button> <button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF</button>':""]),"No batches yet."));
+    panel("Batch archive",'<form data-route="evidence" style="margin:0 0 8px"><button class="btn outline">Process pending evidence</button></form>'+table(["Watchlist","Date range","Citations","Status","Manifest"],data.runs.map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-export="'+esc(r.id)+'">CSV</button> <button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF</button> <button class="btn outline sm" data-zip="'+esc(r.id)+'">ZIP</button>':""]),"No batches yet."));
   $("content").innerHTML=html;
   animate();
+  drawProgress();
 }
 function animate(){
   const reduce=matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -998,8 +1110,17 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-resetlink],[data-revoke]");
+  const target=event.target.closest("[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-resetlink],[data-revoke]");
   if(!target)return;
+  if(target.dataset.zip){
+    const run=target.dataset.zip!=="queue"&&data.runs.find(r=>r.id===target.dataset.zip);
+    const mine=new Set(data.assignments.map(a=>a.pmid));
+    const ids=run?run.ids.filter(id=>mine.has(id)):applyFilter(shown).map(a=>a.pmid);
+    const title=run?(run.molecule||run.portfolio)+" full text "+run.from+" to "+run.to:"LiteraSift full text "+(filt.portfolio||"all portfolios");
+    target.disabled=true;
+    exportFile("export-fulltext","zip",ids,title,"","ZIP").catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    return;
+  }
   if(target.dataset.resetlink){
     target.disabled=true;
     api("/host/reset-link",{email:target.dataset.resetlink}).then(async r=>{
@@ -1060,6 +1181,7 @@ document.addEventListener("submit",async event=>{
   }
   button.disabled=true;message(route==="import"||route==="pull"?"Retrieving PubMed citations…":"Saving…");
   try {const result=await api(route,body);if(route==="review")$("dialog").close();await refresh();
+    if(route==="pull"){pullRun=result.id;drawProgress();extractRun(result.id);}
     if(route==="/host/invite"&&result.link)showLink("Invite link for "+body.email,(result.mailError?result.mailError+" ":"Email isn't configured. ")+"Send this link to them yourself. It works once and expires in 7 days.",result.link);
     if(route==="/host/change-password")form.reset();
     message(route==="/host/invite"?(result.existing?"Profile updated.":result.emailed?"Invite emailed to "+body.email+".":"Profile saved."):route==="/host/change-password"?"Password changed.":route==="recheck-access"?"Open-access check queued for all articles.":route==="import"?"Batch imported.":route==="pull"?result.count+" articles pulled for "+(result.molecule||result.portfolio)+".":route==="watches"?result.created+" molecule watchlists saved."+(result.skipped.length?" Skipped (invalid or too long): "+result.skipped.join(", "):""):"Saved.");}
