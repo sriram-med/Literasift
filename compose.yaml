@@ -1,0 +1,20 @@
+services:
+  capture:
+    build: ./capture
+    environment:
+      SCREENSHOT_TOKEN: ${SCREENSHOT_TOKEN:?set SCREENSHOT_TOKEN}
+    ports:
+      - "127.0.0.1:3000:3000"
+    init: true
+    shm_size: 256mb
+    restart: unless-stopped
+  scheduler:
+    image: node:24-bookworm-slim
+    environment:
+      BENCH_URL: ${BENCH_URL:?set BENCH_URL}
+      SITES_ACCESS_TOKEN: ${SITES_ACCESS_TOKEN:?set SITES_ACCESS_TOKEN}
+      RUN_TOKEN: ${RUN_TOKEN:?set RUN_TOKEN}
+    volumes:
+      - ./scripts/run-watchlists.mjs:/app/run-watchlists.mjs:ro
+    command: ["sh", "-c", "while true; do node /app/run-watchlists.mjs; sleep 60; done"]
+    restart: unless-stopped

@@ -17,9 +17,10 @@ async function write(env, mutate) {
   }
   throw new Error("Concurrent update. Please retry.");
 }
-async function pubmed(operation, params) {
+async function pubmed(env, operation, params) {
   const url = new URL("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/" + operation + ".fcgi");
   url.search = new URLSearchParams({ db: "pubmed", tool: "literature_bench", ...params });
+  if (env.NCBI_EMAIL) url.searchParams.set("email",env.NCBI_EMAIL);
   const response = await fetch(url, { signal: AbortSignal.timeout(20000) });
   if (!response.ok) throw new Error("PubMed returned HTTP " + response.status);
   return response.json();
@@ -35,13 +36,13 @@ function allocate(state, item) {
 async function importWatch(env, watch, from, to) {
   const date = value => value.replaceAll("-", "/");
   const term = "(" + watch.query + ") AND (" + date(from) + "[crdt]:" + date(to) + "[crdt])";
-  const { esearchresult: result } = await pubmed("esearch", { term, retmode: "json", retmax: "9999" });
+  const { esearchresult: result } = await pubmed(env,"esearch", { term, retmode: "json", retmax: "9999" });
   if (!result || Number(result.count) !== result.idlist.length) throw new Error("Search exceeds the batch limit or was incomplete. Use a shorter date range.");
   const articles = {};
   for (let offset = 0; offset < result.idlist.length; offset += 100) {
     const ids = result.idlist.slice(offset, offset + 100);
     await new Promise(resolve => setTimeout(resolve, 350));
-    const { result: summary } = await pubmed("esummary", { id: ids.join(","), retmode: "json" });
+    const { result: summary } = await pubmed(env,"esummary", { id: ids.join(","), retmode: "json" });
     for (const id of ids) {
       const citation = summary?.[id];
       if (!citation?.title) throw new Error("Missing citation for PMID " + id);
@@ -104,9 +105,11 @@ async function captureFullText(env, article) {
 async function captureScreenshot(env, article) {
   const endpoint = new URL(env.SCREENSHOT_ENDPOINT);
   if (endpoint.protocol !== "https:") throw new Error("Screenshot endpoint must use HTTPS.");
-  endpoint.searchParams.set("token",env.SCREENSHOT_TOKEN);
+  const headers = {"Content-Type":"application/json"};
+  if (env.SCREENSHOT_AUTH === "bearer") headers.Authorization = "Bearer " + env.SCREENSHOT_TOKEN;
+  else endpoint.searchParams.set("token",env.SCREENSHOT_TOKEN);
   const response = await fetch(endpoint, {method:"POST",redirect:"error",signal:AbortSignal.timeout(30000),
-    headers:{"Content-Type":"application/json"},body:JSON.stringify({url:article.url,options:{fullPage:true,type:"png"}})});
+    headers,body:JSON.stringify({url:article.url,options:{fullPage:true,type:"png"}})});
   if (!response.ok || !response.body || !response.headers.get("content-type")?.includes("image/png")) {
     throw new Error("Screenshot service returned HTTP " + response.status);
   }
@@ -114,16 +117,35 @@ async function captureScreenshot(env, article) {
   await env.BUCKET.put(key,response.body,{httpMetadata:{contentType:"image/png"}});
   return { screenshotKey:key, screenshotStatus:"Captured", screenshotAt:new Date().toISOString() };
 }
+async function captureCitationXml(env, article) {
+  const url = new URL("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi");
+  url.search = new URLSearchParams({ db:"pubmed", id:article.id, retmode:"xml", tool:"literature_bench" });
+  if (env.NCBI_EMAIL) url.searchParams.set("email",env.NCBI_EMAIL);
+  const response = await fetch(url,{signal:AbortSignal.timeout(15000)});
+  if (!response.ok) throw new Error("PubMed EFetch returned HTTP " + response.status);
+  const xml = await response.text();
+  if (!/<PubmedArticleSet[\s>]/.test(xml) || !new RegExp("<PMID(?: [^>]*)?>" + article.id + "</PMID>").test(xml)) {
+    throw new Error("PubMed EFetch did not return the requested citation");
+  }
+  const key = "evidence/" + article.id + "/pubmed.xml";
+  await env.BUCKET.put(key,xml,{httpMetadata:{contentType:"application/xml"}});
+  return {citationXmlKey:key,citationXmlStatus:"Captured"};
+}
 async function collectEvidence(env, ids) {
   const {state} = await load(env);
   const articles = ids ? ids.map(id=>state.articles[id]).filter(Boolean) : Object.values(state.articles);
   const enabled = Boolean(env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN);
   const needsFullText = a => !a.fullTextStatus || a.fullTextStatus === "Retry needed";
   const needsScreen = a => enabled && !a.screenshotKey;
-  const pending = articles.filter(a=>needsFullText(a) || needsScreen(a))
+  const pending = articles.filter(a=>!a.citationXmlKey || needsFullText(a) || needsScreen(a))
     .sort((a,b)=>String(a.evidenceAttempt || "").localeCompare(String(b.evidenceAttempt || ""))).slice(0,4);
   for (const article of pending) {
+    await new Promise(resolve => setTimeout(resolve,350));
     const status = {evidenceAttempt:new Date().toISOString()};
+    if (!article.citationXmlKey) {
+      try { Object.assign(status,await captureCitationXml(env,article)); }
+      catch { status.citationXmlStatus = "Retry needed"; }
+    }
     if (needsFullText(article)) {
       try { Object.assign(status,await captureFullText(env,article)); }
       catch (error) { Object.assign(status,{fullTextStatus:"Retry needed",fullTextError:error.message}); }
@@ -159,10 +181,11 @@ async function api(request, env, path) {
       runs:manager ? state.runs : [], assignments,
       articles:manager ? state.articles : Object.fromEntries(assignments.map(a => [a.pmid, state.articles[a.pmid]])) });
   }
-  if (request.method === "GET" && (path.startsWith("/api/full-text/") || path.startsWith("/api/screenshot/"))) {
+  if (request.method === "GET" && (path.startsWith("/api/full-text/") || path.startsWith("/api/screenshot/") || path.startsWith("/api/citation-xml/"))) {
     const id = path.split("/").pop();
     const article = state.articles[id];
-    const key = path.startsWith("/api/screenshot/") ? article?.screenshotKey : article?.fullTextKey;
+    const key = { "/api/screenshot":article?.screenshotKey, "/api/citation-xml":article?.citationXmlKey,
+      "/api/full-text":article?.fullTextKey }[path.slice(0,path.lastIndexOf("/"))];
     if ((!manager && !state.assignments.some(a=>a.pmid===id && a.reviewer===email)) || !key) return json({error:"File unavailable."},404);
     const object = await env.BUCKET.get(key);
     if (!object) return json({error:"File unavailable."},404);
@@ -187,10 +210,11 @@ async function api(request, env, path) {
   if (path === "/api/scheduled" && (service || manager)) {
     const results = [];
     for (const watch of state.watches) {
-      const previous = state.runs.find(r => r.portfolio === watch.portfolio && r.query === watch.query && r.status === "Imported");
+      const previous = state.runs.filter(r => r.portfolio === watch.portfolio && r.query === watch.query && r.status === "Imported")
+        .reduce((latest, run) => run.to > latest ? run.to : latest, "");
       const to = new Date(Date.parse(day()) - 86400000).toISOString().slice(0,10);
-      if (previous?.to >= to) continue;
-      try { results.push(await execute(env, watch, previous?.to || to, to)); }
+      if (previous >= to) continue;
+      try { results.push(await execute(env, watch, previous || to, to)); }
       catch (error) { results.push({ portfolio:watch.portfolio, error:error.message }); }
     }
     return json({ results, evidence:await collectEvidence(env) });
@@ -256,7 +280,7 @@ const panel=(title,body)=>"<section><h2>"+title+"</h2>"+body+"</section>";
 function queue(items) {
   return table(["Article","Portfolio","Reviewer","Status",""],items.map(a=>{
     const item=data.articles[a.pmid];
-    return ['<a target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><br><small>PMID '+esc(a.pmid)+' · '+esc(item.journal)+'</small><br>'+(item.fullTextKey?'<a href="/api/full-text/'+esc(a.pmid)+'">Download PMC full text</a>':'<small>'+esc(item.fullTextStatus || "Full text pending")+'</small>')+' · '+(item.screenshotKey?'<a href="/api/screenshot/'+esc(a.pmid)+'">Screenshot</a>':'<small>'+esc(item.screenshotStatus || "Screenshot pending")+'</small>'),
+    return ['<a target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><br><small>PMID '+esc(a.pmid)+' · '+esc(item.journal)+'</small><br>'+(item.fullTextKey?'<a href="/api/full-text/'+esc(a.pmid)+'">Download PMC full text</a>':'<small>'+esc(item.fullTextStatus || "Full text pending")+'</small>')+' · '+(item.screenshotKey?'<a href="/api/screenshot/'+esc(a.pmid)+'">Screenshot</a>':'<small>'+esc(item.screenshotStatus || "Screenshot pending")+'</small>')+(item.citationXmlKey?' · <a href="/api/citation-xml/'+esc(a.pmid)+'">Citation XML</a>':''),
       esc(a.portfolio),esc(a.reviewer || "Unassigned"),'<span class="tag">'+esc(a.status)+'</span>',
       '<button data-review="'+esc(a.id)+'">Review</button>'];
   }),"No articles in this queue.");
@@ -284,10 +308,10 @@ async function refresh(){data=await api("state");render();}
 function download(id) {
   const run=data.runs.find(r=>r.id===id);
   const cell=value=>'"'+String(value??"").replace(/^[=+@\-]/,"'$&").replaceAll('"','""')+'"';
-  const rows=[["PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Reviewer","Status","Full text","Screenshot"]];
+  const rows=[["PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Reviewer","Status","Full text","Screenshot","Citation XML"]];
   run.ids.forEach(pmid=>{
     const a=data.articles[pmid], item=data.assignments.find(x=>x.pmid===pmid&&x.portfolio===run.portfolio);
-    rows.push([pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending"]);
+    rows.push([pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending",a.citationXmlStatus||"Pending"]);
   });
   const url=URL.createObjectURL(new Blob([rows.map(row=>row.map(cell).join(",")).join("\\r\\n")],{type:"text/csv"}));
   const link=document.createElement("a");link.href=url;link.download="pubmed-"+run.from+"-"+run.to+".csv";link.click();
