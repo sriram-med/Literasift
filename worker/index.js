@@ -1,5 +1,5 @@
 const KEY = "bench.json";
-const blank = () => ({ profiles: [], watches: [], articles: {}, assignments: [], runs: [] });
+const blank = () => ({ profiles: [], watches: [], articles: {}, assignments: [], runs: [], cases: [] });
 const day = () => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date());
 const json = (data, status = 200) => Response.json(data, { status, headers: { "Cache-Control":"no-store" } });
 async function load(env) {
@@ -33,7 +33,8 @@ const ncbiParams = env => {
 };
 const withSettings = (base, state) => Object.assign(Object.create(base), {
   UNPAYWALL_EMAIL:base.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail || "", ALLOW_RESTRICTED:state.settings?.storeRestricted !== false,
-  NCBI_EMAIL:base.NCBI_EMAIL || state.settings?.ncbiEmail || "", NCBI_API_KEY:base.NCBI_API_KEY || state.settings?.ncbiApiKey || "" });
+  NCBI_EMAIL:base.NCBI_EMAIL || state.settings?.ncbiEmail || "", NCBI_API_KEY:base.NCBI_API_KEY || state.settings?.ncbiApiKey || "",
+  PV_NEXUS_URL:base.PV_NEXUS_URL || state.settings?.pvNexusUrl || "", PV_NEXUS_TOKEN:base.PV_NEXUS_TOKEN || state.settings?.pvNexusToken || "" });
 async function pubmed(env, operation, params) {
   await ncbiThrottle(env);
   const url = new URL("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/" + operation + ".fcgi");
@@ -647,6 +648,108 @@ async function exportPdf(env, state, viewer, manager, body) {
   if (!sections.length) return null;
   return buildPdf(String(body.title || "LiteraSift export").slice(0, 100), String(body.subtitle || "PubMed citations with page screenshots.").slice(0, 300), sections);
 }
+// ---- ICSR case processing: a port of the deterministic engine in PV Nexus (backend/app/services.py) ----
+// Cases use the same shape as PV Nexus's ICSRExtraction schema, so they can be sent to or checked by a PV Nexus backend as they are.
+const icsrField = (value, state = "edited", evidence = []) => ({ value:value === "" || value == null ? null : String(value), normalized_value:null, state, evidence });
+const FIELDS = {
+  patient:["identifier", "age", "age_unit", "sex", "weight"], reporter:["identifier", "qualification", "country", "contactable"],
+  product:["name", "dose", "frequency", "route", "indication", "start_date", "stop_date", "action_taken", "dechallenge", "rechallenge"],
+  event:["verbatim", "onset_date", "stop_date", "outcome", "expectedness", "coded_term"] };
+const SERIOUS_FLAGS = ["serious", "death", "life_threatening", "hospitalization", "disability", "congenital_anomaly", "other_medically_important"];
+function normalizeCase(input) {
+  const data = input && typeof input === "object" ? input : {};
+  const fixField = f => icsrField(f?.value, ["proposed", "accepted", "edited", "rejected"].includes(f?.state) ? f.state : "edited", Array.isArray(f?.evidence) ? f.evidence.slice(0, 5) : []);
+  const group = (obj, names, extra = {}) => ({ ...Object.fromEntries(names.map(n => [n, fixField(obj?.[n])])), ...extra });
+  const out = {
+    case_id:data.case_id ?? null, receipt_date:data.receipt_date || null,
+    patient:group(data.patient, FIELDS.patient, { medical_history:(data.patient?.medical_history || []).slice(0, 50).map(fixField) }),
+    reporter:group(data.reporter, FIELDS.reporter),
+    products:(data.products || []).slice(0, 30).map(p => ({ ...group(p, FIELDS.product), role:["suspect", "concomitant", "interacting"].includes(p?.role) ? p.role : "suspect" })),
+    events:(data.events || []).slice(0, 30).map(e => ({ ...group(e, FIELDS.event), seriousness:Object.fromEntries(SERIOUS_FLAGS.map(k => [k, Boolean(e?.seriousness?.[k])])) })),
+    labs:Array.isArray(data.labs) ? data.labs.slice(0, 100) : [], source_documents:(data.source_documents || []).slice(0, 20).map(d => ({ filename:String(d?.filename || "").slice(0, 200), media_type:d?.media_type || null, size_bytes:Number(d?.size_bytes) || 0, source_type:d?.source_type || "unknown" })),
+    source_summary:String(data.source_summary || "").slice(0, 20000), warnings:(data.warnings || []).map(String).slice(0, 20), special_situations:(data.special_situations || []).map(String).slice(0, 30) };
+  if (!out.patient.age_unit.value) out.patient.age_unit.value = "years";
+  return out;
+}
+const hasVal = f => Boolean(f && f.value != null && String(f.value).trim());
+const firstSuspect = c => c.products.find(p => p.role === "suspect");
+function icsrValidity(c) {
+  const patient = hasVal(c.patient.identifier) || hasVal(c.patient.age) || hasVal(c.patient.sex);
+  const reporter = hasVal(c.reporter.identifier) || hasVal(c.reporter.qualification);
+  const suspect = c.products.some(p => p.role === "suspect" && hasVal(p.name));
+  const event = c.events.some(e => hasVal(e.verbatim));
+  const checks = { "Identifiable patient":patient, "Identifiable reporter":reporter, "Suspect product":suspect, "Adverse event":event };
+  return { identifiable_patient:patient, identifiable_reporter:reporter, suspect_product:suspect, adverse_event:event, valid_icsr:Object.values(checks).every(Boolean),
+    missing:Object.entries(checks).filter(([, ok]) => !ok).map(([name]) => name) };
+}
+function icsrQc(c) {
+  const findings = [], validity = icsrValidity(c), add = (severity, category, field_path, title, detail, suggested_action) => findings.push({ id:crypto.randomUUID(), severity, category, field_path, title, detail, suggested_action });
+  for (const missing of validity.missing) add("critical", "Validity", null, "Missing " + missing.toLowerCase(), "A minimum ICSR criterion is not sufficiently documented.", "Obtain or verify the missing minimum criterion before case acceptance.");
+  const suspect = firstSuspect(c), event = c.events[0];
+  if (suspect && !hasVal(suspect.indication)) add("minor", "Product", "products[0].indication", "Indication not documented", "The suspect product indication is unavailable.", "Request indication if clinically or procedurally relevant.");
+  if (suspect && !hasVal(suspect.start_date)) add("major", "Chronology", "products[0].start_date", "Therapy start date missing", "Drug-to-event latency cannot be reliably assessed without a therapy start date.", "Obtain or verify the therapy start date.");
+  if (event && !hasVal(event.onset_date)) add("major", "Chronology", "events[0].onset_date", "Event onset date missing", "Temporal relationship cannot be fully assessed.", "Obtain the event onset date or document that it is unknown.");
+  if (event && !hasVal(event.outcome)) add("minor", "Event", "events[0].outcome", "Outcome not documented", "The current clinical status of the adverse event is unknown.", "Obtain current outcome on follow-up.");
+  if (event && !hasVal(event.expectedness)) add("major", "Expectedness", "events[0].expectedness", "Expectedness not assessed", "Expectedness should be assessed against an approved reference safety source.", "Review the applicable RSI/label and record the human-confirmed assessment.");
+  const penalties = { critical:25, major:10, minor:4, info:0 };
+  return { score:Math.max(0, 100 - findings.reduce((n, f) => n + penalties[f.severity], 0)), findings, ready_for_medical_review:validity.valid_icsr && !findings.some(f => f.severity === "critical" || f.severity === "major") };
+}
+function icsrCausality(c) {
+  const suspect = firstSuspect(c), event = c.events[0], rationale = [];
+  if (!suspect || !event) return { category:"Unassessable / Unclassifiable", rationale:["A suspect product and adverse event are required for a meaningful assessment."], confidence:"low", reviewer_confirmation_required:true };
+  const chronology = hasVal(suspect.start_date) && hasVal(event.onset_date);
+  rationale.push(chronology ? "Exposure and event dates are available for temporal assessment." : "Chronology is incomplete, limiting temporal assessment.");
+  const dechallenge = String(suspect.dechallenge.value || "").toLowerCase(), rechallenge = String(suspect.rechallenge.value || "").toLowerCase();
+  if (dechallenge.includes("positive")) rationale.push("Positive dechallenge supports an association."); else if (!dechallenge) rationale.push("Dechallenge information is unavailable.");
+  if (rechallenge.includes("positive")) rationale.push("Positive rechallenge strongly supports an association.");
+  rationale.push(c.patient.medical_history.length || c.products.length > 1 ? "Medical history/concomitant therapies require review for alternative etiologies." : "Alternative etiologies are not well documented in the current case data.");
+  let category = "Unassessable / Unclassifiable", confidence = "low";
+  if (rechallenge.includes("positive") && chronology) { category = "Probable / Likely"; confidence = "moderate"; }
+  else if (dechallenge.includes("positive") && chronology) { category = "Probable / Likely"; confidence = "moderate"; }
+  else if (chronology) { category = "Possible"; confidence = "moderate"; }
+  return { category, rationale, confidence, reviewer_confirmation_required:true };
+}
+function icsrFollowUp(c) {
+  const questions = [], suspect = firstSuspect(c), event = c.events[0], ask = (priority, question, reason) => questions.push({ priority, question, reason });
+  if (!hasVal(c.reporter.identifier) && !hasVal(c.reporter.contactable)) ask("high", "Please provide information that allows the reporter to be identified or contacted.", "Reporter identifiability is required for a valid ICSR.");
+  if (suspect && !hasVal(suspect.start_date)) ask("high", "What was the start date of " + (suspect.name.value || "the suspect product") + "?", "Required to establish drug-event chronology.");
+  if (event && !hasVal(event.onset_date)) ask("high", "What was the exact onset date of " + (event.verbatim.value || "the adverse event") + "?", "Required to assess temporal association.");
+  if (suspect && !hasVal(suspect.action_taken)) ask("medium", "What action was taken with the suspect product after the event occurred?", "Action taken supports dechallenge and case assessment.");
+  if (event && !hasVal(event.outcome)) ask("medium", "What is the current outcome of the adverse event?", "Outcome is clinically relevant and important for case completeness.");
+  if (!c.patient.medical_history.length) ask("low", "Please provide relevant medical history, allergies, and prior similar reactions if known.", "Helps assess confounding and alternative etiologies.");
+  return { questions };
+}
+const localAssessment = data => { const c = normalizeCase(data); return { validity:icsrValidity(c), qc:icsrQc(c), causality:icsrCausality(c), follow_up:icsrFollowUp(c), engine:"LiteraSift (PV Nexus rules)" }; };
+// Optional: run the same checks on a real PV Nexus backend (FastAPI /icsr/*); falls back to the local port if it is unreachable.
+async function assessCase(env, data) {
+  const local = localAssessment(data), url = String(env.PV_NEXUS_URL || "").replace(/\/+$/, "");
+  if (!url) return local;
+  try {
+    const headers = { "Content-Type":"application/json", ...(env.PV_NEXUS_TOKEN ? { Authorization:"Bearer " + env.PV_NEXUS_TOKEN } : {}) }, body = JSON.stringify(normalizeCase(data));
+    const call = async path => { const r = await fetch(url + path, { method:"POST", headers, body, signal:AbortSignal.timeout(15000) }); if (!r.ok) throw new Error(path + " returned HTTP " + r.status); return r.json(); };
+    const [validity, qc, causality, follow_up] = await Promise.all([call("/icsr/validate"), call("/icsr/qc"), call("/icsr/causality/suggest"), call("/icsr/follow-up")]);
+    return { validity, qc, causality, follow_up:follow_up.questions ? follow_up : { questions:follow_up }, engine:"PV Nexus API" };
+  } catch (error) { return { ...local, engine:"LiteraSift (PV Nexus rules)", remoteError:error.message }; }
+}
+const specialSituationHints = [[/pregnan/, "Pregnancy exposure"], [/neonat|newborn/, "Neonatal exposure"], [/\b(child|children|paediatric|pediatric|infant)/, "Paediatric patient"], [/elderly|older adult/, "Elderly patient"],
+  [/overdose/, "Overdose"], [/misuse|abuse/, "Misuse / abuse"], [/lack of (efficacy|effect)|ineffective|treatment failure/, "Lack of effect"], [/off-label/, "Off-label use"], [/interaction/, "Drug interaction"], [/medication error|wrong dose/, "Medication error"]];
+// A starting point built from the published article. Every value is proposed and needs human review.
+function caseFromArticle(article, assignment) {
+  const authors = article.authors || [], cite = (authors.slice(0, 3).join(", ") + (authors.length > 3 ? " et al" : "")) + ". " + article.title + " " + (article.journal || "") + ". " + (article.date || "") + ". PMID " + article.id + (article.doi ? ". doi:" + article.doi : "");
+  const ev = (text, excerpt) => [{ source_file:"PMID " + article.id, excerpt:String(excerpt || text).slice(0, 300), confidence:0.5 }];
+  const text = ((article.title || "") + " " + (article.abstract || "")).toLowerCase();
+  const molecule = (assignment?.molecules || [])[0] || "";
+  const condition = (article.entities?.diseases || [])[0] || "";
+  return normalizeCase({ receipt_date:new Date().toISOString().slice(0, 10),
+    reporter:{ identifier:icsrField(authors[0] ? authors[0] + " (first author)" : "", "proposed", ev(cite)), qualification:icsrField("Health professional (published literature)", "proposed", ev(cite)) },
+    products:[{ role:"suspect", name:icsrField(molecule, "proposed", ev(cite)) }],
+    events:[{ verbatim:icsrField(condition, "proposed", condition ? ev(condition, article.abstract) : []) }],
+    source_documents:[{ filename:article.fullTextKey ? "PMID_" + article.id + "." + (/\.(\w+)$/.exec(article.fullTextKey)?.[1] || "pdf") : "PMID " + article.id + " citation and abstract", media_type:article.fullTextKey ? "application/pdf" : "text/plain", source_type:article.fullTextKey ? "pdf" : "text" }],
+    source_summary:cite + (article.abstract ? "\n\nAbstract: " + article.abstract : ""),
+    special_situations:specialSituationHints.filter(([re]) => re.test(text)).map(([, label]) => label),
+    warnings:["Pre-filled from the published article by LiteraSift. Patient details are usually only partly reported in literature; every value needs human review."] });
+}
+const caseStatuses = ["Draft", "Ready for medical review", "Sent to PV Nexus", "Closed: not a valid ICSR"];
 // ---- Sources: PubMed literature is kept separate from other government agency material ----
 const sourceRegistry = [
   { id:"PubMed", label:"PubMed (NLM / NIH)", kind:"literature", active:true, note:"Biomedical literature citations, abstracts and open full text." },
@@ -953,7 +1056,8 @@ async function apiCore(request, env, path) {
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
-      config:{ ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      cases:state.cases?.filter(c => manager || c.createdBy === email).map(c => { const a = localAssessment(c.data); return { ...c, assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; }) || [],
+      config:{ caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -1002,6 +1106,64 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"review", target:"PMID " + reviewed.pmid, detail:reviewed.before + " → " + body.status + (body.note ? " (note saved)" : "") });
     return json({ ok:true });
   }
+  if (path.startsWith("/api/case-") && viewer) {
+    const cfg = withSettings(env, state), canSee = c => manager || c.createdBy === email, find = id => (state.cases || []).find(c => c.id === id && canSee(c));
+    if (path === "/api/case-create") {
+      const item = state.assignments.find(a => a.pmid === String(body.pmid) && (manager || a.reviewer === email)), article = item && state.articles[item.pmid];
+      if (!article) return json({ error:"Article not found in your queue." }, 404);
+      const record = await write(env, data => {
+        const year = new Date().getFullYear(), at = new Date().toISOString(), counters = data.caseSeq ||= {};
+        const seq = (counters[year] ?? Math.max(0, ...(data.cases || []).filter(c => c.number.startsWith("LS-" + year)).map(c => Number(c.number.split("-")[2]) || 0))) + 1;
+        counters[year] = seq;
+        const created = { id:crypto.randomUUID(), number:"LS-" + year + "-" + String(seq).padStart(4, "0"), pmid:article.id, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"",
+          data:caseFromArticle(article, item), createdBy:email, createdAt:at, updatedAt:at, history:[{ at, by:email, action:"created from PMID " + article.id }] };
+        created.data.case_id = created.number;
+        (data.cases ||= []).push(created);
+        return created;
+      });
+      await audit(env, { by:email, action:"case.create", target:record.number, detail:"from PMID " + record.pmid });
+      return json({ case:record, assessment:await assessCase(cfg, record.data) });
+    }
+    const current = find(String(body.id || ""));
+    if (!current) return json({ error:"Case not found." }, 404);
+    if (path === "/api/case-assess") return json({ assessment:await assessCase(cfg, body.data || current.data) });
+    if (path === "/api/case-save") {
+      const data = normalizeCase(body.data || current.data), status = caseStatuses.includes(body.status) ? body.status : current.status, notes = String(body.notes ?? current.notes).slice(0, 4000);
+      const local = localAssessment(data);
+      if (status === "Ready for medical review" && !local.qc.ready_for_medical_review) return json({ error:"Not ready for medical review yet. " + (local.validity.missing.length ? "Missing: " + local.validity.missing.join(", ") + ". " : "") + local.qc.findings.filter(f => f.severity === "major" || f.severity === "critical").slice(0, 4).map(f => f.title).join("; ") + "." }, 400);
+      if (status === "Closed: not a valid ICSR" && !notes.trim()) return json({ error:"Add a note explaining why this is not a valid ICSR." }, 400);
+      const saved = await write(env, d => {
+        const c = d.cases.find(x => x.id === current.id), at = new Date().toISOString();
+        const changed = c.status !== status;
+        c.data = data; c.notes = notes; c.updatedAt = at;
+        (c.history ||= []).push({ at, by:email, action:changed ? "status " + c.status + " → " + status : "saved" });
+        c.status = status;
+        return c;
+      });
+      await audit(env, { by:email, action:"case.save", target:saved.number, detail:"status " + saved.status });
+      return json({ case:saved, assessment:await assessCase(cfg, saved.data) });
+    }
+    if (path === "/api/case-export") {
+      const data = { ...current.data, case_id:current.number };
+      await audit(env, { by:email, action:"case.export", target:current.number, detail:body.format === "package" ? "package" : "json" });
+      if (body.format !== "package") return new Response(JSON.stringify(data, null, 2), { headers:{ "Content-Type":"application/json", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="' + current.number + '.json"' } });
+      const encoder = new TextEncoder(), article = state.articles[current.pmid] || {}, files = [{ name:"icsr.json", data:encoder.encode(JSON.stringify(data, null, 2)) },
+        { name:"assessment.json", data:encoder.encode(JSON.stringify(await assessCase(cfg, current.data), null, 2)) },
+        { name:"citation.txt", data:encoder.encode(current.data.source_summary + "\r\n\r\nCase " + current.number + " · status " + current.status + "\r\nNotes: " + (current.notes || "") + "\r\n") }];
+      for (const [key, name] of [[article.fullTextKey, "source_PMID_" + current.pmid + "." + (/\.(\w+)$/.exec(article.fullTextKey || "")?.[1] || "bin")], [article.fullTextTextKey, "source_PMID_" + current.pmid + "_text.txt"]]) {
+        const object = key && await env.BUCKET.get(key);
+        if (object) files.push({ name, data:new Uint8Array(await object.arrayBuffer()) });
+      }
+      return new Response(zipFiles(files), { headers:{ "Content-Type":"application/zip", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="' + current.number + '-package.zip"' } });
+    }
+    if (path === "/api/case-delete") {
+      if (!manager) return json({ error:"Manager access required." }, 403);
+      await write(env, d => { d.cases = d.cases.filter(c => c.id !== current.id); });
+      await audit(env, { by:email, action:"case.delete", target:current.number, detail:"" });
+      return json({ ok:true });
+    }
+    return json({ error:"Route unavailable." }, 404);
+  }
   if (path === "/api/export-citations" && viewer) {
     const ids = [...new Set(Array.isArray(body.pmids) ? body.pmids.map(String) : [])].slice(0, 500);
     const articles = ids.map(id => state.articles[id]).filter(a => a && state.assignments.some(x => x.pmid === a.id && (manager || x.reviewer === email)));
@@ -1039,6 +1201,8 @@ async function apiCore(request, env, path) {
   if (!manager) return json({ error:"Manager access required." },403);
   if (path === "/api/settings") {
     const email = String(body.unpaywallEmail ?? "").trim();
+    if ("pvNexusUrl" in body && body.pvNexusUrl && !/^https?:\/\/[^\s/]+(\/\S*)?$/.test(String(body.pvNexusUrl).trim())) return json({error:"Enter the PV Nexus API address, like https://pv-nexus.example.com"},400);
+    if (typeof body.pvNexusToken === "string" && body.pvNexusToken.length > 300) return json({error:"That token is too long."},400);
     if ("ncbiEmail" in body && body.ncbiEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(body.ncbiEmail).trim())) return json({error:"Enter a valid contact email for NCBI."},400);
     if (typeof body.ncbiApiKey === "string" && body.ncbiApiKey.trim() && !/^[A-Za-z0-9]{20,64}$/.test(body.ncbiApiKey.trim())) return json({error:"That does not look like an NCBI API key (letters and digits only)."},400);
     if ("unpaywallEmail" in body && email && (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || email.length > 200)) return json({error:"Enter a valid contact email for Unpaywall."},400);
@@ -1046,6 +1210,9 @@ async function apiCore(request, env, path) {
       const settings = data.settings ||= {};
       if ("unpaywallEmail" in body) settings.unpaywallEmail = email;
       if ("ncbiEmail" in body) settings.ncbiEmail = String(body.ncbiEmail || "").trim();
+      if ("pvNexusUrl" in body) settings.pvNexusUrl = String(body.pvNexusUrl || "").trim();
+      if (body.pvNexusToken === null) delete settings.pvNexusToken;
+      else if (typeof body.pvNexusToken === "string" && body.pvNexusToken.trim()) settings.pvNexusToken = body.pvNexusToken.trim();
       if (body.ncbiApiKey === null) delete settings.ncbiApiKey;
       else if (typeof body.ncbiApiKey === "string" && body.ncbiApiKey.trim()) settings.ncbiApiKey = body.ncbiApiKey.trim();
       if ("storeRestricted" in body) {
@@ -1267,6 +1434,11 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 <div><div class="top"><div><h1 id="heading">LiteraSift</h1><p id="subhead"></p></div><button class="btn outline icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button></div>
 <main id="content"><div class="skel"></div><div class="skel"></div><div class="skel"></div></main></div></div>
 <div id="toast" role="status"></div>
+<dialog id="casedlg" style="width:min(1180px,96vw);max-height:92vh;overflow:auto"><div id="casehead" style="display:flex;justify-content:space-between;gap:12px;align-items:flex-end;margin-bottom:14px"></div>
+<div style="display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));align-items:start"><div id="casebody"></div><div><div id="caseassess"></div></div></div>
+<p id="caseerr" class="msg" style="color:var(--red)" role="alert"></p>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"><button type="button" class="btn" data-caseact="save">Save</button><button type="button" class="btn outline" data-caseact="assess">Assess</button><button type="button" class="btn outline" data-caseact="json">Download ICSR JSON</button><button type="button" class="btn outline" data-caseact="package">Download package (ZIP)</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div>
+<p class="sub" style="margin-top:10px">Human-in-the-loop: values pre-filled from the article are only proposals. Causality and QC are aids; a qualified reviewer decides.</p></dialog>
 <dialog id="linkdlg"><h2 id="linktitle"></h2><p id="linknote" class="sub"></p><div style="display:grid;gap:12px"><input id="linkvalue" readonly aria-label="Link"><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" id="linkcopy">Copy link</button><button type="button" class="btn outline" id="linkshare">Share…</button><button type="button" class="btn outline" id="linkclose">Done</button></div></div></dialog>
 <dialog id="dialog"><h2>Screen citation</h2><p id="citation" class="sub"></p><div id="detail" style="max-height:38vh;overflow:auto;margin-bottom:12px"></div><form id="review"><label>Status<select name="status"><option>Pending</option><option>In review</option><option>Full text needed</option><option>Complete</option></select></label><label>Decision notes<textarea name="note" rows="4"></textarea></label><div style="display:flex;gap:8px"><button class="btn">Save decision</button><button type="button" class="btn outline" id="close">Cancel</button></div></form></dialog>
 <script>
@@ -1280,6 +1452,7 @@ const paths = {
   Batches:'<path d="m12 3 9 5-9 5-9-5 9-5z"/><path d="m3 13 9 5 9-5"/>',
   Watchlists:'<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   Settings:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  "ICSR Cases":'<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>',
   Audit:'<path d="M9 12l2 2 4-4M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
   Library:'<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   Account:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
@@ -1288,7 +1461,7 @@ const paths = {
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only."};
+const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.","ICSR Cases":"Individual case safety reports started from published articles."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -1324,6 +1497,71 @@ const runStats=run=>{
   return {n,abstracts:c(a=>a.abstract),oaChecked:c(a=>a.oaCheckedAt),oaOpen:c(a=>a.oaIsOpen),pmc:c(a=>a.fullTextOrigin==="PMC"&&a.fullTextKey),epmc:c(a=>a.fullTextOrigin==="Europe PMC"&&a.fullTextKey),
     unpaywall:c(a=>a.fullTextOrigin==="Unpaywall"&&a.fullTextKey),linkOnly:c(a=>a.fullTextStatus==="Open access link only"),closed:c(a=>a.oaStatus==="closed"),texts:c(a=>a.fullTextTextKey),passages:c(a=>(a.keyPassages||[]).length),retr:c(a=>a.retractionCheckedAt)};
 };
+let curCase=null, curAssess=null;
+const SIT=["Pregnancy exposure","Neonatal exposure","Paediatric patient","Elderly patient","Overdose","Misuse / abuse","Lack of effect","Off-label use","Drug interaction","Medication error"];
+const QUAL=["","Physician","Pharmacist","Other health professional","Health professional (published literature)","Lawyer","Consumer or other non-health professional"];
+const gp=(o,p)=>p.split(".").reduce((x,k)=>x==null?x:x[k],o);
+const caseTitleTip=f=>((f.evidence||[])[0]||{}).excerpt||"";
+const caseInput=(label,path,type)=>{const f=gp(curCase.data,path)||{};return '<label>'+label+(f.state==="proposed"&&f.value?' <span class="badge amber" title="Proposed from the article: confirm or correct">proposed</span>':"")+'<input data-kind="field" data-path="'+path+'" value="'+esc(f.value||"")+'" title="'+esc(caseTitleTip(f))+'"'+(type?' type="'+type+'"':"")+'></label>';};
+const caseSelect=(label,path,options)=>{const f=gp(curCase.data,path)||{};return '<label>'+label+(f.state==="proposed"&&f.value?' <span class="badge amber">proposed</span>':"")+'<select data-kind="field" data-path="'+path+'">'+options.map(o=>'<option'+(o===(f.value||"")?" selected":"")+'>'+esc(o)+'</option>').join("")+'</select></label>';};
+const blankField=()=>({value:null,normalized_value:null,state:"edited",evidence:[]});
+const blankProduct=()=>({role:"concomitant",name:blankField(),dose:blankField(),frequency:blankField(),route:blankField(),indication:blankField(),start_date:blankField(),stop_date:blankField(),action_taken:blankField(),dechallenge:blankField(),rechallenge:blankField()});
+const blankEvent=()=>({verbatim:blankField(),onset_date:blankField(),stop_date:blankField(),outcome:blankField(),expectedness:blankField(),coded_term:blankField(),seriousness:{serious:false,death:false,life_threatening:false,hospitalization:false,disability:false,congenital_anomaly:false,other_medically_important:false}});
+function setField(o,p,val){const parts=p.split("."),last=parts.pop(),t=parts.reduce((x,k)=>x[k],o),f=t[last];if(f&&(f.value||"")!==val){f.value=val===""?null:val;f.state="edited";}}
+function collectCase(){
+  const d=curCase.data, box=$("casebody");
+  box.querySelectorAll("[data-kind=field]").forEach(el=>{if(el.dataset.path.endsWith(".role")){const parts=el.dataset.path.split(".");d[parts[0]][parts[1]].role=el.value;}else setField(d,el.dataset.path,el.value);});
+  box.querySelectorAll("[data-kind=flag]").forEach(el=>{const parts=el.dataset.path.split("."),last=parts.pop();parts.reduce((x,k)=>x[k],d)[last]=el.checked;});
+  d.events.forEach(e=>{const s=e.seriousness;if(s.death||s.life_threatening||s.hospitalization||s.disability||s.congenital_anomaly||s.other_medically_important)s.serious=true;});
+  const old=d.patient.medical_history, lines=$("casehist").value.split("\\n").map(x=>x.trim()).filter(Boolean);
+  d.patient.medical_history=lines.map(t=>old.find(h=>h.value===t)||{value:t,normalized_value:null,state:"edited",evidence:[]});
+  d.special_situations=[...box.querySelectorAll("[data-kind=situation]")].filter(x=>x.checked).map(x=>x.value).concat(d.special_situations.filter(x=>!SIT.includes(x)));
+  d.source_summary=$("casesummary").value;curCase.notes=$("casenotes").value;curCase.status=$("casestatus").value;
+}
+function assessmentHtml(a){
+  if(!a)return '<div class="empty">Not assessed yet.</div>';
+  const v=a.validity,q=a.qc,c=a.causality,fu=(a.follow_up&&a.follow_up.questions)||[];
+  const tick=(ok,t)=>'<div class="row"><span>'+t+'</span>'+(ok?badge("Met","green"):badge("Missing","red"))+'</div>';
+  const sev={critical:"red",major:"amber",minor:"blue",info:""};
+  return '<div class="sub" style="margin-bottom:6px">Assessed by: '+esc(a.engine||"")+(a.remoteError?' <span class="badge amber" title="'+esc(a.remoteError)+'">PV Nexus API unreachable, local rules used</span>':"")+'</div>'+
+    '<div class="row"><b>Minimum criteria</b>'+(v.valid_icsr?badge("Valid ICSR","green"):badge("Not valid yet","amber"))+'</div>'+tick(v.identifiable_patient,"Identifiable patient")+tick(v.identifiable_reporter,"Identifiable reporter")+tick(v.suspect_product,"Suspect product")+tick(v.adverse_event,"Adverse event")+
+    '<div class="row" style="margin-top:8px"><b>QC score</b><b>'+q.score+' / 100</b></div><div class="bar"><i style="width:'+q.score+'%"></i></div><div style="margin:6px 0">'+(q.ready_for_medical_review?badge("Ready for medical review","green"):badge("Not ready for medical review","amber"))+'</div>'+
+    q.findings.map(f=>'<div class="row" style="align-items:flex-start"><span>'+badge(f.severity,sev[f.severity]||"")+' <b>'+esc(f.title)+'</b><div class="sub">'+esc(f.suggested_action||f.detail)+'</div></span></div>').join("")+
+    '<div class="row" style="margin-top:8px"><b>Causality (suggestion)</b>'+badge(c.category,"blue")+'</div><div class="sub">'+c.rationale.map(esc).join(" · ")+'</div><div class="sub" style="margin-top:4px">Non-authoritative: a medical reviewer must confirm the assessment.</div>'+
+    (fu.length?'<div class="row" style="margin-top:8px"><b>Follow-up questions</b></div>'+fu.map(x=>'<div class="row" style="align-items:flex-start"><span>'+badge(x.priority,x.priority==="high"?"red":x.priority==="medium"?"amber":"")+' '+esc(x.question)+'<div class="sub">'+esc(x.reason)+'</div></span></div>').join(""):"");
+}
+function caseForm(){
+  const d=curCase.data, mine=gp;
+  const products=d.products.map((p,i)=>'<div class="card" style="margin-bottom:10px;padding:12px"><div class="grid" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+
+    '<label>Role<select data-kind="field" data-path="products.'+i+'.role">'+["suspect","concomitant","interacting"].map(r=>'<option'+(p.role===r?" selected":"")+'>'+r+'</option>').join("")+'</select></label>'+
+    caseInput("Product","products."+i+".name")+caseInput("Dose","products."+i+".dose")+caseInput("Frequency","products."+i+".frequency")+caseInput("Route","products."+i+".route")+caseInput("Indication","products."+i+".indication")+
+    caseInput("Start date","products."+i+".start_date","date")+caseInput("Stop date","products."+i+".stop_date","date")+caseInput("Action taken","products."+i+".action_taken")+caseInput("Dechallenge","products."+i+".dechallenge")+caseInput("Rechallenge","products."+i+".rechallenge")+'</div></div>').join("");
+  const events=d.events.map((e,i)=>'<div class="card" style="margin-bottom:10px;padding:12px"><div class="grid" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+
+    caseInput("Event (verbatim)","events."+i+".verbatim")+caseInput("Coded term (MedDRA, if licensed)","events."+i+".coded_term")+caseInput("Onset date","events."+i+".onset_date","date")+caseInput("Stop date","events."+i+".stop_date","date")+caseInput("Outcome","events."+i+".outcome")+caseInput("Expectedness","events."+i+".expectedness")+'</div>'+
+    '<div class="chips" style="margin-top:8px">'+["serious","death","life_threatening","hospitalization","disability","congenital_anomaly","other_medically_important"].map(k=>'<label class="check"><input type="checkbox" data-kind="flag" data-path="events.'+i+'.seriousness.'+k+'"'+(e.seriousness[k]?" checked":"")+'>&nbsp;'+k.replace(/_/g," ")+'</label>').join("")+'</div></div>').join("");
+  return '<h3 style="margin:0 0 8px">Patient</h3><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseInput("Identifier / initials","patient.identifier")+caseInput("Age","patient.age")+caseSelect("Age unit","patient.age_unit",["years","months","weeks","days","hours"])+caseSelect("Sex","patient.sex",["","Male","Female","Unknown"])+caseInput("Weight (kg)","patient.weight")+'</div>'+
+    '<label style="margin-top:10px">Medical history (one per line)<textarea id="casehist" rows="3">'+esc(d.patient.medical_history.map(h=>h.value).join("\\n"))+'</textarea></label>'+
+    '<h3 style="margin:16px 0 8px">Reporter</h3><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseInput("Name / identifier","reporter.identifier")+caseSelect("Qualification","reporter.qualification",QUAL.includes((d.reporter.qualification||{}).value||"")?QUAL:QUAL.concat([d.reporter.qualification.value]))+caseInput("Country","reporter.country")+caseInput("Contactable (how)","reporter.contactable")+'</div>'+
+    '<h3 style="margin:16px 0 8px">Products <button type="button" class="btn outline sm" data-caseact="addprod">Add product</button></h3>'+products+
+    '<h3 style="margin:16px 0 8px">Events <button type="button" class="btn outline sm" data-caseact="addevent">Add event</button></h3>'+events+
+    '<h3 style="margin:16px 0 8px">Special situations</h3><div class="chips">'+SIT.map(x=>'<label class="check"><input type="checkbox" data-kind="situation" value="'+esc(x)+'"'+(d.special_situations.includes(x)?" checked":"")+'>&nbsp;'+esc(x)+'</label>').join("")+'</div>'+
+    '<label style="margin-top:14px">Source and abstract<textarea id="casesummary" rows="5">'+esc(d.source_summary)+'</textarea></label><label style="margin-top:10px">Reviewer notes<textarea id="casenotes" rows="2">'+esc(curCase.notes||"")+'</textarea></label>';
+}
+function renderCase(){
+  const art=data.articles[curCase.pmid]||{};
+  $("casehead").innerHTML='<div><b style="font-size:18px">'+esc(curCase.number)+'</b> <span class="sub">from PMID '+esc(curCase.pmid)+'</span><div class="sub">'+esc(art.title||"")+'</div></div><label style="min-width:240px">Status<select id="casestatus">'+data.config.caseStatuses.map(s=>'<option'+(s===curCase.status?" selected":"")+'>'+esc(s)+'</option>').join("")+'</select></label>';
+  $("casebody").innerHTML=caseForm();
+  $("caseassess").innerHTML=assessmentHtml(curAssess);
+  $("caseerr").textContent="";
+  $("casedel").style.display=data.viewer.role==="manager"?"":"none";
+}
+function openCaseData(c,a){curCase=JSON.parse(JSON.stringify(c));curAssess=a;renderCase();if(!$("casedlg").open)$("casedlg").showModal();}
+async function downloadCase(format){
+  collectCase();
+  const res=await fetch("/api/case-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:curCase.id,format})});
+  if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||"Export failed.");}
+  const link=document.createElement("a");link.href=URL.createObjectURL(await res.blob());link.download=curCase.number+(format==="package"?"-package.zip":".json");link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
+}
 let libNumbers=null, libSortFor="";
 let extracting=null, pullRun="", libPath="/", auditData=null, auditMonth=new Date().toISOString().slice(0,7), auditQ="", auditAction="";
 function drawAudit(){
@@ -1481,7 +1719,7 @@ function applyFilter(items){
 function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Batches","Watchlists","Team","Audit","Settings"]:["My Queue"]).concat(data.config.accounts?["Account"]:[]);
+  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","ICSR Cases","Batches","Watchlists","Team","Audit","Settings"]:["My Queue","ICSR Cases"]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   libNumbers=null;
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
@@ -1515,6 +1753,14 @@ function render() {
     const today=new Date().toISOString().slice(0,10), start=new Date(Date.now()-30*864e5).toISOString().slice(0,10);
     html=panel("Pull articles from PubMed",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div class="wide" style="display:flex;gap:16px;flex-wrap:wrap;grid-column:1/-1"><span class="sub">Narrow with PubMed filters:</span><label class="check"><input type="checkbox" name="humans">&nbsp;Humans only</label><label class="check"><input type="checkbox" name="caseReports">&nbsp;Case reports only</label><label class="check"><input type="checkbox" name="english">&nbsp;English only</label><label class="check"><input type="checkbox" name="noReviews">&nbsp;Exclude reviews</label></div><div><button class="btn">Pull articles</button> <button type="button" class="btn outline" data-suggest="1">Suggest synonyms &amp; brands</button></div></form><div id="suggest"></div>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+'<div id="progress"></div>'+
       panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>':""]),"No pulls yet."),"",true);
+  }
+  if(tab==="ICSR Cases"){
+    const cs=(data.cases||[]).slice().sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt));
+    const stColor={"Ready for medical review":"blue","Sent to PV Nexus":"green"};
+    html=panel("ICSR cases",table(["Case","Article","Product · event","Status","Minimum criteria","QC",""],cs.map(c=>{const a=c.assessment||{},d=c.data,sp=(d.products.find(p=>p.role==="suspect")||{name:{}}).name.value||"—",ev=((d.events[0]||{}).verbatim||{}).value||"—",art=data.articles[c.pmid]||{};
+      return ['<b>'+esc(c.number)+'</b>','<a href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,90))+'</a><div class="sub">PMID '+esc(c.pmid)+'</div>',esc(sp)+" · "+esc(ev),badge(c.status,stColor[c.status]||""),a.valid?badge("Valid ICSR","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"),(a.score??"")+" / 100",'<button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>'];}),
+      "No cases yet. Open an article's Review dialog and choose Create ICSR case when it reports a patient with an adverse event."),"",true)+
+      panel("How it works",'<div class="row"><span>Start</span><span class="sub">Create a case from a screened article; it is pre-filled with the citation, first author as reporter, the molecule as suspect product, and likely special situations.</span></div><div class="row"><span>Complete</span><span class="sub">Add patient, product and event details from the article or its full text. The four minimum criteria, QC findings, causality suggestion and follow-up questions update as you assess.</span></div><div class="row"><span>Hand over</span><span class="sub">Download the case as PV Nexus ICSR JSON, or a package with the citation, assessment and source full text.</span></div>'+(data.config.pvNexus.configured?'<div class="row"><span>PV Nexus API</span>'+badge("Connected","green")+'</div>':""));
   }
   if(tab==="Audit"){
     const months=[...Array(12)].map((_,i)=>{const d=new Date();d.setDate(1);d.setMonth(d.getMonth()-i);return d.toISOString().slice(0,7);});
@@ -1567,6 +1813,8 @@ function render() {
       '<div class="row"><span>Status</span>'+(data.config.unpaywall?badge("Active","green"):badge("Not configured","amber"))+'</div>'+
       '<form data-route="recheck-access" style="margin-top:10px"><button class="btn outline">Re-check open access for all articles</button></form>',
       "Unpaywall requires a contact email on each request; it is sent to Unpaywall only. Every article with a DOI gets an open-access status (gold, hybrid, green, bronze or closed). Permissively licensed PDFs are stored, other open copies are linked. Closed articles are re-checked every 30 days."+(data.config.unpaywallFromEnv?" The email is set by the server environment (UNPAYWALL_EMAIL).":""))+
+    panel("PV Nexus (ICSR processing)",'<form class="grid" data-route="settings"><label>PV Nexus API address (optional)<input name="pvNexusUrl" value="'+esc((data.config.pvNexus||{}).url||"")+'" placeholder="https://your-pv-nexus-backend"'+((data.config.pvNexus||{}).urlFromEnv?" disabled":"")+'></label><label>API token (optional)<input type="password" name="pvNexusToken" autocomplete="off" placeholder="'+((data.config.pvNexus||{}).tokenSet?"Token is set; leave blank to keep it":"Sent as a Bearer token if your gateway needs one")+'"></label><div><button class="btn">Save</button>'+((data.config.pvNexus||{}).tokenSet?' <button type="button" class="btn outline" data-pvremove="1">Remove token</button>':"")+'</div></form>',
+      "ICSR cases are assessed here with a port of PV Nexus's deterministic rules (validity, QC, causality suggestion, follow-up questions), checked to give identical results. If you enter the address of a PV Nexus backend, the same checks are run by it instead, and LiteraSift falls back to the local rules if it is unreachable.")+
     panel("NCBI / PubMed access",'<form class="grid" data-route="settings"><label>Contact email for NCBI<input type="email" name="ncbiEmail" value="'+esc((data.config.ncbi||{}).email||"")+'" placeholder="you@example.com"'+((data.config.ncbi||{}).emailFromEnv?" disabled":"")+'></label><label>NCBI API key (optional)<input type="password" name="ncbiApiKey" autocomplete="off" placeholder="'+((data.config.ncbi||{}).keySet?"Key is set; leave blank to keep it":"Paste a free key to allow 10 requests a second")+'"'+((data.config.ncbi||{}).keyFromEnv?" disabled":"")+'></label><div><button class="btn">Save</button>'+(((data.config.ncbi||{}).keySet&&!(data.config.ncbi||{}).keyFromEnv)?' <button type="button" class="btn outline" data-ncbiremove="1">Remove key</button>':"")+'</div></form>',
       "PubMed is read through NCBI's E-utilities only; its web pages are never scraped, which NCBI forbids. NCBI asks automated tools to identify themselves with a contact email, and allows 3 requests a second, or 10 with a free API key (create one in your NCBI account settings). The key is stored with the app data; for a server install it is safer in /etc/literasift.env as NCBI_API_KEY.")+
     panel("Sources",(data.config.sources||[]).map(x=>'<div class="row"><span><b>'+esc(x.label)+'</b><div class="sub">'+esc(x.note)+'</div></span>'+(x.active?badge("Active","green"):badge("Not enabled","amber"))+'</div>').join(""),
@@ -1657,8 +1905,37 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pvremove],[data-opencase],[data-newcase],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
+  if(target.dataset.pvremove){api("settings",{pvNexusToken:null}).then(()=>{message("Token removed.");return refresh();}).catch(e=>message(e.message,true));return;}
+  if(target.dataset.opencase){
+    event.preventDefault();const c=(data.cases||[]).find(x=>x.id===target.dataset.opencase);if(!c)return;
+    api("case-assess",{id:c.id}).then(r=>{if($("dialog").open)$("dialog").close();openCaseData(c,r.assessment);}).catch(e=>message(e.message,true));return;
+  }
+  if(target.dataset.newcase){
+    target.disabled=true;
+    api("case-create",{pmid:target.dataset.newcase}).then(async r=>{await refresh();if($("dialog").open)$("dialog").close();openCaseData(r.case,r.assessment);message("Case "+r.case.number+" created. Review the proposed values.");}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;
+  }
+  if(target.dataset.caseact){
+    const act=target.dataset.caseact;
+    if(act==="close"){$("casedlg").close();return;}
+    if(act==="addprod"){collectCase();curCase.data.products.push(blankProduct());renderCase();return;}
+    if(act==="addevent"){collectCase();curCase.data.events.push(blankEvent());renderCase();return;}
+    target.disabled=true;
+    (async()=>{
+      try{
+        if(act==="json"||act==="package"){await downloadCase(act);}
+        else if(act==="delete"){if(!confirm("Delete "+curCase.number+"? This cannot be undone (the audit trail keeps a record)."))return;await api("case-delete",{id:curCase.id});$("casedlg").close();await refresh();message("Case deleted.");}
+        else{
+          collectCase();
+          if(act==="assess"){const r=await api("case-assess",{id:curCase.id,data:curCase.data});curAssess=r.assessment;$("caseassess").innerHTML=assessmentHtml(curAssess);}
+          else{const r=await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes});curCase=JSON.parse(JSON.stringify(r.case));curAssess=r.assessment;renderCase();await refresh();message("Case saved.");}
+        }
+      }catch(e){$("caseerr").textContent=e.message;message(e.message,true);}
+      finally{target.disabled=false;}
+    })();
+    return;
+  }
   if(target.dataset.ncbiremove){api("settings",{ncbiApiKey:null}).then(()=>{message("API key removed.");return refresh();}).catch(e=>message(e.message,true));return;}
   if(target.dataset.rkadd){const rows=document.querySelectorAll(".rkrow"),last=rows.length?Number(rows[rows.length-1].querySelector(".rkt").value):0;rkAddRow(last?last+1:1,"");return;}
   if(target.dataset.rkdel){target.closest(".rkrow").remove();return;}
@@ -1784,6 +2061,7 @@ document.addEventListener("click",event=>{
       ((art.meshTerms||[]).length?'<div class="chips">'+art.meshTerms.slice(0,12).map(t=>badge(t)).join("")+'</div>':"")+
       ((art.authors||[]).length?'<div class="sub" style="margin-top:8px">'+esc(art.authors.join(", "))+'</div>':"")+
       ((art.linkOut||[]).length?'<div class="sub" style="margin:10px 0 4px">PubMed LinkOut'+(art.pubmedCitedBy!==undefined?" · cited by "+art.pubmedCitedBy+" in PubMed":"")+'</div><div class="chips">'+art.linkOut.map(l=>'<a class="badge '+(l.free?"green":"blue")+'" target="_blank" rel="noopener" href="'+esc(l.url)+'">'+esc((l.free?"Free: ":"")+l.provider)+'</a>').join("")+'</div>':"")+
+      '<div style="margin-top:10px"><button type="button" class="btn outline sm" data-newcase="'+esc(active.pmid)+'">Create ICSR case</button> '+(data.cases||[]).filter(c=>c.pmid===active.pmid).map(c=>'<a href="#" data-opencase="'+esc(c.id)+'">'+esc(c.number)+'</a>').join(" · ")+'</div>'+
       (art.fullTextKey?'<div style="margin-top:8px"><a href="/api/full-text/'+esc(active.pmid)+'">Download full text</a></div>':"");
     $("review").elements.status.value=active.status;
     $("review").elements.note.value=active.note||"";

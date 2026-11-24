@@ -121,3 +121,7 @@ Every article and pull carries a `source` (PubMed by default). Queues show a sou
 **LinkOut and cited-by.** Each article also gets PubMed LinkOut links (free ones are highlighted for articles without stored full text, and included in the retrieval CSV) and a "cited by in PubMed" count, through the E-utilities `elink` endpoint.
 
 **NCBI compliance.** Settings has "NCBI / PubMed access": a contact email and an optional free API key (3 requests/second without a key, 10 with one). Every E-utilities call now sends the tool name and email (and key) and goes through one pacing gate. The old optional mode that screenshotted live PubMed pages has been removed, because NCBI forbids scraping its web pages; snapshots are rendered from stored data. For a server install, `NCBI_EMAIL` and `NCBI_API_KEY` can be set in `/etc/literasift.env`.
+
+## ICSR cases (PV Nexus)
+
+Articles that report a patient with an adverse event can become ICSR cases: Review dialog, "Create ICSR case". The case editor pre-fills proposals from the article and assesses the four minimum criteria, QC, causality suggestion and follow-up questions with a port of PV Nexus's own rules (checked for identical results), or with a PV Nexus backend if one is configured in Settings. Cases export as PV Nexus ICSR JSON or a ZIP package. Details, limits and what is not built yet: `docs/PV_NEXUS.md`. Not a validated safety database.
