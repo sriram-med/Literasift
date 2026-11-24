@@ -1068,6 +1068,41 @@ function caseFromArticle(article, assignment) {
       ...(facts?.series ? ["The article reports more than one patient. Each patient may need its own ICSR."] : [])] });
 }
 const caseStatuses = ["Draft", "Ready for medical review", "Sent to PV Nexus", "Closed: not a valid ICSR"];
+// ---- Electronic signatures (21 CFR Part 11 pattern, design from argus-auditable-rag, MIT): signer, meaning, time, and a hash that binds the
+// signature to exactly what was signed. The server recomputes that hash, so a signature over different content is rejected. ----
+const SIGN_MEANINGS = {
+  case_approve:{ label:"Approve for medical review", statement:"I have reviewed the article, the proposed case values and the assessment, and I approve this case for medical review.", status:"Ready for medical review", approval:true },
+  case_invalid:{ label:"Not a valid ICSR", statement:"I have reviewed the article and I confirm that this is not a valid ICSR, for the reason recorded in the notes.", status:"Closed: not a valid ICSR", approval:true },
+  screening:{ label:"Screening decision", statement:"I have read this article and I record the screening decision and notes as my own.", status:"Complete", approval:false } };
+// What the signer saw: the citation, abstract, detected events and the stored full-text reference. A change to any of it invalidates the review.
+const evidenceHash = article => sha256(canonicalJson({ id:article?.id, title:article?.title, abstract:article?.abstract, doi:article?.doi, authors:article?.authors, journal:article?.journal, date:article?.date,
+  events:(article?.events || []).map(e => e.term), fullText:[article?.fullTextKey, article?.fullTextStatus, article?.fullTextSource], keyPassages:article?.keyPassages || [] }));
+async function signContent(kind, record, article, meaningCode) {
+  const meaning = SIGN_MEANINGS[meaningCode], evidence = await evidenceHash(article);
+  const content = kind === "case" ? { kind, case_id:record.id, number:record.number, pmid:record.pmid, meaning:meaningCode, signed_status:meaning.status, data:normalizeCase(record.data), notes:record.notes || "", evidence_sha256:evidence }
+    : { kind, assignment_id:record.id, pmid:record.pmid, portfolio:record.portfolio, molecules:record.molecules || [], meaning:meaningCode, signed_status:meaning.status, note:record.note || "", evidence_sha256:evidence };
+  return { content, content_sha256:await sha256(canonicalJson(content)), evidence_sha256:evidence };
+}
+const activeSignature = record => [...(record?.signatures || [])].reverse().find(s => !s.superseded) || null;
+// True while the record still matches what was signed; null when there is no active signature.
+async function signatureIntact(kind, record, article) {
+  const sig = activeSignature(record);
+  if (!sig) return null;
+  return (await signContent(kind, record, article, sig.meaning)).content_sha256 === sig.content_sha256;
+}
+function signPolicyProblems(state, kind, record, meaning, viewer, manager) {
+  const problems = [], settings = state.settings || {};
+  if (activeSignature(record)) problems.push("Already signed. A manager must supersede the signature before it can change.");
+  if (meaning.approval && (settings.esignApprovers || "manager") === "manager" && !manager) problems.push("Only managers may sign approvals (this can be changed in Settings).");
+  if (kind === "case" && meaning.approval && settings.esignFourEyes === true && record.createdBy === viewer.email) problems.push("Four-eyes rule: the person who created the case cannot approve it.");
+  if (kind === "case") {
+    const local = localAssessment(record.data);
+    if (meaning.status === "Ready for medical review" && !local.qc.ready_for_medical_review) problems.push("Not ready for medical review yet. " + (local.validity.missing.length ? "Missing: " + local.validity.missing.join(", ") + ". " : "") + local.qc.findings.filter(f => f.severity === "major" || f.severity === "critical").slice(0, 3).map(f => f.title).join("; "));
+    if (meaning.status === "Closed: not a valid ICSR" && !String(record.notes || "").trim()) problems.push("Add a note explaining why this is not a valid ICSR.");
+  }
+  return problems;
+}
+const signatureText = s => "Signed by " + s.signer_name + " (" + s.signer_id + ") on " + s.signed_at + " UTC.\nMeaning: " + s.meaning_text + "\nAuthentication: " + s.auth + "\nContent SHA-256: " + s.content_sha256 + "\nEvidence SHA-256: " + s.evidence_sha256 + (s.superseded ? "\nSUPERSEDED " + s.superseded.at + " by " + s.superseded.by + ": " + s.superseded.reason : "") + "\n";
 // ---- Sources: PubMed literature is kept separate from other government agency material ----
 const sourceRegistry = [
   { id:"PubMed", label:"PubMed (NLM / NIH)", kind:"literature", active:true, note:"Biomedical literature citations, abstracts and open full text." },
@@ -1314,36 +1349,124 @@ function rankedList(state, portfolio, molecule, order, pool) {
   ranked.sort(order === "newest" ? (x, y) => num(y) - num(x) : order === "oldest" ? (x, y) => num(x) - num(y) : (x, y) => y.score - x.score || num(y) - num(x));
   return ranked;
 }
-// ---- Audit trail: append-only monthly log, each entry hash-chained to the previous one so edits or deletions are detectable ----
-const auditKey = month => "audit/" + month + ".ndjson";
+// ---- Audit trail v2 ----
+// Design ported from argus-auditable-rag (MIT, Copyright (c) 2026 Yashwanth Ravva): one hash-chained, append-only chain with contiguous sequence numbers,
+// canonical-JSON hashing (sha256(prev_hash + canonical payload)), actor and entity attribution, chain verification that says where and why it breaks,
+// and a head record so truncation is detected. Tamper-EVIDENT; the host also refuses non-append writes at the storage layer (server/storage.mjs).
+const AUDIT_GENESIS = "0".repeat(64), AUDIT_SCHEMA = 2, AUDIT_HEAD = "audit2/head.json";
+const auditMonthKey = month => "audit2/" + month + ".ndjson";
 const sha256 = async text => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)))].map(b => b.toString(16).padStart(2, "0")).join("");
-const auditHash = (prev, e) => sha256([prev, e.at, e.by, e.action, e.target, e.detail].join("|"));
+const sortKeys = v => Array.isArray(v) ? v.map(sortKeys) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map(k => [k, sortKeys(v[k])])) : v;
+// Sorted keys, no whitespace, non-ASCII escaped (Python json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=True)).
+const canonicalJson = v => JSON.stringify(sortKeys(v)).replace(/[\u0080-￿]/g, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+const auditPayload = e => canonicalJson({ sequence:e.sequence, occurred_at:e.occurred_at, actor:e.actor, action:e.action, entity_type:e.entity_type, entity_id:e.entity_id, detail:e.detail, schema_version:e.schema_version });
+const auditEntryHash = e => sha256(e.prev_hash + auditPayload(e));
+const auditActor = by => { const s = String(by || "system"); return s === "system" ? "system:literasift" : s === "anonymous" ? "anonymous" : s.includes("@") ? "user:" + s.toLowerCase() : s.slice(0, 120); };
+const entityTypes = { case:"Case", review:"Assignment", "bulk-status":"Assignment", assign:"Assignment", molecule:"Watchlist", pull:"Watchlist", import:"Watchlist", watch:"Watchlist", scheduled:"Watchlist", export:"Export", download:"Article",
+  account:"Account", password:"Account", login:"Account", logout:"Account", esign:"Account", settings:"Settings", ime:"Reference data", ma:"Reference data", access:"Settings", profile:"Profile", audit:"AuditLog", sign:"Signature" };
 async function audit(env, entry) {
   try {
-    const month = new Date().toISOString().slice(0, 7), key = auditKey(month);
-    for (let attempt = 0; attempt < 6; attempt++) {
-      const object = await env.BUCKET.get(key);
-      const text = object ? await object.text() : "";
-      const lines = text.split("\n").filter(Boolean);
-      const prev = lines.length ? JSON.parse(lines[lines.length - 1]).hash : "GENESIS-" + month;
-      const e = { at:new Date().toISOString(), by:String(entry.by || "system").slice(0, 200), action:String(entry.action).slice(0, 60),
-        target:String(entry.target ?? "").slice(0, 300), detail:String(entry.detail ?? "").slice(0, 600) };
-      e.prev = prev; e.hash = await auditHash(prev, e);
-      const saved = await env.BUCKET.put(key, text + JSON.stringify(e) + "\n", { onlyIf:object ? { etagMatches:object.etag } : { etagDoesNotMatch:"*" }, httpMetadata:{ contentType:"application/x-ndjson" } });
-      if (saved) return;
+    const month = new Date().toISOString().slice(0, 7), key = auditMonthKey(month);
+    const action = String(entry.action).slice(0, 60), prefix = action.split(".")[0];
+    const detail = typeof entry.detail === "object" && entry.detail ? entry.detail : (String(entry.detail ?? "") ? { text:String(entry.detail).slice(0, 600) } : {});
+    for (let attempt = 0; attempt < 60; attempt++) {
+      if (attempt) await new Promise(r => setTimeout(r, Math.random() * Math.min(5 * attempt, 40)));
+      const headObject = await env.BUCKET.get(AUDIT_HEAD), head = headObject ? await headObject.json() : null;
+      const monthObject = await env.BUCKET.get(key), text = monthObject ? await monthObject.text() : "";
+      const lines = text.split("\n").filter(Boolean), last = lines.length ? JSON.parse(lines[lines.length - 1]) : null;
+      // The month file is the source of truth; the head can lag by one entry after a crash, and an empty month continues from the previous one.
+      const [sequence, prev] = last && (!head || last.sequence >= head.sequence) ? [last.sequence + 1, last.hash] : head ? [head.sequence + 1, head.hash] : [0, AUDIT_GENESIS];
+      const e = { sequence, occurred_at:new Date().toISOString(), actor:auditActor(entry.by), action, entity_type:String(entry.entityType || entityTypes[prefix] || "Record").slice(0, 60),
+        entity_id:String(entry.entityId ?? entry.target ?? "").slice(0, 300) || "-", detail, schema_version:AUDIT_SCHEMA, prev_hash:prev };
+      e.hash = await auditEntryHash(e);
+      const saved = await env.BUCKET.put(key, text + JSON.stringify(e) + "\n", { onlyIf:monthObject ? { etagMatches:monthObject.etag } : { etagDoesNotMatch:"*" }, httpMetadata:{ contentType:"application/x-ndjson" } });
+      if (!saved) continue;
+      for (let h = 0; h < 5; h++) {
+        const current = await env.BUCKET.get(AUDIT_HEAD), currentHead = current ? await current.json() : null;
+        if (currentHead && currentHead.sequence >= e.sequence) break;
+        const months = [...new Set([...(currentHead?.months || []), month])].sort();
+        if (await env.BUCKET.put(AUDIT_HEAD, JSON.stringify({ sequence:e.sequence, hash:e.hash, months, count:e.sequence + 1, updated_at:e.occurred_at }), { onlyIf:current ? { etagMatches:current.etag } : { etagDoesNotMatch:"*" }, httpMetadata:{ contentType:"application/json" } })) break;
+      }
+      return e;
     }
   } catch { /* the audit trail never blocks the action itself */ }
 }
-async function readAudit(env, month) {
-  const object = await env.BUCKET.get(auditKey(month));
-  const lines = (object ? await object.text() : "").split("\n").filter(Boolean);
-  const entries = []; let verified = true, prev = "GENESIS-" + month;
-  for (const line of lines) {
-    let e; try { e = JSON.parse(line); } catch { verified = false; continue; }
-    if (e.prev !== prev || e.hash !== await auditHash(prev, e)) verified = false;
-    prev = e.hash; entries.push(e);
+const parseAuditLines = text => String(text || "").split("\n").filter(Boolean).map(line => { try { return JSON.parse(line); } catch { return null; } });
+// Pure chain check over an ordered list of entries (mirrors verify_entries in Argus): contiguity, linkage, recomputed hash.
+async function verifyAuditEntries(entries) {
+  let expected = AUDIT_GENESIS;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (!e) return { ok:false, entries_checked:i, first_broken_sequence:i, reason:"unreadable entry" };
+    if (e.sequence !== i) return { ok:false, entries_checked:i, first_broken_sequence:e.sequence, reason:"sequence gap or reorder" };
+    if (e.prev_hash !== expected) return { ok:false, entries_checked:i, first_broken_sequence:e.sequence, reason:"broken linkage to predecessor" };
+    if (await auditEntryHash(e) !== e.hash) return { ok:false, entries_checked:i, first_broken_sequence:e.sequence, reason:"content does not match stored hash" };
+    expected = e.hash;
   }
-  return { month, total:entries.length, verified, entries:entries.reverse().slice(0, 5000) };
+  return { ok:true, entries_checked:entries.length, first_broken_sequence:null, reason:null };
+}
+async function verifyAuditChain(env) {
+  const headObject = await env.BUCKET.get(AUDIT_HEAD), head = headObject ? await headObject.json() : null, entries = [];
+  if (!head) return { ok:true, entries_checked:0, first_broken_sequence:null, reason:null, head:null };
+  for (const month of head.months || []) {
+    const object = await env.BUCKET.get(auditMonthKey(month));
+    if (!object) return { ok:false, entries_checked:entries.length, first_broken_sequence:entries.length, reason:"month file missing: " + month, head };
+    entries.push(...parseAuditLines(await object.text()));
+  }
+  const result = await verifyAuditEntries(entries), last = entries[entries.length - 1];
+  if (result.ok && (!last || last.sequence !== head.sequence || last.hash !== head.hash)) return { ...result, ok:false, first_broken_sequence:head.sequence, reason:"head does not match the last entry (entries may have been removed)", head };
+  return { ...result, head };
+}
+// Entries written before v2 (monthly chains with no sequence numbers) stay readable and are verified on their own.
+async function readLegacyAudit(env, month) {
+  const object = await env.BUCKET.get("audit/" + month + ".ndjson");
+  if (!object) return { entries:[], ok:true };
+  const hashOf = (prev, e) => sha256([prev, e.at, e.by, e.action, e.target, e.detail].join("|"));
+  const entries = []; let ok = true, prev = "GENESIS-" + month;
+  for (const e of parseAuditLines(await object.text())) { if (!e) { ok = false; continue; } if (e.prev !== prev || e.hash !== await hashOf(prev, e)) ok = false; prev = e.hash; entries.push({ at:e.at, by:e.by, action:e.action, target:e.target, detail:e.detail, hash:e.hash, legacy:true }); }
+  return { entries, ok };
+}
+const auditDetailText = d => d && typeof d === "object" ? (d.text ?? Object.entries(d).map(([k, v]) => k + ": " + (typeof v === "object" ? JSON.stringify(v) : v)).join("; ")) : String(d ?? "");
+async function readAudit(env, month) {
+  const object = await env.BUCKET.get(auditMonthKey(month)), raw = parseAuditLines(object ? await object.text() : ""), entries = raw.filter(Boolean);
+  // Month-level check: contiguous sequence numbers, linkage and recomputed hashes within this month's file.
+  let verified = raw.every(Boolean);
+  for (let i = 0; i < entries.length && verified; i++) {
+    const e = entries[i];
+    if (i && (e.sequence !== entries[i - 1].sequence + 1 || e.prev_hash !== entries[i - 1].hash)) verified = false;
+    if (await auditEntryHash(e) !== e.hash) verified = false;
+  }
+  const legacy = await readLegacyAudit(env, month), verification = await env.BUCKET.get("audit2/verification.json");
+  const shown = [...entries.map(e => ({ sequence:e.sequence, at:e.occurred_at, by:e.actor.replace(/^user:/, ""), action:e.action, entityType:e.entity_type, target:e.entity_id, detail:auditDetailText(e.detail), hash:e.hash, legacy:false })), ...legacy.entries].reverse();
+  return { month, total:shown.length, verified:verified && legacy.ok, legacyEntries:legacy.entries.length, entries:shown.slice(0, 5000), lastVerification:verification ? await verification.json() : null };
+}
+// The anchor is the chain head, signed when the host provides a key. Keep copies off the server: a later rewrite of the whole log cannot match them.
+async function hmacHex(key, text) {
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(key), { name:"HMAC", hash:"SHA-256" }, false, ["sign"]);
+  return [...new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(text)))].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+async function auditAnchor(env) {
+  const head = await (await env.BUCKET.get(AUDIT_HEAD))?.json();
+  if (!head) return null;
+  const at = new Date().toISOString(), anchor = { sequence:head.sequence, hash:head.hash, anchored_at:at, count:head.count };
+  if (env.AUDIT_ANCHOR_KEY) anchor.mac = await hmacHex(env.AUDIT_ANCHOR_KEY, [anchor.sequence, anchor.hash, at].join("|"));
+  return anchor;
+}
+async function checkAnchor(env, anchor) {
+  if (!anchor || !Number.isInteger(anchor.sequence) || !/^[0-9a-f]{64}$/.test(anchor.hash || "")) return { ok:false, reason:"That is not an audit anchor file." };
+  if (anchor.mac) {
+    if (!env.AUDIT_ANCHOR_KEY) return { ok:false, reason:"This server has no anchor key, so the signature cannot be checked." };
+    if (await hmacHex(env.AUDIT_ANCHOR_KEY, [anchor.sequence, anchor.hash, anchor.anchored_at].join("|")) !== anchor.mac) return { ok:false, reason:"The anchor's signature does not match: the file was altered or comes from another server." };
+  }
+  const chain = await verifyAuditChain(env);
+  if (!chain.ok) return { ok:false, reason:"The chain itself fails verification (entry " + chain.first_broken_sequence + ": " + chain.reason + "), so it cannot be trusted to match the anchor." };
+  const head = await (await env.BUCKET.get(AUDIT_HEAD))?.json();
+  if (!head || head.sequence < anchor.sequence) return { ok:false, reason:"The log is shorter than the anchor: entries after it were removed." };
+  for (const month of head.months) {
+    const entries = parseAuditLines(await (await env.BUCKET.get(auditMonthKey(month)))?.text()).filter(Boolean), hit = entries.find(e => e.sequence === anchor.sequence);
+    if (hit) return hit.hash === anchor.hash ? { ok:true, sequence:anchor.sequence, reason:"Entry " + anchor.sequence + " is still in the chain with the same hash; " + (head.sequence - anchor.sequence) + " entries were added since." } : { ok:false, reason:"Entry " + anchor.sequence + " exists but its hash differs from the anchor: the log was rewritten." };
+  }
+  return { ok:false, reason:"Entry " + anchor.sequence + " was not found in the log." };
 }
 const decodeWatch = value => { const [portfolio, molecule = ""] = String(value || "").split("|").map(v => { try { return decodeURIComponent(v); } catch { return v; } }); return molecule ? portfolio + " / " + molecule : portfolio; };
 const auditRules = {
@@ -1395,8 +1518,8 @@ async function apiCore(request, env, path) {
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
-      cases:state.cases?.filter(c => manager || c.createdBy === email).map(c => { const a = localAssessment(c.data); return { ...c, assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; }) || [],
-      config:{ ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      cases:await Promise.all((state.cases || []).filter(c => manager || c.createdBy === email).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
+      config:{ esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -1423,7 +1546,7 @@ async function apiCore(request, env, path) {
     const updated = await write(env, data => {
       let count = 0;
       for (const a of data.assignments) {
-        if (!ids.has(a.pmid) || (!manager && a.reviewer !== email) || a.status === "Complete" || a.status === body.status) continue;
+        if (!ids.has(a.pmid) || (!manager && a.reviewer !== email) || a.status === "Complete" || a.status === body.status || activeSignature(a)) continue;
         a.status = body.status; count++;
         (a.history ||= []).push({ status:a.status, note:"Bulk update", by:email, at:new Date().toISOString() });
       }
@@ -1436,6 +1559,7 @@ async function apiCore(request, env, path) {
     const reviewed = await write(env, data => {
       const item = data.assignments.find(a => a.id === body.id && (manager || a.reviewer === email));
       if (!item) throw new Error("Assignment unavailable.");
+      if (activeSignature(item)) throw new Error("This decision is signed. A manager must supersede the signature before it can change.");
       const before = item.status;
       item.status = body.status;
       item.note = String(body.note || "").slice(0, 4000);
@@ -1444,6 +1568,48 @@ async function apiCore(request, env, path) {
     });
     await audit(env, { by:email, action:"review", target:"PMID " + reviewed.pmid, detail:reviewed.before + " → " + body.status + (body.note ? " (note saved)" : "") });
     return json({ ok:true });
+  }
+  if ((path === "/api/sign-preview" || path === "/api/sign" || path === "/api/supersede") && viewer) {
+    const kind = body.kind === "screening" ? "screening" : "case";
+    const record = kind === "case" ? (state.cases || []).find(c => c.id === body.id && (manager || c.createdBy === email)) : state.assignments.find(a => a.id === body.id && (manager || a.reviewer === email));
+    if (!record) return json({ error:"Record not found." }, 404);
+    const article = state.articles[record.pmid] || {};
+    if (path === "/api/supersede") {
+      if (!manager) return json({ error:"Manager access required." }, 403);
+      const reason = String(body.reason || "").trim();
+      if (reason.length < 10) return json({ error:"Give a reason of at least 10 characters. Signatures are never deleted; they are superseded and kept." }, 400);
+      if (!activeSignature(record)) return json({ error:"There is no active signature to supersede." }, 409);
+      await write(env, data => {
+        const target = kind === "case" ? data.cases.find(c => c.id === record.id) : data.assignments.find(a => a.id === record.id), at = new Date().toISOString();
+        activeSignature(target).superseded = { at, by:email, reason:reason.slice(0, 500) };
+        if (kind === "case") { target.locked = false; target.status = "Draft"; } else target.status = "In review";
+        (target.history ||= []).push({ at, by:email, action:"signature superseded: " + reason.slice(0, 200) });
+      });
+      await audit(env, { by:email, action:"sign.superseded", entityType:kind === "case" ? "Case" : "Assignment", entityId:kind === "case" ? record.number : record.id, detail:{ reason:reason.slice(0, 500) } });
+      return json({ ok:true });
+    }
+    const meaningCode = kind === "screening" ? "screening" : body.meaning === "case_invalid" ? "case_invalid" : "case_approve", meaning = SIGN_MEANINGS[meaningCode];
+    const { content_sha256, evidence_sha256 } = await signContent(kind, record, article, meaningCode), problems = signPolicyProblems(state, kind, record, meaning, viewer, manager);
+    if (path === "/api/sign-preview") return json({ kind, meaning:meaningCode, meanings:kind === "case" ? ["case_approve", "case_invalid"].map(code => ({ code, label:SIGN_MEANINGS[code].label, statement:SIGN_MEANINGS[code].statement })) : [{ code:"screening", label:meaning.label, statement:meaning.statement }],
+      statement:meaning.statement, content_sha256, evidence_sha256, signer:{ id:email, name:viewer.name, role:viewer.role }, reauth:Boolean(env.HOST_ACCOUNTS), problems, signatures:record.signatures || [], intact:await signatureIntact(kind, record, article), manager });
+    if (problems.length) return json({ error:problems[0] }, 409);
+    // Review binding: you can only sign what you actually fetched. Anything that changed since the preview is refused.
+    if (body.expected_content_sha256 !== content_sha256) return json({ error:"The record changed since you opened it. Reload it and review it again before signing." }, 409);
+    if (body.reviewed_evidence_sha256 !== evidence_sha256) return json({ error:"The article evidence changed since you reviewed it. Review it again before signing." }, 409);
+    const reauth = !env.HOST_ACCOUNTS ? "session only (no password re-entry on this host)" : request.headers.get("x-esign-reauth") === "1" ? "password re-entry" : "";
+    if (!reauth) return json({ error:"Confirm your password to sign." }, 401);
+    const signature = { id:crypto.randomUUID(), signer_id:email, signer_name:viewer.name, meaning:meaningCode, meaning_text:meaning.statement, signed_at:new Date().toISOString(), content_sha256, evidence_sha256, auth:reauth, superseded:null };
+    const saved = await write(env, data => {
+      const target = kind === "case" ? data.cases.find(c => c.id === record.id) : data.assignments.find(a => a.id === record.id);
+      if (activeSignature(target)) throw new Error("Already signed.");
+      (target.signatures ||= []).push(signature);
+      target.status = meaning.status;
+      if (kind === "case") target.locked = true;
+      (target.history ||= []).push({ at:signature.signed_at, by:email, action:"signed: " + meaning.label });
+      return target;
+    });
+    await audit(env, { by:email, action:"sign.signed", entityType:kind === "case" ? "Case" : "Assignment", entityId:kind === "case" ? record.number : record.id, detail:{ meaning:meaningCode, content_sha256, evidence_sha256, auth:reauth, pmid:record.pmid } });
+    return json({ signature, record:saved });
   }
   if (path.startsWith("/api/case-") && viewer) {
     const cfg = withSettings(env, state), canSee = c => manager || c.createdBy === email, find = id => (state.cases || []).find(c => c.id === id && canSee(c));
@@ -1467,6 +1633,7 @@ async function apiCore(request, env, path) {
     if (!current) return json({ error:"Case not found." }, 404);
     if (path === "/api/case-assess") return json({ assessment:withRegulatory(await assessCase(cfg, body.data || current.data), state, { data:normalizeCase(body.data || current.data), molecule:current.molecule }) });
     if (path === "/api/case-save") {
+      if (current.locked) return json({ error:"This case is signed and locked. A manager must supersede the signature before it can be edited." }, 409);
       const data = normalizeCase(body.data || current.data), status = caseStatuses.includes(body.status) ? body.status : current.status, notes = String(body.notes ?? current.notes).slice(0, 4000);
       const local = localAssessment(data);
       if (status === "Ready for medical review" && !local.qc.ready_for_medical_review) return json({ error:"Not ready for medical review yet. " + (local.validity.missing.length ? "Missing: " + local.validity.missing.join(", ") + ". " : "") + local.qc.findings.filter(f => f.severity === "major" || f.severity === "critical").slice(0, 4).map(f => f.title).join("; ") + "." }, 400);
@@ -1488,6 +1655,8 @@ async function apiCore(request, env, path) {
       if (body.format !== "package") return new Response(JSON.stringify(data, null, 2), { headers:{ "Content-Type":"application/json", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="' + current.number + '.json"' } });
       const encoder = new TextEncoder(), article = state.articles[current.pmid] || {}, files = [{ name:"icsr.json", data:encoder.encode(JSON.stringify(data, null, 2)) },
         { name:"assessment.json", data:encoder.encode(JSON.stringify(withRegulatory(await assessCase(cfg, current.data), state, current), null, 2)) },
+        { name:"signatures.json", data:encoder.encode(JSON.stringify(current.signatures || [], null, 2)) },
+        { name:"SIGNATURES.txt", data:encoder.encode((current.signatures || []).length ? (current.signatures || []).map(signatureText).join("\r\n") : "Not signed.\r\n") },
         { name:"citation.txt", data:encoder.encode(current.data.source_summary + "\r\n\r\nCase " + current.number + " · status " + current.status + "\r\nNotes: " + (current.notes || "") + "\r\n") }];
       for (const [key, name] of [[article.fullTextKey, "source_PMID_" + current.pmid + "." + (/\.(\w+)$/.exec(article.fullTextKey || "")?.[1] || "bin")], [article.fullTextTextKey, "source_PMID_" + current.pmid + "_text.txt"]]) {
         const object = key && await env.BUCKET.get(key);
@@ -1497,6 +1666,7 @@ async function apiCore(request, env, path) {
     }
     if (path === "/api/case-delete") {
       if (!manager) return json({ error:"Manager access required." }, 403);
+      if ((current.signatures || []).length) return json({ error:"Signed cases cannot be deleted. Supersede the signature and close the case instead." }, 409);
       await write(env, d => { d.cases = d.cases.filter(c => c.id !== current.id); });
       await audit(env, { by:email, action:"case.delete", target:current.number, detail:"" });
       return json({ ok:true });
@@ -1549,6 +1719,8 @@ async function apiCore(request, env, path) {
       const settings = data.settings ||= {};
       if ("unpaywallEmail" in body) settings.unpaywallEmail = email;
       if ("ncbiEmail" in body) settings.ncbiEmail = String(body.ncbiEmail || "").trim();
+      if (body.esignApprovers === "manager" || body.esignApprovers === "any") settings.esignApprovers = body.esignApprovers;
+      if ("esignFourEyes" in body) settings.esignFourEyes = body.esignFourEyes === true;
       if ("pvNexusUrl" in body) settings.pvNexusUrl = String(body.pvNexusUrl || "").trim();
       if (body.pvNexusToken === null) delete settings.pvNexusToken;
       else if (typeof body.pvNexusToken === "string" && body.pvNexusToken.trim()) settings.pvNexusToken = body.pvNexusToken.trim();
@@ -1597,6 +1769,14 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"ma.save", target:entries.length + " records", detail:errors.length ? errors.length + " lines skipped" : "" });
     return json({ ok:true, saved:entries.length, errors:errors.slice(0, 10) });
   }
+  if (path === "/api/audit-verify") {
+    const chain = await verifyAuditChain(env);
+    await env.BUCKET.put("audit2/verification.json", JSON.stringify({ at:new Date().toISOString(), by:email, ok:chain.ok, checked:chain.entries_checked, reason:chain.reason }), { httpMetadata:{ contentType:"application/json" } });
+    await audit(env, { by:email, action:chain.ok ? "audit.verified" : "audit.verification_failed", detail:{ checked:chain.entries_checked, reason:chain.reason } });
+    return json(chain);
+  }
+  if (path === "/api/audit-anchor") return json({ anchor:await auditAnchor(env) });
+  if (path === "/api/audit-anchor-check") return json(await checkAnchor(env, body.anchor));
   if (path === "/api/audit") {
     const month = /^\d{4}-\d{2}$/.test(String(body.month || "")) ? body.month : new Date().toISOString().slice(0, 7);
     return json(await readAudit(env, month));
@@ -1810,10 +1990,11 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 <dialog id="casedlg" style="width:min(1180px,96vw);max-height:92vh;overflow:auto"><div id="casehead" style="display:flex;justify-content:space-between;gap:12px;align-items:flex-end;margin-bottom:14px"></div>
 <div style="display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));align-items:start"><div id="casebody"></div><div><div id="caseassess"></div></div></div>
 <p id="caseerr" class="msg" style="color:var(--red)" role="alert"></p>
-<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"><button type="button" class="btn" data-caseact="save">Save</button><button type="button" class="btn outline" data-caseact="assess">Assess</button><button type="button" class="btn outline" data-caseact="json">Download ICSR JSON</button><button type="button" class="btn outline" data-caseact="package">Download package (ZIP)</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"><button type="button" class="btn" data-caseact="save">Save</button><button type="button" class="btn outline" data-caseact="assess">Assess</button><button type="button" class="btn outline" data-caseact="json">Download ICSR JSON</button><button type="button" class="btn outline" data-caseact="package">Download package (ZIP)</button><button type="button" class="btn outline" data-signopen="case" id="casesign">Signature…</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div>
 <p class="sub" style="margin-top:10px">Human-in-the-loop: values pre-filled from the article are only proposals. Causality and QC are aids; a qualified reviewer decides.</p></dialog>
+<dialog id="signdlg" style="width:min(640px,94vw)"><h2 id="signtitle">Electronic signature</h2><div id="signbody"></div><p id="signerr" class="msg" style="color:var(--red)" role="alert"></p></dialog>
 <dialog id="linkdlg"><h2 id="linktitle"></h2><p id="linknote" class="sub"></p><div style="display:grid;gap:12px"><input id="linkvalue" readonly aria-label="Link"><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" id="linkcopy">Copy link</button><button type="button" class="btn outline" id="linkshare">Share…</button><button type="button" class="btn outline" id="linkclose">Done</button></div></div></dialog>
-<dialog id="dialog"><h2>Screen citation</h2><p id="citation" class="sub"></p><div id="detail" style="max-height:38vh;overflow:auto;margin-bottom:12px"></div><form id="review"><label>Status<select name="status"><option>Pending</option><option>In review</option><option>Full text needed</option><option>Complete</option></select></label><label>Decision notes<textarea name="note" rows="4"></textarea></label><div style="display:flex;gap:8px"><button class="btn">Save decision</button><button type="button" class="btn outline" id="close">Cancel</button></div></form></dialog>
+<dialog id="dialog"><h2>Screen citation</h2><p id="citation" class="sub"></p><div id="detail" style="max-height:38vh;overflow:auto;margin-bottom:12px"></div><form id="review"><label>Status<select name="status"><option>Pending</option><option>In review</option><option>Full text needed</option><option>Complete</option></select></label><label>Decision notes<textarea name="note" rows="4"></textarea></label><div style="display:flex;gap:8px"><button class="btn">Save decision</button><button type="button" class="btn outline" id="close">Cancel</button><button type="button" class="btn outline" data-signopen="screening" id="screensign">Signature…</button></div></form></dialog>
 <script>
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -1939,6 +2120,29 @@ function renderCase(){
   $("caseassess").innerHTML=assessmentHtml(curAssess);
   $("caseerr").textContent="";
   $("casedel").style.display=data.viewer.role==="manager"?"":"none";
+  $("casesign").dataset.id=curCase.id;$("casesign").textContent=(curCase.signatures||[]).some(x=>!x.superseded)?(curCase.signature_intact===false?"Signature: changed after signing":"Signed · view signature"):"Signature…";
+}
+let signCtx=null;
+async function openSign(kind,id){
+  $("signerr").textContent="";
+  try{
+    const pre=await api("sign-preview",{kind,id});signCtx={kind,id,pre};
+    const hist=(pre.signatures||[]).map(sg=>'<div class="row" style="align-items:flex-start"><div><b>'+esc(sg.signer_name)+'</b> <span class="sub">'+esc(sg.signer_id)+'</span><div class="sub">'+esc(new Date(sg.signed_at).toLocaleString())+' · '+esc(sg.meaning_text)+'</div><div class="sub">Authentication: '+esc(sg.auth)+' · content '+esc(sg.content_sha256.slice(0,16))+'…</div>'+(sg.superseded?'<div class="sub">Superseded '+esc(new Date(sg.superseded.at).toLocaleString())+' by '+esc(sg.superseded.by)+': '+esc(sg.superseded.reason)+'</div>':'')+'</div>'+(sg.superseded?'<span class="badge">Superseded</span>':pre.intact===false?'<span class="badge red">Changed after signing</span>':'<span class="badge green">Valid</span>')+'</div>').join("");
+    const active=(pre.signatures||[]).some(sg=>!sg.superseded);
+    let form="";
+    if(active){
+      form=pre.manager?'<h3 style="margin:14px 0 6px">Supersede signature</h3><p class="sub">The signature stays in the record. Superseding unlocks the record so it can be corrected and signed again.</p><textarea id="signreason" rows="2" placeholder="Why is this signature being superseded? (at least 10 characters)" style="width:100%"></textarea><div style="margin-top:8px"><button class="btn outline" data-signgo="supersede">Supersede</button></div>':'<p class="sub" style="margin-top:12px">This record is signed. A manager can supersede the signature if it needs to change.</p>';
+    }else if(pre.problems.length){
+      form='<div style="margin-top:12px" class="sub"><b style="color:var(--red)">Cannot sign yet</b><ul>'+pre.problems.map(x=>"<li>"+esc(x)+"</li>").join("")+'</ul></div>';
+    }else{
+      form='<h3 style="margin:14px 0 6px">Sign</h3>'+(pre.meanings.length>1?'<label>Meaning<select id="signmeaning">'+pre.meanings.map(m=>'<option value="'+esc(m.code)+'"'+(m.code===pre.meaning?" selected":"")+'>'+esc(m.label)+'</option>').join("")+'</select></label>':"")+
+        '<p style="margin:10px 0;font-size:14px" id="signstatement">'+esc(pre.statement)+'</p><div class="sub">Signing as '+esc(pre.signer.name)+' ('+esc(pre.signer.id)+') · the saved version of this record · content '+esc(pre.content_sha256.slice(0,16))+'…</div>'+
+        (pre.reauth?'<label style="margin-top:10px">Confirm your password to sign<input id="signpw" type="password" autocomplete="current-password"></label>':'')+'<div style="margin-top:10px"><button class="btn" data-signgo="sign">Sign</button></div>';
+    }
+    $("signbody").innerHTML=(hist||'<p class="sub">Not signed yet.</p>')+form;
+    if(!$("signdlg").open)$("signdlg").showModal();
+    const sel=$("signmeaning");if(sel)sel.onchange=async()=>{const p2=await api("sign-preview",{kind,id,meaning:sel.value});signCtx.pre=p2;$("signstatement").textContent=p2.statement;};
+  }catch(e){message(e.message,true);}
 }
 function openCaseData(c,a){curCase=JSON.parse(JSON.stringify(c));curAssess=a;renderCase();if(!$("casedlg").open)$("casedlg").showModal();}
 async function downloadCase(format){
@@ -1954,8 +2158,9 @@ function drawAudit(){
   if(!auditData){box.innerHTML='<div class="empty">Loading…</div>';return;}
   const q=auditQ.trim().toLowerCase();
   const rows=auditData.entries.filter(e=>(!auditAction||e.action.split(".")[0]===auditAction)&&(!q||(e.by+" "+e.action+" "+e.target+" "+e.detail).toLowerCase().includes(q)));
-  box.innerHTML='<div class="row" style="padding:0 0 10px"><span>'+auditData.total+' entries in '+esc(auditData.month)+' · '+(auditData.verified?'<span class="badge green">Chain verified</span>':'<span class="badge red">Chain broken: log was altered</span>')+'</span><button class="btn outline sm" data-auditcsv="1">Export CSV</button></div>'+
-    table(["Time","User","Action","Target","Detail"],rows.slice(0,500).map(e=>['<span class="sub">'+esc(new Date(e.at).toLocaleString())+'</span>',esc(e.by),'<span class="badge">'+esc(e.action)+'</span>',esc(e.target),'<span class="sub">'+esc(e.detail)+'</span>']),"No entries match.")+(rows.length>500?'<p class="sub">Showing 500 of '+rows.length+'. Narrow the filters or export the CSV.</p>':"");
+  const lv=auditData.lastVerification, vtext=lv?'Last full verification: '+esc(new Date(lv.at).toLocaleString())+' · '+(lv.ok?'passed ('+lv.checked+' entries)':'<b style="color:var(--red)">FAILED: '+esc(lv.reason||"")+'</b>'):'The whole chain has not been verified yet.';
+  box.innerHTML='<div class="row" style="padding:0 0 10px;flex-wrap:wrap"><span>'+auditData.total+' entries in '+esc(auditData.month)+' · '+(auditData.verified?'<span class="badge green">This month is intact</span>':'<span class="badge red">This month was altered</span>')+(auditData.legacyEntries?' <span class="badge">'+auditData.legacyEntries+' earlier entries</span>':'')+'</span><span style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn outline sm" data-auditverify="1">Verify whole chain</button><button class="btn outline sm" data-auditanchor="get">Download anchor</button><button class="btn outline sm" data-auditanchor="check">Check an anchor</button><button class="btn outline sm" data-auditcsv="1">Export CSV</button></span></div><div class="sub" style="padding:0 0 10px" id="auditverdict">'+vtext+'</div>'+
+    table(["#","Time","User","Action","Entity","Detail"],rows.slice(0,500).map(e=>['<span class="sub">'+(e.sequence==null?"earlier":e.sequence)+'</span>','<span class="sub">'+esc(new Date(e.at).toLocaleString())+'</span>',esc(e.by),'<span class="badge">'+esc(e.action)+'</span>',esc((e.entityType?e.entityType+" ":"")+e.target),'<span class="sub">'+esc(e.detail)+'</span>']),"No entries match.")+(rows.length>500?'<p class="sub">Showing 500 of '+rows.length+'. Narrow the filters or export the CSV.</p>':"");
 }
 async function loadAudit(){
   auditData=null;drawAudit();
@@ -2188,7 +2393,7 @@ function render() {
   }
   if(tab==="Audit"){
     const months=[...Array(12)].map((_,i)=>{const d=new Date();d.setDate(1);d.setMonth(d.getMonth()-i);return d.toISOString().slice(0,7);});
-    html=panel("Audit trail",'<div class="filters" style="padding:0 0 14px;border:0"><select id="auditmonth" aria-label="Month">'+months.map(m=>'<option'+(m===auditMonth?" selected":"")+'>'+m+'</option>').join("")+'</select><input id="auditq" placeholder="Search user, target, detail…" value="'+esc(auditQ)+'"><select id="auditaction" aria-label="Action"><option value="">All actions</option>'+["login","logout","password","account","review","bulk-status","pull","import","scheduled","watch","molecule","profile","export","download","settings","access"].map(a=>'<option'+(auditAction===a?" selected":"")+'>'+a+'</option>').join("")+'</select></div><div id="auditbody"></div>',
+    html=panel("Audit trail",'<div class="filters" style="padding:0 0 14px;border:0"><select id="auditmonth" aria-label="Month">'+months.map(m=>'<option'+(m===auditMonth?" selected":"")+'>'+m+'</option>').join("")+'</select><input id="auditq" placeholder="Search user, target, detail…" value="'+esc(auditQ)+'"><select id="auditaction" aria-label="Action"><option value="">All actions</option>'+["login","logout","password","account","review","bulk-status","pull","import","scheduled","watch","molecule","profile","export","download","settings","access","sign","audit"].map(a=>'<option'+(auditAction===a?" selected":"")+'>'+a+'</option>').join("")+'</select></div><div id="auditbody"></div>',
       "Every sign-in, review decision, assignment, pull, export, download, account change and setting is recorded with the user and time. Entries are chained by hash, so edits or deletions show up as a broken chain.");
   }
   if(tab==="Library"){
@@ -2343,7 +2548,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.pickevent){
     collectCase();const art=data.articles[curCase.pmid]||{},e=(art.events||[]).find(x=>x.term===target.dataset.pickevent);if(!e)return;
@@ -2412,10 +2617,43 @@ document.addEventListener("click",event=>{
     }
     return;
   }
+  if(target.dataset.auditverify){
+    target.disabled=true;$("auditverdict").textContent="Verifying every entry…";
+    api("audit-verify",{}).then(r=>{$("auditverdict").innerHTML=r.ok?'<span class="badge green">Whole chain verified: '+r.entries_checked+' entries, none altered, removed or reordered.</span>':'<span class="badge red">Chain broken at entry '+esc(String(r.first_broken_sequence))+': '+esc(r.reason||"")+'</span>';}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    return;
+  }
+  if(target.dataset.auditanchor==="get"){
+    api("audit-anchor",{}).then(r=>{const link=document.createElement("a");link.href=URL.createObjectURL(new Blob([JSON.stringify(r.anchor,null,2)],{type:"application/json"}));link.download="literasift-audit-anchor-"+new Date().toISOString().slice(0,10)+".json";link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);message("Anchor downloaded. Keep it somewhere the app cannot write to, such as email or a locked folder.");}).catch(e=>message(e.message,true));
+    return;
+  }
+  if(target.dataset.auditanchor==="check"){
+    const input=document.createElement("input");input.type="file";input.accept=".json,application/json";
+    input.onchange=async()=>{try{const anchor=JSON.parse(await input.files[0].text()),r=await api("audit-anchor-check",{anchor});$("auditverdict").innerHTML=r.ok?'<span class="badge green">Matches the anchor: nothing up to entry '+esc(String(r.sequence))+' changed since it was taken.</span>':'<span class="badge red">Does not match the anchor: '+esc(r.reason||"")+'</span>';}catch(e){message(e.message||"Could not read that file.",true);}};
+    input.click();return;
+  }
+  if(target.dataset.signopen){openSign(target.dataset.signopen,target.dataset.id);return;}
+  if(target.dataset.signgo){
+    const b=target.dataset.signgo==="sign";target.disabled=true;$("signerr").textContent="";
+    (async()=>{
+      try{
+        if(b){
+          const pw=$("signpw");
+          await api("sign",{kind:signCtx.kind,id:signCtx.id,meaning:$("signmeaning")?$("signmeaning").value:"",expected_content_sha256:signCtx.pre.content_sha256,reviewed_evidence_sha256:signCtx.pre.evidence_sha256,password:pw?pw.value:""});
+          message("Signed.");
+        }else{
+          await api("supersede",{kind:signCtx.kind,id:signCtx.id,reason:$("signreason").value});message("Signature superseded and kept in the record.");
+        }
+        await refresh();if(curCase&&signCtx.kind==="case"&&$("casedlg").open){const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}}
+        await openSign(signCtx.kind,signCtx.id);
+      }catch(e){$("signerr").textContent=e.message;}
+      finally{target.disabled=false;}
+    })();
+    return;
+  }
   if(target.dataset.auditcsv&&auditData){
     const q=auditQ.trim().toLowerCase(), rows=auditData.entries.filter(e=>(!auditAction||e.action.split(".")[0]===auditAction)&&(!q||(e.by+" "+e.action+" "+e.target+" "+e.detail).toLowerCase().includes(q)));
     const cell=v=>'"'+String(v??"").replace(/^[=+@\\-]/,"'$&").replaceAll('"','""')+'"';
-    const link=document.createElement("a");link.href=URL.createObjectURL(new Blob([[["Time (UTC)","User","Action","Target","Detail","Hash"]].concat(rows.map(e=>[e.at,e.by,e.action,e.target,e.detail,e.hash])).map(r=>r.map(cell).join(",")).join("\\r\\n")],{type:"text/csv"}));
+    const link=document.createElement("a");link.href=URL.createObjectURL(new Blob([[["Sequence","Time (UTC)","User","Action","Entity","Detail","Hash"]].concat(rows.map(e=>[e.sequence==null?"":e.sequence,e.at,e.by,e.action,(e.entityType?e.entityType+" ":"")+e.target,e.detail,e.hash||""])).map(r=>r.map(cell).join(",")).join("\\r\\n")],{type:"text/csv"}));
     link.download="literasift-audit-"+auditData.month+".csv";link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
     return;
   }
@@ -2511,6 +2749,7 @@ document.addEventListener("click",event=>{
     active=data.assignments.find(a=>a.id===target.dataset.review);
     const art=data.articles[active.pmid];
     $("citation").textContent=art.title;
+    $("screensign").dataset.id=active.id;$("screensign").textContent=(active.signatures||[]).some(x=>!x.superseded)?"Signed · view signature":"Sign decision…";
     $("detail").innerHTML=(art.abstract?'<div class="sub" style="margin-bottom:4px">Abstract'+(art.abstractSource?" ("+esc(art.abstractSource)+")":"")+'</div><div style="font-size:13px;line-height:1.55">'+mark(art.abstract,active.molecules,(art.entities||{}).diseases)+'</div>':'<div class="sub">No abstract available yet.</div>')+
       (((art.entities||{}).diseases||[]).length?'<div class="sub" style="margin:10px 0 4px">Conditions mentioned (PubTator)</div><div class="chips">'+art.entities.diseases.map(t=>badge(t,"amber")).join("")+'</div>':"")+
       (((art.entities||{}).chemicals||[]).length?'<div class="sub" style="margin:10px 0 4px">Chemicals mentioned</div><div class="chips">'+art.entities.chemicals.map(t=>badge(t)).join("")+'</div>':"")+
@@ -2585,7 +2824,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  libraryLayout, audit,
+  libraryLayout, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);

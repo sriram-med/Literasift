@@ -129,3 +129,15 @@ Articles that report a patient with an adverse event can become ICSR cases: Revi
 ## Events, country, IME and case facts
 
 Articles get automatic event detection (IME list, MeSH drug-induced headings, PubTator), a country (patient, author or journal) with marketing-authorisation status and regulator, and case facts (patient, action taken, dechallenge, rechallenge, treatment, concomitants, confounders). The IME list must be uploaded in Settings (it is licensed MedDRA content and is not in the repo). Details and limits: `docs/EVENTS_COUNTRY_ICSR.md`.
+
+
+## Audit trail and electronic signatures
+
+The audit trail is a hash-chained, append-only log with contiguous sequence numbers (design from
+[argus-auditable-rag](https://github.com/iamyashwanth99/argus-auditable-rag), MIT; see `THIRD_PARTY_NOTICES.md`).
+Managers can verify the whole chain, download an anchor and later check it from the Audit tab; the server also verifies the chain daily.
+
+Screening decisions and ICSR cases can be signed. A signature records who signed, what it means, the UTC time and a hash of
+exactly what was signed; it needs the signer's password again, it is refused if the record or the article evidence changed since the
+signer opened it, and a signed record is locked until a manager supersedes the signature with a reason (the old signature is kept).
+Settings control who may sign approvals and a four-eyes rule. The validation documents are in `docs/dossier/`. Run the tests with `npm test`.

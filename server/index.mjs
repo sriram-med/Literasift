@@ -17,7 +17,7 @@ if (secret.length < 32 || runToken.length < 32) { console.error("SESSION_SECRET 
 const secureCookie = e.COOKIE_SECURE !== "false";
 const publicUrl = String(e.PUBLIC_URL || "").replace(/\/+$/, "");
 const env = { BUCKET: new FileBucket(dataDir + "/objects"), RUN_TOKEN: runToken, UNPAYWALL_EMAIL: e.UNPAYWALL_EMAIL, CROSSREF_EMAIL: e.CROSSREF_EMAIL,
-  SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN, HOST_ACCOUNTS: true, LIBRARY_PATH: dataDir + "/library" };
+  SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN, HOST_ACCOUNTS: true, AUDIT_ANCHOR_KEY: e.AUDIT_ANCHOR_KEY || createHmac("sha256", secret).update("literasift-audit-anchor").digest("hex"), LIBRARY_PATH: dataDir + "/library" };
 
 const screenshotFn = await makeScreenshotFn();
 if (screenshotFn) env.SCREENSHOT_FN = screenshotFn;
@@ -191,11 +191,20 @@ async function handler(req, res) {
 
   const headers = new Headers();
   for (const [name, value] of Object.entries(req.headers)) {
-    if (["host", "connection", "content-length", "transfer-encoding", "cookie", "oai-authenticated-user-email"].includes(name) || Array.isArray(value)) continue;
+    if (["host", "connection", "content-length", "transfer-encoding", "cookie", "oai-authenticated-user-email", "x-esign-reauth"].includes(name) || Array.isArray(value)) continue;
     headers.set(name, value);
   }
   if (signedIn) headers.set("oai-authenticated-user-email", email);
-  const body = req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req);
+  let body = req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req);
+  // Signing requires the password again. The host checks it, removes it from the request, and tells the app it was verified.
+  if (path === "/api/sign" && signedIn && body) {
+    let parsed = {}; try { parsed = JSON.parse(body.toString() || "{}"); } catch {}
+    const password = String(parsed.password || ""); delete parsed.password;
+    if (blocked("esign-" + email, 8)) return reply(res, 429, { error: "Too many attempts. Try again later." });
+    if (password && await checkPassword(users[email], password)) headers.set("x-esign-reauth", "1");
+    else { fail("esign-" + email); await record(email, "sign.reauth_failed", "", "ip " + ip); return reply(res, 401, { error: "Password incorrect. The record was not signed." }); }
+    body = Buffer.from(JSON.stringify(parsed));
+  }
   const response = await worker.fetch(new Request(new URL(req.url, "http://localhost"), { method: req.method, headers, body }), env);
   const out = {}; response.headers.forEach((v, k) => { out[k] = v; });
   if (out["content-type"]?.startsWith("text/html")) {
@@ -229,6 +238,15 @@ async function runScheduled() {
   }
   console.log(JSON.stringify({ time: new Date().toISOString(), batches: results.length, failed: results.filter(r => r.error).length, remaining: last?.remaining || 0, evidence: last?.evidence }));
 }
+// Verify the whole audit chain every day and record the result, so tampering is noticed without anyone having to look.
+async function verifyChainDaily() {
+  const chain = await worker.verifyAuditChain(env);
+  await env.BUCKET.put("audit2/verification.json", JSON.stringify({ at: new Date().toISOString(), by: "system:literasift", ok: chain.ok, checked: chain.entries_checked, reason: chain.reason }), { httpMetadata: { contentType: "application/json" } });
+  await worker.audit(env, { by: "system", action: chain.ok ? "audit.verified" : "audit.verification_failed", detail: { checked: chain.entries_checked, reason: chain.reason } });
+  if (chain.ok) console.log("Audit chain verified: " + chain.entries_checked + " entries"); else console.error("AUDIT CHAIN BROKEN at entry " + chain.first_broken_sequence + ": " + chain.reason);
+}
+setTimeout(() => verifyChainDaily().catch(err => console.error("Audit verify:", err.message)), 60000);
+setInterval(() => verifyChainDaily().catch(err => console.error("Audit verify:", err.message)), 24 * 3600000);
 let mirroring = false;
 const mirror = () => { if (mirroring) return; mirroring = true; mirrorLibrary(worker, env, dataDir + "/library").then(n => n && console.log("Library folders: copied " + n + " files")).catch(err => console.error("Library mirror:", err.message)).finally(() => { mirroring = false; }); };
 setTimeout(mirror, 20000); setInterval(mirror, 15 * 60000);

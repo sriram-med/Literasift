@@ -35,6 +35,16 @@ export class FileBucket {
       if (cond?.etagDoesNotMatch && cond.etagDoesNotMatch !== "*" && current?.etag === cond.etagDoesNotMatch) return null;
       const data = typeof value === "string" ? Buffer.from(value)
         : Buffer.from(await new Response(value).arrayBuffer());
+      // Storage-level append-only guard for the audit log (the counterpart of Argus's database trigger): whatever the application code does,
+      // a month file may only grow by appending, and the head may only move forward.
+      if (current && key.startsWith("audit2/") && key.endsWith(".ndjson")) {
+        const old = await readFile(join(this.dir, name));
+        if (data.length < old.length || !data.subarray(0, old.length).equals(old)) throw new Error("audit log is append-only");
+      }
+      if (current && key === "audit2/head.json") {
+        const before = JSON.parse(await readFile(join(this.dir, name), "utf8")), after = JSON.parse(data.toString());
+        if (!(after.sequence >= before.sequence)) throw new Error("audit head cannot move backwards");
+      }
       const etag = createHash("sha256").update(data).digest("hex").slice(0, 32);
       await mkdir(this.dir, { recursive: true });
       const tmp = join(this.dir, name + ".tmp-" + process.pid);
