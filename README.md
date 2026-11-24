@@ -49,3 +49,7 @@ DOMAIN=literasift.tech ADMIN_EMAIL=you@example.com REPO_BRANCH=main bash deploy/
 ```
 
 Run `dist/install-literasift.sh` as root on a fresh Ubuntu VPS (or supply it as a Hostinger post-install script). It clones the repository, so the repository must be readable from the VPS during install; `literasift-update` later pulls and restarts. It installs Node, Caddy and the service, generates `SESSION_SECRET` and `RUN_TOKEN` into `/etc/literasift.env`, and writes the first password to `/root/literasift-admin.txt`. The first person to sign in becomes the manager; add reviewers on the Team tab, then give each a password with `literasift-user set reviewer@example.com`. Point the domain's A record at the VPS before the first start so Caddy can obtain its certificate.
+
+### Automatic deploys
+
+On the VPS, run once (as root): `curl -fsSL https://raw.githubusercontent.com/sriram-med/Literasift/claude/vigilant-planck-42pjio/deploy/enable-autoupdate.sh | bash`. It installs `literasift-update` and a systemd timer that checks the branch every 3 minutes. A new commit is syntax-checked, swapped in, restarted and health-checked; if it does not become healthy it is rolled back and not retried. Logs: `journalctl -u literasift-update`. The script also prints a read-only deploy key, so the repository can be made private again (add it under the repository's Deploy keys). `literasift-update --force` redeploys the current commit.

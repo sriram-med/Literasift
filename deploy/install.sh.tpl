@@ -89,15 +89,6 @@ exec runuser -u literasift -- env DATA_DIR=/var/lib/literasift node /opt/literas
 CLI
 chmod +x /usr/local/bin/literasift-user
 
-cat > /usr/local/bin/literasift-update <<UPD
-#!/usr/bin/env bash
-set -euo pipefail
-git -C /opt/literasift-src fetch --depth 1 origin "$REPO_BRANCH"
-git -C /opt/literasift-src reset --hard FETCH_HEAD
-cp -r /opt/literasift-src/package.json /opt/literasift-src/worker /opt/literasift-src/server /opt/literasift/
-systemctl restart literasift
-UPD
-chmod +x /usr/local/bin/literasift-update
 
 if [ -n "$ADMIN_EMAIL" ] && [ -z "$(literasift-user list | grep -x "$ADMIN_EMAIL" || true)" ]; then
   umask 077
@@ -115,5 +106,6 @@ systemctl daemon-reload
 systemctl enable --now literasift
 systemctl enable caddy
 systemctl restart caddy
+REPO_URL="$REPO_URL" REPO_BRANCH="$REPO_BRANCH" bash /opt/literasift-src/deploy/enable-autoupdate.sh
 echo "== Done. Credentials (if created): /root/literasift-admin.txt"
 exit 0
