@@ -89,3 +89,13 @@ On Search & Pull, "Suggest synonyms & brands" proposes names from RxNorm and Pub
 ## Articles with no free full text
 
 Full text is fetched from PubMed Central, Europe PMC, Unpaywall and Semantic Scholar, in that order. Many articles (closed journals) have no legal free copy, and the app never bypasses paywalls. For those: a missing DOI is looked up in Europe PMC and OpenAlex and the article is re-checked; each article shows a "Publisher page" link; "Retrieval list (CSV)" exports the listed articles without stored full text (DOI links, PubMed links, access status) for a library or document-delivery request; and "Flag for manual retrieval" sets them to "Full text needed" so reviewers can see what is outstanding. When a new source is added, earlier "not found" results are retried once automatically.
+
+## Library, audit trail and backups
+
+**Library.** The Library tab shows a folder per molecule and, inside it, a subfolder per pull's date range (`Molecule/2026-10-01_to_2026-11-04/`). Each folder has ZIP (full texts in that folder structure plus `manifest.csv`), PDF (with record snapshots) and RIS buttons, and an article is filed once, in the oldest date range that imported it. On the VPS the same tree is kept on disk under `/var/lib/literasift/library/` (full text, extracted text, record snapshot, `_index.csv` per folder), refreshed after each scheduled run and every 15 minutes, so it can be copied or browsed directly.
+
+**Audit trail.** The Audit tab (managers) lists sign-ins and failed sign-ins, review decisions, bulk status changes, molecule assignments, pulls and imports, watchlist and setting changes, account invites/resets/revocations, password changes, exports and full-text downloads, each with user and time. Entries are stored append-only in monthly files (`audit/YYYY-MM.ndjson`) and hash-chained, so an edited or removed entry shows as "Chain broken". It can be exported as CSV. This is tamper-evident, not tamper-proof: someone with full server access could rewrite the whole file, so keep off-server backups.
+
+**Deleting a watchlist** (Watchlists tab) stops new pulls only; articles, files and past pulls stay.
+
+**Backups (VPS).** Run once on the server: `bash /opt/literasift-src/deploy/enable-backups.sh`. It archives all data (database, files, audit trail, library, accounts) daily at 02:30 and keeps the last 14 in `/var/backups/literasift`. Copy them off the server now and then.

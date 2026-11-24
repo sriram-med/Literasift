@@ -601,6 +601,22 @@ async function exportPdf(env, state, viewer, manager, body) {
   if (!sections.length) return null;
   return buildPdf(String(body.title || "LiteraSift export").slice(0, 100), String(body.subtitle || "PubMed citations with page screenshots.").slice(0, 300), sections);
 }
+// ---- Library: a folder per molecule and a subfolder per pull's date range ----
+const safeName = value => String(value || "").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/\s+/g, " ").trim().replace(/^\.+/, "").slice(0, 80) || "unnamed";
+// Each article sits in the first (oldest) date range that imported it, once per molecule.
+function libraryLayout(state) {
+  const seen = new Set(), out = [];
+  for (const run of [...state.runs].reverse()) {
+    if (run.status !== "Imported") continue;
+    const molecule = safeName(run.molecule || run.portfolio), range = run.from + "_to_" + run.to;
+    for (const pmid of run.ids) {
+      if (seen.has(pmid + "|" + molecule)) continue;
+      seen.add(pmid + "|" + molecule);
+      out.push({ pmid, molecule, range, folder:molecule + "/" + range });
+    }
+  }
+  return out;
+}
 // ---- ZIP (stored, no compression) for bulk full-text download ----
 const crcTable = (() => { const table = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; table[n] = c >>> 0; } return table; })();
 const crc32 = bytes => { let c = 0xffffffff; for (let i = 0; i < bytes.length; i++) c = crcTable[(c ^ bytes[i]) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
@@ -629,22 +645,27 @@ function zipFiles(files) {
 const csvCell = value => '"' + String(value ?? "").replace(/^[=+@\-]/, "'$&").replaceAll('"', '""') + '"';
 async function exportFullTexts(env, state, viewer, manager, body) {
   const ids = [...new Set(Array.isArray(body.pmids) ? body.pmids.map(String) : [])].slice(0, pdfMaxArticles);
-  const files = [], rows = [["PMID", "Title", "DOI", "Full text status", "Source", "Licence", "Source URL", "Access", "Files"]];
+  const files = [], rows = [["Folder", "PMID", "Title", "DOI", "Full text status", "Source", "Licence", "Source URL", "Access", "Files"]];
   let total = 0;
+  // With layout, files go into Molecule/DateRange/ subfolders (an article in two molecules appears in both).
+  const folders = new Map();
+  if (body.layout === true) for (const e of libraryLayout(state)) (folders.get(e.pmid) || folders.set(e.pmid, []).get(e.pmid)).push(e.folder + "/");
   for (const id of ids) {
     const article = state.articles[id];
     if (!article || !state.assignments.some(a => a.pmid === id && (manager || a.reviewer === viewer.email))) continue;
-    const names = [];
-    for (const [key, name] of [[article.fullTextKey, "PMID_" + id + "." + (/\.(\w+)$/.exec(article.fullTextKey || "")?.[1] || "bin")], [article.fullTextTextKey, "PMID_" + id + "_text.txt"]]) {
-      if (!key) continue;
-      const object = await env.BUCKET.get(key);
-      if (!object) continue;
-      const data = new Uint8Array(await object.arrayBuffer());
-      total += data.length;
-      if (total > 150 * 1024 * 1024) throw new Error("Selection too large for one ZIP; export fewer articles.");
-      files.push({ name, data }); names.push(name);
+    for (const prefix of folders.size ? (folders.get(id) || ["Unfiled/"]) : [""]) {
+      const names = [];
+      for (const [key, name] of [[article.fullTextKey, "PMID_" + id + "." + (/\.(\w+)$/.exec(article.fullTextKey || "")?.[1] || "bin")], [article.fullTextTextKey, "PMID_" + id + "_text.txt"]]) {
+        if (!key) continue;
+        const object = await env.BUCKET.get(key);
+        if (!object) continue;
+        const data = new Uint8Array(await object.arrayBuffer());
+        total += data.length;
+        if (total > 150 * 1024 * 1024) throw new Error("Selection too large for one ZIP; export fewer articles.");
+        files.push({ name:prefix + name, data }); names.push(name);
+      }
+      rows.push([prefix.replace(/\/$/, ""), id, article.title, article.doi, article.fullTextStatus || "Pending", article.fullTextOrigin || "", article.fullTextLicense || "", article.fullTextSource || article.fullTextLink || "", article.oaStatus || "", names.join(" ")]);
     }
-    rows.push([id, article.title, article.doi, article.fullTextStatus || "Pending", article.fullTextOrigin || "", article.fullTextLicense || "", article.fullTextSource || article.fullTextLink || "", article.oaStatus || "", names.join(" ")]);
   }
   if (!files.length) return null;
   files.push({ name:"manifest.csv", data:new TextEncoder().encode(rows.map(r => r.map(csvCell).join(",")).join("\r\n")) });
@@ -737,7 +758,69 @@ async function collectEvidence(baseEnv, ids) {
     screenshotConfigured:enabled, unpaywallConfigured:Boolean(env.UNPAYWALL_EMAIL), grobidConfigured:Boolean(env.GROBID_URL)};
 }
 
+// ---- Audit trail: append-only monthly log, each entry hash-chained to the previous one so edits or deletions are detectable ----
+const auditKey = month => "audit/" + month + ".ndjson";
+const sha256 = async text => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)))].map(b => b.toString(16).padStart(2, "0")).join("");
+const auditHash = (prev, e) => sha256([prev, e.at, e.by, e.action, e.target, e.detail].join("|"));
+async function audit(env, entry) {
+  try {
+    const month = new Date().toISOString().slice(0, 7), key = auditKey(month);
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const object = await env.BUCKET.get(key);
+      const text = object ? await object.text() : "";
+      const lines = text.split("\n").filter(Boolean);
+      const prev = lines.length ? JSON.parse(lines[lines.length - 1]).hash : "GENESIS-" + month;
+      const e = { at:new Date().toISOString(), by:String(entry.by || "system").slice(0, 200), action:String(entry.action).slice(0, 60),
+        target:String(entry.target ?? "").slice(0, 300), detail:String(entry.detail ?? "").slice(0, 600) };
+      e.prev = prev; e.hash = await auditHash(prev, e);
+      const saved = await env.BUCKET.put(key, text + JSON.stringify(e) + "\n", { onlyIf:object ? { etagMatches:object.etag } : { etagDoesNotMatch:"*" }, httpMetadata:{ contentType:"application/x-ndjson" } });
+      if (saved) return;
+    }
+  } catch { /* the audit trail never blocks the action itself */ }
+}
+async function readAudit(env, month) {
+  const object = await env.BUCKET.get(auditKey(month));
+  const lines = (object ? await object.text() : "").split("\n").filter(Boolean);
+  const entries = []; let verified = true, prev = "GENESIS-" + month;
+  for (const line of lines) {
+    let e; try { e = JSON.parse(line); } catch { verified = false; continue; }
+    if (e.prev !== prev || e.hash !== await auditHash(prev, e)) verified = false;
+    prev = e.hash; entries.push(e);
+  }
+  return { month, total:entries.length, verified, entries:entries.reverse().slice(0, 5000) };
+}
+const decodeWatch = value => { const [portfolio, molecule = ""] = String(value || "").split("|").map(v => { try { return decodeURIComponent(v); } catch { return v; } }); return molecule ? portfolio + " / " + molecule : portfolio; };
+const auditRules = {
+  "/api/bulk-status":(b, r) => ({ action:"bulk-status", target:(r.updated ?? 0) + " articles", detail:"status " + b.status }),
+  "/api/export":b => ({ action:"export.pdf", target:(b.pmids || []).length + " articles", detail:b.title }),
+  "/api/export-fulltext":b => ({ action:"export.fulltext-zip", target:(b.pmids || []).length + " articles", detail:b.layout ? "library layout" : "" }),
+  "/api/export-citations":b => ({ action:"export.citations", target:(b.pmids || []).length + " articles", detail:b.format }),
+  "/api/scheduled":(b, r) => (r.results || []).length ? { action:"scheduled.run", target:"", detail:r.results.length + " batches, " + r.results.filter(x => x.error).length + " failed" } : null,
+  "/api/settings":b => ({ action:"settings.update", target:Object.keys(b).join(", "), detail:"storeRestricted" in b ? "storeRestricted=" + b.storeRestricted : "" }),
+  "/api/delete-watch":b => ({ action:"watch.delete", target:decodeWatch(b.watch), detail:"" }),
+  "/api/assign-molecule":(b, r) => ({ action:"molecule.assign", target:decodeWatch(b.watch), detail:"to " + (b.owner || "auto") + ", " + (r.moved ?? 0) + " articles" + (b.reassign ? " (including reassigned)" : "") }),
+  "/api/recheck-access":() => ({ action:"access.recheck", target:"all articles", detail:"" }),
+  "/api/profile":b => ({ action:"profile.save", target:b.email, detail:"limit " + b.capacity + ", " + (b.active === false ? "unavailable" : "active") }),
+  "/api/watch":b => ({ action:"watch.save", target:(b.molecule ? b.portfolio + " / " + b.molecule : b.portfolio), detail:String(b.query || "").slice(0, 200) }),
+  "/api/watches":(b, r) => ({ action:"watch.bulk-save", target:b.portfolio, detail:(r.created ?? 0) + " molecules" + (b.owner ? ", owner " + b.owner : "") }),
+  "/api/pull":(b, r) => ({ action:"pull", target:b.molecule, detail:b.from + " to " + b.to + ": " + (r.count ?? 0) + " articles" }),
+  "/api/import":(b, r) => ({ action:"import", target:decodeWatch(b.watch), detail:b.from + " to " + b.to + ": " + (r.count ?? 0) + " articles" }),
+};
 async function api(request, env, path) {
+  const copy = request.method === "POST" ? request.clone() : null;
+  const response = await apiCore(request, env, path);
+  const rule = copy && response.status < 400 && auditRules[path];
+  if (rule) {
+    try {
+      const body = await copy.json().catch(() => ({}));
+      const result = response.headers.get("content-type")?.includes("json") ? await response.clone().json().catch(() => ({})) : {};
+      const entry = rule(body, result);
+      if (entry) await audit(env, { by:request.headers.get("oai-authenticated-user-email")?.toLowerCase() || "system", ...entry });
+    } catch { /* ignore */ }
+  }
+  return response;
+}
+async function apiCore(request, env, path) {
   const email = request.headers.get("oai-authenticated-user-email")?.toLowerCase();
   const service = env.RUN_TOKEN && request.headers.get("Authorization") === "Bearer " + env.RUN_TOKEN;
   if (!email && !(service && path === "/api/scheduled")) return json({ error:"Sign-in required." }, 401);
@@ -754,7 +837,8 @@ async function api(request, env, path) {
   if (!viewer && !service) return json({ error:"Your account needs a Literature Bench profile." }, 403);
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email);
-    return json({ viewer, config:{ storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+    return json({ viewer, library:manager ? libraryLayout(state) : [],
+      config:{ libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -767,6 +851,7 @@ async function api(request, env, path) {
     if ((!manager && !state.assignments.some(a=>a.pmid===id && a.reviewer===email)) || !key) return json({error:"File unavailable."},404);
     const object = await env.BUCKET.get(key);
     if (!object) return json({error:"File unavailable."},404);
+    await audit(env, { by:email, action:path.startsWith("/api/screenshot/") ? "download.snapshot" : "download.fulltext", target:"PMID " + id, detail:article?.fullTextOrigin || "" });
     const headers = new Headers({"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff",
       "Content-Disposition":'attachment; filename="'+key.split("/").pop()+'"'});
     object.writeHttpMetadata(headers);
@@ -790,13 +875,16 @@ async function api(request, env, path) {
   }
   if (path === "/api/review" && viewer) {
     if (!["Pending","In review","Complete","Full text needed"].includes(body.status)) return json({error:"Invalid status."},400);
-    await write(env, data => {
+    const reviewed = await write(env, data => {
       const item = data.assignments.find(a => a.id === body.id && (manager || a.reviewer === email));
       if (!item) throw new Error("Assignment unavailable.");
+      const before = item.status;
       item.status = body.status;
       item.note = String(body.note || "").slice(0, 4000);
       (item.history ||= []).push({ status:item.status, note:item.note, by:email, at:new Date().toISOString() });
+      return { pmid:item.pmid, before };
     });
+    await audit(env, { by:email, action:"review", target:"PMID " + reviewed.pmid, detail:reviewed.before + " → " + body.status + (body.note ? " (note saved)" : "") });
     return json({ ok:true });
   }
   if (path === "/api/export-citations" && viewer) {
@@ -847,6 +935,17 @@ async function api(request, env, path) {
         if (turnedOn) for (const a of Object.values(data.articles)) if (/^(Open access link only|No eligible PMC file|No PMC record|No downloadable open-access copy)$/.test(a.fullTextStatus || "")) { delete a.fullTextStatus; delete a.evidenceAttempt; }
       }
     });
+    return json({ ok:true });
+  }
+  if (path === "/api/audit") {
+    const month = /^\d{4}-\d{2}$/.test(String(body.month || "")) ? body.month : new Date().toISOString().slice(0, 7);
+    return json(await readAudit(env, month));
+  }
+  if (path === "/api/delete-watch") {
+    const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
+    if (!state.watches.some(w => w.portfolio === portfolio && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
+    // Only the watchlist stops; imported articles, assignments, files and past pulls are kept.
+    await write(env, data => { data.watches = data.watches.filter(w => !(w.portfolio === portfolio && (w.molecule || "") === molecule)); });
     return json({ ok:true });
   }
   if (path === "/api/suggest-synonyms") return json(await suggestSynonyms(body.name));
@@ -1032,13 +1131,15 @@ const paths = {
   Batches:'<path d="m12 3 9 5-9 5-9-5 9-5z"/><path d="m3 13 9 5 9-5"/>',
   Watchlists:'<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   Settings:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  Audit:'<path d="M9 12l2 2 4-4M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
+  Library:'<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   Account:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
   Team:'<circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0M17 4a4 4 0 0 1 0 8M22 21a7 7 0 0 0-4-6"/>',
   moon:'<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>', sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password."};
+const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -1074,7 +1175,21 @@ const runStats=run=>{
   return {n,abstracts:c(a=>a.abstract),oaChecked:c(a=>a.oaCheckedAt),oaOpen:c(a=>a.oaIsOpen),pmc:c(a=>a.fullTextOrigin==="PMC"&&a.fullTextKey),epmc:c(a=>a.fullTextOrigin==="Europe PMC"&&a.fullTextKey),
     unpaywall:c(a=>a.fullTextOrigin==="Unpaywall"&&a.fullTextKey),linkOnly:c(a=>a.fullTextStatus==="Open access link only"),closed:c(a=>a.oaStatus==="closed"),texts:c(a=>a.fullTextTextKey),passages:c(a=>(a.keyPassages||[]).length),retr:c(a=>a.retractionCheckedAt)};
 };
-let extracting=null, pullRun="";
+let extracting=null, pullRun="", libPath="/", auditData=null, auditMonth=new Date().toISOString().slice(0,7), auditQ="", auditAction="";
+function drawAudit(){
+  const box=$("auditbody");if(!box)return;
+  if(!auditData){box.innerHTML='<div class="empty">Loading…</div>';return;}
+  const q=auditQ.trim().toLowerCase();
+  const rows=auditData.entries.filter(e=>(!auditAction||e.action.split(".")[0]===auditAction)&&(!q||(e.by+" "+e.action+" "+e.target+" "+e.detail).toLowerCase().includes(q)));
+  box.innerHTML='<div class="row" style="padding:0 0 10px"><span>'+auditData.total+' entries in '+esc(auditData.month)+' · '+(auditData.verified?'<span class="badge green">Chain verified</span>':'<span class="badge red">Chain broken: log was altered</span>')+'</span><button class="btn outline sm" data-auditcsv="1">Export CSV</button></div>'+
+    table(["Time","User","Action","Target","Detail"],rows.slice(0,500).map(e=>['<span class="sub">'+esc(new Date(e.at).toLocaleString())+'</span>',esc(e.by),'<span class="badge">'+esc(e.action)+'</span>',esc(e.target),'<span class="sub">'+esc(e.detail)+'</span>']),"No entries match.")+(rows.length>500?'<p class="sub">Showing 500 of '+rows.length+'. Narrow the filters or export the CSV.</p>':"");
+}
+async function loadAudit(){
+  auditData=null;drawAudit();
+  try{auditData=await api("audit",{month:auditMonth});}catch(e){message(e.message,true);auditData={month:auditMonth,total:0,verified:true,entries:[]};}
+  drawAudit();
+}
+const libIds=path=>[...new Set((data.library||[]).filter(e=>path==="/"||e.folder===path||e.folder.startsWith(path+"/")).map(e=>e.pmid))];
 function drawProgress(){
   const box=$("progress");if(!box)return;
   const runs=data.runs.filter(r=>r.status==="Imported"&&r.ids.length);
@@ -1199,7 +1314,7 @@ function applyFilter(items){
 function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=(manager?["Overview","Search & Pull","My Queue","All Assignments","Batches","Watchlists","Team","Settings"]:["My Queue"]).concat(data.config.accounts?["Account"]:[]);
+  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Batches","Watchlists","Team","Audit","Settings"]:["My Queue"]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
   const open=mine.filter(a=>a.status!=="Complete").length;
@@ -1232,6 +1347,28 @@ function render() {
     html=panel("Pull articles for a molecule",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Pull articles</button> <button type="button" class="btn outline" data-suggest="1">Suggest synonyms &amp; brands</button></div></form><div id="suggest"></div>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+'<div id="progress"></div>'+
       panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>':""]),"No pulls yet."),"",true);
   }
+  if(tab==="Audit"){
+    const months=[...Array(12)].map((_,i)=>{const d=new Date();d.setDate(1);d.setMonth(d.getMonth()-i);return d.toISOString().slice(0,7);});
+    html=panel("Audit trail",'<div class="filters" style="padding:0 0 14px;border:0"><select id="auditmonth" aria-label="Month">'+months.map(m=>'<option'+(m===auditMonth?" selected":"")+'>'+m+'</option>').join("")+'</select><input id="auditq" placeholder="Search user, target, detail…" value="'+esc(auditQ)+'"><select id="auditaction" aria-label="Action"><option value="">All actions</option>'+["login","logout","password","account","review","bulk-status","pull","import","scheduled","watch","molecule","profile","export","download","settings","access"].map(a=>'<option'+(auditAction===a?" selected":"")+'>'+a+'</option>').join("")+'</select></div><div id="auditbody"></div>',
+      "Every sign-in, review decision, assignment, pull, export, download, account change and setting is recorded with the user and time. Entries are chained by hash, so edits or deletions show up as a broken chain.");
+  }
+  if(tab==="Library"){
+    const lib=data.library||[], byMol={};
+    lib.forEach(e=>{((byMol[e.molecule]||={})[e.range]||=new Set()).add(e.pmid);});
+    const stat=ids=>{const arts=[...ids].map(id=>data.articles[id]).filter(Boolean);return{n:arts.length,ft:arts.filter(a=>a.fullTextKey).length,shot:arts.filter(a=>a.screenshotKey).length};};
+    const [mol,range]=libPath==="/"?["",""]:libPath.split("/");
+    if(mol&&!byMol[mol])libPath="/";
+    const crumbs='<div class="sub" style="margin-bottom:12px"><button class="btn outline sm" data-libopen="/">Library</button>'+(mol?' / <button class="btn outline sm" data-libopen="'+esc(mol)+'">'+esc(mol)+'</button>':"")+(range?' / <b>'+esc(range)+'</b>':"")+'</div>';
+    const actions=path=>'<button class="btn outline sm" data-libzip="'+esc(path)+'">ZIP</button> <button class="btn outline sm" data-libpdf="'+esc(path)+'">PDF</button> <button class="btn outline sm" data-libris="'+esc(path)+'">RIS</button>';
+    if(!lib.length) html=panel("Library",'<div class="empty">Nothing here yet. Pull articles for a molecule on Search &amp; Pull and its folder appears here.</div>');
+    else if(libPath==="/") html=crumbs+'<div class="cards">'+Object.entries(byMol).sort().map(([m,ranges])=>{const all=new Set(Object.values(ranges).flatMap(x=>[...x])),st=stat(all);
+      return '<div class="card"><div class="lbl"><b style="font-size:16px;color:var(--fg)">📁 '+esc(m)+'</b></div><div class="sub" style="margin:6px 0 10px">'+Object.keys(ranges).length+" date range"+(Object.keys(ranges).length===1?"":"s")+" · "+st.n+" articles · "+st.ft+' full texts</div><button class="btn sm" data-libopen="'+esc(m)+'">Open</button> <button class="btn outline sm" data-libzip="'+esc(m)+'">ZIP</button></div>';}).join("")+'</div>'+
+      panel("Whole library",'<button class="btn outline" data-libzip="/">Download everything (ZIP)</button>',"Full texts arranged as Molecule / Date range / files, with a manifest.csv.");
+    else if(!range) html=crumbs+panel(esc(mol),table(["Date range","Articles","Full text","Snapshots",""],Object.entries(byMol[mol]).sort((a,b)=>b[0].localeCompare(a[0])).map(([r,ids])=>{const st=stat(ids);
+      return ['📁 <a href="#" data-libopen="'+esc(mol+"/"+r)+'">'+esc(r.replace("_to_"," → "))+'</a>',st.n,st.ft+" / "+st.n,st.shot+" / "+st.n,actions(mol+"/"+r)];}),"No date ranges."),"",true)+
+      panel("Whole molecule",actions(mol));
+    else { const ids=byMol[mol][range]||new Set(); html=crumbs+panel(esc(mol+" · "+range.replace("_to_"," → ")),actions(libPath),"",false)+queueView(items.filter(a=>ids.has(a.pmid))); }
+  }
   if(tab==="My Queue"){
     const groups={};mine.forEach(a=>{const k=(a.molecules||[]).length?a.molecules.join(", "):a.portfolio;(groups[k]||={n:0,d:0}).n++;if(a.status==="Complete")groups[k].d++;});
     const done=mine.filter(a=>a.status==="Complete").length;
@@ -1243,13 +1380,14 @@ function render() {
     panel("Add molecules in bulk",'<form class="grid" data-route="watches"><label>Portfolio<input name="portfolio" required></label><label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label>Assign all to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Save molecules</button></div></form>',"One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs.")+
     panel("Assign a molecule to an employee",watchOptions?'<form class="grid" data-route="assign-molecule"><label>Molecule<select name="watch">'+watchOptions+'</select></label><label>Employee<select name="owner">'+peopleOptions("","Unassign (auto)")+'</select></label><label class="check"><input type="checkbox" name="reassign">&nbsp;Also move articles already assigned to someone else</label><div><button class="btn">Assign</button></div></form>':'<div class="empty">Save a watchlist first.</div>',
       "The employee receives every pulled article for the molecule that is not yet complete, and every article pulled for it from now on. Their open-article limit does not apply to owned molecules.")+
-    panel("Saved watchlists ("+data.watches.length+")",table(["Portfolio","Molecule","Owner","Query"],data.watches.map(w=>[esc(w.portfolio),esc(w.molecule||"—"),w.owner?esc((data.profiles.find(p=>p.email===w.owner)||{name:w.owner}).name):'<span class="sub">Auto</span>','<span class="sub">'+esc(w.query)+"</span>"]),"Add a molecule or portfolio watchlist to start."),"",true);
+    panel("Saved watchlists ("+data.watches.length+")",table(["Portfolio","Molecule","Owner","Query",""],data.watches.map(w=>[esc(w.portfolio),esc(w.molecule||"—"),w.owner?esc((data.profiles.find(p=>p.email===w.owner)||{name:w.owner}).name):'<span class="sub">Auto</span>','<span class="sub">'+esc(w.query)+"</span>",'<button class="btn outline sm" data-delwatch="'+esc(encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||""))+'">Delete</button>']),"Add a molecule or portfolio watchlist to start."),"",true);
   if(tab==="Settings") html=panel("Unpaywall (open access)",'<form class="grid" data-route="settings"><label class="wide">Contact email for Unpaywall<input type="email" name="unpaywallEmail" value="'+esc(data.config.unpaywallEmail)+'" placeholder="you@example.com"'+(data.config.unpaywallFromEnv?' disabled':'')+'></label><div><button class="btn"'+(data.config.unpaywallFromEnv?' disabled':'')+'>Save</button></div></form>'+
       '<div class="row"><span>Status</span>'+(data.config.unpaywall?badge("Active","green"):badge("Not configured","amber"))+'</div>'+
       '<form data-route="recheck-access" style="margin-top:10px"><button class="btn outline">Re-check open access for all articles</button></form>',
       "Unpaywall requires a contact email on each request; it is sent to Unpaywall only. Every article with a DOI gets an open-access status (gold, hybrid, green, bronze or closed). Permissively licensed PDFs are stored, other open copies are linked. Closed articles are re-checked every 30 days."+(data.config.unpaywallFromEnv?" The email is set by the server environment (UNPAYWALL_EMAIL).":""))+
     panel("Restricted-licence full text",'<form class="grid" data-route="settings"><label class="wide">Store open-access copies under restrictive licences<select name="storeRestricted"><option value="true"'+(data.config.storeRestricted?" selected":"")+'>Yes, store them (internal use)</option><option value="false"'+(data.config.storeRestricted?"":" selected")+'>No, only open licences (CC0, CC BY, CC BY-SA, CC BY-ND)</option></select></label><div><button class="btn">Save</button></div></form>',
       "Covers free-to-read copies found by PubMed Central, Europe PMC and Unpaywall that carry licences such as CC BY-NC or publisher terms, or none at all. They are marked 'Restricted licence' and meant for internal screening only; do not redistribute them. Only copies the publisher or a repository offers legally for free are fetched. Turning this on retries articles that only had a link.")+
+    (data.config.libraryPath?panel("Library folder on the server",'<div class="row"><span>Path</span><b>'+esc(data.config.libraryPath)+'</b></div>',"The same Molecule / Date range folders are kept on disk (full texts, extracted text, record snapshots, an _index.csv per folder), refreshed after every scheduled run, so they can be copied or backed up directly."):"")+
     panel("Article screenshots",'<div class="row"><span>Status</span>'+(data.config.screenshots?badge("Active","green"):badge("Not configured","amber"))+'</div>',data.config.screenshots?"A snapshot of each article's PubMed record (title, authors, abstract, MeSH, status) is rendered and embedded in PDF exports.":"PDF exports include a screenshot of each article once capture is enabled. On the VPS, run: bash /opt/literasift-src/deploy/enable-screenshots.sh")+
     panel("Extraction sources",['PubMed (E-utilities): citations, abstracts, authors, MeSH terms','PubMed Central open-access bucket: full text under open licences','Europe PMC: abstracts, keywords, citation counts, full-text XML for open-licensed articles','OpenAlex: citation counts, topics, abstract fallback','Crossref and PubMed: retraction notices','Unpaywall: open-access status and PDF fallback'].map(t=>'<div class="row"><span>'+esc(t)+'</span>'+badge("On","green")+'</div>').join("")+
       '<div class="row"><span>GROBID: structured text from PDFs (self-hosted, optional)</span>'+(data.config.grobid?badge("On","green"):badge("Not configured","amber"))+'</div>',"All sources are free and open; none needs an account. Full text is stored only when its licence allows it. Key passages are sentences mentioning the molecule and a safety term.")+
@@ -1278,6 +1416,12 @@ function render() {
   $("content").innerHTML=html;
   animate();
   drawProgress();
+  if(tab==="Audit"){
+    $("auditmonth").onchange=e=>{auditMonth=e.target.value;loadAudit();};
+    $("auditq").oninput=e=>{auditQ=e.target.value;drawAudit();};
+    $("auditaction").onchange=e=>{auditAction=e.target.value;drawAudit();};
+    if(auditData&&auditData.month===auditMonth)drawAudit();else loadAudit();
+  }
 }
 function animate(){
   const reduce=matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -1326,8 +1470,29 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke]");
+  const target=event.target.closest("[data-auditcsv],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
+  if(target.dataset.auditcsv&&auditData){
+    const q=auditQ.trim().toLowerCase(), rows=auditData.entries.filter(e=>(!auditAction||e.action.split(".")[0]===auditAction)&&(!q||(e.by+" "+e.action+" "+e.target+" "+e.detail).toLowerCase().includes(q)));
+    const cell=v=>'"'+String(v??"").replace(/^[=+@\\-]/,"'$&").replaceAll('"','""')+'"';
+    const link=document.createElement("a");link.href=URL.createObjectURL(new Blob([[["Time (UTC)","User","Action","Target","Detail","Hash"]].concat(rows.map(e=>[e.at,e.by,e.action,e.target,e.detail,e.hash])).map(r=>r.map(cell).join(",")).join("\\r\\n")],{type:"text/csv"}));
+    link.download="literasift-audit-"+auditData.month+".csv";link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
+    return;
+  }
+  if(target.dataset.libopen){event.preventDefault();libPath=target.dataset.libopen;render();return;}
+  if(target.dataset.delwatch){
+    if(!confirm("Delete this watchlist? It stops pulling new articles. Articles, files and past pulls are kept."))return;
+    api("delete-watch",{watch:target.dataset.delwatch}).then(()=>{message("Watchlist deleted.");return refresh();}).catch(e=>message(e.message,true));
+    return;
+  }
+  if(target.dataset.libzip||target.dataset.libpdf||target.dataset.libris){
+    const kind=target.dataset.libzip?"zip":target.dataset.libpdf?"pdf":"ris", path=target.dataset[kind==="zip"?"libzip":kind==="pdf"?"libpdf":"libris"];
+    const ids=libIds(path), name=path==="/"?"LiteraSift library":path.replace("/"," ").replace(/_to_/g," to ");
+    target.disabled=true;
+    (kind==="zip"?exportFile("export-fulltext","zip",ids,name,"","ZIP",{layout:true}):kind==="pdf"?exportFile("export","pdf",ids,name,"Library folder "+path,"PDF"):exportFile("export-citations","ris",ids,name+" citations","","citations",{format:"ris"}))
+      .catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    return;
+  }
   if(target.dataset.retrieval){
     const list=applyFilter(shown).filter(a=>!(data.articles[a.pmid]||{}).fullTextKey);
     if(!list.length){message("Every article in this list already has full text stored.");return;}
@@ -1474,6 +1639,7 @@ async function mcp(request, env) {
 }
 
 export default {
+  libraryLayout, audit,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);

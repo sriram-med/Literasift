@@ -7,6 +7,7 @@ import { FileBucket } from "./storage.mjs";
 import { addPendingUser, checkPassword, consumeToken, createToken, peekToken, readUsers, removeUser, setPassword, strongEnough, validEmail } from "./accounts.mjs";
 import { mailConfigured, sendMail } from "./mail.mjs";
 import { makeScreenshotFn } from "./screenshots.mjs";
+import { mirrorLibrary } from "./library.mjs";
 
 const e = process.env;
 const port = Number(e.PORT || 8787), dataDir = e.DATA_DIR || "/var/lib/literasift";
@@ -15,7 +16,7 @@ if (secret.length < 32 || runToken.length < 32) { console.error("SESSION_SECRET 
 const secureCookie = e.COOKIE_SECURE !== "false";
 const publicUrl = String(e.PUBLIC_URL || "").replace(/\/+$/, "");
 const env = { BUCKET: new FileBucket(dataDir + "/objects"), RUN_TOKEN: runToken, UNPAYWALL_EMAIL: e.UNPAYWALL_EMAIL, CROSSREF_EMAIL: e.CROSSREF_EMAIL,
-  SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN, HOST_ACCOUNTS: true };
+  SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN, HOST_ACCOUNTS: true, LIBRARY_PATH: dataDir + "/library" };
 
 const screenshotFn = await makeScreenshotFn();
 if (screenshotFn) env.SCREENSHOT_FN = screenshotFn;
@@ -60,6 +61,7 @@ async function readBody(req, limit = 2_000_000) {
 }
 const send = (res, status, body, headers = {}) => { res.writeHead(status, { ...security, ...headers }); res.end(body); };
 const reply = (res, status, data) => send(res, status, JSON.stringify(data), json);
+const record = (by, action, target = "", detail = "") => worker.audit(env, { by, action, target, detail }).catch(() => {});
 const asWorker = (email, path, method = "GET", body) => worker.fetch(new Request("http://localhost" + path, { method, headers: { "oai-authenticated-user-email": email, "Content-Type": "application/json" }, body }), env);
 
 async function sendAccountMail(kind, to, link, inviter) {
@@ -81,9 +83,11 @@ async function handler(req, res) {
     const keys = ["ip:" + ip, "email:" + email];
     if (keys.some(k => blocked(k))) return send(res, 429, loginPage("Too many attempts. Try again in 15 minutes."), html);
     const users = await readUsers();
-    if (!(await checkPassword(Object.hasOwn(users, email) ? users[email] : null, password))) { keys.forEach(fail); return send(res, 401, loginPage("Incorrect email or password."), html); }
+    if (!(await checkPassword(Object.hasOwn(users, email) ? users[email] : null, password))) { keys.forEach(fail); await record("anonymous", "login.failed", email.slice(0, 200), "ip " + ip); return send(res, 401, loginPage("Incorrect email or password."), html); }
+    await record(email, "login", "", "ip " + ip);
     return send(res, 303, "", { Location: "/", "Set-Cookie": cookieFor(email, users[email].v) });
   }
+  if (path === "/logout" && req.method === "POST") { const who = readSession(req)?.email; if (who) await record(who, "logout"); }
   if (path === "/logout" && req.method === "POST") return send(res, 303, "", { Location: "/login", "Set-Cookie": "ls=; HttpOnly; Path=/; Max-Age=0" });
 
   // Password recovery: always answers the same way so it cannot be used to discover which emails have accounts.
@@ -97,6 +101,7 @@ async function handler(req, res) {
     keys.forEach(fail);
     const users = await readUsers();
     if (Object.hasOwn(users, email) && mailConfigured(e) && publicUrl) {
+      await record("anonymous", "password.forgot", email, "ip " + ip);
       try { await sendAccountMail("reset", email, publicUrl + "/reset?token=" + await createToken(email, "reset")); } catch (error) { console.error("Reset email failed:", error.message); }
     }
     return send(res, 200, forgotPage(message), html);
@@ -116,6 +121,7 @@ async function handler(req, res) {
     const used = await consumeToken(token);
     if (!used) return send(res, 400, invalidLink(), html);
     await setPassword(used.email)(password);
+    await record(used.email, used.type === "invite" ? "account.activate" : "password.reset", used.email, "ip " + ip);
     return send(res, 303, "", { Location: "/login?done=1" });
   }
 
@@ -140,6 +146,7 @@ async function handler(req, res) {
       if (!(await checkPassword(users[email], String(body.current || "")))) { fail("pw-" + email); return reply(res, 400, { error: "Your current password is incorrect." }); }
       if (!strongEnough(body.next, email)) return reply(res, 400, { error: "Use at least 12 characters, and not your email address." });
       await setPassword(email)(String(body.next));
+      await record(email, "password.change", email);
       return send(res, 200, JSON.stringify({ ok: true }), { ...json, "Set-Cookie": cookieFor(email, (await readUsers())[email].v) });
     }
     const state = await (await asWorker(email, "/api/state")).json();
@@ -162,15 +169,18 @@ async function handler(req, res) {
       if (!profile.ok) return reply(res, profile.status, await profile.json().catch(() => ({ error: "Could not save the profile." })));
       if (Object.hasOwn(users, target) && users[target].hash) return reply(res, 200, { ok: true, existing: true });
       await addPendingUser(target);
+      await record(email, "account.invite", target, "role reviewer");
       return reply(res, 200, { ok: true, ...(await deliver("invite", target)) });
     }
     if (path === "/host/reset-link" && req.method === "POST") {
       if (!Object.hasOwn(users, target) || target === email) return reply(res, 400, { error: "Choose another user's account." });
+      await record(email, "account.reset-link", target);
       return reply(res, 200, { ok: true, ...(await deliver(users[target].hash ? "reset" : "invite", target)) });
     }
     if (path === "/host/revoke" && req.method === "POST") {
       if (!Object.hasOwn(users, target) || target === email) return reply(res, 400, { error: "Choose another user's account." });
       await removeUser(target);
+      await record(email, "account.revoke", target);
       return reply(res, 200, { ok: true });
     }
     return reply(res, 404, { error: "Route unavailable." });
@@ -216,7 +226,10 @@ async function runScheduled() {
   }
   console.log(JSON.stringify({ time: new Date().toISOString(), batches: results.length, failed: results.filter(r => r.error).length, remaining: last?.remaining || 0, evidence: last?.evidence }));
 }
+let mirroring = false;
+const mirror = () => { if (mirroring) return; mirroring = true; mirrorLibrary(worker, env, dataDir + "/library").then(n => n && console.log("Library folders: copied " + n + " files")).catch(err => console.error("Library mirror:", err.message)).finally(() => { mirroring = false; }); };
+setTimeout(mirror, 20000); setInterval(mirror, 15 * 60000);
 const everyMs = Math.max(5, Number(e.SCHEDULE_MINUTES || 60)) * 60000;
 let running = false;
-const tick = () => { if (running) return; running = true; runScheduled().catch(err => console.error("Scheduler:", err.message)).finally(() => { running = false; }); };
+const tick = () => { if (running) return; running = true; runScheduled().catch(err => console.error("Scheduler:", err.message)).finally(() => { running = false; mirror(); }); };
 setTimeout(tick, 120000); setInterval(tick, everyMs);
