@@ -141,3 +141,11 @@ Screening decisions and ICSR cases can be signed. A signature records who signed
 exactly what was signed; it needs the signer's password again, it is refused if the record or the article evidence changed since the
 signer opened it, and a signed record is locked until a manager supersedes the signature with a reason (the old signature is kept).
 Settings control who may sign approvals and a four-eyes rule. The validation documents are in `docs/dossier/`. Run the tests with `npm test`.
+
+## Full-text intake to the ICSR workbench
+
+Articles whose full text is stored (PMC, Europe PMC, Unpaywall, Semantic Scholar) and that have detected events become draft ICSR cases,
+automatically as evidence is processed (Settings can turn this off) or with **Add to ICSR workbench** on the ICSR tab. Events and case facts are read
+from the abstract plus the case section of the full text (or the sentences about the patient or drug when the paper has no such section).
+The verbatim phraser records, for each event, the exact wording used in the paper, the sentence around it and the section, and these
+go into the case as the reported term and its source evidence. Full texts that are PDFs without a GROBID service have no extractable text, so those cases use the abstract.

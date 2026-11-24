@@ -753,8 +753,50 @@ async function loadIme(env) {
 }
 const imeInvalidate = () => { imeCache = { at:0, value:null }; };
 const negationWords = /\b(no|not|without|denied|denies|absence|absent|negative|free|ruled|never|none|nor|neither)\b/;
-const EVENT_VERSION = 4;
+const EVENT_VERSION = 5;
 // Candidate adverse events in the title and abstract, each with the sentence that supports it. IME terms come first.
+// ---- Verbatim phraser: finds the exact words the article used for an event, the sentence around them and the section they sit in ----
+const paperSentences = text => String(text || "").replace(/[ \t]+/g, " ").split(/(?<=[.!?])\s+(?=[A-Z(\[])|\n+/).map(s => s.trim()).filter(s => s.length > 3);
+const HEADING_RE = /^(abstract|introduction|background|case (report|presentation|description|summary|history)|patient (information|presentation)|clinical (course|presentation)|history of present illness|methods?|results?|discussion|conclusions?|outcome( and follow[- ]up)?|follow[- ]up|investigations?|diagnosis|treatment|timeline|references)\s*:?$/i;
+const NARRATIVE_RE = /case|patient|clinical|history|course|presentation|outcome|follow|timeline|investigation|diagnos|treatment|results?$/i, SKIP_RE = /^(references|introduction|background|discussion|methods?|abstract|conclusions?)$/i;
+const PATIENT_RE = /\b(patient|he|she|his|her|man|woman|boy|girl|infant|neonate|year[- ]old|month[- ]old|admitted|presented)\b/i;
+function fullTextSections(text) {
+  const out = []; let name = "Full text", buf = [];
+  const flush = () => { if (buf.length) out.push({ name, text:buf.join("\n") }); buf = []; };
+  for (const line of String(text || "").split(/\n/)) {
+    const t = line.trim(), bare = t.replace(/^\d+(\.\d+)*\.?\s*/, "");
+    if (t.length <= 60 && HEADING_RE.test(bare)) { flush(); name = bare.replace(/:$/, ""); } else if (t) buf.push(t);
+  }
+  flush();
+  return out;
+}
+// The part of a full text that describes the patient: case sections if the paper has them, otherwise sentences about a patient or the drug.
+function caseNarrative(text, molecules) {
+  const names = (molecules || []).map(m => String(m).toLowerCase()).filter(Boolean);
+  let parts = fullTextSections(text).filter(s => NARRATIVE_RE.test(s.name) && !SKIP_RE.test(s.name)).map(s => ({ section:s.name, text:s.text }));
+  if (!parts.length) {
+    const keep = paperSentences(text).filter(s => PATIENT_RE.test(s) || names.some(n => s.toLowerCase().includes(n)));
+    if (keep.length) parts = [{ section:"Full text", text:keep.join("\n") }];
+  }
+  let budget = 24000;
+  parts = parts.map(p => { const t = p.text.slice(0, Math.max(0, budget)); budget -= t.length; return { section:p.section, text:t }; }).filter(p => p.text);
+  return { parts, text:parts.map(p => p.text).join("\n") };
+}
+// Returns { reported, quote, section } for a term: reported is the exact wording found in the source.
+function verbatimPhrase(sources, term, evidence) {
+  const words = imeNorm(term).split(" ").filter(Boolean);
+  if (!words.length) return null;
+  const re = new RegExp("\\b" + words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[\\s-]+") + "[a-z]*", "i"), hint = String(evidence || "").slice(0, 50);
+  let fallback = null;
+  for (const source of sources) for (const sentence of paperSentences(source.text)) {
+    const m = re.exec(sentence);
+    if (!m) continue;
+    const hit = { reported:m[0], quote:sentence.slice(0, 400), section:source.section };
+    if (!hint || sentence.includes(hint)) return hit;
+    fallback ||= hit;
+  }
+  return fallback;
+}
 function detectEvents(article, molecules, ime, promotions, exclude) {
   const text = (article.title || "") + ". " + (article.abstract || ""), names = new Set((molecules || []).map(imeNorm).filter(Boolean));
   // Conditions the patient already had (history, comorbidities) are not adverse events.
@@ -797,14 +839,19 @@ function detectEvents(article, molecules, ime, promotions, exclude) {
   return [...found.values()].sort((a, b) => rank(a) - rank(b)).slice(0, 12);
 }
 // Country and event detection are pure functions of stored data, so they are recomputed whenever the inputs or the IME list change.
-const detectKey = (a, ime) => [EVENT_VERSION, ime?.info.version || "none", ime?.info.count || 0, a.abstract ? 1 : 0, (a.entities?.diseases || []).length, (a.aeMesh || []).length, a.affiliation ? 1 : 0].join("|");
-function applyDetection(article, molecules, ime, promotions) {
-  const history = extractCaseFacts({ ...article, events:[] }, molecules, article.pubTypes).patient.history || [];
-  const events = detectEvents(article, molecules, ime, promotions, history);
-  const caseLike = /case report/i.test((article.pubTypes || []).join(" ")) || /\b(a|an|the)\b[^.]{0,50}\b(\d+[- ]year[- ]old|man|woman|boy|girl|patient)\b/i.test(article.abstract || "");
-  const caseFacts = extractCaseFacts({ ...article, events }, molecules, article.pubTypes);
-  return { events, caseFacts, imeCount:events.filter(e => e.ime).length, affiliationCountry:countryFromAffiliation(article.affiliation)?.name || "",
-    patientCountry:caseLike ? patientCountryFrom((article.title || "") + ". " + (article.abstract || "")) : null, eventsKey:detectKey(article, ime) };
+const detectKey = (a, ime) => [EVENT_VERSION, ime?.info.version || "none", ime?.info.count || 0, a.abstract ? 1 : 0, a.fullTextTextKey ? 1 : 0, (a.entities?.diseases || []).length, (a.aeMesh || []).length, a.affiliation ? 1 : 0].join("|");
+function applyDetection(article, molecules, ime, promotions, fullText = "") {
+  // With a stored full text, events and case facts are read from the abstract plus the part of the paper that describes the patient.
+  const narrative = fullText ? caseNarrative(fullText, molecules) : null, used = Boolean(narrative?.text);
+  const source = used ? { ...article, abstract:[article.abstract || "", narrative.text].filter(Boolean).join("\n") } : article;
+  const history = extractCaseFacts({ ...source, events:[] }, molecules, source.pubTypes).patient.history || [];
+  const found = detectEvents(source, molecules, ime, promotions, history);
+  const sources = [{ section:"Title", text:article.title || "" }, { section:"Abstract", text:article.abstract || "" }, ...(narrative?.parts || [])];
+  const events = found.map(e => ({ ...e, verbatim:verbatimPhrase(sources, e.term, e.evidence) || undefined }));
+  const caseLike = /case report/i.test((source.pubTypes || []).join(" ")) || /\b(a|an|the)\b[^.]{0,50}\b(\d+[- ]year[- ]old|man|woman|boy|girl|patient)\b/i.test(source.abstract || "");
+  const caseFacts = extractCaseFacts({ ...source, events }, molecules, source.pubTypes);
+  return { events, caseFacts, imeCount:events.filter(e => e.ime).length, affiliationCountry:countryFromAffiliation(article.affiliation)?.name || "", detectedFrom:used ? "Full text and abstract" : "Abstract",
+    patientCountry:caseLike ? patientCountryFrom((source.title || "") + ". " + (source.abstract || "")) : null, eventsKey:detectKey(article, ime) };
 }
 // ---- Case facts from the article text: patient, dechallenge, rechallenge, action taken, treatment, concomitants, confounders ----
 // Approach follows PV Nexus's literature extractor (lib/literature-pv.ts, itself modelled on Lixplore) and is deterministic: every value carries
@@ -1047,7 +1094,8 @@ function caseFromArticle(article, assignment) {
   const fe = (value, f) => icsrField(value || "", "proposed", f?.evidence ? ev(f.evidence) : []);
   const history = (facts?.patient?.history || []).map(h => icsrField(h, "proposed", ev(facts.patient.evidence || h)));
   const events = picked.length ? picked.map(e => { const s = { ...e.serious, other_medically_important:Boolean(e.ime) }; s.serious = Object.values(s).some(Boolean);
-    return { verbatim:icsrField(e.term, "proposed", ev(e.term, e.evidence)), coded_term:e.ime ? icsrField(e.term, "proposed", ev(e.ime.provenance + (e.ime.code ? " (PT " + e.ime.code + ")" : ""), e.evidence)) : icsrField(""), seriousness:s }; })
+    const quote = e.verbatim ? "[" + e.verbatim.section + "] " + e.verbatim.quote : e.evidence;
+    return { verbatim:icsrField(e.verbatim?.reported || e.term, "proposed", ev(e.verbatim?.reported || e.term, quote)), coded_term:e.ime ? icsrField(e.term, "proposed", ev(e.ime.provenance + (e.ime.code ? " (PT " + e.ime.code + ")" : ""), quote)) : icsrField(""), seriousness:s }; })
     : [{ verbatim:icsrField(condition, "proposed", condition ? ev(condition, article.abstract) : []) }];
   return normalizeCase({ receipt_date:new Date().toISOString().slice(0, 10),
     patient:{ country:icsrField(article.patientCountry?.name || "", "proposed", article.patientCountry ? ev(article.patientCountry.evidence) : []),
@@ -1066,6 +1114,32 @@ function caseFromArticle(article, assignment) {
       ...(picked.some(e => e.ime) ? ["Events matching the EMA IME list are pre-ticked as other medically important (ICH E2A criterion 6). Confirm each one."] : []),
       ...(facts?.dechallenge?.confounded ? ["Dechallenge looks positive but treatment was given (" + facts.treatment.map(t => t.text).join(", ") + "), so it is confounded. Weigh it cautiously."] : []),
       ...(facts?.series ? ["The article reports more than one patient. Each patient may need its own ICSR."] : [])] });
+}
+function makeCase(data, article, item, by, intake) {
+  const year = new Date().getFullYear(), at = new Date().toISOString(), counters = data.caseSeq ||= {};
+  const seq = (counters[year] ?? Math.max(0, ...(data.cases || []).filter(c => c.number.startsWith("LS-" + year)).map(c => Number(c.number.split("-")[2]) || 0))) + 1;
+  counters[year] = seq;
+  const created = { id:crypto.randomUUID(), number:"LS-" + year + "-" + String(seq).padStart(4, "0"), pmid:article.id, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"",
+    data:caseFromArticle(article, item), createdBy:by, createdAt:at, updatedAt:at, intake,
+    history:[{ at, by, action:(intake === "automatic" ? "added automatically from the full text of PMID " : "created from PMID ") + article.id }] };
+  created.data.case_id = created.number;
+  (data.cases ||= []).push(created);
+  return created;
+}
+// Adds a draft case for every article whose full text is stored and that has detected events (one case per article).
+function icsrIntake(data, by, scope, limit = 1000) {
+  const out = { created:[], existing:0, noEvents:0 }, have = new Set((data.cases || []).map(c => c.pmid));
+  for (const article of Object.values(data.articles)) {
+    if (article.fullTextStatus !== "Captured" || !article.fullTextKey) continue;
+    const item = data.assignments.find(a => a.pmid === article.id && scope(a));
+    if (!item) continue;
+    if (have.has(article.id)) { out.existing++; continue; }
+    if (!(article.events || []).length) { out.noEvents++; continue; }
+    if (out.created.length >= limit) break;
+    out.created.push(makeCase(data, article, item, by, by === "system" ? "automatic" : "manual").number);
+    have.add(article.id);
+  }
+  return out;
 }
 const caseStatuses = ["Draft", "Ready for medical review", "Sent to PV Nexus", "Closed: not a valid ICSR"];
 // ---- Electronic signatures (21 CFR Part 11 pattern, design from argus-auditable-rag, MIT): signer, meaning, time, and a hash that binds the
@@ -1234,7 +1308,11 @@ async function collectEvidence(baseEnv, ids) {
   const needsDetect = a => a.eventsKey !== detectKey(a, ime);
   const detectBatch = articles.filter(needsDetect).slice(0, 300);
   if (detectBatch.length) {
-    const results = detectBatch.map(a => [a.id, applyDetection(a, moleculesOf(a.id), ime, promotions)]);
+    const results = [];
+    for (const a of detectBatch) {
+      const object = a.fullTextTextKey ? await env.BUCKET.get(a.fullTextTextKey) : null;
+      results.push([a.id, applyDetection(a, moleculesOf(a.id), ime, promotions, object ? await object.text() : "")]);
+    }
     results.forEach(([id, r]) => Object.assign(state.articles[id], r));
     await write(env, data => results.forEach(([id, r]) => data.articles[id] && Object.assign(data.articles[id], r)));
   }
@@ -1284,11 +1362,16 @@ async function collectEvidence(baseEnv, ids) {
         status.keyPassages = keyPassages(status._text, molecules);
       } catch { /* best effort */ }
     }
+    const capturedText = status._text || "";
     delete status._text;
-    Object.assign(status, applyDetection({ ...article, ...status }, moleculesOf(article.id), ime, promotions));
+    Object.assign(status, applyDetection({ ...article, ...status }, moleculesOf(article.id), ime, promotions, capturedText));
     await write(env, data => Object.assign(data.articles[article.id],status));
   }
   if (state.assignments.some(a => !a.reviewer)) await write(env, data => data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data, a)));
+  if (state.settings?.autoIcsr !== false) {
+    const intake = await write(env, data => icsrIntake(data, "system", () => true, 50));
+    if (intake.created.length) await audit(env, { by:"system", action:"case.intake", target:intake.created.length + " cases", detail:{ cases:intake.created.join(", "), source:"automatic, articles with stored full text" } });
+  }
   const queued = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a) || needsEntities(a) || needsLinks(a) || needsDetect(a)).length;
   return {processed:pending.length, queued, unattempted:articles.filter(a=>!a.evidenceAttempt).length,
     screenshotConfigured:enabled, unpaywallConfigured:Boolean(env.UNPAYWALL_EMAIL), grobidConfigured:Boolean(env.GROBID_URL)};
@@ -1519,7 +1602,7 @@ async function apiCore(request, env, path) {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
       cases:await Promise.all((state.cases || []).filter(c => manager || c.createdBy === email).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
-      config:{ esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      config:{ autoIcsr:state.settings?.autoIcsr !== false, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -1569,6 +1652,11 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"review", target:"PMID " + reviewed.pmid, detail:reviewed.before + " → " + body.status + (body.note ? " (note saved)" : "") });
     return json({ ok:true });
   }
+  if (path === "/api/icsr-intake" && viewer) {
+    const result = await write(env, data => icsrIntake(data, email, a => manager || a.reviewer === email));
+    if (result.created.length) await audit(env, { by:email, action:"case.intake", target:result.created.length + " cases", detail:{ cases:result.created.slice(0, 50).join(", "), source:"articles with stored full text" } });
+    return json(result);
+  }
   if ((path === "/api/sign-preview" || path === "/api/sign" || path === "/api/supersede") && viewer) {
     const kind = body.kind === "screening" ? "screening" : "case";
     const record = kind === "case" ? (state.cases || []).find(c => c.id === body.id && (manager || c.createdBy === email)) : state.assignments.find(a => a.id === body.id && (manager || a.reviewer === email));
@@ -1616,16 +1704,7 @@ async function apiCore(request, env, path) {
     if (path === "/api/case-create") {
       const item = state.assignments.find(a => a.pmid === String(body.pmid) && (manager || a.reviewer === email)), article = item && state.articles[item.pmid];
       if (!article) return json({ error:"Article not found in your queue." }, 404);
-      const record = await write(env, data => {
-        const year = new Date().getFullYear(), at = new Date().toISOString(), counters = data.caseSeq ||= {};
-        const seq = (counters[year] ?? Math.max(0, ...(data.cases || []).filter(c => c.number.startsWith("LS-" + year)).map(c => Number(c.number.split("-")[2]) || 0))) + 1;
-        counters[year] = seq;
-        const created = { id:crypto.randomUUID(), number:"LS-" + year + "-" + String(seq).padStart(4, "0"), pmid:article.id, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"",
-          data:caseFromArticle(article, item), createdBy:email, createdAt:at, updatedAt:at, history:[{ at, by:email, action:"created from PMID " + article.id }] };
-        created.data.case_id = created.number;
-        (data.cases ||= []).push(created);
-        return created;
-      });
+      const record = await write(env, data => makeCase(data, article, item, email, "manual"));
       await audit(env, { by:email, action:"case.create", target:record.number, detail:"from PMID " + record.pmid });
       return json({ case:record, assessment:withRegulatory(await assessCase(cfg, record.data), state, record) });
     }
@@ -1720,6 +1799,7 @@ async function apiCore(request, env, path) {
       if ("unpaywallEmail" in body) settings.unpaywallEmail = email;
       if ("ncbiEmail" in body) settings.ncbiEmail = String(body.ncbiEmail || "").trim();
       if (body.esignApprovers === "manager" || body.esignApprovers === "any") settings.esignApprovers = body.esignApprovers;
+      if ("autoIcsr" in body) settings.autoIcsr = body.autoIcsr !== "off" && body.autoIcsr !== false;
       if ("esignFourEyes" in body) settings.esignFourEyes = body.esignFourEyes === true;
       if ("pvNexusUrl" in body) settings.pvNexusUrl = String(body.pvNexusUrl || "").trim();
       if (body.pvNexusToken === null) delete settings.pvNexusToken;
@@ -2386,7 +2466,8 @@ function render() {
   if(tab==="ICSR Cases"){
     const cs=(data.cases||[]).slice().sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt));
     const stColor={"Ready for medical review":"blue","Sent to PV Nexus":"green"};
-    html=panel("ICSR cases",table(["Case","Article","Product · event","Status","Minimum criteria","QC",""],cs.map(c=>{const a=c.assessment||{},d=c.data,sp=(d.products.find(p=>p.role==="suspect")||{name:{}}).name.value||"—",ev=((d.events[0]||{}).verbatim||{}).value||"—",art=data.articles[c.pmid]||{};
+    const ready=Object.values(data.articles).filter(a=>a.fullTextStatus==="Captured"&&a.fullTextKey&&(a.events||[]).length&&!(data.cases||[]).some(c=>c.pmid===a.id)).length;
+    html=panel("Full-text intake",'<div class="row"><span>'+ready+' article'+(ready===1?"":"s")+' with stored full text and detected events '+(ready===1?"is":"are")+' not in the workbench yet.'+(data.config.autoIcsr?' New ones are added automatically.':' Automatic adding is off (Settings).')+'</span><button class="btn" data-icsrintake="1"'+(ready?"":" disabled")+'>Add to ICSR workbench</button></div>','Each article becomes a draft case. Events, drug actions and patient details are read from the abstract and the case section of the full text, and each value keeps the exact sentence it came from.')+panel("ICSR cases",table(["Case","Article","Product · event","Status","Minimum criteria","QC",""],cs.map(c=>{const a=c.assessment||{},d=c.data,sp=(d.products.find(p=>p.role==="suspect")||{name:{}}).name.value||"—",ev=((d.events[0]||{}).verbatim||{}).value||"—",art=data.articles[c.pmid]||{};
       return ['<b>'+esc(c.number)+'</b>','<a href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,90))+'</a><div class="sub">PMID '+esc(c.pmid)+'</div>',esc(sp)+" · "+esc(ev),badge(c.status,stColor[c.status]||""),a.valid?badge("Valid ICSR","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"),(a.score??"")+" / 100",'<button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>'];}),
       "No cases yet. Open an article's Review dialog and choose Create ICSR case when it reports a patient with an adverse event."),"",true)+
       panel("How it works",'<div class="row"><span>Start</span><span class="sub">Create a case from a screened article; it is pre-filled with the citation, first author as reporter, the molecule as suspect product, and likely special situations.</span></div><div class="row"><span>Complete</span><span class="sub">Add patient, product and event details from the article or its full text. The four minimum criteria, QC findings, causality suggestion and follow-up questions update as you assess.</span></div><div class="row"><span>Hand over</span><span class="sub">Download the case as PV Nexus ICSR JSON, or a package with the citation, assessment and source full text.</span></div>'+(data.config.pvNexus.configured?'<div class="row"><span>PV Nexus API</span>'+badge("Connected","green")+'</div>':""));
@@ -2458,6 +2539,7 @@ function render() {
       "There is no open worldwide source for marketing-authorisation status, so this table is yours to maintain. The country decides the regulator, whether the product is authorised there, and the reporting clock shown on ICSR cases (default 15 days for serious and 90 for non-serious cases unless a row says otherwise; confirm with local regulations). Statuses are read as Authorised, Not authorised, Withdrawn or Under review.")+
     panel("PV Nexus (ICSR processing)",'<form class="grid" data-route="settings"><label>PV Nexus API address (optional)<input name="pvNexusUrl" value="'+esc((data.config.pvNexus||{}).url||"")+'" placeholder="https://your-pv-nexus-backend"'+((data.config.pvNexus||{}).urlFromEnv?" disabled":"")+'></label><label>API token (optional)<input type="password" name="pvNexusToken" autocomplete="off" placeholder="'+((data.config.pvNexus||{}).tokenSet?"Token is set; leave blank to keep it":"Sent as a Bearer token if your gateway needs one")+'"></label><div><button class="btn">Save</button>'+((data.config.pvNexus||{}).tokenSet?' <button type="button" class="btn outline" data-pvremove="1">Remove token</button>':"")+'</div></form>',
       "ICSR cases are assessed here with a port of PV Nexus's deterministic rules (validity, QC, causality suggestion, follow-up questions), checked to give identical results. If you enter the address of a PV Nexus backend, the same checks are run by it instead, and LiteraSift falls back to the local rules if it is unreachable.")+
+    panel("ICSR workbench intake",'<form class="grid" data-route="settings"><label>Add full-text articles automatically<select name="autoIcsr"><option value="on"'+(data.config.autoIcsr?" selected":"")+'>On: draft a case for each article with stored full text and detected events</option><option value="off"'+(data.config.autoIcsr?"":" selected")+'>Off: add them with the button on the ICSR tab</option></select></label><div><button class="btn">Save</button></div></form>')+
     panel("NCBI / PubMed access",'<form class="grid" data-route="settings"><label>Contact email for NCBI<input type="email" name="ncbiEmail" value="'+esc((data.config.ncbi||{}).email||"")+'" placeholder="you@example.com"'+((data.config.ncbi||{}).emailFromEnv?" disabled":"")+'></label><label>NCBI API key (optional)<input type="password" name="ncbiApiKey" autocomplete="off" placeholder="'+((data.config.ncbi||{}).keySet?"Key is set; leave blank to keep it":"Paste a free key to allow 10 requests a second")+'"'+((data.config.ncbi||{}).keyFromEnv?" disabled":"")+'></label><div><button class="btn">Save</button>'+(((data.config.ncbi||{}).keySet&&!(data.config.ncbi||{}).keyFromEnv)?' <button type="button" class="btn outline" data-ncbiremove="1">Remove key</button>':"")+'</div></form>',
       "PubMed is read through NCBI's E-utilities only; its web pages are never scraped, which NCBI forbids. NCBI asks automated tools to identify themselves with a contact email, and allows 3 requests a second, or 10 with a free API key (create one in your NCBI account settings). The key is stored with the app data; for a server install it is safer in /etc/literasift.env as NCBI_API_KEY.")+
     panel("Sources",(data.config.sources||[]).map(x=>'<div class="row"><span><b>'+esc(x.label)+'</b><div class="sub">'+esc(x.note)+'</div></span>'+(x.active?badge("Active","green"):badge("Not enabled","amber"))+'</div>').join(""),
@@ -2548,7 +2630,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.pickevent){
     collectCase();const art=data.articles[curCase.pmid]||{},e=(art.events||[]).find(x=>x.term===target.dataset.pickevent);if(!e)return;
@@ -2573,6 +2655,11 @@ document.addEventListener("click",event=>{
   if(target.dataset.opencase){
     event.preventDefault();const c=(data.cases||[]).find(x=>x.id===target.dataset.opencase);if(!c)return;
     api("case-assess",{id:c.id}).then(r=>{if($("dialog").open)$("dialog").close();openCaseData(c,r.assessment);}).catch(e=>message(e.message,true));return;
+  }
+  if(target.dataset.icsrintake){
+    target.disabled=true;
+    api("icsr-intake",{}).then(async r=>{await refresh();message(r.created.length+" case"+(r.created.length===1?"":"s")+" added to the workbench"+(r.noEvents?" ("+r.noEvents+" skipped: no events detected)":"")+".");}).catch(e=>{message(e.message,true);target.disabled=false;});
+    return;
   }
   if(target.dataset.newcase){
     target.disabled=true;
@@ -2824,7 +2911,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  libraryLayout, audit, verifyAuditChain, auditAnchor,
+  libraryLayout, applyDetection, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);

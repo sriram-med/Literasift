@@ -177,3 +177,48 @@ test("changing a signed case outside the app is reported as changed after signin
   const pre = (await t.call(MANAGER, "/api/sign-preview", { kind: "case", id: created.id })).body;
   assert.equal(pre.intact, false);
 });
+
+const FULL_TEXT = [
+  "Introduction", "Hepatic failure has been described with many drugs.",
+  "Case presentation", "A 54-year-old man with type 2 diabetes was admitted with jaundice. He had started aciclovir 10 days earlier.",
+  "Liver function tests showed Hepatic Failure and he was hospitalised. Aciclovir was stopped and the jaundice resolved within a week.",
+  "Discussion", "Seizures were not observed in this patient.",
+].join("\n");
+
+test("verbatim phraser reads events from the case section and keeps the exact wording and sentence", () => {
+  const article = { id: "1", title: "Aciclovir and the liver", abstract: "A case report.", entities: { diseases: ["hepatic failure", "jaundice"] }, pubTypes: ["Case Reports"] };
+  const r = worker.applyDetection(article, ["aciclovir"], null, [], FULL_TEXT);
+  assert.equal(r.detectedFrom, "Full text and abstract");
+  const event = r.events.find(e => /hepatic failure/i.test(e.term));
+  assert.ok(event, "event found");
+  assert.equal(event.verbatim.reported, "Hepatic Failure");               // exact wording, original casing
+  assert.equal(event.verbatim.section, "Case presentation");              // not the Introduction mention
+  assert.match(event.verbatim.quote, /^Liver function tests showed Hepatic Failure/);
+  assert.equal(event.serious.hospitalization, true);
+  assert.ok(r.caseFacts, "case facts are extracted from the same text");
+});
+
+test("full-text articles go to the ICSR workbench with verbatim evidence; each article once", async () => {
+  const t = await setup();
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
+  Object.assign(bench.articles["1"], { entities: { diseases: ["hepatic failure"] }, fullTextStatus: "Captured", fullTextKey: "evidence/1/x.pdf", ...worker.applyDetection({ ...bench.articles["1"], entities: { diseases: ["hepatic failure"] } }, ["aciclovir"], null, [], FULL_TEXT) });
+  await t.BUCKET.put("bench.json", JSON.stringify(bench));
+  const first = (await t.call(REVIEWER, "/api/icsr-intake")).body;
+  assert.equal(first.created.length, 1);
+  const again = (await t.call(REVIEWER, "/api/icsr-intake")).body;
+  assert.equal(again.created.length, 0); assert.equal(again.existing, 1);
+  const stored = JSON.parse(await readFile(benchFile(t.dir), "utf8")).cases[0];
+  assert.equal(stored.intake, "manual");
+  const ev = stored.data.events[0];
+  assert.equal(ev.verbatim.value, "Hepatic Failure");
+  assert.match(ev.verbatim.evidence[0].excerpt, /^\[Case presentation\] Liver function tests/);
+});
+
+test("articles without detected events or full text are not added", async () => {
+  const t = await setup();
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
+  Object.assign(bench.articles["1"], { fullTextStatus: "Captured", fullTextKey: "evidence/1/x.pdf", events: [] });
+  await t.BUCKET.put("bench.json", JSON.stringify(bench));
+  const r = (await t.call(REVIEWER, "/api/icsr-intake")).body;
+  assert.equal(r.created.length, 0); assert.equal(r.noEvents, 1);
+});
