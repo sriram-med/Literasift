@@ -226,6 +226,80 @@ async function enrichMetadata(env, article, coreOnce) {
   if (errors.length) fields.enrichError = errors.join("; ");
   return fields;
 }
+// PubTator3 (NCBI): text-mined diseases and chemicals per article, used for highlighting and screening context.
+async function fetchEntities(article) {
+  const url = "https://www.ncbi.nlm.nih.gov/research/pubtator3-api/publications/export/biocjson?pmids=" + encodeURIComponent(article.id);
+  const response = await fetch(url, { signal:AbortSignal.timeout(20000) });
+  if (response.status === 404) return { entitiesCheckedAt:new Date().toISOString() };
+  if (!response.ok) throw new Error("PubTator returned HTTP " + response.status);
+  const raw = await response.text();
+  let docs;
+  try { const json = JSON.parse(raw); docs = Array.isArray(json) ? json : json.PubTator3 || json.documents || [json]; }
+  catch { docs = raw.split("\n").filter(Boolean).map(line => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean); }
+  const found = { Disease:new Map(), Chemical:new Map() };
+  for (const doc of docs) for (const passage of doc.passages || []) for (const note of passage.annotations || []) {
+    const map = found[note.infons?.type], name = String(note.text || "").trim();
+    if (map && name.length > 2) { const key = name.toLowerCase(); map.set(key, { name, count:(map.get(key)?.count || 0) + 1 }); }
+  }
+  const top = map => [...map.values()].sort((a, b) => b.count - a.count).slice(0, 12).map(x => x.name);
+  return { entitiesCheckedAt:new Date().toISOString(), entities:{ diseases:top(found.Disease), chemicals:top(found.Chemical) } };
+}
+// RxNorm brand/ingredient names and PubChem synonyms, offered as suggestions when setting up a molecule search.
+async function suggestSynonyms(name) {
+  const clean = String(name || "").replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim().slice(0, 100);
+  const out = new Map(), counts = { rxnorm:0, pubchem:0 };
+  const add = (value, source) => {
+    const text = String(value || "").trim();
+    if (/^[A-Za-z][A-Za-z\- ]{2,40}$/.test(text) && text.toLowerCase() !== clean.toLowerCase() && !out.has(text.toLowerCase())) { out.set(text.toLowerCase(), text); counts[source]++; }
+  };
+  if (!clean) return { names:[], sources:counts };
+  try {
+    const response = await fetch("https://rxnav.nlm.nih.gov/REST/drugs.json?name=" + encodeURIComponent(clean), { signal:AbortSignal.timeout(15000) });
+    if (response.ok) for (const group of (await response.json()).drugGroup?.conceptGroup || []) for (const concept of group.conceptProperties || []) {
+      if (concept.tty === "BN" || concept.tty === "IN" || concept.tty === "MIN") add(concept.name, "rxnorm");
+      for (const match of String(concept.name || "").matchAll(/\[([^\]]+)\]/g)) add(match[1], "rxnorm");
+    }
+  } catch { /* optional source */ }
+  try {
+    const response = await fetch("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/" + encodeURIComponent(clean) + "/synonyms/JSON", { signal:AbortSignal.timeout(15000) });
+    if (response.ok) for (const name of ((await response.json()).InformationList?.Information?.[0]?.Synonym || []).slice(0, 120)) { if (out.size >= 20) break; add(name, "pubchem"); }
+  } catch { /* optional source */ }
+  return { names:[...out.values()].slice(0, 20), sources:counts };
+}
+// openFDA FAERS: most-reported reactions for a drug, as context only (spontaneous reports; no causality or incidence).
+async function faersReactions(names) {
+  for (const raw of names.slice(0, 6)) {
+    const name = String(raw).replace(/["\\]/g, "").trim().slice(0, 100);
+    if (!name) continue;
+    const search = encodeURIComponent('patient.drug.openfda.generic_name:"' + name + '"');
+    const response = await fetch("https://api.fda.gov/drug/event.json?search=" + search + "&count=patient.reaction.reactionmeddrapt.exact&limit=15", { signal:AbortSignal.timeout(20000) });
+    if (response.status === 404) continue;
+    if (!response.ok) throw new Error("openFDA returned HTTP " + response.status);
+    const results = (await response.json()).results || [];
+    if (!results.length) continue;
+    let total = null;
+    try { total = (await (await fetch("https://api.fda.gov/drug/event.json?search=" + search + "&limit=1", { signal:AbortSignal.timeout(15000) })).json()).meta?.results?.total ?? null; } catch { /* optional */ }
+    return { name, total, reactions:results.map(x => ({ term:x.term, count:x.count })) };
+  }
+  return null;
+}
+// Reference-manager export (RIS for EndNote/Zotero/Mendeley, BibTeX for LaTeX tools).
+function citationFile(articles, format, assignmentFor) {
+  const oneLine = v => String(v ?? "").replace(/\s+/g, " ").trim();
+  const year = a => /\d{4}/.exec(a.date || "")?.[0] || "";
+  if (format === "bibtex") return articles.map(a => {
+    const field = (k, v) => v ? "  " + k + " = {" + oneLine(v).replace(/[{}]/g, "") + "},\n" : "";
+    return "@article{pmid" + a.id + ",\n" + field("title", a.title) + field("author", (a.authors || []).join(" and ")) + field("journal", a.journal) + field("year", year(a)) +
+      field("doi", a.doi) + field("pmid", a.id) + field("keywords", [...(a.keywords || []), ...(a.meshTerms || [])].join(", ")) + field("abstract", a.abstract) + field("url", a.url) + "}\n";
+  }).join("\n");
+  return articles.map(a => {
+    const item = assignmentFor(a.id);
+    const authors = (a.authors || []).map(n => { const [last, ...rest] = oneLine(n).split(" "); return "AU  - " + last + (rest.length ? ", " + rest.join(" ") : ""); });
+    return ["TY  - JOUR", "TI  - " + oneLine(a.title), ...authors, "JO  - " + oneLine(a.journal), "PY  - " + year(a), "DA  - " + oneLine(a.date), "DO  - " + oneLine(a.doi), "AN  - PMID " + a.id,
+      "AB  - " + oneLine(a.abstract), ...[...(a.keywords || []), ...(a.meshTerms || [])].map(k => "KW  - " + oneLine(k)), "UR  - " + a.url,
+      "N1  - " + oneLine("Portfolio: " + (item?.portfolio || "") + (item?.molecules?.length ? "; Molecules: " + item.molecules.join(", ") : "")), "ER  - "].filter(l => !/^[A-Z0-9]{2}  - $/.test(l) || l.startsWith("ER")).join("\r\n") + "\r\n";
+  }).join("\r\n");
+}
 // Text of the main sections from JATS (PMC / Europe PMC) or TEI (GROBID) XML.
 function xmlToText(xml) {
   const cleaned = String(xml).replace(/<xref\b[^>]*>[\s\S]*?<\/xref>/g, "").replace(/<ref\b[^>]*>[\s\S]*?<\/ref>/g, "").replace(/<table-wrap\b[\s\S]*?<\/table-wrap>/g, "");
@@ -578,10 +652,11 @@ async function collectEvidence(baseEnv, ids) {
   // Local captures made before screenshotKind existed may be saved error pages, so they are taken again.
   const needsScreen = a => enabled && (!a.screenshotKey || (Boolean(env.SCREENSHOT_FN) && !a.screenshotKind));
   const needsEnrich = a => !a.enrichedAt;
+  const needsEntities = a => !a.entitiesCheckedAt;
   const needsOa = a => Boolean(env.UNPAYWALL_EMAIL) && (!a.oaCheckedAt ||
     (!a.oaIsOpen && Date.now() - Date.parse(a.oaCheckedAt) > oaRecheckMs));
   const needsRetraction = a => !a.retractionCheckedAt || Date.now() - Date.parse(a.retractionCheckedAt) > retractionRecheckMs;
-  const pending = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a) || needsEnrich(a))
+  const pending = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a) || needsEnrich(a) || needsEntities(a))
     .sort((a,b)=>String(a.evidenceAttempt || "").localeCompare(String(b.evidenceAttempt || ""))).slice(0,4);
   for (const article of pending) {
     const status = {evidenceAttempt:new Date().toISOString()};
@@ -592,6 +667,10 @@ async function collectEvidence(baseEnv, ids) {
     if (needsEnrich(article)) {
       try { Object.assign(status,await enrichMetadata(env,article,coreOnce)); }
       catch (error) { status.enrichError = error.message; }
+    }
+    if (needsEntities(article)) {
+      try { Object.assign(status,await fetchEntities(article)); }
+      catch (error) { status.entitiesError = error.message; }
     }
     if (needsFullText(article)) {
       try { Object.assign(status,await captureFullText(env,article,lookupOnce,coreOnce)); }
@@ -622,7 +701,7 @@ async function collectEvidence(baseEnv, ids) {
     await write(env, data => Object.assign(data.articles[article.id],status));
   }
   if (state.assignments.some(a => !a.reviewer)) await write(env, data => data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data, a)));
-  const queued = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a)).length;
+  const queued = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a) || needsEntities(a)).length;
   return {processed:pending.length, queued, unattempted:articles.filter(a=>!a.evidenceAttempt).length,
     screenshotConfigured:enabled, unpaywallConfigured:Boolean(env.UNPAYWALL_EMAIL), grobidConfigured:Boolean(env.GROBID_URL)};
 }
@@ -675,6 +754,14 @@ async function api(request, env, path) {
     });
     return json({ ok:true });
   }
+  if (path === "/api/export-citations" && viewer) {
+    const ids = [...new Set(Array.isArray(body.pmids) ? body.pmids.map(String) : [])].slice(0, 500);
+    const articles = ids.map(id => state.articles[id]).filter(a => a && state.assignments.some(x => x.pmid === a.id && (manager || x.reviewer === email)));
+    if (!articles.length) return json({ error:"No exportable articles in the selection." }, 400);
+    const format = body.format === "bibtex" ? "bibtex" : "ris";
+    return new Response(citationFile(articles, format, id => state.assignments.find(x => x.pmid === id)), { headers:{ "Content-Type":"text/plain; charset=utf-8", "Cache-Control":"private, no-store", "X-Content-Type-Options":"nosniff",
+      "Content-Disposition":'attachment; filename="literasift-' + day() + (format === "bibtex" ? ".bib" : ".ris") + '"' } });
+  }
   if (path === "/api/export-fulltext" && viewer) {
     const zip = await exportFullTexts(env, state, viewer, manager, body);
     if (!zip) return json({ error:"No stored full texts in this selection yet." }, 400);
@@ -716,6 +803,11 @@ async function api(request, env, path) {
       }
     });
     return json({ ok:true });
+  }
+  if (path === "/api/suggest-synonyms") return json(await suggestSynonyms(body.name));
+  if (path === "/api/faers") {
+    const names = Array.isArray(body.names) ? body.names.map(String) : [];
+    try { return json({ result:await faersReactions(names) }); } catch (error) { return json({ error:error.message }, 502); }
   }
   if (path === "/api/assign-molecule") {
     const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
@@ -917,13 +1009,13 @@ async function exportPdf(pmids,title,subtitle){
   }
   message(pmids.length+" articles exported in "+parts+" PDF"+(parts>1?"s":"")+".");
 }
-async function exportFile(route,ext,pmids,title,subtitle,label){
+async function exportFile(route,ext,pmids,title,subtitle,label,extra){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
   const parts=Math.ceil(pmids.length/40);
   for(let i=0;i<parts;i++){
     message("Building "+label+" "+(i+1)+" of "+parts+"…");
-    const res=await fetch("/api/"+route,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pmids:pmids.slice(i*40,i*40+40),title:title+(parts>1?" (part "+(i+1)+" of "+parts+")":""),subtitle})});
+    const res=await fetch("/api/"+route,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...extra,pmids:pmids.slice(i*40,i*40+40),title:title+(parts>1?" (part "+(i+1)+" of "+parts+")":""),subtitle})});
     if(!res.ok){const e=await res.json().catch(()=>({}));if(parts>1&&res.status===400)continue;throw new Error(e.error||"Export failed.");}
     const link=document.createElement("a");link.href=URL.createObjectURL(await res.blob());
     const slug=title.toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"").slice(0,40);
@@ -946,14 +1038,33 @@ function drawProgress(){
   const bar=(label,value,color)=>'<div class="row"><span>'+label+'</span><span class="sub">'+value+" / "+st.n+'</span></div><div class="bar"><i style="width:'+(st.n?Math.round(value/st.n*100):0)+'%"></i></div>';
   box.innerHTML=panel("Full-text extraction",'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px"><select id="runpick" aria-label="Pull">'+runs.slice(0,15).map(r=>'<option value="'+esc(r.id)+'"'+(r.id===run.id?" selected":"")+'>'+esc((r.molecule||r.portfolio)+" · "+r.from+" → "+r.to+" ("+r.count+")")+'</option>').join("")+'</select>'+
     (extracting?'<button class="btn outline" id="extractstop">Stop</button><span class="sub" style="align-self:center">Working… '+got+' full texts so far</span>':'<button class="btn" id="extractgo">Extract full text now</button>')+
-    '<button class="btn outline" data-zip="'+esc(run.id)+'">Download full texts (ZIP)</button><button class="btn outline" data-pdfrun="'+esc(run.id)+'">PDF with snapshots</button></div>'+
+    '<button class="btn outline" data-zip="'+esc(run.id)+'">Download full texts (ZIP)</button><button class="btn outline" data-pdfrun="'+esc(run.id)+'">PDF with snapshots</button><button class="btn outline" data-cite="ris" data-scope="'+esc(run.id)+'">Citations (RIS)</button><button class="btn outline" data-cite="bibtex" data-scope="'+esc(run.id)+'">BibTeX</button></div>'+
     bar("Abstracts and metadata",st.abstracts)+bar("Open access checked (Unpaywall)",st.oaChecked)+bar("Retraction checked",st.retr)+
     '<div class="row"><span>Full text stored</span><b>'+got+'</b></div><div class="row"><span class="sub">PubMed Central '+st.pmc+' · Europe PMC '+st.epmc+' · Unpaywall '+st.unpaywall+'</span></div>'+
     '<div class="row"><span>Open access, link only (licence does not allow storing)</span><b>'+st.linkOnly+'</b></div><div class="row"><span>Closed access</span><b>'+st.closed+'</b></div><div class="row"><span>With key passages extracted</span><b>'+st.passages+'</b></div>',
-    "Starts automatically after a pull. For each article: PubMed Central, then Europe PMC, then Unpaywall, stored only under open licences.");
+    "Starts automatically after a pull. For each article: PubMed Central, then Europe PMC, then Unpaywall, stored only under open licences.")+'<div id="faers"></div>';
+  loadFaers(run);
   $("runpick").onchange=e=>{pullRun=e.target.value;drawProgress();};
   if($("extractgo"))$("extractgo").onclick=()=>extractRun(run.id);
   if($("extractstop"))$("extractstop").onclick=()=>{if(extracting)extracting.stop=true;};
+}
+const faersCache={};
+function drawFaers(key){
+  const box=$("faers");if(!box)return;
+  const f=faersCache[key];
+  if(f==="loading"){box.innerHTML=panel("FDA adverse event reports (FAERS)",'<div class="empty">Loading…</div>');return;}
+  if(!f||f.error||!f.result){box.innerHTML=panel("FDA adverse event reports (FAERS)",'<div class="empty">'+(f&&f.error?esc(f.error):"No reports found for this molecule's generic name.")+'</div>');return;}
+  const top=f.result.reactions[0].count;
+  box.innerHTML=panel("FDA adverse event reports (FAERS)",f.result.reactions.map(r=>'<div class="row"><span>'+esc(r.term)+'</span><span class="sub">'+r.count.toLocaleString()+'</span></div><div class="bar"><i style="width:'+Math.round(r.count/top*100)+'%"></i></div>').join(""),
+    "Most reported reactions for "+esc(f.result.name)+(f.result.total?" across "+f.result.total.toLocaleString()+" reports":"")+". Spontaneous reports only: they show what is reported, not how often a reaction occurs or whether the drug caused it. Source: openFDA.");
+}
+function loadFaers(run){
+  const names=[run.molecule,...[...String(run.query||"").matchAll(/"([^"]+)"\\[tiab\\]/g)].map(m=>m[1])].filter(Boolean);
+  const key=[...new Set(names.map(n=>n.toLowerCase()))].join("|");
+  if(!key)return;
+  if(faersCache[key]){drawFaers(key);return;}
+  faersCache[key]="loading";drawFaers(key);
+  api("faers",{names:[...new Set(names)]}).then(r=>{faersCache[key]=r;}).catch(e=>{faersCache[key]={error:e.message};}).finally(()=>drawFaers(key));
 }
 async function extractRun(runId){
   if(extracting)return;
@@ -993,8 +1104,8 @@ const table=(headers,rows,empty)=>rows.length?
   '<div class="empty">'+empty+"</div>";
 const panel=(title,body,sub,flush)=>"<section><header><h2>"+title+"</h2>"+(sub?"<p>"+sub+"</p>":"")+"</header><div class='body'"+(flush?" style='padding:8px 0 0'":"")+">"+body+"</div></section>";
 const statusColor={"Pending":"","In review":"blue","Full text needed":"amber","Complete":"green"};
-function mark(text,molecules){
-  const names=(molecules||[]).filter(Boolean), terms=(data.config.terms||[]).concat(names);
+function mark(text,molecules,extra){
+  const names=(molecules||[]).filter(Boolean), terms=(data.config.terms||[]).concat((extra||[]).filter(t=>String(t).length>2),names);
   if(!terms.length)return esc(text);
   const re=new RegExp("("+terms.map(t=>t.replace(/[.*+?^()|\\[\\]\\\\]/g,"\\\\$&")).join("|")+")","gi");
   return String(text).split(re).map((part,i)=>i%2?'<mark class="'+(names.some(n=>n.toLowerCase()===part.toLowerCase())?"mol":"ae")+'">'+esc(part)+"</mark>":esc(part)).join("");
@@ -1016,7 +1127,8 @@ function queueRows(items){
   return table(["Article","Portfolio","Reviewer","Status",""],items.slice(0,200).map(a=>{
     const item=data.articles[a.pmid]||{};
     return ['<a class="title" target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><div class="sub">PMID '+esc(a.pmid)+' · '+esc(item.journal)+' · '+esc(item.date)+((item.authors||[]).length?' · '+esc(item.authors.slice(0,3).join(", ")+(item.authors.length>3?" et al.":"")):"")+'</div>'+evidenceChips({...item,id:a.pmid})+
-        (item.abstract?'<details class="abs"><summary>Abstract</summary><div>'+mark(item.abstract.slice(0,2500),a.molecules)+'</div></details>':""),
+        (item.abstract?'<details class="abs"><summary>Abstract</summary><div>'+mark(item.abstract.slice(0,2500),a.molecules,(item.entities||{}).diseases)+'</div></details>':"")+
+        (((item.entities||{}).diseases||[]).length?'<div class="sub" style="margin-top:6px">Conditions mentioned: '+esc(item.entities.diseases.slice(0,5).join(", "))+'</div>':""),
       esc(a.portfolio)+((a.molecules||[]).length?'<div class="chips">'+a.molecules.map(m=>badge(m)).join("")+"</div>":""),
       a.reviewer?esc(a.reviewer):badge("Unassigned","amber"),badge(a.status,statusColor[a.status]),
       '<button class="btn outline sm" data-review="'+esc(a.id)+'">Review</button>'];
@@ -1029,7 +1141,7 @@ function queueView(items){
     '<select data-filter="status" aria-label="Status"><option value="">All statuses</option>'+["Pending","In review","Full text needed","Complete"].map(s=>'<option'+(filt.status===s?" selected":"")+'>'+s+"</option>").join("")+"</select>"+
     '<select data-filter="oa" aria-label="Access"><option value="">All access</option>'+[["open","Open access"],["closed","Closed access"],["unchecked","Not yet checked"]].map(([v,l])=>'<option value="'+v+'"'+(filt.oa===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
     '<select data-filter="ft" aria-label="Full text"><option value="">All full-text states</option>'+[["stored","Full text stored"],["link","Open-access link only"],["none","No full text"]].map(([v,l])=>'<option value="'+v+'"'+(filt.ft===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
-    '<button class="btn outline" data-pdf="queue" title="Download the filtered list as a PDF with a snapshot of each article">Export PDF</button><button class="btn outline" data-zip="queue" title="Download stored full texts for the filtered list as a ZIP">Full texts (ZIP)</button>'+
+    '<button class="btn outline" data-pdf="queue" title="Download the filtered list as a PDF with a snapshot of each article">Export PDF</button><button class="btn outline" data-zip="queue" title="Download stored full texts for the filtered list as a ZIP">Full texts (ZIP)</button><button class="btn outline" data-cite="ris" data-scope="queue" title="Citations for EndNote, Zotero or Mendeley">Citations (RIS)</button>'+
     '<select data-filter="portfolio" aria-label="Portfolio"><option value="">All portfolios</option>'+portfolios.map(p=>'<option'+(filt.portfolio===p?" selected":"")+'>'+esc(p)+"</option>").join("")+"</select></div>"+
     '<div id="qtable">'+queueRows(applyFilter(items))+"</div></section>";
 }
@@ -1071,7 +1183,7 @@ function render() {
   }
   if(tab==="Search & Pull"){
     const today=new Date().toISOString().slice(0,10), start=new Date(Date.now()-30*864e5).toISOString().slice(0,10);
-    html=panel("Pull articles for a molecule",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Pull articles</button></div></form>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+'<div id="progress"></div>'+
+    html=panel("Pull articles for a molecule",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Pull articles</button> <button type="button" class="btn outline" data-suggest="1">Suggest synonyms &amp; brands</button></div></form><div id="suggest"></div>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+'<div id="progress"></div>'+
       panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>':""]),"No pulls yet."),"",true);
   }
   if(tab==="My Queue"){
@@ -1168,8 +1280,32 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-resetlink],[data-revoke]");
+  const target=event.target.closest("[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke]");
   if(!target)return;
+  if(target.dataset.cite){
+    const run=target.dataset.scope!=="queue"&&data.runs.find(r=>r.id===target.dataset.scope);
+    const mine=new Set(data.assignments.map(a=>a.pmid));
+    const ids=run?run.ids.filter(id=>mine.has(id)):applyFilter(shown).map(a=>a.pmid);
+    const fmt=target.dataset.cite;
+    target.disabled=true;
+    exportFile("export-citations",fmt==="bibtex"?"bib":"ris",ids,run?(run.molecule||run.portfolio)+" citations":"LiteraSift citations","","citations",{format:fmt}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    return;
+  }
+  if(target.dataset.suggest){
+    const name=document.querySelector('form[data-route=pull] [name=molecule]').value.trim();
+    if(!name){message("Type the molecule name first.",true);return;}
+    target.disabled=true;
+    api("suggest-synonyms",{name}).then(r=>{
+      $("suggest").innerHTML=r.names.length?'<div class="sub" style="margin:8px 0 4px">Tap to add (RxNorm brands and ingredients, PubChem synonyms):</div><div class="chips">'+r.names.map(n=>'<button type="button" class="badge" style="cursor:pointer" data-addsyn="'+esc(n)+'">+ '+esc(n)+'</button>').join("")+'</div>':'<div class="sub" style="margin-top:8px">No suggestions found.</div>';
+    }).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    return;
+  }
+  if(target.dataset.addsyn){
+    const input=document.querySelector('form[data-route=pull] [name=synonyms]'), current=input.value.split(/[,;]/).map(x=>x.trim()).filter(Boolean);
+    if(!current.some(x=>x.toLowerCase()===target.dataset.addsyn.toLowerCase()))current.push(target.dataset.addsyn);
+    input.value=current.join(", ");target.style.opacity=.4;
+    return;
+  }
   if(target.dataset.zip){
     const run=target.dataset.zip!=="queue"&&data.runs.find(r=>r.id===target.dataset.zip);
     const mine=new Set(data.assignments.map(a=>a.pmid));
@@ -1208,7 +1344,9 @@ document.addEventListener("click",event=>{
     active=data.assignments.find(a=>a.id===target.dataset.review);
     const art=data.articles[active.pmid];
     $("citation").textContent=art.title;
-    $("detail").innerHTML=(art.abstract?'<div class="sub" style="margin-bottom:4px">Abstract'+(art.abstractSource?" ("+esc(art.abstractSource)+")":"")+'</div><div style="font-size:13px;line-height:1.55">'+mark(art.abstract,active.molecules)+'</div>':'<div class="sub">No abstract available yet.</div>')+
+    $("detail").innerHTML=(art.abstract?'<div class="sub" style="margin-bottom:4px">Abstract'+(art.abstractSource?" ("+esc(art.abstractSource)+")":"")+'</div><div style="font-size:13px;line-height:1.55">'+mark(art.abstract,active.molecules,(art.entities||{}).diseases)+'</div>':'<div class="sub">No abstract available yet.</div>')+
+      (((art.entities||{}).diseases||[]).length?'<div class="sub" style="margin:10px 0 4px">Conditions mentioned (PubTator)</div><div class="chips">'+art.entities.diseases.map(t=>badge(t,"amber")).join("")+'</div>':"")+
+      (((art.entities||{}).chemicals||[]).length?'<div class="sub" style="margin:10px 0 4px">Chemicals mentioned</div><div class="chips">'+art.entities.chemicals.map(t=>badge(t)).join("")+'</div>':"")+
       ((art.keyPassages||[]).length?'<div class="sub" style="margin:10px 0 4px">Key passages from the full text</div>'+art.keyPassages.map(t=>'<div style="font-size:13px;margin-bottom:6px">“'+mark(t,active.molecules)+'”</div>').join(""):"")+
       ((art.meshTerms||[]).length?'<div class="chips">'+art.meshTerms.slice(0,12).map(t=>badge(t)).join("")+'</div>':"")+
       ((art.authors||[]).length?'<div class="sub" style="margin-top:8px">'+esc(art.authors.join(", "))+'</div>':"")+
