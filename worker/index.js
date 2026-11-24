@@ -48,6 +48,7 @@ async function importWatch(env, watch, from, to) {
       articles[id] = { id, title:citation.title, journal:citation.fulljournalname, date:citation.pubdate,
         doi:citation.articleids?.find(a => a.idtype === "doi")?.value || "",
         pmcid:citation.articleids?.find(a => a.idtype === "pmc")?.value || "",
+        pubmedRetracted:(citation.pubtype || []).includes("Retracted Publication"),
         url:"https://pubmed.ncbi.nlm.nih.gov/" + id + "/" };
     }
   }
@@ -138,6 +139,29 @@ async function captureFullText(env, article) {
   if (pmc.fullTextStatus === "Captured") return pmc;
   return captureFromUnpaywall(env, article, pmc.fullTextStatus);
 }
+// Crossref update notices (publisher and Retraction Watch sources) for the article's DOI.
+const noticeTypes = { retraction:"Retracted", withdrawal:"Retracted", removal:"Retracted",
+  expression_of_concern:"Expression of concern", correction:"Correction", erratum:"Correction" };
+const noticeRank = ["Retracted","Expression of concern","Correction"];
+const retractionRecheckMs = 30 * 86400000;
+async function checkRetraction(env, article) {
+  const checked = { retractionCheckedAt:new Date().toISOString() };
+  const flagged = article.pubmedRetracted ? "Retracted" : "";
+  if (!/^10\.\d{4,9}\/\S+$/.test(article.doi)) return { ...checked, retractionStatus:flagged || "No DOI to check" };
+  const url = new URL("https://api.crossref.org/works/" + encodeURIComponent(article.doi));
+  const mailto = env.CROSSREF_EMAIL || env.UNPAYWALL_EMAIL;
+  if (mailto) url.searchParams.set("mailto", mailto);
+  const response = await fetch(url, { signal:AbortSignal.timeout(15000) });
+  if (response.status === 404) return { ...checked, retractionStatus:flagged || "Not in Crossref" };
+  if (!response.ok) throw new Error("Crossref returned HTTP " + response.status);
+  const { message = {} } = await response.json();
+  const seen = new Set();
+  const notices = (message["updated-by"] || []).map(u => ({ label:noticeTypes[String(u.type || "").toLowerCase()],
+    type:u.type, doi:u.DOI, source:u.source, date:(u.updated?.["date-time"] || "").slice(0,10) }))
+    .filter(n => n.label && !seen.has(n.label + n.doi) && seen.add(n.label + n.doi));
+  const worst = [flagged, ...notices.map(n => n.label)].filter(Boolean).sort((a,b) => noticeRank.indexOf(a) - noticeRank.indexOf(b))[0];
+  return { ...checked, retractionStatus:worst || "None found", retractionNotices:notices.slice(0,10) };
+}
 async function captureScreenshot(env, article) {
   const endpoint = new URL(env.SCREENSHOT_ENDPOINT);
   if (endpoint.protocol !== "https:") throw new Error("Screenshot endpoint must use HTTPS.");
@@ -158,7 +182,8 @@ async function collectEvidence(env, ids) {
   const needsFullText = a => !a.fullTextStatus || a.fullTextStatus === "Retry needed" ||
     (Boolean(env.UNPAYWALL_EMAIL) && ["No PMC record","No eligible PMC file"].includes(a.fullTextStatus));
   const needsScreen = a => enabled && !a.screenshotKey;
-  const pending = articles.filter(a=>needsFullText(a) || needsScreen(a))
+  const needsRetraction = a => !a.retractionCheckedAt || Date.now() - Date.parse(a.retractionCheckedAt) > retractionRecheckMs;
+  const pending = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a))
     .sort((a,b)=>String(a.evidenceAttempt || "").localeCompare(String(b.evidenceAttempt || ""))).slice(0,4);
   for (const article of pending) {
     const status = {evidenceAttempt:new Date().toISOString()};
@@ -169,6 +194,10 @@ async function collectEvidence(env, ids) {
     if (needsScreen(article)) {
       try { Object.assign(status,await captureScreenshot(env,article)); }
       catch { status.screenshotStatus="Retry needed"; }
+    }
+    if (needsRetraction(article)) {
+      try { Object.assign(status,await checkRetraction(env,article)); }
+      catch (error) { status.retractionError = error.message; }
     }
     await write(env, data => Object.assign(data.articles[article.id],status));
   }
@@ -269,7 +298,7 @@ async function api(request, env, path) {
 }
 const html = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Literature Bench</title><style>
-*{box-sizing:border-box}body{margin:0;background:#f3f5f9;color:#182739;font:16px system-ui,sans-serif}header{background:#10283f;color:white;padding:22px max(5vw,18px);display:flex;justify-content:space-between;align-items:center;gap:15px}header strong{font-size:20px}header span{font-size:14px;color:#b9d4dd}main{max-width:1320px;margin:auto;padding:38px max(4vw,16px)}h1{font-size:clamp(32px,5vw,50px);margin:0;letter-spacing:-.045em}h2{font-size:22px;margin:0 0 18px}p{line-height:1.55;color:#485d71}nav{display:flex;gap:8px;flex-wrap:wrap;margin:26px 0}button,input,select,textarea{font:inherit}button{background:#126359;color:#fff;border:0;border-radius:8px;padding:10px 15px;cursor:pointer;font-weight:600}button:disabled{opacity:.55;cursor:wait}nav button{background:white;color:#234047;border:1px solid #d5dfe5}nav button[aria-current]{background:#126359;color:white}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px}.card,section{background:#fff;border:1px solid #dce4eb;border-radius:14px;padding:20px}.card b{font-size:34px;display:block}.card span{color:#485d71}section{margin:18px 0;overflow:auto}table{border-collapse:collapse;width:100%;text-align:left}td,th{padding:13px 9px;vertical-align:top;border-bottom:1px solid #e6edf1}th{font-size:14px;color:#485d71}a{color:#116158}label{display:flex;flex-direction:column;gap:6px;font-weight:600}input,select,textarea{padding:9px;border:1px solid #b6c7d3;border-radius:7px;background:white;color:#182739;max-width:100%}form{display:grid;gap:13px;align-items:end;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));margin-bottom:20px}form .wide{grid-column:1/-1}.msg{color:#8e331e}small{font-size:14px;color:#485d71}dialog{border:1px solid #b6c7d3;border-radius:14px;width:min(560px,94vw);padding:24px}dialog::backdrop{background:#10283f80}.tag{display:inline-block;background:#e3f0ee;padding:4px 9px;border-radius:7px;white-space:nowrap}
+*{box-sizing:border-box}body{margin:0;background:#f3f5f9;color:#182739;font:16px system-ui,sans-serif}header{background:#10283f;color:white;padding:22px max(5vw,18px);display:flex;justify-content:space-between;align-items:center;gap:15px}header strong{font-size:20px}header span{font-size:14px;color:#b9d4dd}main{max-width:1320px;margin:auto;padding:38px max(4vw,16px)}h1{font-size:clamp(32px,5vw,50px);margin:0;letter-spacing:-.045em}h2{font-size:22px;margin:0 0 18px}p{line-height:1.55;color:#485d71}nav{display:flex;gap:8px;flex-wrap:wrap;margin:26px 0}button,input,select,textarea{font:inherit}button{background:#126359;color:#fff;border:0;border-radius:8px;padding:10px 15px;cursor:pointer;font-weight:600}button:disabled{opacity:.55;cursor:wait}nav button{background:white;color:#234047;border:1px solid #d5dfe5}nav button[aria-current]{background:#126359;color:white}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px}.card,section{background:#fff;border:1px solid #dce4eb;border-radius:14px;padding:20px}.card b{font-size:34px;display:block}.card span{color:#485d71}section{margin:18px 0;overflow:auto}table{border-collapse:collapse;width:100%;text-align:left}td,th{padding:13px 9px;vertical-align:top;border-bottom:1px solid #e6edf1}th{font-size:14px;color:#485d71}a{color:#116158}label{display:flex;flex-direction:column;gap:6px;font-weight:600}input,select,textarea{padding:9px;border:1px solid #b6c7d3;border-radius:7px;background:white;color:#182739;max-width:100%}form{display:grid;gap:13px;align-items:end;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));margin-bottom:20px}form .wide{grid-column:1/-1}.msg{color:#8e331e}small{font-size:14px;color:#485d71}dialog{border:1px solid #b6c7d3;border-radius:14px;width:min(560px,94vw);padding:24px}dialog::backdrop{background:#10283f80}.alert{display:inline-block;background:#f8dcd5;color:#8e331e;font-weight:600;padding:3px 8px;border-radius:7px;margin-bottom:4px}.tag{display:inline-block;background:#e3f0ee;padding:4px 9px;border-radius:7px;white-space:nowrap}
 </style><header><strong>Literature Bench</strong><span id="identity"></span></header>
 <main><h1>Literature screening</h1><p>PubMed batches, reviewer assignments, and screening decisions.</p><nav id="nav" aria-label="Literature Bench"></nav><p id="message" role="status"></p><div id="content"></div></main>
 <dialog id="dialog"><h2>Screen citation</h2><p id="citation"></p><form id="review"><label>Status<select name="status"><option>Pending</option><option>In review</option><option>Full text needed</option><option>Complete</option></select></label><label class="wide">Decision notes<textarea name="note" rows="4"></textarea></label><button>Save decision</button><button type="button" id="close">Cancel</button></form></dialog>
@@ -294,7 +323,7 @@ const panel=(title,body)=>"<section><h2>"+title+"</h2>"+body+"</section>";
 function queue(items) {
   return table(["Article","Portfolio","Reviewer","Status",""],items.map(a=>{
     const item=data.articles[a.pmid];
-    return ['<a target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><br><small>PMID '+esc(a.pmid)+' · '+esc(item.journal)+'</small><br>'+(item.fullTextKey?'<a href="/api/full-text/'+esc(a.pmid)+'">Download full text</a>':(item.fullTextLink?'<a target="_blank" rel="noopener" href="'+esc(item.fullTextLink)+'">Open-access link</a>':'<small>'+esc(item.fullTextStatus || "Full text pending")+'</small>'))+' · '+(item.screenshotKey?'<a href="/api/screenshot/'+esc(a.pmid)+'">Screenshot</a>':'<small>'+esc(item.screenshotStatus || "Screenshot pending")+'</small>'),
+    return [(["Retracted","Expression of concern"].includes(item.retractionStatus)?'<span class="alert">'+esc(item.retractionStatus)+'</span><br>':'')+'<a target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><br><small>PMID '+esc(a.pmid)+' · '+esc(item.journal)+'</small><br>'+(item.fullTextKey?'<a href="/api/full-text/'+esc(a.pmid)+'">Download full text</a>':(item.fullTextLink?'<a target="_blank" rel="noopener" href="'+esc(item.fullTextLink)+'">Open-access link</a>':'<small>'+esc(item.fullTextStatus || "Full text pending")+'</small>'))+' · '+(item.screenshotKey?'<a href="/api/screenshot/'+esc(a.pmid)+'">Screenshot</a>':'<small>'+esc(item.screenshotStatus || "Screenshot pending")+'</small>'),
       esc(a.portfolio),esc(a.reviewer || "Unassigned"),'<span class="tag">'+esc(a.status)+'</span>',
       '<button data-review="'+esc(a.id)+'">Review</button>'];
   }),"No articles in this queue.");
@@ -322,10 +351,10 @@ async function refresh(){data=await api("state");render();}
 function download(id) {
   const run=data.runs.find(r=>r.id===id);
   const cell=value=>'"'+String(value??"").replace(/^[=+@\-]/,"'$&").replaceAll('"','""')+'"';
-  const rows=[["PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Reviewer","Status","Full text","Screenshot"]];
+  const rows=[["PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Reviewer","Status","Full text","Screenshot","Retraction check"]];
   run.ids.forEach(pmid=>{
     const a=data.articles[pmid], item=data.assignments.find(x=>x.pmid===pmid&&x.portfolio===run.portfolio);
-    rows.push([pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending"]);
+    rows.push([pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending",a.retractionStatus||"Pending"]);
   });
   const url=URL.createObjectURL(new Blob([rows.map(row=>row.map(cell).join(",")).join("\\r\\n")],{type:"text/csv"}));
   const link=document.createElement("a");link.href=url;link.download="pubmed-"+run.from+"-"+run.to+".csv";link.click();
