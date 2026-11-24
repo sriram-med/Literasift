@@ -64,7 +64,7 @@ async function importWatch(env, watch, from, to) {
     for (const id of ids) {
       const citation = summary?.[id];
       if (!citation?.title) throw new Error("Missing citation for PMID " + id);
-      articles[id] = { id, title:citation.title, journal:citation.fulljournalname, date:citation.pubdate,
+      articles[id] = { id, source:"PubMed", title:citation.title, journal:citation.fulljournalname, date:citation.pubdate,
         doi:citation.articleids?.find(a => a.idtype === "doi")?.value || "",
         pmcid:citation.articleids?.find(a => a.idtype === "pmc")?.value || "",
         pubmedRetracted:(citation.pubtype || []).includes("Retracted Publication"),
@@ -76,7 +76,7 @@ async function importWatch(env, watch, from, to) {
   }
   return write(env, state => {
     for (const [id, article] of Object.entries(articles)) state.articles[id] = { ...state.articles[id], ...article };
-    const run = { id:crypto.randomUUID(), portfolio:watch.portfolio, molecule:watch.molecule || "", from, to, count:result.idlist.length,
+    const run = { id:crypto.randomUUID(), source:"PubMed", portfolio:watch.portfolio, molecule:watch.molecule || "", from, to, count:result.idlist.length,
       ids:result.idlist, time:new Date().toISOString(), query:watch.query, status:"Imported" };
     state.runs.unshift(run);
     for (const id of result.idlist) {
@@ -96,7 +96,7 @@ async function importWatch(env, watch, from, to) {
 async function execute(env, watch, from, to) {
   try { return await importWatch(env, watch, from, to); }
   catch (error) {
-    await write(env, state => state.runs.unshift({ id:crypto.randomUUID(), portfolio:watch.portfolio, molecule:watch.molecule || "", from, to,
+    await write(env, state => state.runs.unshift({ id:crypto.randomUUID(), source:"PubMed", portfolio:watch.portfolio, molecule:watch.molecule || "", from, to,
       query:watch.query, status:"Failed", error:error.message, time:new Date().toISOString(), ids:[], count:0 }));
     throw error;
   }
@@ -298,7 +298,7 @@ function citationFile(articles, format, assignmentFor) {
   return articles.map(a => {
     const item = assignmentFor(a.id);
     const authors = (a.authors || []).map(n => { const [last, ...rest] = oneLine(n).split(" "); return "AU  - " + last + (rest.length ? ", " + rest.join(" ") : ""); });
-    return ["TY  - JOUR", "TI  - " + oneLine(a.title), ...authors, "JO  - " + oneLine(a.journal), "PY  - " + year(a), "DA  - " + oneLine(a.date), "DO  - " + oneLine(a.doi), "AN  - PMID " + a.id,
+    return ["TY  - JOUR", "TI  - " + oneLine(a.title), ...authors, "JO  - " + oneLine(a.journal), "DB  - " + (a.source || "PubMed"), "PY  - " + year(a), "DA  - " + oneLine(a.date), "DO  - " + oneLine(a.doi), "AN  - PMID " + a.id,
       "AB  - " + oneLine(a.abstract), ...[...(a.keywords || []), ...(a.meshTerms || [])].map(k => "KW  - " + oneLine(k)), "UR  - " + a.url,
       "N1  - " + oneLine("Portfolio: " + (item?.portfolio || "") + (item?.molecules?.length ? "; Molecules: " + item.molecules.join(", ") : "")), "ER  - "].filter(l => !/^[A-Z0-9]{2}  - $/.test(l) || l.startsWith("ER")).join("\r\n") + "\r\n";
   }).join("\r\n");
@@ -586,7 +586,7 @@ async function exportPdf(env, state, viewer, manager, body) {
     if (!article || !item) continue;
     let png = null;
     if (article.screenshotKey) { const object = await env.BUCKET.get(article.screenshotKey); if (object) png = new Uint8Array(await object.arrayBuffer()); }
-    const lines = ["PMID " + id + " · " + [article.journal, article.date].filter(Boolean).join(" · "),
+    const lines = ["Source: " + articleSource(article) + " · PMID " + id + " · " + [article.journal, article.date].filter(Boolean).join(" · "),
       "DOI: " + (article.doi || "-") + " · " + article.url,
       "Portfolio: " + item.portfolio + ((item.molecules || []).filter(m => m !== item.portfolio).length ? " · Molecules: " + item.molecules.join(", ") : ""),
       "Reviewer: " + (item.reviewer || "Unassigned") + " · Status: " + item.status + (item.note ? " · Note: " + item.note : ""),
@@ -601,18 +601,28 @@ async function exportPdf(env, state, viewer, manager, body) {
   if (!sections.length) return null;
   return buildPdf(String(body.title || "LiteraSift export").slice(0, 100), String(body.subtitle || "PubMed citations with page screenshots.").slice(0, 300), sections);
 }
+// ---- Sources: PubMed literature is kept separate from other government agency material ----
+const sourceRegistry = [
+  { id:"PubMed", label:"PubMed (NLM / NIH)", kind:"literature", active:true, note:"Biomedical literature citations, abstracts and open full text." },
+  { id:"FDA", label:"US FDA", kind:"agency", active:false, note:"Drug safety communications and labelling changes." },
+  { id:"EMA", label:"EU EMA", kind:"agency", active:false, note:"Pharmacovigilance (PRAC) recommendations and safety updates." },
+  { id:"MHRA", label:"UK MHRA", kind:"agency", active:false, note:"Drug Safety Update bulletins." },
+  { id:"WHO", label:"WHO", kind:"agency", active:false, note:"Pharmacovigilance alerts and safety communications." },
+  { id:"Health Canada", label:"Health Canada", kind:"agency", active:false, note:"Advisories and recalls." },
+  { id:"CDSCO", label:"CDSCO India", kind:"agency", active:false, note:"Drug alerts and safety notices." } ];
+const articleSource = a => a?.source || "PubMed";
 // ---- Library: a folder per molecule and a subfolder per pull's date range ----
 const safeName = value => String(value || "").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/\s+/g, " ").trim().replace(/^\.+/, "").slice(0, 80) || "unnamed";
-// Each article sits in the first (oldest) date range that imported it, once per molecule.
+// Folders are Source / Molecule / Date range. Each article sits in the first (oldest) date range that imported it, once per source and molecule.
 function libraryLayout(state) {
   const seen = new Set(), out = [];
   for (const run of [...state.runs].reverse()) {
     if (run.status !== "Imported") continue;
-    const molecule = safeName(run.molecule || run.portfolio), range = run.from + "_to_" + run.to;
+    const source = safeName(run.source || "PubMed"), molecule = safeName(run.molecule || run.portfolio), range = run.from + "_to_" + run.to;
     for (const pmid of run.ids) {
-      if (seen.has(pmid + "|" + molecule)) continue;
-      seen.add(pmid + "|" + molecule);
-      out.push({ pmid, molecule, range, folder:molecule + "/" + range });
+      if (seen.has(pmid + "|" + source + "|" + molecule)) continue;
+      seen.add(pmid + "|" + source + "|" + molecule);
+      out.push({ pmid, source, molecule, range, folder:source + "/" + molecule + "/" + range });
     }
   }
   return out;
@@ -645,7 +655,7 @@ function zipFiles(files) {
 const csvCell = value => '"' + String(value ?? "").replace(/^[=+@\-]/, "'$&").replaceAll('"', '""') + '"';
 async function exportFullTexts(env, state, viewer, manager, body) {
   const ids = [...new Set(Array.isArray(body.pmids) ? body.pmids.map(String) : [])].slice(0, pdfMaxArticles);
-  const files = [], rows = [["Folder", "PMID", "Title", "DOI", "Full text status", "Source", "Licence", "Source URL", "Access", "Files"]];
+  const files = [], rows = [["Folder", "Source", "PMID", "Title", "DOI", "Full text status", "Source", "Licence", "Source URL", "Access", "Files"]];
   let total = 0;
   // With layout, files go into Molecule/DateRange/ subfolders (an article in two molecules appears in both).
   const folders = new Map();
@@ -664,7 +674,7 @@ async function exportFullTexts(env, state, viewer, manager, body) {
         if (total > 150 * 1024 * 1024) throw new Error("Selection too large for one ZIP; export fewer articles.");
         files.push({ name:prefix + name, data }); names.push(name);
       }
-      rows.push([prefix.replace(/\/$/, ""), id, article.title, article.doi, article.fullTextStatus || "Pending", article.fullTextOrigin || "", article.fullTextLicense || "", article.fullTextSource || article.fullTextLink || "", article.oaStatus || "", names.join(" ")]);
+      rows.push([prefix.replace(/\/$/, ""), articleSource(article), id, article.title, article.doi, article.fullTextStatus || "Pending", article.fullTextOrigin || "", article.fullTextLicense || "", article.fullTextSource || article.fullTextLink || "", article.oaStatus || "", names.join(" ")]);
     }
   }
   if (!files.length) return null;
@@ -885,7 +895,7 @@ async function apiCore(request, env, path) {
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
-      config:{ libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      config:{ sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -1321,8 +1331,10 @@ async function extractRun(runId){
   }catch(e){message(e.message,true);}
   extracting=null;drawProgress();
 }
-let data, tab, active, filt={q:"",status:"",portfolio:"",oa:"",ft:"",sort:"relevance"}, shown=[];
+let data, tab, active, filt={q:"",status:"",portfolio:"",oa:"",ft:"",sort:"relevance",source:""}, shown=[];
 const levelColor={High:"red",Medium:"amber",Low:""};
+const sourceOf=a=>(a&&a.source)||"PubMed";
+const sourceBadge=a=>{const k=sourceOf(a);return '<span class="badge '+(k==="PubMed"?"blue":"amber")+'" title="'+esc(((data.config.sources||[]).find(x=>x.id===k)||{}).label||k)+'">'+esc(k)+'</span>';};
 const relevanceCell=a=>'<span class="badge '+(levelColor[a.level]||"")+'" title="'+esc((a.why||[]).join(" · "))+'">'+esc(a.level||"")+" "+(a.score??"")+'</span>'+((a.why||[]).length?'<div class="sub" style="margin-top:4px;max-width:170px">'+esc(a.why.slice(0,2).join(" · "))+'</div>':"");
 const oaColor={gold:"green",diamond:"green",hybrid:"blue",green:"blue",bronze:"amber",closed:""};
 const oaLabel=a=>a.oaStatus?(a.oaStatus==="closed"?"Closed access":["No DOI","Not in Unpaywall"].includes(a.oaStatus)?a.oaStatus:"OA · "+a.oaStatus):"";
@@ -1354,7 +1366,7 @@ function mark(text,molecules,extra){
 const badge=(text,color="")=>'<span class="badge '+color+'">'+esc(text)+'</span>';
 const flagged=item=>["Retracted","Expression of concern"].includes(item?.retractionStatus);
 function evidenceChips(item){
-  const chips=[];
+  const chips=[sourceBadge(item)];
   if(flagged(item))chips.push(badge(item.retractionStatus,"red"));
   else if(item.retractionStatus==="Correction")chips.push(badge("Correction","amber"));
   if(item.citedBy!==undefined)chips.push(badge("Cited "+item.citedBy+"×"));
@@ -1385,6 +1397,7 @@ function queueView(items){
     '<select data-filter="oa" aria-label="Access"><option value="">All access</option>'+[["open","Open access"],["closed","Closed access"],["unchecked","Not yet checked"]].map(([v,l])=>'<option value="'+v+'"'+(filt.oa===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
     '<select data-filter="ft" aria-label="Full text"><option value="">All full-text states</option>'+[["stored","Full text stored"],["link","Open-access link only"],["none","No full text"]].map(([v,l])=>'<option value="'+v+'"'+(filt.ft===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
     '<button class="btn outline" data-pdf="queue" title="Download the filtered list as a PDF with a snapshot of each article">Export PDF</button><button class="btn outline" data-zip="queue" title="Download stored full texts for the filtered list as a ZIP">Full texts (ZIP)</button><button class="btn outline" data-cite="ris" data-scope="queue" title="Citations for EndNote, Zotero or Mendeley">Citations (RIS)</button><button class="btn outline" data-retrieval="csv" title="CSV of the listed articles that have no stored full text, with DOI links, for a library or document-delivery request">Retrieval list (CSV)</button><button class="btn outline" data-retrieval="flag" title="Set the listed articles without stored full text to Full text needed">Flag for manual retrieval</button>'+
+    '<select data-filter="source" aria-label="Source"><option value="">All sources</option><option value="pubmed"'+(filt.source==="pubmed"?" selected":"")+'>PubMed only</option><option value="agency"'+(filt.source==="agency"?" selected":"")+'>Government agencies</option></select>'+
     '<select data-filter="sort" aria-label="Sort"><option value="relevance"'+(filt.sort==="relevance"?" selected":"")+'>Sort: most relevant</option><option value="newest"'+(filt.sort==="newest"?" selected":"")+'>Sort: newest</option><option value="oldest"'+(filt.sort==="oldest"?" selected":"")+'>Sort: oldest</option></select>'+
     '<select data-filter="portfolio" aria-label="Portfolio"><option value="">All portfolios</option>'+portfolios.map(p=>'<option'+(filt.portfolio===p?" selected":"")+'>'+esc(p)+"</option>").join("")+"</select></div>"+
     '<div id="qtable">'+queueRows(applyFilter(items))+"</div></section>";
@@ -1392,7 +1405,7 @@ function queueView(items){
 function applyFilter(items){
   const q=filt.q.trim().toLowerCase();
   const pm=a=>Number(a.pmid)||0, order=filt.sort==="newest"?(x,y)=>pm(y)-pm(x):filt.sort==="oldest"?(x,y)=>pm(x)-pm(y):(x,y)=>(y.score||0)-(x.score||0)||pm(y)-pm(x);
-  return items.filter(a=>(!filt.status||a.status===filt.status)&&(!filt.portfolio||a.portfolio===filt.portfolio)&&(!filt.oa||oaGroup(data.articles[a.pmid]||{})===filt.oa)&&(!filt.ft||ftGroup(data.articles[a.pmid]||{})===filt.ft)&&
+  return items.filter(a=>(!filt.status||a.status===filt.status)&&(!filt.portfolio||a.portfolio===filt.portfolio)&&(!filt.oa||oaGroup(data.articles[a.pmid]||{})===filt.oa)&&(!filt.ft||ftGroup(data.articles[a.pmid]||{})===filt.ft)&&(!filt.source||(filt.source==="pubmed")===(sourceOf(data.articles[a.pmid])==="PubMed"))&&
     (!q||(a.pmid+" "+(data.articles[a.pmid]?.title||"")+" "+(a.molecules||[]).join(" ")).toLowerCase().includes(q))).sort(order);
 }
 function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
@@ -1417,6 +1430,7 @@ function render() {
     html='<div class="cards">'+stat("Unique citations",arts.length,"Batches")+stat("Assigned",items.filter(a=>a.reviewer).length,"Team")+stat("Unassigned",items.filter(a=>!a.reviewer).length,"alert",true)+stat("Complete",done,"My Queue")+stat("Retraction alerts",alerts,"alert",true)+stat("Open access %",checkedOa.length?Math.round(openOa.length/checkedOa.length*100):0,"Watchlists")+'</div>'+
       '<div class="grid2">'+panel("Screening progress",'<div class="row"><span>'+done+" of "+items.length+' complete</span><b>'+pct+'%</b></div><div class="bar"><i data-width="'+pct+'"></i></div>'+
         portfolios.map(p=>{const list=items.filter(a=>a.portfolio===p),d=list.filter(a=>a.status==="Complete").length;return '<div class="row"><span>'+esc(p)+'</span><span class="sub">'+d+" / "+list.length+"</span></div>";}).join(""))+
+      panel("By source",(data.config.sources||[]).map(x=>{const n=arts.filter(a=>sourceOf(a)===x.id).length;return '<div class="row"><span>'+esc(x.label)+(x.active?"":' <span class="sub">(not enabled)</span>')+'</span><b>'+n+'</b></div>';}).join(""),"PubMed articles are kept separate from government agency material everywhere: queues, Library folders and exports.")+
       panel("Open access (Unpaywall)",data.config.unpaywall?(checkedOa.length?Object.entries(oaCounts).sort((x,y)=>y[1]-x[1]).map(([k,v])=>'<div class="row"><span>'+badge(oaLabel({oaStatus:k}),oaColor[k]||"")+'</span><span class="sub">'+v+" · "+Math.round(v/checkedOa.length*100)+'%</span></div>').join("")+'<div class="row"><span class="sub">'+(arts.length-checkedOa.length)+' not yet checked</span></div>':'<div class="empty">Checks start with the next evidence run.</div>'):'<div class="empty">Add a contact email under Settings to turn on Unpaywall.</div>')+
       panel("Needs attention",
         '<div class="row"><span>Unassigned citations</span>'+badge(items.filter(a=>!a.reviewer).length,items.some(a=>!a.reviewer)?"amber":"")+'</div>'+
@@ -1428,7 +1442,7 @@ function render() {
   }
   if(tab==="Search & Pull"){
     const today=new Date().toISOString().slice(0,10), start=new Date(Date.now()-30*864e5).toISOString().slice(0,10);
-    html=panel("Pull articles for a molecule",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Pull articles</button> <button type="button" class="btn outline" data-suggest="1">Suggest synonyms &amp; brands</button></div></form><div id="suggest"></div>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+'<div id="progress"></div>'+
+    html=panel("Pull articles from PubMed",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Pull articles</button> <button type="button" class="btn outline" data-suggest="1">Suggest synonyms &amp; brands</button></div></form><div id="suggest"></div>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+'<div id="progress"></div>'+
       panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>':""]),"No pulls yet."),"",true);
   }
   if(tab==="Audit"){
@@ -1437,21 +1451,27 @@ function render() {
       "Every sign-in, review decision, assignment, pull, export, download, account change and setting is recorded with the user and time. Entries are chained by hash, so edits or deletions show up as a broken chain.");
   }
   if(tab==="Library"){
-    const lib=data.library||[], byMol={};
-    lib.forEach(e=>{((byMol[e.molecule]||={})[e.range]||=new Set()).add(e.pmid);});
+    const lib=data.library||[], tree={};
+    lib.forEach(e=>{(((tree[e.source]||={})[e.molecule]||={})[e.range]||=new Set()).add(e.pmid);});
     const stat=ids=>{const arts=[...ids].map(id=>data.articles[id]).filter(Boolean);return{n:arts.length,ft:arts.filter(a=>a.fullTextKey).length,shot:arts.filter(a=>a.screenshotKey).length};};
-    const [mol,range]=libPath==="/"?["",""]:libPath.split("/");
-    if(mol&&!byMol[mol])libPath="/";
-    const crumbs='<div class="sub" style="margin-bottom:12px"><button class="btn outline sm" data-libopen="/">Library</button>'+(mol?' / <button class="btn outline sm" data-libopen="'+esc(mol)+'">'+esc(mol)+'</button>':"")+(range?' / <b>'+esc(range)+'</b>':"")+'</div>';
+    let [src,mol,range]=libPath==="/"?[]:libPath.split("/");
+    if(src&&!tree[src]){libPath="/";src=mol=range=undefined;}
+    else if(mol&&!tree[src][mol]){libPath=src;mol=range=undefined;}
+    else if(range&&!tree[src][mol][range]){libPath=src+"/"+mol;range=undefined;}
+    const crumbs='<div class="sub" style="margin-bottom:12px"><button class="btn outline sm" data-libopen="/">Library</button>'+(src?' / <button class="btn outline sm" data-libopen="'+esc(src)+'">'+esc(src)+'</button>':"")+(mol?' / <button class="btn outline sm" data-libopen="'+esc(src+"/"+mol)+'">'+esc(mol)+'</button>':"")+(range?' / <b>'+esc(range)+'</b>':"")+'</div>';
     const actions=path=>'<button class="btn outline sm" data-libzip="'+esc(path)+'">ZIP</button> <button class="btn outline sm" data-libpdf="'+esc(path)+'">PDF</button> <button class="btn outline sm" data-libris="'+esc(path)+'">RIS</button>';
+    const idsOf=obj=>new Set(Object.values(obj).flatMap(x=>x instanceof Set?[...x]:[...idsOf(x)]));
+    const reg=id=>(data.config.sources||[]).find(x=>x.id===id)||{label:id,note:""};
     if(!lib.length) html=panel("Library",'<div class="empty">Nothing here yet. Pull articles for a molecule on Search &amp; Pull and its folder appears here.</div>');
-    else if(libPath==="/") html=crumbs+'<div class="cards">'+Object.entries(byMol).sort().map(([m,ranges])=>{const all=new Set(Object.values(ranges).flatMap(x=>[...x])),st=stat(all);
-      return '<div class="card"><div class="lbl"><b style="font-size:16px;color:var(--fg)">📁 '+esc(m)+'</b></div><div class="sub" style="margin:6px 0 10px">'+Object.keys(ranges).length+" date range"+(Object.keys(ranges).length===1?"":"s")+" · "+st.n+" articles · "+st.ft+' full texts</div><button class="btn sm" data-libopen="'+esc(m)+'">Open</button> <button class="btn outline sm" data-libzip="'+esc(m)+'">ZIP</button></div>';}).join("")+'</div>'+
-      panel("Whole library",'<button class="btn outline" data-libzip="/">Download everything (ZIP)</button>',"Full texts arranged as Molecule / Date range / files, with a manifest.csv.");
-    else if(!range) html=crumbs+panel(esc(mol),table(["Date range","Articles","Full text","Snapshots",""],Object.entries(byMol[mol]).sort((a,b)=>b[0].localeCompare(a[0])).map(([r,ids])=>{const st=stat(ids);
-      return ['📁 <a href="#" data-libopen="'+esc(mol+"/"+r)+'">'+esc(r.replace("_to_"," → "))+'</a>',st.n,st.ft+" / "+st.n,st.shot+" / "+st.n,actions(mol+"/"+r)];}),"No date ranges."),"",true)+
-      panel("Whole molecule",actions(mol));
-    else { const ids=byMol[mol][range]||new Set(); html=crumbs+panel(esc(mol+" · "+range.replace("_to_"," → ")),actions(libPath),"",false)+queueView(items.filter(a=>ids.has(a.pmid))); }
+    else if(!src) html=crumbs+'<div class="cards">'+Object.entries(tree).sort().map(([k,molecules])=>{const st=stat(idsOf(molecules));
+      return '<div class="card"><div class="lbl"><b style="font-size:16px;color:var(--fg)">📁 '+esc(reg(k).label)+'</b></div><div class="sub" style="margin:6px 0 10px">'+Object.keys(molecules).length+" molecule"+(Object.keys(molecules).length===1?"":"s")+" · "+st.n+" articles · "+st.ft+' full texts</div><button class="btn sm" data-libopen="'+esc(k)+'">Open</button> <button class="btn outline sm" data-libzip="'+esc(k)+'">ZIP</button></div>';}).join("")+'</div>'+
+      panel("Whole library",'<button class="btn outline" data-libzip="/">Download everything (ZIP)</button>',"Full texts arranged as Source / Molecule / Date range / files, with a manifest.csv. PubMed articles and each government agency's material are kept in separate top-level folders.");
+    else if(!mol) html=crumbs+'<div class="cards">'+Object.entries(tree[src]).sort().map(([m,ranges])=>{const st=stat(idsOf(ranges));
+      return '<div class="card"><div class="lbl"><b style="font-size:16px;color:var(--fg)">📁 '+esc(m)+'</b></div><div class="sub" style="margin:6px 0 10px">'+Object.keys(ranges).length+" date range"+(Object.keys(ranges).length===1?"":"s")+" · "+st.n+" articles · "+st.ft+' full texts</div><button class="btn sm" data-libopen="'+esc(src+"/"+m)+'">Open</button> <button class="btn outline sm" data-libzip="'+esc(src+"/"+m)+'">ZIP</button></div>';}).join("")+'</div>'+panel("Whole source folder",actions(src),reg(src).note);
+    else if(!range) html=crumbs+panel(esc(mol),table(["Date range","Articles","Full text","Snapshots",""],Object.entries(tree[src][mol]).sort((x,y)=>y[0].localeCompare(x[0])).map(([r,ids])=>{const st=stat(ids);
+      return ['📁 <a href="#" data-libopen="'+esc(src+"/"+mol+"/"+r)+'">'+esc(r.replace("_to_"," → "))+'</a>',st.n,st.ft+" / "+st.n,st.shot+" / "+st.n,actions(src+"/"+mol+"/"+r)];}),"No date ranges."),"",true)+
+      panel("Whole molecule",actions(src+"/"+mol));
+    else { const ids=tree[src][mol][range]||new Set(); html=crumbs+panel(esc(mol+" · "+range.replace("_to_"," → ")),actions(libPath),"",false)+queueView(items.filter(a=>ids.has(a.pmid))); }
   }
   if(tab==="My Queue"){
     const groups={};mine.forEach(a=>{const k=(a.molecules||[]).length?a.molecules.join(", "):a.portfolio;(groups[k]||={n:0,d:0}).n++;if(a.status==="Complete")groups[k].d++;});
@@ -1471,6 +1491,8 @@ function render() {
       '<div class="row"><span>Status</span>'+(data.config.unpaywall?badge("Active","green"):badge("Not configured","amber"))+'</div>'+
       '<form data-route="recheck-access" style="margin-top:10px"><button class="btn outline">Re-check open access for all articles</button></form>',
       "Unpaywall requires a contact email on each request; it is sent to Unpaywall only. Every article with a DOI gets an open-access status (gold, hybrid, green, bronze or closed). Permissively licensed PDFs are stored, other open copies are linked. Closed articles are re-checked every 30 days."+(data.config.unpaywallFromEnv?" The email is set by the server environment (UNPAYWALL_EMAIL).":""))+
+    panel("Sources",(data.config.sources||[]).map(x=>'<div class="row"><span><b>'+esc(x.label)+'</b><div class="sub">'+esc(x.note)+'</div></span>'+(x.active?badge("Active","green"):badge("Not enabled","amber"))+'</div>').join(""),
+      "Each source is stored and filed separately: its own badge and filter in the queues, its own top-level Library folder, and a Source column in every export. Only PubMed is connected today; agency feeds would plug in here.")+
     panel("Restricted-licence full text",'<form class="grid" data-route="settings"><label class="wide">Store open-access copies under restrictive licences<select name="storeRestricted"><option value="true"'+(data.config.storeRestricted?" selected":"")+'>Yes, store them (internal use)</option><option value="false"'+(data.config.storeRestricted?"":" selected")+'>No, only open licences (CC0, CC BY, CC BY-SA, CC BY-ND)</option></select></label><div><button class="btn">Save</button></div></form>',
       "Covers free-to-read copies found by PubMed Central, Europe PMC and Unpaywall that carry licences such as CC BY-NC or publisher terms, or none at all. They are marked 'Restricted licence' and meant for internal screening only; do not redistribute them. Only copies the publisher or a repository offers legally for free are fetched. Turning this on retries articles that only had a link.")+
     (data.config.libraryPath?panel("Library folder on the server",'<div class="row"><span>Path</span><b>'+esc(data.config.libraryPath)+'</b></div>',"The same Molecule / Date range folders are kept on disk (full texts, extracted text, record snapshots, an _index.csv per folder), refreshed after every scheduled run, so they can be copied or backed up directly."):"")+
@@ -1534,10 +1556,10 @@ function showLink(title,note,link){
 function download(id) {
   const run=data.runs.find(r=>r.id===id);
   const cell=value=>'"'+String(value??"").replace(/^[=+@\\-]/,"'$&").replaceAll('"','""')+'"';
-  const rows=[["PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Molecules","Reviewer","Status","Full text","Screenshot","Retraction check","OA status","OA licence","OA link","Cited by","Abstract","Key passages"]];
+  const rows=[["Source","PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Molecules","Reviewer","Status","Full text","Screenshot","Retraction check","OA status","OA licence","OA link","Cited by","Abstract","Key passages"]];
   run.ids.forEach(pmid=>{
     const a=data.articles[pmid], item=data.assignments.find(x=>x.pmid===pmid&&x.portfolio===run.portfolio);
-    rows.push([pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,(item?.molecules||[]).join("; "),item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending",a.retractionStatus||"Pending",a.oaStatus||"Pending",a.oaLicense||"",a.oaUrl||"",a.citedBy??"",a.abstract||"",(a.keyPassages||[]).join(" | ")]);
+    rows.push([sourceOf(a),pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,(item?.molecules||[]).join("; "),item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending",a.retractionStatus||"Pending",a.oaStatus||"Pending",a.oaLicense||"",a.oaUrl||"",a.citedBy??"",a.abstract||"",(a.keyPassages||[]).join(" | ")]);
   });
   const url=URL.createObjectURL(new Blob([rows.map(row=>row.map(cell).join(",")).join("\\r\\n")],{type:"text/csv"}));
   const link=document.createElement("a");link.href=url;link.download="pubmed-"+run.from+"-"+run.to+".csv";link.click();
@@ -1607,8 +1629,8 @@ document.addEventListener("click",event=>{
       return;
     }
     const cell=v=>'"'+String(v??"").replace(/^[=+@\\-]/,"'$&").replaceAll('"','""')+'"';
-    const rows=[["PMID","Title","Journal","Date","DOI","DOI link","PubMed link","Access","Full-text status","Portfolio","Molecules","Reviewer"]].concat(list.map(a=>{const x=data.articles[a.pmid]||{};
-      return [a.pmid,x.title,x.journal,x.date,x.doi,x.doi?"https://doi.org/"+x.doi:"",x.url,x.oaStatus||"",x.fullTextStatus||"",a.portfolio,(a.molecules||[]).join("; "),a.reviewer||""];}));
+    const rows=[["Source","PMID","Title","Journal","Date","DOI","DOI link","PubMed link","Access","Full-text status","Portfolio","Molecules","Reviewer"]].concat(list.map(a=>{const x=data.articles[a.pmid]||{};
+      return [sourceOf(x),a.pmid,x.title,x.journal,x.date,x.doi,x.doi?"https://doi.org/"+x.doi:"",x.url,x.oaStatus||"",x.fullTextStatus||"",a.portfolio,(a.molecules||[]).join("; "),a.reviewer||""];}));
     const link=document.createElement("a");link.href=URL.createObjectURL(new Blob([rows.map(r=>r.map(cell).join(",")).join("\\r\\n")],{type:"text/csv"}));
     link.download="literasift-retrieval-list.csv";link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
     message(list.length+" articles listed.");

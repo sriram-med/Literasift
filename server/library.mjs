@@ -15,7 +15,7 @@ export async function mirrorLibrary(worker, env, root) {
   for (const [folder, ids] of folders) {
     const dir = join(root, ...folder.split("/"));
     await mkdir(dir, { recursive: true });
-    const rows = [["PMID", "Title", "DOI", "Full text", "Source", "Licence", "Access", "Retraction check"]];
+    const rows = [["Source", "PMID", "Title", "DOI", "Full text", "Full-text source", "Licence", "Access", "Retraction check"]];
     for (const id of ids) {
       const a = state.articles[id];
       if (!a) continue;
@@ -29,7 +29,7 @@ export async function mirrorLibrary(worker, env, root) {
         await writeFile(target, Buffer.from(await object.arrayBuffer()));
         written++;
       }
-      rows.push([id, a.title, a.doi, a.fullTextStatus || "", a.fullTextOrigin || "", a.fullTextLicense || "", a.oaStatus || "", a.retractionStatus || ""]);
+      rows.push([a.source || "PubMed", id, a.title, a.doi, a.fullTextStatus || "", a.fullTextOrigin || "", a.fullTextLicense || "", a.oaStatus || "", a.retractionStatus || ""]);
     }
     await writeFile(join(dir, "_index.csv"), csv(rows));
   }
