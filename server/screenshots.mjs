@@ -1,7 +1,6 @@
 // Optional local screenshots with Playwright (see deploy/enable-screenshots.sh). Returns null when Playwright is not installed.
-// Default: render a clean "record card" from the data we already hold (always works, no scraping).
-// SCREENSHOT_SOURCE=pubmed additionally tries the live PubMed page first, but NCBI often answers automated browsers with 403,
-// so any non-200 response falls back to the record card rather than saving an error page.
+// Each snapshot is a "record card" rendered from the data we already hold. The live PubMed web pages are deliberately NOT scraped:
+// NCBI directs automated access to the E-utilities API and blocks automated browsing of its web interface.
 const candidates = [process.env.PLAYWRIGHT_MODULE, "/opt/literasift-shots/node_modules/playwright/index.mjs", "playwright"].filter(Boolean);
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -30,22 +29,9 @@ export async function makeScreenshotFn() {
     try { ({ chromium } = await import(candidate)); if (chromium) break; } catch { /* try the next location */ }
   }
   if (!chromium) return null;
-  const tryPage = process.env.SCREENSHOT_SOURCE === "pubmed";
   let browser, queue = Promise.resolve();
   const capture = async article => {
     if (!browser?.isConnected()) browser = await chromium.launch({ args: ["--no-sandbox", "--disable-dev-shm-usage"] });
-    if (tryPage && /^https:\/\/pubmed\.ncbi\.nlm\.nih\.gov\/\d{1,9}\/$/.test(article.url || "")) {
-      const context = await browser.newContext({ viewport: { width: 1280, height: 900 },
-        userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" });
-      try {
-        const page = await context.newPage();
-        const response = await page.goto(article.url, { waitUntil: "domcontentloaded", timeout: 30000 });
-        if (response?.status() === 200 && !/^\s*403 Forbidden/i.test(await page.title())) {
-          await page.waitForTimeout(1200);
-          return { bytes: await page.screenshot({ fullPage: true, type: "png", timeout: 30000 }), kind: "page" };
-        }
-      } catch { /* fall back to the record card */ } finally { await context.close().catch(() => {}); }
-    }
     const context = await browser.newContext({ viewport: { width: 1000, height: 800 }, javaScriptEnabled: false });
     try {
       const page = await context.newPage();
@@ -53,6 +39,6 @@ export async function makeScreenshotFn() {
       return { bytes: await page.screenshot({ fullPage: true, type: "png", timeout: 30000 }), kind: "record" };
     } finally { await context.close().catch(() => {}); }
   };
-  // One capture at a time; a pause only when the live site was tried.
-  return article => (queue = queue.catch(() => {}).then(async () => { const shot = await capture(article); if (shot.kind === "page") await new Promise(r => setTimeout(r, 1500)); return shot; }));
+  // One capture at a time.
+  return article => (queue = queue.catch(() => {}).then(() => capture(article)));
 }

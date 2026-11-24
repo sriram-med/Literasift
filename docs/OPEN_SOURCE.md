@@ -36,6 +36,19 @@ These are Python libraries. LiteraSift does the equivalent in JavaScript, so add
 | [paperscraper](https://pypi.org/project/paperscraper) | Scrapes publisher and preprint sites; its PMC BioC fallback duplicates our PMC and Europe PMC tiers, and publisher scraping raises terms-of-use risks |
 | Zotero translation-server, PyMuPDF, trafilatura | Not evaluated in depth here; check their licences (some are copyleft) before bundling |
 
+## PubMed "scraper" tools
+
+| Tool | Licence (per its package page; check the repo) | What we did |
+|---|---|---|
+| [PyMed / pymed-paperscraper](https://pypi.org/project/pymed-paperscraper/) | MIT (the original is archived) | Python wrapper around E-utilities; its search/fetch is already done natively here |
+| [paperscraper](https://github.com/jannisborn/paperscraper) | MIT | Search and full-text download across PubMed, arXiv and bio/medRxiv; our PMC, Europe PMC and Unpaywall tiers cover the PubMed side |
+| [metapub](https://pypi.org/project/metapub/) | Apache-2.0 | E-utilities and Crossref lookups, already covered |
+| [PubMed-FAST-Scrape](https://github.com/jimnoneill/PubMed-FAST-Scrape) | MIT | Bulk fetching; replaced by our paced E-utilities import |
+
+These are Python libraries, so nothing was copied in. What we took from them is their features, built on the supported API: search filters (humans, case reports, English, exclude reviews), LinkOut full-text links and "cited by" counts through `elink`, and a registered tool name, contact email, optional API key and request pacing for every E-utilities call.
+
+**Why no HTML scraping.** NCBI's own guidance says to avoid high-frequency hits on its web interface, forbids screen-scraping PubMed Central, and directs automated retrieval to E-utilities (an unregistered or too-fast client can be blocked); the earlier optional live-page screenshot mode was removed for that reason, and snapshots are rendered from stored data instead. See [NCBI's guidance](https://support.nlm.nih.gov/knowledgebase/article/KA-03539/en-us) and the [PMC developer page](https://pmc.ncbi.nlm.nih.gov/tools/developers).
+
 ## Considered but not integrated
 
 | Tool / source | Why not |

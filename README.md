@@ -70,7 +70,7 @@ Links are emailed when SMTP is configured in `/etc/literasift.env` (`SMTP_HOST`,
 
 Abstracts, authors, MeSH terms and citation counts are pulled from PubMed, Europe PMC and OpenAlex; full text from PMC, Europe PMC and Unpaywall (open-licensed only); PDFs can be turned into text by a self-hosted GROBID (`GROBID_URL`). Reviewers see the abstract with the molecule and safety terms highlighted, plus key passages from the full text. See `docs/OPEN_SOURCE.md` for the full list, licences and what was deliberately not integrated.
 
-Screenshots on the VPS are a rendered "record card" built from the stored PubMed data. NCBI answers automated browsers on pubmed.ncbi.nlm.nih.gov with `403 Forbidden`, so scraping the live page is off by default; set `SCREENSHOT_SOURCE=pubmed` to try the live page first (any non-200 response falls back to the card, and an error page is never saved). When no reviewers exist yet, new citations are assigned to the manager.
+Screenshots on the VPS are a rendered "record card" built from the stored PubMed data. NCBI answers automated browsers on pubmed.ncbi.nlm.nih.gov with `403 Forbidden`, so scraping the live page is off by default; set `(removed)` to try the live page first (any non-200 response falls back to the card, and an error page is never saved). When no reviewers exist yet, new citations are assigned to the manager.
 
 ## Molecule search to full text
 
@@ -111,3 +111,13 @@ Queues are sorted by a transparent relevance score (0-100: High 60+, Medium 30-5
 Every article and pull carries a `source` (PubMed by default). Queues show a source badge and have an "All sources / PubMed only / Government agencies" filter; the Library has a top-level folder per source (on disk too: `library/PubMed/...`, `library/FDA/...`); exports carry a Source column (RIS uses `DB`); Overview shows counts per source; Settings lists the registry (`sourceRegistry` in `worker/index.js`: PubMed active; FDA, EMA, MHRA, WHO, Health Canada and CDSCO prepared but not enabled, since no agency feed is connected yet). A future agency feed only needs to create articles and runs with its own `source`; everything else already keeps it apart. Library paths now have a source level, so folders created by the previous layout stay on disk but are no longer updated.
 
 `/healthz` returns `ok <commit>` on the server (the updater writes the deployed commit), so you can check which version is running: `curl https://literasift.tech/healthz`.
+
+## Library numbering, PubMed search filters, NCBI compliance
+
+**Numbering.** Every article in a Library folder has a number (`001`, `002`, … within its Source / Molecule / Date range folder, ordered by PMID so numbers never shift). It appears in the folder's article list (sortable), in file names (`001_PMID_123.pdf`), in `manifest.csv` / `_index.csv`, and on Library PDF exports ("No. 001"). Files already on disk from before numbering are renamed, not duplicated.
+
+**PubMed search filters** (Search & Pull): Humans only, Case reports only, English only, Exclude reviews, added to the query in PubMed's own syntax.
+
+**LinkOut and cited-by.** Each article also gets PubMed LinkOut links (free ones are highlighted for articles without stored full text, and included in the retrieval CSV) and a "cited by in PubMed" count, through the E-utilities `elink` endpoint.
+
+**NCBI compliance.** Settings has "NCBI / PubMed access": a contact email and an optional free API key (3 requests/second without a key, 10 with one). Every E-utilities call now sends the tool name and email (and key) and goes through one pacing gate. The old optional mode that screenshotted live PubMed pages has been removed, because NCBI forbids scraping its web pages; snapshots are rendered from stored data. For a server install, `NCBI_EMAIL` and `NCBI_API_KEY` can be set in `/etc/literasift.env`.
