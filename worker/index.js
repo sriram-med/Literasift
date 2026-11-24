@@ -25,6 +25,9 @@ async function pubmed(operation, params) {
   return response.json();
 }
 function allocate(state, item) {
+  // A molecule owner (set by a manager) receives every article for that molecule, regardless of capacity.
+  const owned = state.watches.find(w => w.owner && w.portfolio === item.portfolio && (!w.molecule || (item.molecules || []).includes(w.molecule)));
+  if (owned && state.profiles.some(p => p.email === owned.owner && p.active)) { item.reviewer = owned.owner; return; }
   const matches = p => p.active && (!p.portfolio || p.portfolio.toLowerCase() === item.portfolio.toLowerCase());
   let candidates = state.profiles.filter(p => p.role === "reviewer" && matches(p));
   // With no reviewers yet, managers screen their own queue so nothing sits unassigned.
@@ -106,6 +109,7 @@ function buildQuery(names, safetyOnly) {
   const query = "(" + terms.join(" OR ") + ")" + (safetyOnly ? " AND " + safetyFilter : "");
   return query.length <= 1500 ? query : "";
 }
+const keepOwner = (data, watch) => { const old = data.watches.find(w => watchKey(w) === watchKey(watch)); if (old?.owner && !watch.owner) watch.owner = old.owner; };
 const watchKey = w => w.portfolio + "\u0000" + (w.molecule || "");
 const maxWatchesPerRun = 10;
 const pmcOrigin = "https://pmc-oa-opendata.s3.amazonaws.com";
@@ -120,9 +124,9 @@ async function captureFromPmc(env, article) {
     if (!response.ok) throw new Error("PMC metadata unavailable.");
     return response.json();
   }));
-  const item = versions.filter(v => ["CC0","CC BY","CC BY-SA","CC BY-ND"].includes(String(v.license_code)
-      .trim().toUpperCase().replace(/^CC[-_]/,"CC ").replace(/_/g,"-")))
-    .sort((a,b) => Number(a.is_manuscript === "yes") - Number(b.is_manuscript === "yes") || Number(b.version) - Number(a.version))[0];
+  const permissivePmc = v => ["CC0","CC BY","CC BY-SA","CC BY-ND"].includes(String(v.license_code).trim().toUpperCase().replace(/^CC[-_]/,"CC ").replace(/_/g,"-"));
+  const item = versions.filter(v => env.ALLOW_RESTRICTED || permissivePmc(v))
+    .sort((a,b) => Number(permissivePmc(b)) - Number(permissivePmc(a)) || Number(a.is_manuscript === "yes") - Number(b.is_manuscript === "yes") || Number(b.version) - Number(a.version))[0];
   if (!item) return {fullTextStatus:"No eligible PMC file"};
   const version = String(item.version);
   if (!/^[0-9]+$/.test(version)) throw new Error("Invalid PMC version.");
@@ -137,7 +141,7 @@ async function captureFromPmc(env, article) {
   await env.BUCKET.put(key, bytes, {httpMetadata:{contentType:format === "pdf" ? "application/pdf" : "application/xml"}});
   let text = "";
   try { text = format === "pdf" ? await pdfToText(env, bytes) : xmlToText(new TextDecoder().decode(bytes)); } catch { /* text extraction is best effort */ }
-  return {fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:item.license_code, fullTextSource:url, fullTextOrigin:"PMC", _text:text};
+  return {fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:item.license_code, fullTextSource:url, fullTextOrigin:"PMC", fullTextRestricted:!permissivePmc(item), _text:text};
 }
 // ---- Extraction: abstracts/metadata (PubMed, Europe PMC, OpenAlex), full-text text + key passages, optional GROBID for PDFs ----
 const safetyTerms = ["adverse","toxicity","toxic","hepatotoxic","nephrotoxic","cardiotoxic","neurotoxic","death","fatal","overdose","reaction","syndrome","injury",
@@ -286,7 +290,10 @@ async function captureFromUnpaywall(env, article, reason, lookupOnce) {
   const locations = [data.best_oa_location, ...(data.oa_locations || [])].filter(Boolean);
   const license = l => String(l.license || "").toLowerCase();
   const rank = l => (l.version === "publishedVersion" ? 0 : l.version === "acceptedVersion" ? 1 : 2);
-  const pdfs = locations.filter(l => /^https:\/\//.test(l.url_for_pdf || "") && openLicenses.includes(license(l))).sort((a, b) => rank(a) - rank(b));
+  const permissive = l => openLicenses.includes(license(l));
+  // Restricted licences (CC BY-NC, publisher terms, no stated licence) are stored too when the manager allows it; permissive copies come first.
+  const pdfs = locations.filter(l => /^https:\/\//.test(l.url_for_pdf || "") && (env.ALLOW_RESTRICTED || permissive(l)))
+    .sort((a, b) => (Number(!permissive(a)) * 10 + rank(a)) - (Number(!permissive(b)) * 10 + rank(b)));
   for (const location of pdfs.slice(0, 3)) {
     try {
       const file = await fetch(location.url_for_pdf, { signal:AbortSignal.timeout(25000), headers:{ Accept:"application/pdf" } });
@@ -298,7 +305,7 @@ async function captureFromUnpaywall(env, article, reason, lookupOnce) {
       let text = "";
       try { text = await pdfToText(env, bytes); } catch { /* text extraction is best effort */ }
       return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:license(location), fullTextSource:location.url_for_pdf,
-        fullTextOrigin:"Unpaywall", fullTextVersion:location.version || "", _text:text };
+        fullTextOrigin:"Unpaywall", fullTextVersion:location.version || "", fullTextRestricted:!permissive(location), _text:text };
     } catch { /* try the next location */ }
   }
   const link = locations.map(l => l.url_for_landing_page || l.url).find(u => /^https:\/\//.test(u || ""));
@@ -309,7 +316,7 @@ async function captureFromEuropePmc(env, article, coreOnce, reason) {
   const core = await coreOnce();
   const license = String(core?.license || "").toLowerCase().trim().replace(/\s+/g, "-");
   const id = core?.pmcid || article.pmcid;
-  if (!core || core.isOpenAccess !== "Y" || !openLicenses.includes(license) || !/^PMC[0-9]+$/.test(id || "")) return { fullTextStatus:reason };
+  if (!core || core.isOpenAccess !== "Y" || !(env.ALLOW_RESTRICTED || openLicenses.includes(license)) || !/^PMC[0-9]+$/.test(id || "")) return { fullTextStatus:reason };
   const response = await fetch(epmcBase + "/" + id + "/fullTextXML", { signal:AbortSignal.timeout(25000) });
   if (!response.ok) return { fullTextStatus:reason };
   const bytes = await response.arrayBuffer();
@@ -317,7 +324,7 @@ async function captureFromEuropePmc(env, article, coreOnce, reason) {
   if (bytes.byteLength > 15 * 1024 * 1024 || !/<article\b/.test(xml)) return { fullTextStatus:reason };
   const key = "evidence/" + article.id + "/europepmc.xml";
   await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:"application/xml" } });
-  return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:license, fullTextSource:epmcBase + "/" + id + "/fullTextXML", fullTextOrigin:"Europe PMC", _text:xmlToText(xml) };
+  return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:license, fullTextSource:epmcBase + "/" + id + "/fullTextXML", fullTextOrigin:"Europe PMC", fullTextRestricted:!openLicenses.includes(license), _text:xmlToText(xml) };
 }
 async function captureFullText(env, article, lookupOnce, coreOnce) {
   const pmc = await captureFromPmc(env, article);
@@ -538,6 +545,7 @@ async function exportFullTexts(env, state, viewer, manager, body) {
   }
   if (!files.length) return null;
   files.push({ name:"manifest.csv", data:new TextEncoder().encode(rows.map(r => r.map(csvCell).join(",")).join("\r\n")) });
+  if (ids.some(id => state.articles[id]?.fullTextRestricted)) files.push({ name:"NOTICE.txt", data:new TextEncoder().encode("Some documents in this archive are open-access copies under licences that restrict reuse (for example CC BY-NC, publisher terms, or no stated licence). They are included for internal literature screening only. Check the Licence column in manifest.csv and do not redistribute them.\r\n") });
   return zipFiles(files);
 }
 async function captureScreenshot(env, article) {
@@ -561,7 +569,8 @@ async function captureScreenshot(env, article) {
 }
 async function collectEvidence(baseEnv, ids) {
   const {state} = await load(baseEnv);
-  const env = Object.assign(Object.create(baseEnv), { UNPAYWALL_EMAIL:baseEnv.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail || "" });
+  const env = Object.assign(Object.create(baseEnv), { UNPAYWALL_EMAIL:baseEnv.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail || "",
+    ALLOW_RESTRICTED:state.settings?.storeRestricted !== false });
   const articles = ids ? ids.map(id=>state.articles[id]).filter(Boolean) : Object.values(state.articles);
   const enabled = Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN));
   const needsFullText = a => !a.fullTextStatus || a.fullTextStatus === "Retry needed" ||
@@ -635,7 +644,7 @@ async function api(request, env, path) {
   if (!viewer && !service) return json({ error:"Your account needs a Literature Bench profile." }, 403);
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email);
-    return json({ viewer, config:{ grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+    return json({ viewer, config:{ storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -694,10 +703,40 @@ async function api(request, env, path) {
   }
   if (!manager) return json({ error:"Manager access required." },403);
   if (path === "/api/settings") {
-    const email = String(body.unpaywallEmail || "").trim();
-    if (email && (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || email.length > 200)) return json({error:"Enter a valid contact email for Unpaywall."},400);
-    await write(env, data => { (data.settings ||= {}).unpaywallEmail = email; });
+    const email = String(body.unpaywallEmail ?? "").trim();
+    if ("unpaywallEmail" in body && email && (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || email.length > 200)) return json({error:"Enter a valid contact email for Unpaywall."},400);
+    await write(env, data => {
+      const settings = data.settings ||= {};
+      if ("unpaywallEmail" in body) settings.unpaywallEmail = email;
+      if ("storeRestricted" in body) {
+        const turnedOn = body.storeRestricted === true && settings.storeRestricted === false;
+        settings.storeRestricted = body.storeRestricted === true;
+        // Articles that only had a link (or no eligible copy) are tried again under the wider rule.
+        if (turnedOn) for (const a of Object.values(data.articles)) if (/^(Open access link only|No eligible PMC file|No PMC record|No downloadable open-access copy)$/.test(a.fullTextStatus || "")) { delete a.fullTextStatus; delete a.evidenceAttempt; }
+      }
+    });
     return json({ ok:true });
+  }
+  if (path === "/api/assign-molecule") {
+    const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
+    const owner = String(body.owner || "").trim().toLowerCase();
+    if (!state.watches.some(w => w.portfolio === portfolio && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
+    if (owner && !state.profiles.some(p => p.email === owner && p.active)) return json({error:"Choose an active team member."},400);
+    const moved = await write(env, data => {
+      const watch = data.watches.find(w => w.portfolio === portfolio && (w.molecule || "") === molecule);
+      if (owner) watch.owner = owner; else delete watch.owner;
+      let count = 0;
+      for (const a of data.assignments) {
+        if (a.portfolio !== portfolio || a.status === "Complete" || (molecule && !(a.molecules || []).includes(molecule))) continue;
+        const target = owner || (body.reassign === true ? "" : a.reviewer);
+        if (a.reviewer === target || (a.reviewer && body.reassign !== true)) continue;
+        a.reviewer = target; count++;
+        (a.history ||= []).push({ status:a.status, note:target ? "Assigned to " + target : "Unassigned", by:email, at:new Date().toISOString() });
+      }
+      if (!owner) data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data, a));
+      return count;
+    });
+    return json({ ok:true, moved });
   }
   if (path === "/api/recheck-access") {
     await write(env, data => { for (const a of Object.values(data.articles)) { delete a.oaCheckedAt; delete a.evidenceAttempt; if (/^(No PMC record|No eligible PMC file|No open-access copy|Not in Unpaywall|No downloadable open-access copy)$/.test(a.fullTextStatus || "")) delete a.fullTextStatus; } });
@@ -720,6 +759,7 @@ async function api(request, env, path) {
     const watch = { portfolio:String(body.portfolio || "").trim(), molecule:String(body.molecule || "").trim().slice(0,100), query:String(body.query || "").trim() };
     if (!watch.portfolio || !watch.query || watch.query.length > 1500) return json({error:"Enter a portfolio and a PubMed query."},400);
     await write(env, data => {
+      keepOwner(data, watch);
       data.watches = data.watches.filter(w => watchKey(w) !== watchKey(watch));
       data.watches.push(watch);
     });
@@ -727,14 +767,17 @@ async function api(request, env, path) {
     const portfolio = String(body.portfolio || "").trim();
     if (!portfolio || !Array.isArray(body.rows) || !body.rows.length || body.rows.length > 500) return json({error:"Enter a portfolio and 1 to 500 molecules."},400);
     const created = [], skipped = [];
+    const bulkOwner = String(body.owner || "").trim().toLowerCase();
+    if (bulkOwner && !state.profiles.some(p => p.email === bulkOwner && p.active)) return json({error:"Choose an active team member."},400);
     for (const row of body.rows) {
       const names = [row?.molecule, ...(Array.isArray(row?.synonyms) ? row.synonyms : [])];
       const molecule = String(row?.molecule || "").trim().slice(0,100);
       const query = molecule && buildQuery(names, body.safetyOnly === true);
-      if (query) created.push({ portfolio, molecule, query }); else skipped.push(molecule || "(blank)");
+      if (query) created.push({ portfolio, molecule, query, ...(bulkOwner ? { owner:bulkOwner } : {}) }); else skipped.push(molecule || "(blank)");
     }
     await write(env, data => {
       const keys = new Set(created.map(watchKey));
+      created.forEach(w => keepOwner(data, w));
       data.watches = data.watches.filter(w => !keys.has(watchKey(w))).concat(created);
     });
     return json({ created:created.length, skipped });
@@ -750,8 +793,11 @@ async function api(request, env, path) {
     if (!valid(body.from) || !valid(body.to) || body.from > body.to || body.to > day()) {
       return json({error:"Choose a valid date range through today."},400);
     }
-    const watch = { portfolio, molecule, query };
+    const owner = String(body.owner || "").trim().toLowerCase();
+    if (owner && !state.profiles.some(p => p.email === owner && p.active)) return json({error:"Choose an active team member."},400);
+    const watch = { portfolio, molecule, query, ...(owner ? { owner } : {}) };
     await write(env, data => {
+      keepOwner(data, watch);
       data.watches = data.watches.filter(w => watchKey(w) !== watchKey(watch));
       data.watches.push(watch);
     });
@@ -928,6 +974,7 @@ async function extractRun(runId){
 let data, tab, active, filt={q:"",status:"",portfolio:"",oa:"",ft:""}, shown=[];
 const oaColor={gold:"green",diamond:"green",hybrid:"blue",green:"blue",bronze:"amber",closed:""};
 const oaLabel=a=>a.oaStatus?(a.oaStatus==="closed"?"Closed access":["No DOI","Not in Unpaywall"].includes(a.oaStatus)?a.oaStatus:"OA · "+a.oaStatus):"";
+const peopleOptions=(selected="",blank="")=>(blank?'<option value="">'+blank+'</option>':"")+data.profiles.filter(p=>p.active).map(p=>'<option value="'+esc(p.email)+'"'+(p.email===selected?" selected":"")+'>'+esc(p.name+" ("+p.role+")")+'</option>').join("");
 const ftGroup=a=>a.fullTextKey?"stored":a.fullTextLink?"link":"none";
 const oaGroup=a=>!a.oaCheckedAt?"unchecked":a.oaIsOpen?"open":"closed";
 let toastTimer;
@@ -960,6 +1007,7 @@ function evidenceChips(item){
   else if(item.retractionStatus==="Correction")chips.push(badge("Correction","amber"));
   if(item.citedBy!==undefined)chips.push(badge("Cited "+item.citedBy+"×"));
   if(item.oaStatus)chips.push('<span class="badge '+(oaColor[item.oaStatus]||"")+'" title="'+esc((item.oaLicense?"Licence: "+item.oaLicense+". ":"")+(item.oaVersion?"Version: "+item.oaVersion+". ":"")+(item.oaHostType?"Host: "+item.oaHostType+".":""))+'">'+esc(oaLabel(item))+'</span>');
+  if(item.fullTextKey&&item.fullTextRestricted)chips.push('<span class="badge amber" title="Open-access copy under a restrictive licence: internal screening use only">Restricted licence'+(item.fullTextLicense?" · "+esc(item.fullTextLicense):"")+'</span>');
   chips.push(item.fullTextKey?'<a class="badge green" href="/api/full-text/'+esc(item.id)+'">Full text</a>':item.fullTextLink?'<a class="badge blue" target="_blank" rel="noopener" href="'+esc(item.fullTextLink)+'">Open-access link</a>':badge(item.fullTextStatus||"Full text pending"));
   chips.push(item.screenshotKey?'<a class="badge green" href="/api/screenshot/'+esc(item.id)+'">Screenshot</a>':badge(item.screenshotStatus||"Screenshot pending"));
   return '<div class="chips">'+chips.join("")+"</div>";
@@ -1023,18 +1071,27 @@ function render() {
   }
   if(tab==="Search & Pull"){
     const today=new Date().toISOString().slice(0,10), start=new Date(Date.now()-30*864e5).toISOString().slice(0,10);
-    html=panel("Pull articles for a molecule",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Pull articles</button></div></form>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+'<div id="progress"></div>'+
+    html=panel("Pull articles for a molecule",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Pull articles</button></div></form>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+'<div id="progress"></div>'+
       panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>':""]),"No pulls yet."),"",true);
   }
-  if(tab==="My Queue") html=queueView(mine);
+  if(tab==="My Queue"){
+    const groups={};mine.forEach(a=>{const k=(a.molecules||[]).length?a.molecules.join(", "):a.portfolio;(groups[k]||={n:0,d:0}).n++;if(a.status==="Complete")groups[k].d++;});
+    const done=mine.filter(a=>a.status==="Complete").length;
+    html=(mine.length?panel("My coverage",'<div class="row"><span>'+done+" of "+mine.length+' articles screened</span><b>'+Math.round(done/mine.length*100)+'%</b></div><div class="bar"><i data-width="'+Math.round(done/mine.length*100)+'"></i></div>'+
+      Object.entries(groups).sort((x,y)=>y[1].n-x[1].n).map(([k,g])=>'<div class="row"><span>'+esc(k)+'</span><span class="sub">'+g.d+" / "+g.n+'</span></div>').join(""),"Work through every article assigned to you; mark each Complete when screened."):"")+queueView(mine);
+  }
   if(tab==="All Assignments") html=queueView(items);
   if(tab==="Watchlists") html=panel("Add a watchlist",'<form class="grid" data-route="watch"><label>Portfolio<input name="portfolio" required></label><label>Molecule<input name="molecule" placeholder="Optional"></label><label class="wide">PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><div><button class="btn">Save watchlist</button></div></form>')+
-    panel("Add molecules in bulk",'<form class="grid" data-route="watches"><label>Portfolio<input name="portfolio" required></label><label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Save molecules</button></div></form>',"One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs.")+
-    panel("Saved watchlists ("+data.watches.length+")",table(["Portfolio","Molecule","Query"],data.watches.map(w=>[esc(w.portfolio),esc(w.molecule||"—"),'<span class="sub">'+esc(w.query)+"</span>"]),"Add a molecule or portfolio watchlist to start."),"",true);
+    panel("Add molecules in bulk",'<form class="grid" data-route="watches"><label>Portfolio<input name="portfolio" required></label><label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label>Assign all to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Save molecules</button></div></form>',"One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs.")+
+    panel("Assign a molecule to an employee",watchOptions?'<form class="grid" data-route="assign-molecule"><label>Molecule<select name="watch">'+watchOptions+'</select></label><label>Employee<select name="owner">'+peopleOptions("","Unassign (auto)")+'</select></label><label class="check"><input type="checkbox" name="reassign">&nbsp;Also move articles already assigned to someone else</label><div><button class="btn">Assign</button></div></form>':'<div class="empty">Save a watchlist first.</div>',
+      "The employee receives every pulled article for the molecule that is not yet complete, and every article pulled for it from now on. Their open-article limit does not apply to owned molecules.")+
+    panel("Saved watchlists ("+data.watches.length+")",table(["Portfolio","Molecule","Owner","Query"],data.watches.map(w=>[esc(w.portfolio),esc(w.molecule||"—"),w.owner?esc((data.profiles.find(p=>p.email===w.owner)||{name:w.owner}).name):'<span class="sub">Auto</span>','<span class="sub">'+esc(w.query)+"</span>"]),"Add a molecule or portfolio watchlist to start."),"",true);
   if(tab==="Settings") html=panel("Unpaywall (open access)",'<form class="grid" data-route="settings"><label class="wide">Contact email for Unpaywall<input type="email" name="unpaywallEmail" value="'+esc(data.config.unpaywallEmail)+'" placeholder="you@example.com"'+(data.config.unpaywallFromEnv?' disabled':'')+'></label><div><button class="btn"'+(data.config.unpaywallFromEnv?' disabled':'')+'>Save</button></div></form>'+
       '<div class="row"><span>Status</span>'+(data.config.unpaywall?badge("Active","green"):badge("Not configured","amber"))+'</div>'+
       '<form data-route="recheck-access" style="margin-top:10px"><button class="btn outline">Re-check open access for all articles</button></form>',
       "Unpaywall requires a contact email on each request; it is sent to Unpaywall only. Every article with a DOI gets an open-access status (gold, hybrid, green, bronze or closed). Permissively licensed PDFs are stored, other open copies are linked. Closed articles are re-checked every 30 days."+(data.config.unpaywallFromEnv?" The email is set by the server environment (UNPAYWALL_EMAIL).":""))+
+    panel("Restricted-licence full text",'<form class="grid" data-route="settings"><label class="wide">Store open-access copies under restrictive licences<select name="storeRestricted"><option value="true"'+(data.config.storeRestricted?" selected":"")+'>Yes, store them (internal use)</option><option value="false"'+(data.config.storeRestricted?"":" selected")+'>No, only open licences (CC0, CC BY, CC BY-SA, CC BY-ND)</option></select></label><div><button class="btn">Save</button></div></form>',
+      "Covers free-to-read copies found by PubMed Central, Europe PMC and Unpaywall that carry licences such as CC BY-NC or publisher terms, or none at all. They are marked 'Restricted licence' and meant for internal screening only; do not redistribute them. Only copies the publisher or a repository offers legally for free are fetched. Turning this on retries articles that only had a link.")+
     panel("Article screenshots",'<div class="row"><span>Status</span>'+(data.config.screenshots?badge("Active","green"):badge("Not configured","amber"))+'</div>',data.config.screenshots?"A snapshot of each article's PubMed record (title, authors, abstract, MeSH, status) is rendered and embedded in PDF exports.":"PDF exports include a screenshot of each article once capture is enabled. On the VPS, run: bash /opt/literasift-src/deploy/enable-screenshots.sh")+
     panel("Extraction sources",['PubMed (E-utilities): citations, abstracts, authors, MeSH terms','PubMed Central open-access bucket: full text under open licences','Europe PMC: abstracts, keywords, citation counts, full-text XML for open-licensed articles','OpenAlex: citation counts, topics, abstract fallback','Crossref and PubMed: retraction notices','Unpaywall: open-access status and PDF fallback'].map(t=>'<div class="row"><span>'+esc(t)+'</span>'+badge("On","green")+'</div>').join("")+
       '<div class="row"><span>GROBID: structured text from PDFs (self-hosted, optional)</span>'+(data.config.grobid?badge("On","green"):badge("Not configured","amber"))+'</div>',"All sources are free and open; none needs an account. Full text is stored only when its licence allows it. Key passages are sentences mentioning the molecule and a safety term.")+
@@ -1045,8 +1102,9 @@ function render() {
     const hosted=data.config.accounts, accts=data.accounts.users;
     html=panel(hosted?"Invite or update a reviewer":"Add or update a reviewer",'<form class="grid" data-route="'+(hosted?"/host/invite":"profile")+'"><label>Name<input name="name" required></label><label>Sign-in email<input type="email" name="email" required></label><label>Portfolio<input name="portfolio" placeholder="All portfolios"></label><label>Open assignment limit<input type="number" name="capacity" min="1" max="500" value="25" required></label><label>Availability<select name="active"><option value="true">Active</option><option value="false">Unavailable</option></select></label><div><button class="btn">'+(hosted?"Save and invite":"Save reviewer")+'</button></div></form>',
         hosted?(data.accounts.mail?"New reviewers get an email with a link to set their password.":"Email delivery isn't configured, so you'll be shown a link to send to each new reviewer yourself."):"")+
-      panel("Team",table(hosted?["Name","Email","Role","Portfolio","Open","Sign-in",""]:["Name","Email","Role","Portfolio","Open"],data.profiles.map(p=>{
-        const row=[esc(p.name),esc(p.email),badge(p.role,p.role==="manager"?"blue":""),esc(p.portfolio||"All"),items.filter(a=>a.reviewer===p.email&&a.status!=="Complete").length];
+      panel("Team",table(hosted?["Name","Email","Role","Portfolio","Open","Screened","Sign-in",""]:["Name","Email","Role","Portfolio","Open","Screened"],data.profiles.map(p=>{
+        const own=items.filter(a=>a.reviewer===p.email), fin=own.filter(a=>a.status==="Complete").length;
+        const row=[esc(p.name),esc(p.email),badge(p.role,p.role==="manager"?"blue":""),esc(p.portfolio||"All"),own.length-fin,fin+" / "+own.length+(own.length?" ("+Math.round(fin/own.length*100)+"%)":"")];
         if(hosted){
           const st=accts[p.email];
           row.push(st==="active"?badge("Active","green"):st==="invited"?badge("Invited","amber"):badge("No account"));
@@ -1169,7 +1227,9 @@ document.addEventListener("submit",async event=>{
   const form=event.target, button=form.querySelector("button");
   const body=Object.fromEntries(new FormData(form));
   if(body.active)body.active=body.active==="true";
+  if(body.storeRestricted)body.storeRestricted=body.storeRestricted==="true";
   const route=form.dataset.route || "review";
+  if(route==="assign-molecule")body.reassign=body.reassign==="on";
   if(route==="review")body.id=active.id;
   if(route==="watches"){
     body.safetyOnly=body.safety==="on";
@@ -1184,7 +1244,7 @@ document.addEventListener("submit",async event=>{
     if(route==="pull"){pullRun=result.id;drawProgress();extractRun(result.id);}
     if(route==="/host/invite"&&result.link)showLink("Invite link for "+body.email,(result.mailError?result.mailError+" ":"Email isn't configured. ")+"Send this link to them yourself. It works once and expires in 7 days.",result.link);
     if(route==="/host/change-password")form.reset();
-    message(route==="/host/invite"?(result.existing?"Profile updated.":result.emailed?"Invite emailed to "+body.email+".":"Profile saved."):route==="/host/change-password"?"Password changed.":route==="recheck-access"?"Open-access check queued for all articles.":route==="import"?"Batch imported.":route==="pull"?result.count+" articles pulled for "+(result.molecule||result.portfolio)+".":route==="watches"?result.created+" molecule watchlists saved."+(result.skipped.length?" Skipped (invalid or too long): "+result.skipped.join(", "):""):"Saved.");}
+    message(route==="assign-molecule"?result.moved+" article"+(result.moved===1?"":"s")+" assigned.":route==="/host/invite"?(result.existing?"Profile updated.":result.emailed?"Invite emailed to "+body.email+".":"Profile saved."):route==="/host/change-password"?"Password changed.":route==="recheck-access"?"Open-access check queued for all articles.":route==="import"?"Batch imported.":route==="pull"?result.count+" articles pulled for "+(result.molecule||result.portfolio)+".":route==="watches"?result.created+" molecule watchlists saved."+(result.skipped.length?" Skipped (invalid or too long): "+result.skipped.join(", "):""):"Saved.");}
   catch(error){message(error.message,true);if(route==="review")$("dialog").close();if(route==="import"||route==="pull")await refresh().catch(()=>{});}
   finally{button.disabled=false;}
 });
