@@ -99,3 +99,9 @@ Full text is fetched from PubMed Central, Europe PMC, Unpaywall and Semantic Sch
 **Deleting a watchlist** (Watchlists tab) stops new pulls only; articles, files and past pulls stay.
 
 **Backups (VPS).** Run once on the server: `bash /opt/literasift-src/deploy/enable-backups.sh`. It archives all data (database, files, audit trail, library, accounts) daily at 02:30 and keeps the last 14 in `/var/backups/literasift`. Copy them off the server now and then.
+
+## Relevance ranking and assigning by number
+
+Queues are sorted by a transparent relevance score (0-100: High 60+, Medium 30-59, Low below 30) with the reasons shown under each badge; the sort can be switched to newest or oldest. The score adds up: the molecule in the title or abstract; safety terms (matched at word starts, so "harm" does not match "pharmacokinetics"); serious-outcome terms; case reports; special populations; PubTator conditions; key passages from full text; retracted articles and expressions of concern; and a little for citations. Missing abstracts and editorials/letters score lower. It is rule-based, not learned, and meant for ordering work, not for deciding relevance.
+
+**Assign by number** (Watchlists tab): pick a molecule, an order (most relevant, newest or oldest first) and which articles (all not yet complete, or unassigned only); then give each range to a person, for example 1-20 to one person and 21-30 to another. "Preview ranked list" shows the numbered list and who each range goes to before "Assign" applies it. Ranges must not overlap; articles outside the ranges are untouched; every assignment is written to the article history and the audit trail.

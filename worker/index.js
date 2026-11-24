@@ -758,6 +758,52 @@ async function collectEvidence(baseEnv, ids) {
     screenshotConfigured:enabled, unpaywallConfigured:Boolean(env.UNPAYWALL_EMAIL), grobidConfigured:Boolean(env.GROBID_URL)};
 }
 
+// ---- Relevance ranking (transparent, rule-based): higher = more likely to need attention in safety screening ----
+const severeTerms = ["fatal","death","anaphyla","hepatotox","failure","overdose","hospitali","serious","life-threatening","stevens-johnson","toxic epidermal","necrosis"];
+const populationTerms = ["pregnan","neonat","infant","child","pediatric","paediatric","elderly","renal impairment","hepatic impairment","breastfeeding","lactation"];
+const termLabels = { hospitali:"hospitalisation", anaphyla:"anaphylaxis", hepatotox:"hepatotoxicity", nephrotox:"nephrotoxicity", cardiotox:"cardiotoxicity", neurotox:"neurotoxicity",
+  pregnan:"pregnancy", contraindicat:"contraindication", discontinu:"discontinuation", neonat:"neonate", "adverse":"adverse event", pediatric:"paediatric" };
+const termLabel = t => termLabels[t] || t;
+const termPatterns = new Map();
+// Terms match at the start of a word ("hepatotox" matches "hepatotoxicity", but "harm" does not match "pharmacokinetics").
+const hasTerm = (text, term) => (termPatterns.get(term) || termPatterns.set(term, new RegExp("\\b" + term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))).get(term)).test(text);
+const termHitsIn = (text, terms) => { const hits = terms.filter(t => hasTerm(text, t)); return hits.filter(t => !hits.some(o => o !== t && o.startsWith(t))); };
+function scoreArticle(article, molecules) {
+  const a = article || {}, title = String(a.title || "").toLowerCase(), abstract = String(a.abstract || "").toLowerCase();
+  const names = (molecules || []).map(m => String(m).toLowerCase()).filter(Boolean), why = [];
+  let score = 0;
+  if (names.some(n => title.includes(n))) { score += 25; why.push("molecule in title"); }
+  else if (names.some(n => abstract.includes(n))) { score += 15; why.push("molecule in abstract"); }
+  const titleHits = termHitsIn(title, safetyTerms), abstractHits = termHitsIn(abstract, safetyTerms).filter(t => !titleHits.includes(t));
+  const safetyPoints = Math.min(titleHits.length * 6, 18) + Math.min(abstractHits.length * 3, 21);
+  if (safetyPoints) { score += safetyPoints; why.push("safety terms: " + [...titleHits, ...abstractHits].slice(0, 4).map(termLabel).join(", ")); }
+  const severe = termHitsIn(title + " " + abstract, severeTerms);
+  if (severe.length) { score += Math.min(severe.length * 5, 15); why.push("serious outcome: " + severe.slice(0, 3).map(termLabel).join(", ")); }
+  const types = (a.pubTypes || []).join(" ").toLowerCase();
+  if (/case report/.test(types)) { score += 12; why.push("case report"); }
+  else if (/randomi[sz]ed|clinical trial/.test(types)) score += 4;
+  else if (/meta-analysis|review/.test(types)) score -= 3;
+  else if (/editorial|comment|letter|news/.test(types)) { score -= 8; why.push("editorial or letter"); }
+  const population = termHitsIn(title + " " + abstract + " " + (a.meshTerms || []).join(" ").toLowerCase(), populationTerms);
+  if (population.length) { score += 5; why.push("special population: " + termLabel(population[0])); }
+  const conditions = (a.entities?.diseases || []).length;
+  if (conditions) score += Math.min(conditions, 5) * 1.5;
+  const passages = (a.keyPassages || []).length;
+  if (passages) { score += Math.min(passages, 4) * 2; why.push(passages + " key passage" + (passages === 1 ? "" : "s")); }
+  if (!abstract) { score -= 5; why.push("no abstract yet"); }
+  if (["Retracted", "Expression of concern"].includes(a.retractionStatus)) { score += 20; why.push(a.retractionStatus.toLowerCase()); }
+  if (a.citedBy > 0) score += Math.min(Math.round(Math.log10(a.citedBy + 1) * 2), 4);
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  return { score, level:score >= 60 ? "High" : score >= 30 ? "Medium" : "Low", why };
+}
+// The open assignments of one watchlist in a chosen order; positions (1, 2, 3…) are what "assign by number" refers to.
+function rankedList(state, portfolio, molecule, order, pool) {
+  let list = state.assignments.filter(a => a.portfolio === portfolio && a.status !== "Complete" && (!molecule || (a.molecules || []).includes(molecule)));
+  if (pool === "unassigned") list = list.filter(a => !a.reviewer);
+  const ranked = list.map(a => ({ a, ...scoreArticle(state.articles[a.pmid], a.molecules) })), num = x => Number(x.a.pmid) || 0;
+  ranked.sort(order === "newest" ? (x, y) => num(y) - num(x) : order === "oldest" ? (x, y) => num(x) - num(y) : (x, y) => y.score - x.score || num(y) - num(x));
+  return ranked;
+}
 // ---- Audit trail: append-only monthly log, each entry hash-chained to the previous one so edits or deletions are detectable ----
 const auditKey = month => "audit/" + month + ".ndjson";
 const sha256 = async text => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)))].map(b => b.toString(16).padStart(2, "0")).join("");
@@ -797,6 +843,7 @@ const auditRules = {
   "/api/export-citations":b => ({ action:"export.citations", target:(b.pmids || []).length + " articles", detail:b.format }),
   "/api/scheduled":(b, r) => (r.results || []).length ? { action:"scheduled.run", target:"", detail:r.results.length + " batches, " + r.results.filter(x => x.error).length + " failed" } : null,
   "/api/settings":b => ({ action:"settings.update", target:Object.keys(b).join(", "), detail:"storeRestricted" in b ? "storeRestricted=" + b.storeRestricted : "" }),
+  "/api/assign-ranges":(b, r) => ({ action:"assign.ranges", target:decodeWatch(b.watch), detail:(b.ranges || []).map(x => "#" + x.from + "-" + x.to + " to " + x.owner).join("; ") + " (" + (b.order || "relevance") + ", " + (b.pool || "open") + "): " + Object.values(r.per || {}).reduce((n, v) => n + v, 0) + " assigned" }),
   "/api/delete-watch":b => ({ action:"watch.delete", target:decodeWatch(b.watch), detail:"" }),
   "/api/assign-molecule":(b, r) => ({ action:"molecule.assign", target:decodeWatch(b.watch), detail:"to " + (b.owner || "auto") + ", " + (r.moved ?? 0) + " articles" + (b.reassign ? " (including reassigned)" : "") }),
   "/api/recheck-access":() => ({ action:"access.recheck", target:"all articles", detail:"" }),
@@ -836,7 +883,7 @@ async function apiCore(request, env, path) {
   const manager = viewer?.role === "manager";
   if (!viewer && !service) return json({ error:"Your account needs a Literature Bench profile." }, 403);
   if (request.method === "GET" && path === "/api/state") {
-    const assignments = state.assignments.filter(a => manager || a.reviewer === email);
+    const assignments = state.assignments.filter(a => manager || a.reviewer === email).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
       config:{ libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
@@ -940,6 +987,31 @@ async function apiCore(request, env, path) {
   if (path === "/api/audit") {
     const month = /^\d{4}-\d{2}$/.test(String(body.month || "")) ? body.month : new Date().toISOString().slice(0, 7);
     return json(await readAudit(env, month));
+  }
+  if (path === "/api/rank-list" || path === "/api/assign-ranges") {
+    const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(v => { try { return decodeURIComponent(v); } catch { return v; } });
+    if (!state.watches.some(w => w.portfolio === portfolio && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
+    const order = ["relevance", "newest", "oldest"].includes(body.order) ? body.order : "relevance", pool = body.pool === "unassigned" ? "unassigned" : "open";
+    if (path === "/api/rank-list") {
+      const ranked = rankedList(state, portfolio, molecule, order, pool);
+      return json({ total:ranked.length, items:ranked.slice(0, 300).map((x, i) => ({ n:i + 1, pmid:x.a.pmid, title:state.articles[x.a.pmid]?.title || "", score:x.score, level:x.level, reviewer:x.a.reviewer || "", status:x.a.status })) });
+    }
+    const ranges = (Array.isArray(body.ranges) ? body.ranges : []).map(r => ({ from:Number(r.from), to:Number(r.to), owner:String(r.owner || "").trim().toLowerCase() }));
+    if (!ranges.length || ranges.length > 20 || ranges.some(r => !Number.isInteger(r.from) || !Number.isInteger(r.to) || r.from < 1 || r.to < r.from || r.to > 100000)) return json({error:"Enter ranges like 1 to 20, with a person for each."},400);
+    if (ranges.some(r => !state.profiles.some(p => p.email === r.owner && p.active))) return json({error:"Choose an active team member for every range."},400);
+    const sorted = [...ranges].sort((a, b) => a.from - b.from);
+    if (sorted.some((r, i) => i && r.from <= sorted[i - 1].to)) return json({error:"Ranges must not overlap."},400);
+    const result = await write(env, data => {
+      const ranked = rankedList(data, portfolio, molecule, order, pool), per = {}, at = new Date().toISOString();
+      for (const r of ranges) for (let n = r.from; n <= Math.min(r.to, ranked.length); n++) {
+        const a = ranked[n - 1].a;
+        if (a.reviewer === r.owner) continue;
+        a.reviewer = r.owner; per[r.owner] = (per[r.owner] || 0) + 1;
+        (a.history ||= []).push({ status:a.status, note:"Assigned to " + r.owner + " (rank #" + n + ")", by:email, at });
+      }
+      return { per, total:ranked.length };
+    });
+    return json({ ok:true, ...result });
   }
   if (path === "/api/delete-watch") {
     const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
@@ -1208,6 +1280,13 @@ function drawProgress(){
   if($("extractgo"))$("extractgo").onclick=()=>extractRun(run.id);
   if($("extractstop"))$("extractstop").onclick=()=>{if(extracting)extracting.stop=true;};
 }
+function rkAddRow(from,to){
+  const row=document.createElement("div");row.className="rkrow";row.style.cssText="display:grid;gap:12px;grid-template-columns:100px 100px minmax(160px,1fr) auto;align-items:end;margin-bottom:8px";
+  row.innerHTML='<label>From #<input type="number" min="1" class="rkf" value="'+(from||"")+'"></label><label>To #<input type="number" min="1" class="rkt" value="'+(to||"")+'"></label><label>Person<select class="rko">'+peopleOptions("","Choose…")+'</select></label><button type="button" class="btn outline sm" data-rkdel="1">Remove</button>';
+  $("rkrows").appendChild(row);
+}
+const rkRanges=()=>[...document.querySelectorAll(".rkrow")].map(r=>({from:Number(r.querySelector(".rkf").value),to:Number(r.querySelector(".rkt").value),owner:r.querySelector(".rko").value})).filter(x=>x.from||x.to||x.owner);
+const rkBody=()=>({watch:$("rkwatch").value,order:$("rkorder").value,pool:$("rkpool").value});
 const faersCache={};
 function drawFaers(key){
   const box=$("faers");if(!box)return;
@@ -1242,7 +1321,9 @@ async function extractRun(runId){
   }catch(e){message(e.message,true);}
   extracting=null;drawProgress();
 }
-let data, tab, active, filt={q:"",status:"",portfolio:"",oa:"",ft:""}, shown=[];
+let data, tab, active, filt={q:"",status:"",portfolio:"",oa:"",ft:"",sort:"relevance"}, shown=[];
+const levelColor={High:"red",Medium:"amber",Low:""};
+const relevanceCell=a=>'<span class="badge '+(levelColor[a.level]||"")+'" title="'+esc((a.why||[]).join(" · "))+'">'+esc(a.level||"")+" "+(a.score??"")+'</span>'+((a.why||[]).length?'<div class="sub" style="margin-top:4px;max-width:170px">'+esc(a.why.slice(0,2).join(" · "))+'</div>':"");
 const oaColor={gold:"green",diamond:"green",hybrid:"blue",green:"blue",bronze:"amber",closed:""};
 const oaLabel=a=>a.oaStatus?(a.oaStatus==="closed"?"Closed access":["No DOI","Not in Unpaywall"].includes(a.oaStatus)?a.oaStatus:"OA · "+a.oaStatus):"";
 const peopleOptions=(selected="",blank="")=>(blank?'<option value="">'+blank+'</option>':"")+data.profiles.filter(p=>p.active).map(p=>'<option value="'+esc(p.email)+'"'+(p.email===selected?" selected":"")+'>'+esc(p.name+" ("+p.role+")")+'</option>').join("");
@@ -1267,7 +1348,7 @@ const statusColor={"Pending":"","In review":"blue","Full text needed":"amber","C
 function mark(text,molecules,extra){
   const names=(molecules||[]).filter(Boolean), terms=(data.config.terms||[]).concat((extra||[]).filter(t=>String(t).length>2),names);
   if(!terms.length)return esc(text);
-  const re=new RegExp("("+terms.map(t=>t.replace(/[.*+?^()|\\[\\]\\\\]/g,"\\\\$&")).join("|")+")","gi");
+  const re=new RegExp("\\\\b("+terms.map(t=>t.replace(/[.*+?^()|\\[\\]\\\\]/g,"\\\\$&")).join("|")+")","gi");
   return String(text).split(re).map((part,i)=>i%2?'<mark class="'+(names.some(n=>n.toLowerCase()===part.toLowerCase())?"mol":"ae")+'">'+esc(part)+"</mark>":esc(part)).join("");
 }
 const badge=(text,color="")=>'<span class="badge '+color+'">'+esc(text)+'</span>';
@@ -1285,11 +1366,12 @@ function evidenceChips(item){
   return '<div class="chips">'+chips.join("")+"</div>";
 }
 function queueRows(items){
-  return table(["Article","Portfolio","Reviewer","Status",""],items.slice(0,200).map(a=>{
+  return table(["Article","Relevance","Portfolio","Reviewer","Status",""],items.slice(0,200).map(a=>{
     const item=data.articles[a.pmid]||{};
     return ['<a class="title" target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><div class="sub">PMID '+esc(a.pmid)+' · '+esc(item.journal)+' · '+esc(item.date)+((item.authors||[]).length?' · '+esc(item.authors.slice(0,3).join(", ")+(item.authors.length>3?" et al.":"")):"")+'</div>'+evidenceChips({...item,id:a.pmid})+
         (item.abstract?'<details class="abs"><summary>Abstract</summary><div>'+mark(item.abstract.slice(0,2500),a.molecules,(item.entities||{}).diseases)+'</div></details>':"")+
         (((item.entities||{}).diseases||[]).length?'<div class="sub" style="margin-top:6px">Conditions mentioned: '+esc(item.entities.diseases.slice(0,5).join(", "))+'</div>':""),
+      relevanceCell(a),
       esc(a.portfolio)+((a.molecules||[]).length?'<div class="chips">'+a.molecules.map(m=>badge(m)).join("")+"</div>":""),
       a.reviewer?esc(a.reviewer):badge("Unassigned","amber"),badge(a.status,statusColor[a.status]),
       '<button class="btn outline sm" data-review="'+esc(a.id)+'">Review</button>'];
@@ -1303,13 +1385,15 @@ function queueView(items){
     '<select data-filter="oa" aria-label="Access"><option value="">All access</option>'+[["open","Open access"],["closed","Closed access"],["unchecked","Not yet checked"]].map(([v,l])=>'<option value="'+v+'"'+(filt.oa===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
     '<select data-filter="ft" aria-label="Full text"><option value="">All full-text states</option>'+[["stored","Full text stored"],["link","Open-access link only"],["none","No full text"]].map(([v,l])=>'<option value="'+v+'"'+(filt.ft===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
     '<button class="btn outline" data-pdf="queue" title="Download the filtered list as a PDF with a snapshot of each article">Export PDF</button><button class="btn outline" data-zip="queue" title="Download stored full texts for the filtered list as a ZIP">Full texts (ZIP)</button><button class="btn outline" data-cite="ris" data-scope="queue" title="Citations for EndNote, Zotero or Mendeley">Citations (RIS)</button><button class="btn outline" data-retrieval="csv" title="CSV of the listed articles that have no stored full text, with DOI links, for a library or document-delivery request">Retrieval list (CSV)</button><button class="btn outline" data-retrieval="flag" title="Set the listed articles without stored full text to Full text needed">Flag for manual retrieval</button>'+
+    '<select data-filter="sort" aria-label="Sort"><option value="relevance"'+(filt.sort==="relevance"?" selected":"")+'>Sort: most relevant</option><option value="newest"'+(filt.sort==="newest"?" selected":"")+'>Sort: newest</option><option value="oldest"'+(filt.sort==="oldest"?" selected":"")+'>Sort: oldest</option></select>'+
     '<select data-filter="portfolio" aria-label="Portfolio"><option value="">All portfolios</option>'+portfolios.map(p=>'<option'+(filt.portfolio===p?" selected":"")+'>'+esc(p)+"</option>").join("")+"</select></div>"+
     '<div id="qtable">'+queueRows(applyFilter(items))+"</div></section>";
 }
 function applyFilter(items){
   const q=filt.q.trim().toLowerCase();
+  const pm=a=>Number(a.pmid)||0, order=filt.sort==="newest"?(x,y)=>pm(y)-pm(x):filt.sort==="oldest"?(x,y)=>pm(x)-pm(y):(x,y)=>(y.score||0)-(x.score||0)||pm(y)-pm(x);
   return items.filter(a=>(!filt.status||a.status===filt.status)&&(!filt.portfolio||a.portfolio===filt.portfolio)&&(!filt.oa||oaGroup(data.articles[a.pmid]||{})===filt.oa)&&(!filt.ft||ftGroup(data.articles[a.pmid]||{})===filt.ft)&&
-    (!q||(a.pmid+" "+(data.articles[a.pmid]?.title||"")+" "+(a.molecules||[]).join(" ")).toLowerCase().includes(q)));
+    (!q||(a.pmid+" "+(data.articles[a.pmid]?.title||"")+" "+(a.molecules||[]).join(" ")).toLowerCase().includes(q))).sort(order);
 }
 function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
@@ -1380,6 +1464,8 @@ function render() {
     panel("Add molecules in bulk",'<form class="grid" data-route="watches"><label>Portfolio<input name="portfolio" required></label><label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label>Assign all to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Save molecules</button></div></form>',"One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs.")+
     panel("Assign a molecule to an employee",watchOptions?'<form class="grid" data-route="assign-molecule"><label>Molecule<select name="watch">'+watchOptions+'</select></label><label>Employee<select name="owner">'+peopleOptions("","Unassign (auto)")+'</select></label><label class="check"><input type="checkbox" name="reassign">&nbsp;Also move articles already assigned to someone else</label><div><button class="btn">Assign</button></div></form>':'<div class="empty">Save a watchlist first.</div>',
       "The employee receives every pulled article for the molecule that is not yet complete, and every article pulled for it from now on. Their open-article limit does not apply to owned molecules.")+
+    panel("Assign by number",watchOptions?'<div class="grid"><label>Molecule<select id="rkwatch">'+watchOptions+'</select></label><label>Order<select id="rkorder"><option value="relevance">Most relevant first</option><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></label><label>Articles<select id="rkpool"><option value="open">All not yet complete</option><option value="unassigned">Unassigned only</option></select></label></div><div id="rkrows" style="margin-top:12px"></div><div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0"><button type="button" class="btn outline" data-rkadd="1">Add range</button><button type="button" class="btn outline" data-rkpreview="1">Preview ranked list</button><button type="button" class="btn" data-rkapply="1">Assign</button></div><div id="rkpreview"></div>':'<div class="empty">Save a watchlist first.</div>',
+      "Number the articles in the order you choose (#1 is the top) and give each range to a person, for example 1 to 20 to one person and 21 to 30 to another. Articles outside the ranges stay as they are.")+
     panel("Saved watchlists ("+data.watches.length+")",table(["Portfolio","Molecule","Owner","Query",""],data.watches.map(w=>[esc(w.portfolio),esc(w.molecule||"—"),w.owner?esc((data.profiles.find(p=>p.email===w.owner)||{name:w.owner}).name):'<span class="sub">Auto</span>','<span class="sub">'+esc(w.query)+"</span>",'<button class="btn outline sm" data-delwatch="'+esc(encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||""))+'">Delete</button>']),"Add a molecule or portfolio watchlist to start."),"",true);
   if(tab==="Settings") html=panel("Unpaywall (open access)",'<form class="grid" data-route="settings"><label class="wide">Contact email for Unpaywall<input type="email" name="unpaywallEmail" value="'+esc(data.config.unpaywallEmail)+'" placeholder="you@example.com"'+(data.config.unpaywallFromEnv?' disabled':'')+'></label><div><button class="btn"'+(data.config.unpaywallFromEnv?' disabled':'')+'>Save</button></div></form>'+
       '<div class="row"><span>Status</span>'+(data.config.unpaywall?badge("Active","green"):badge("Not configured","amber"))+'</div>'+
@@ -1416,6 +1502,7 @@ function render() {
   $("content").innerHTML=html;
   animate();
   drawProgress();
+  if(tab==="Watchlists"&&$("rkrows")){rkAddRow(1,20);rkAddRow(21,30);}
   if(tab==="Audit"){
     $("auditmonth").onchange=e=>{auditMonth=e.target.value;loadAudit();};
     $("auditq").oninput=e=>{auditQ=e.target.value;drawAudit();};
@@ -1470,8 +1557,26 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-auditcsv],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
+  if(target.dataset.rkadd){const rows=document.querySelectorAll(".rkrow"),last=rows.length?Number(rows[rows.length-1].querySelector(".rkt").value):0;rkAddRow(last?last+1:1,"");return;}
+  if(target.dataset.rkdel){target.closest(".rkrow").remove();return;}
+  if(target.dataset.rkpreview||target.dataset.rkapply){
+    const ranges=rkRanges();
+    const bad=ranges.some(r=>!Number.isInteger(r.from)||!Number.isInteger(r.to)||r.from<1||r.to<r.from||!r.owner);
+    if(target.dataset.rkapply&&(!ranges.length||bad)){message("Give every range a start, an end and a person.",true);return;}
+    if(target.dataset.rkapply&&!confirm("Assign these ranges now? This overwrites the current reviewer on those articles."))return;
+    target.disabled=true;
+    if(target.dataset.rkapply){
+      api("assign-ranges",{...rkBody(),ranges}).then(r=>{message("Assigned "+Object.entries(r.per).map(([e,n])=>n+" to "+((data.profiles.find(p=>p.email===e)||{name:e}).name)).join(", ")+" (of "+r.total+" in the list).");return refresh();}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    }else{
+      api("rank-list",rkBody()).then(r=>{
+        const who=n=>{const x=ranges.find(q=>n>=q.from&&n<=q.to&&q.owner);return x?(data.profiles.find(p=>p.email===x.owner)||{name:x.owner}).name:"";};
+        $("rkpreview").innerHTML=r.total?'<div class="sub" style="margin:6px 0">'+r.total+' articles in this list'+(r.total>300?" (first 300 shown)":"")+'</div>'+table(["#","Article","Relevance","Now","Will go to"],r.items.map(i=>[i.n,esc(i.title),'<span class="badge '+(levelColor[i.level]||"")+'">'+esc(i.level)+" "+i.score+'</span>',i.reviewer?esc((data.profiles.find(p=>p.email===i.reviewer)||{name:i.reviewer}).name):'<span class="sub">Unassigned</span>',who(i.n)?"<b>"+esc(who(i.n))+"</b>":'<span class="sub">—</span>']),"Nothing to list."):'<div class="empty">No articles match this list.</div>';
+      }).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    }
+    return;
+  }
   if(target.dataset.auditcsv&&auditData){
     const q=auditQ.trim().toLowerCase(), rows=auditData.entries.filter(e=>(!auditAction||e.action.split(".")[0]===auditAction)&&(!q||(e.by+" "+e.action+" "+e.target+" "+e.detail).toLowerCase().includes(q)));
     const cell=v=>'"'+String(v??"").replace(/^[=+@\\-]/,"'$&").replaceAll('"','""')+'"';
