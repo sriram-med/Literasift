@@ -74,7 +74,7 @@ async function execute(env, watch, from, to) {
   }
 }
 const pmcOrigin = "https://pmc-oa-opendata.s3.amazonaws.com";
-async function captureFullText(env, article) {
+async function captureFromPmc(env, article) {
   if (!/^PMC[0-9]+$/.test(article.pmcid)) return { fullTextStatus:"No PMC record" };
   const listUrl = pmcOrigin + "/?list-type=2&prefix=" + encodeURIComponent("metadata/" + article.pmcid + ".");
   const list = await fetch(listUrl, {signal:AbortSignal.timeout(15000)});
@@ -99,7 +99,44 @@ async function captureFullText(env, article) {
   if (!response.ok || !response.body) throw new Error("PMC file returned HTTP " + response.status);
   const key = "evidence/" + article.id + "/" + file;
   await env.BUCKET.put(key, response.body, {httpMetadata:{contentType:format === "pdf" ? "application/pdf" : "application/xml"}});
-  return {fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:item.license_code, fullTextSource:url};
+  return {fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:item.license_code, fullTextSource:url, fullTextOrigin:"PMC"};
+}
+// Unpaywall fallback: only stores PDFs under the same permissive licences accepted for PMC; otherwise keeps the link only.
+const openLicenses = ["cc0","cc-by","cc-by-sa","cc-by-nd"];
+const maxPdfBytes = 25 * 1024 * 1024;
+async function captureFromUnpaywall(env, article, reason) {
+  if (!env.UNPAYWALL_EMAIL) return { fullTextStatus:reason };
+  if (!/^10\.\d{4,9}\/\S+$/.test(article.doi)) return { fullTextStatus:"No DOI for open-access lookup" };
+  const lookup = new URL("https://api.unpaywall.org/v2/" + encodeURIComponent(article.doi));
+  lookup.searchParams.set("email", env.UNPAYWALL_EMAIL);
+  const response = await fetch(lookup, { signal:AbortSignal.timeout(15000) });
+  if (response.status === 404) return { fullTextStatus:"Not in Unpaywall" };
+  if (!response.ok) throw new Error("Unpaywall returned HTTP " + response.status);
+  const data = await response.json();
+  if (!data.is_oa) return { fullTextStatus:"No open-access copy" };
+  const locations = [data.best_oa_location, ...(data.oa_locations || [])].filter(Boolean);
+  const license = l => String(l.license || "").toLowerCase();
+  const rank = l => (l.version === "publishedVersion" ? 0 : l.version === "acceptedVersion" ? 1 : 2);
+  const pdfs = locations.filter(l => /^https:\/\//.test(l.url_for_pdf || "") && openLicenses.includes(license(l))).sort((a, b) => rank(a) - rank(b));
+  for (const location of pdfs.slice(0, 3)) {
+    try {
+      const file = await fetch(location.url_for_pdf, { signal:AbortSignal.timeout(25000), headers:{ Accept:"application/pdf" } });
+      if (!file.ok) continue;
+      const bytes = await file.arrayBuffer();
+      if (bytes.byteLength > maxPdfBytes || new TextDecoder().decode(bytes.slice(0, 5)) !== "%PDF-") continue;
+      const key = "evidence/" + article.id + "/unpaywall.pdf";
+      await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:"application/pdf" } });
+      return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:license(location), fullTextSource:location.url_for_pdf,
+        fullTextOrigin:"Unpaywall", fullTextVersion:location.version || "" };
+    } catch { /* try the next location */ }
+  }
+  const link = locations.map(l => l.url_for_landing_page || l.url).find(u => /^https:\/\//.test(u || ""));
+  return link ? { fullTextStatus:"Open access link only", fullTextLink:link } : { fullTextStatus:"No downloadable open-access copy" };
+}
+async function captureFullText(env, article) {
+  const pmc = await captureFromPmc(env, article);
+  if (pmc.fullTextStatus === "Captured") return pmc;
+  return captureFromUnpaywall(env, article, pmc.fullTextStatus);
 }
 async function captureScreenshot(env, article) {
   const endpoint = new URL(env.SCREENSHOT_ENDPOINT);
@@ -118,7 +155,8 @@ async function collectEvidence(env, ids) {
   const {state} = await load(env);
   const articles = ids ? ids.map(id=>state.articles[id]).filter(Boolean) : Object.values(state.articles);
   const enabled = Boolean(env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN);
-  const needsFullText = a => !a.fullTextStatus || a.fullTextStatus === "Retry needed";
+  const needsFullText = a => !a.fullTextStatus || a.fullTextStatus === "Retry needed" ||
+    (Boolean(env.UNPAYWALL_EMAIL) && ["No PMC record","No eligible PMC file"].includes(a.fullTextStatus));
   const needsScreen = a => enabled && !a.screenshotKey;
   const pending = articles.filter(a=>needsFullText(a) || needsScreen(a))
     .sort((a,b)=>String(a.evidenceAttempt || "").localeCompare(String(b.evidenceAttempt || ""))).slice(0,4);
@@ -256,7 +294,7 @@ const panel=(title,body)=>"<section><h2>"+title+"</h2>"+body+"</section>";
 function queue(items) {
   return table(["Article","Portfolio","Reviewer","Status",""],items.map(a=>{
     const item=data.articles[a.pmid];
-    return ['<a target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><br><small>PMID '+esc(a.pmid)+' · '+esc(item.journal)+'</small><br>'+(item.fullTextKey?'<a href="/api/full-text/'+esc(a.pmid)+'">Download PMC full text</a>':'<small>'+esc(item.fullTextStatus || "Full text pending")+'</small>')+' · '+(item.screenshotKey?'<a href="/api/screenshot/'+esc(a.pmid)+'">Screenshot</a>':'<small>'+esc(item.screenshotStatus || "Screenshot pending")+'</small>'),
+    return ['<a target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><br><small>PMID '+esc(a.pmid)+' · '+esc(item.journal)+'</small><br>'+(item.fullTextKey?'<a href="/api/full-text/'+esc(a.pmid)+'">Download full text</a>':(item.fullTextLink?'<a target="_blank" rel="noopener" href="'+esc(item.fullTextLink)+'">Open-access link</a>':'<small>'+esc(item.fullTextStatus || "Full text pending")+'</small>'))+' · '+(item.screenshotKey?'<a href="/api/screenshot/'+esc(a.pmid)+'">Screenshot</a>':'<small>'+esc(item.screenshotStatus || "Screenshot pending")+'</small>'),
       esc(a.portfolio),esc(a.reviewer || "Unassigned"),'<span class="tag">'+esc(a.status)+'</span>',
       '<button data-review="'+esc(a.id)+'">Review</button>'];
   }),"No articles in this queue.");
