@@ -25,8 +25,10 @@ async function pubmed(operation, params) {
   return response.json();
 }
 function allocate(state, item) {
-  const candidates = state.profiles.filter(p => p.role === "reviewer" && p.active &&
-    (!p.portfolio || p.portfolio.toLowerCase() === item.portfolio.toLowerCase()));
+  const matches = p => p.active && (!p.portfolio || p.portfolio.toLowerCase() === item.portfolio.toLowerCase());
+  let candidates = state.profiles.filter(p => p.role === "reviewer" && matches(p));
+  // With no reviewers yet, managers screen their own queue so nothing sits unassigned.
+  if (!state.profiles.some(p => p.role === "reviewer" && p.active)) candidates = state.profiles.filter(p => p.role === "manager" && p.active).map(p => ({ ...p, capacity:Infinity }));
   const open = p => state.assignments.filter(a => a.reviewer === p.email && a.status !== "Complete").length;
   const reviewer = candidates.map(p => ({ ...p, open: open(p) }))
     .filter(p => p.open < p.capacity).sort((a, b) => a.open - b.open || a.email.localeCompare(b.email))[0];
@@ -350,7 +352,7 @@ async function checkRetraction(env, article) {
 // ---- PDF export (dependency-free): a cover page, then one section per article with its PubMed screenshot ----
 const pdfPage = [595.28, 841.89], pdfMargin = 36, pdfMaxSlices = 4, pdfMaxArticles = 40;
 const latin = value => String(value ?? "").replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[–—]/g, "-")
-  .replace(/…/g, "...").replace(/[^\x20-\x7e\xa0-\xff]/g, "?");
+  .replace(/…/g, "...").replace(/[^\x20-\x7e\xa0-\xff]/g, c => c.normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^\x20-\x7e]/g, "?"));
 const pdfEscape = value => latin(value).replace(/[\\()]/g, "\\$&");
 const textBytes = value => Uint8Array.from(value, c => c.charCodeAt(0) & 255);
 function textWidth(value, size, bold) {
@@ -362,7 +364,7 @@ function wrap(value, size, bold, width) {
   const lines = []; let line = "";
   for (const word of latin(value).split(/\s+/).filter(Boolean)) {
     const test = line ? line + " " + word : word;
-    if (line && textWidth(test, size, bold) > width) { lines.push(line); line = word; } else line = test;
+    if (line && textWidth(test, size, bold) > width * 0.93) { lines.push(line); line = word; } else line = test;
   }
   if (line) lines.push(line);
   return lines.length ? lines : [""];
@@ -476,7 +478,7 @@ async function exportPdf(env, state, viewer, manager, body) {
     if (article.screenshotKey) { const object = await env.BUCKET.get(article.screenshotKey); if (object) png = new Uint8Array(await object.arrayBuffer()); }
     const lines = ["PMID " + id + " · " + [article.journal, article.date].filter(Boolean).join(" · "),
       "DOI: " + (article.doi || "-") + " · " + article.url,
-      "Portfolio: " + item.portfolio + ((item.molecules || []).length ? " · Molecules: " + item.molecules.join(", ") : ""),
+      "Portfolio: " + item.portfolio + ((item.molecules || []).filter(m => m !== item.portfolio).length ? " · Molecules: " + item.molecules.join(", ") : ""),
       "Reviewer: " + (item.reviewer || "Unassigned") + " · Status: " + item.status + (item.note ? " · Note: " + item.note : ""),
       "Retraction check: " + (article.retractionStatus || "Pending") + " · Access: " + (article.oaStatus || "Pending") + " · Full text: " + (article.fullTextStatus || "Pending") +
         (article.citedBy !== undefined ? " · Cited by: " + article.citedBy : "")];
@@ -491,10 +493,10 @@ async function exportPdf(env, state, viewer, manager, body) {
 }
 async function captureScreenshot(env, article) {
   if (env.SCREENSHOT_FN) {
-    const bytes = await env.SCREENSHOT_FN(article.url);
+    const shot = await env.SCREENSHOT_FN(article);
     const key = "evidence/" + article.id + "/pubmed.png";
-    await env.BUCKET.put(key, bytes, {httpMetadata:{contentType:"image/png"}});
-    return { screenshotKey:key, screenshotStatus:"Captured", screenshotAt:new Date().toISOString() };
+    await env.BUCKET.put(key, shot.bytes, {httpMetadata:{contentType:"image/png"}});
+    return { screenshotKey:key, screenshotStatus:"Captured", screenshotKind:shot.kind, screenshotAt:new Date().toISOString() };
   }
   const endpoint = new URL(env.SCREENSHOT_ENDPOINT);
   if (endpoint.protocol !== "https:") throw new Error("Screenshot endpoint must use HTTPS.");
@@ -515,7 +517,8 @@ async function collectEvidence(baseEnv, ids) {
   const enabled = Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN));
   const needsFullText = a => !a.fullTextStatus || a.fullTextStatus === "Retry needed" ||
     (Boolean(env.UNPAYWALL_EMAIL) && ["No PMC record","No eligible PMC file"].includes(a.fullTextStatus));
-  const needsScreen = a => enabled && !a.screenshotKey;
+  // Local captures made before screenshotKind existed may be saved error pages, so they are taken again.
+  const needsScreen = a => enabled && (!a.screenshotKey || (Boolean(env.SCREENSHOT_FN) && !a.screenshotKind));
   const needsEnrich = a => !a.enrichedAt;
   const needsOa = a => Boolean(env.UNPAYWALL_EMAIL) && (!a.oaCheckedAt ||
     (!a.oaIsOpen && Date.now() - Date.parse(a.oaCheckedAt) > oaRecheckMs));
@@ -536,10 +539,6 @@ async function collectEvidence(baseEnv, ids) {
       try { Object.assign(status,await captureFullText(env,article,lookupOnce,coreOnce)); }
       catch (error) { Object.assign(status,{fullTextStatus:"Retry needed",fullTextError:error.message}); }
     }
-    if (needsScreen(article)) {
-      try { Object.assign(status,await captureScreenshot(env,article)); }
-      catch { status.screenshotStatus="Retry needed"; }
-    }
     if (needsOa(article)) {
       try { Object.assign(status,oaFields(await lookupOnce())); }
       catch (error) { status.oaError = error.message; }
@@ -547,6 +546,10 @@ async function collectEvidence(baseEnv, ids) {
     if (needsRetraction(article)) {
       try { Object.assign(status,await checkRetraction(env,article)); }
       catch (error) { status.retractionError = error.message; }
+    }
+    if (needsScreen(article)) {
+      try { Object.assign(status,await captureScreenshot(env,{...article,...status})); }
+      catch { status.screenshotStatus="Retry needed"; }
     }
     if (status._text) {
       const molecules = [...new Set(state.assignments.filter(a => a.pmid === article.id).flatMap(a => a.molecules || []))];
@@ -560,6 +563,7 @@ async function collectEvidence(baseEnv, ids) {
     delete status._text;
     await write(env, data => Object.assign(data.articles[article.id],status));
   }
+  if (state.assignments.some(a => !a.reviewer)) await write(env, data => data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data, a)));
   const queued = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a)).length;
   return {processed:pending.length, queued, unattempted:articles.filter(a=>!a.evidenceAttempt).length,
     screenshotConfigured:enabled, unpaywallConfigured:Boolean(env.UNPAYWALL_EMAIL), grobidConfigured:Boolean(env.GROBID_URL)};
@@ -920,7 +924,7 @@ function render() {
       '<div class="row"><span>Status</span>'+(data.config.unpaywall?badge("Active","green"):badge("Not configured","amber"))+'</div>'+
       '<form data-route="recheck-access" style="margin-top:10px"><button class="btn outline">Re-check open access for all articles</button></form>',
       "Unpaywall requires a contact email on each request; it is sent to Unpaywall only. Every article with a DOI gets an open-access status (gold, hybrid, green, bronze or closed). Permissively licensed PDFs are stored, other open copies are linked. Closed articles are re-checked every 30 days."+(data.config.unpaywallFromEnv?" The email is set by the server environment (UNPAYWALL_EMAIL).":""))+
-    panel("Article screenshots",'<div class="row"><span>Status</span>'+(data.config.screenshots?badge("Active","green"):badge("Not configured","amber"))+'</div>',data.config.screenshots?"Every article's PubMed page is captured and embedded in PDF exports.":"PDF exports include a screenshot of each article once capture is enabled. On the VPS, run: bash /opt/literasift-src/deploy/enable-screenshots.sh")+
+    panel("Article screenshots",'<div class="row"><span>Status</span>'+(data.config.screenshots?badge("Active","green"):badge("Not configured","amber"))+'</div>',data.config.screenshots?"A snapshot of each article's PubMed record (title, authors, abstract, MeSH, status) is rendered and embedded in PDF exports.":"PDF exports include a screenshot of each article once capture is enabled. On the VPS, run: bash /opt/literasift-src/deploy/enable-screenshots.sh")+
     panel("Extraction sources",['PubMed (E-utilities): citations, abstracts, authors, MeSH terms','PubMed Central open-access bucket: full text under open licences','Europe PMC: abstracts, keywords, citation counts, full-text XML for open-licensed articles','OpenAlex: citation counts, topics, abstract fallback','Crossref and PubMed: retraction notices','Unpaywall: open-access status and PDF fallback'].map(t=>'<div class="row"><span>'+esc(t)+'</span>'+badge("On","green")+'</div>').join("")+
       '<div class="row"><span>GROBID: structured text from PDFs (self-hosted, optional)</span>'+(data.config.grobid?badge("On","green"):badge("Not configured","amber"))+'</div>',"All sources are free and open; none needs an account. Full text is stored only when its licence allows it. Key passages are sentences mentioning the molecule and a safety term.")+
     panel("What Unpaywall adds across the site",'<div class="row"><span>Overview</span><span class="sub">Open-access share and breakdown</span></div><div class="row"><span>Queues</span><span class="sub">OA badge on every citation and an access filter</span></div><div class="row"><span>Full text</span><span class="sub">Fallback when PubMed Central has no eligible copy</span></div><div class="row"><span>CSV export</span><span class="sub">OA status, licence and link columns</span></div>');

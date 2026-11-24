@@ -56,7 +56,7 @@ On the VPS, run once (as root): `curl -fsSL https://raw.githubusercontent.com/sr
 
 ## PDF export with screenshots
 
-"Export PDF" on the queue (current filter) and the "PDF" buttons on Batches and Search & Pull build a document with a cover page and, for each article, its details (PMID, journal, DOI, portfolio, molecules, reviewer, status, retraction/access status) plus a screenshot of its PubMed page. Exports are split into parts of 40 articles. Reviewers can export only their own assignments. The PDF writer is built into the Worker and needs no libraries.
+"Export PDF" on the queue (current filter) and the "PDF" buttons on Batches and Search & Pull build a document with a cover page and, for each article, its details (PMID, journal, DOI, portfolio, molecules, reviewer, status, retraction/access status) plus a snapshot of its PubMed record. Exports are split into parts of 40 articles. Reviewers can export only their own assignments. The PDF writer is built into the Worker and needs no libraries.
 
 Screenshots come from a Browserless-compatible endpoint (`SCREENSHOT_ENDPOINT`/`SCREENSHOT_TOKEN`) or, on the VPS, from a local Chromium: run `bash /opt/literasift-src/deploy/enable-screenshots.sh` once. Articles without a screenshot are exported with a placeholder.
 
@@ -69,3 +69,5 @@ Links are emailed when SMTP is configured in `/etc/literasift.env` (`SMTP_HOST`,
 ## Extraction sources
 
 Abstracts, authors, MeSH terms and citation counts are pulled from PubMed, Europe PMC and OpenAlex; full text from PMC, Europe PMC and Unpaywall (open-licensed only); PDFs can be turned into text by a self-hosted GROBID (`GROBID_URL`). Reviewers see the abstract with the molecule and safety terms highlighted, plus key passages from the full text. See `docs/OPEN_SOURCE.md` for the full list, licences and what was deliberately not integrated.
+
+Screenshots on the VPS are a rendered "record card" built from the stored PubMed data. NCBI answers automated browsers on pubmed.ncbi.nlm.nih.gov with `403 Forbidden`, so scraping the live page is off by default; set `SCREENSHOT_SOURCE=pubmed` to try the live page first (any non-200 response falls back to the card, and an error page is never saved). When no reviewers exist yet, new citations are assigned to the manager.
