@@ -38,11 +38,18 @@ DATA_DIR=/var/lib/literasift
 SESSION_SECRET=$(openssl rand -hex 32)
 RUN_TOKEN=$(openssl rand -hex 32)
 SCHEDULE_MINUTES=60
+PUBLIC_URL=https://$DOMAIN
 # Optional integrations:
 #UNPAYWALL_EMAIL=
 #CROSSREF_EMAIL=
 #SCREENSHOT_ENDPOINT=
 #SCREENSHOT_TOKEN=
+# Optional: email invites and password resets (SMTP over TLS, port 465).
+#SMTP_HOST=
+#SMTP_PORT=465
+#SMTP_USER=
+#SMTP_PASS=
+#MAIL_FROM=LiteraSift <noreply@example.com>
 ENV
 fi
 

@@ -1,10 +1,11 @@
-// Node host for worker/index.js: file storage, cookie sign-in, and an in-process scheduler.
+// Node host for worker/index.js: file storage, accounts (invite / sign-in / password reset), and an in-process scheduler.
 import http from "node:http";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { Readable } from "node:stream";
 import worker from "../worker/index.js";
 import { FileBucket } from "./storage.mjs";
-import { checkPassword, readUsers } from "./users.mjs";
+import { addPendingUser, checkPassword, consumeToken, createToken, peekToken, readUsers, removeUser, setPassword, strongEnough, validEmail } from "./accounts.mjs";
+import { mailConfigured, sendMail } from "./mail.mjs";
 import { makeScreenshotFn } from "./screenshots.mjs";
 
 const e = process.env;
@@ -12,97 +13,189 @@ const port = Number(e.PORT || 8787), dataDir = e.DATA_DIR || "/var/lib/literasif
 const secret = e.SESSION_SECRET || "", runToken = e.RUN_TOKEN || "";
 if (secret.length < 32 || runToken.length < 32) { console.error("SESSION_SECRET and RUN_TOKEN must each be at least 32 characters."); process.exit(1); }
 const secureCookie = e.COOKIE_SECURE !== "false";
+const publicUrl = String(e.PUBLIC_URL || "").replace(/\/+$/, "");
 const env = { BUCKET: new FileBucket(dataDir + "/objects"), RUN_TOKEN: runToken, UNPAYWALL_EMAIL: e.UNPAYWALL_EMAIL, CROSSREF_EMAIL: e.CROSSREF_EMAIL,
-  SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN };
+  SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN, HOST_ACCOUNTS: true };
 
 const screenshotFn = await makeScreenshotFn();
 if (screenshotFn) env.SCREENSHOT_FN = screenshotFn;
 console.log(screenshotFn ? "Local screenshots: on" : "Local screenshots: off (run deploy/enable-screenshots.sh to turn on)");
+console.log(mailConfigured(e) ? "Email: on" : "Email: off (invite and reset links are shown to managers instead)", publicUrl ? "" : "| PUBLIC_URL not set: forgot-password emails are disabled");
 
 const sign = value => createHmac("sha256", secret).update(value).digest("base64url");
-const makeSession = email => { const body = Buffer.from(JSON.stringify({ e: email, x: Date.now() + 7 * 86400000 })).toString("base64url"); return body + "." + sign(body); };
-function sessionEmail(req) {
+const makeSession = (email, v) => { const body = Buffer.from(JSON.stringify({ e: email, v: v || 0, x: Date.now() + 7 * 86400000 })).toString("base64url"); return body + "." + sign(body); };
+function readSession(req) {
   const raw = /(?:^|;\s*)ls=([^;]+)/.exec(req.headers.cookie || "")?.[1] || "";
   const [body, mac] = raw.split(".");
-  if (!body || !mac || mac.length !== sign(body).length || !timingSafeEqual(Buffer.from(mac), Buffer.from(sign(body)))) return "";
-  try { const s = JSON.parse(Buffer.from(body, "base64url").toString()); return s.x > Date.now() ? String(s.e) : ""; } catch { return ""; }
+  if (!body || !mac || mac.length !== sign(body).length || !timingSafeEqual(Buffer.from(mac), Buffer.from(sign(body)))) return null;
+  try { const s = JSON.parse(Buffer.from(body, "base64url").toString()); return s.x > Date.now() ? { email: String(s.e).toLowerCase(), v: s.v || 0 } : null; } catch { return null; }
 }
+const cookieFor = (email, v) => "ls=" + makeSession(email, v) + "; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800" + (secureCookie ? "; Secure" : "");
 const security = { "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
   "Content-Security-Policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; form-action 'self'" };
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-const loginPage = (error = "") => `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · LiteraSift</title><style>
+const html = { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" };
+const json = { "Content-Type": "application/json", "Cache-Control": "no-store" };
+const page = (title, inner) => `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} · LiteraSift</title><style>
 *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#fafafa;color:#09090b;font:14px/1.5 ui-sans-serif,system-ui,sans-serif}
-@media(prefers-color-scheme:dark){body{background:#09090b;color:#fafafa}form{background:#111113!important;border-color:#27272a!important}input{background:#111113!important;border-color:#27272a!important;color:#fafafa}}
-form{width:min(380px,92vw);background:#fff;border:1px solid #e4e4e7;border-radius:12px;padding:28px;display:grid;gap:14px}h1{margin:0;font-size:20px;letter-spacing:-.02em}p{margin:0;color:#71717a}
+@media(prefers-color-scheme:dark){body{background:#09090b;color:#fafafa}form,.box{background:#111113!important;border-color:#27272a!important}input{background:#111113!important;border-color:#27272a!important;color:#fafafa}}
+form,.box{width:min(380px,92vw);background:#fff;border:1px solid #e4e4e7;border-radius:12px;padding:28px;display:grid;gap:14px}h1{margin:0;font-size:20px;letter-spacing:-.02em}p{margin:0;color:#71717a}
 label{display:grid;gap:5px;font-weight:500}input{padding:9px 10px;border:1px solid #e4e4e7;border-radius:8px;font:inherit}input:focus{outline:2px solid #0f766e55;border-color:#0f766e}
-button{background:#0f766e;color:#fff;border:0;border-radius:8px;padding:10px;font:inherit;font-weight:600;cursor:pointer}.err{color:#dc2626}</style>
-<form method="post" action="/login"><h1>LiteraSift</h1><p>Sign in to continue.</p>${error ? `<p class="err" role="alert">${esc(error)}</p>` : ""}
-<label>Email<input name="email" type="email" autocomplete="username" required autofocus></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button>Sign in</button></form></html>`;
+button{background:#0f766e;color:#fff;border:0;border-radius:8px;padding:10px;font:inherit;font-weight:600;cursor:pointer}.err{color:#dc2626}.ok{color:#15803d}a{color:#0f766e}small{color:#71717a}</style>${inner}</html>`;
+const loginPage = (error = "", notice = "") => page("Sign in", `<form method="post" action="/login"><h1>LiteraSift</h1><p>Sign in to continue.</p>${error ? `<p class="err" role="alert">${esc(error)}</p>` : ""}${notice ? `<p class="ok" role="status">${esc(notice)}</p>` : ""}
+<label>Email<input name="email" type="email" autocomplete="username" required autofocus></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button>Sign in</button><small><a href="/forgot">Forgot your password?</a></small></form>`);
+const forgotPage = (message = "") => page("Reset password", `<form method="post" action="/forgot"><h1>Reset your password</h1><p>Enter your account email and we'll send a reset link.</p>${message ? `<p class="ok" role="status">${esc(message)}</p>` : ""}
+<label>Email<input name="email" type="email" autocomplete="username" required autofocus></label><button>Send reset link</button><small><a href="/login">Back to sign in</a></small></form>`);
+const resetPage = (token, invite, error = "") => page(invite ? "Set your password" : "Choose a new password", `<form method="post" action="/reset"><h1>${invite ? "Welcome to LiteraSift" : "Choose a new password"}</h1><p>${invite ? "Set a password to finish creating your account." : "Pick a new password for your account."} Use at least 12 characters.</p>${error ? `<p class="err" role="alert">${esc(error)}</p>` : ""}
+<input type="hidden" name="token" value="${esc(token)}"><label>New password<input name="password" type="password" autocomplete="new-password" minlength="12" required autofocus></label><label>Confirm password<input name="confirm" type="password" autocomplete="new-password" minlength="12" required></label><button>${invite ? "Create account" : "Save password"}</button></form>`);
+const invalidLink = () => page("Link expired", `<div class="box"><h1>This link has expired</h1><p>Request a new one with "Forgot your password?", or ask a manager to send you another.</p><a href="/forgot">Reset your password</a></div>`);
 
 const failures = new Map();
-const blocked = key => (failures.get(key) || []).filter(t => t > Date.now() - 900000).length >= 8;
+const blocked = (key, limit = 8) => (failures.get(key) || []).filter(t => t > Date.now() - 900000).length >= limit;
 const fail = key => failures.set(key, [...(failures.get(key) || []).filter(t => t > Date.now() - 900000), Date.now()]);
 async function readBody(req, limit = 2_000_000) {
   const chunks = []; let size = 0;
   for await (const chunk of req) { size += chunk.length; if (size > limit) throw Object.assign(new Error("Request too large."), { status: 413 }); chunks.push(chunk); }
   return Buffer.concat(chunks);
 }
-function send(res, status, body, headers = {}) { res.writeHead(status, { ...security, ...headers }); res.end(body); }
+const send = (res, status, body, headers = {}) => { res.writeHead(status, { ...security, ...headers }); res.end(body); };
+const reply = (res, status, data) => send(res, status, JSON.stringify(data), json);
+const asWorker = (email, path, method = "GET", body) => worker.fetch(new Request("http://localhost" + path, { method, headers: { "oai-authenticated-user-email": email, "Content-Type": "application/json" }, body }), env);
+
+async function sendAccountMail(kind, to, link, inviter) {
+  const text = kind === "invite"
+    ? `${inviter || "A LiteraSift manager"} invited you to LiteraSift, the literature screening workspace.\n\nSet your password and sign in:\n${link}\n\nThis link works once and expires in 7 days.\n`
+    : `Someone asked to reset the password for this LiteraSift account.\n\nChoose a new password:\n${link}\n\nThis link works once and expires in 1 hour. If you didn't ask for it, you can ignore this email.\n`;
+  await sendMail(e, { to, subject: kind === "invite" ? "You're invited to LiteraSift" : "Reset your LiteraSift password", text });
+}
 
 async function handler(req, res) {
   const url = new URL(req.url, "http://localhost"), path = url.pathname;
   if (path === "/healthz") return send(res, 200, "ok", { "Content-Type": "text/plain" });
   const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
-  if (path === "/login" && req.method === "GET") return send(res, 200, loginPage(), { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+  const form = async () => new URLSearchParams((await readBody(req, 10000)).toString());
+
+  if (path === "/login" && req.method === "GET") return send(res, 200, loginPage("", url.searchParams.get("done") ? "Password saved. Sign in with your new password." : ""), html);
   if (path === "/login" && req.method === "POST") {
-    const form = new URLSearchParams((await readBody(req, 10000)).toString());
-    const email = String(form.get("email") || "").trim().toLowerCase(), password = String(form.get("password") || "");
+    const f = await form(), email = String(f.get("email") || "").trim().toLowerCase(), password = String(f.get("password") || "");
     const keys = ["ip:" + ip, "email:" + email];
-    if (keys.some(blocked)) return send(res, 429, loginPage("Too many attempts. Try again in 15 minutes."), { "Content-Type": "text/html; charset=utf-8" });
+    if (keys.some(k => blocked(k))) return send(res, 429, loginPage("Too many attempts. Try again in 15 minutes."), html);
     const users = await readUsers();
-    if (!(await checkPassword(Object.hasOwn(users, email) ? users[email] : null, password))) {
-      keys.forEach(fail);
-      return send(res, 401, loginPage("Incorrect email or password."), { "Content-Type": "text/html; charset=utf-8" });
-    }
-    return send(res, 303, "", { Location: "/", "Set-Cookie": "ls=" + makeSession(email) + "; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800" + (secureCookie ? "; Secure" : "") });
+    if (!(await checkPassword(Object.hasOwn(users, email) ? users[email] : null, password))) { keys.forEach(fail); return send(res, 401, loginPage("Incorrect email or password."), html); }
+    return send(res, 303, "", { Location: "/", "Set-Cookie": cookieFor(email, users[email].v) });
   }
   if (path === "/logout" && req.method === "POST") return send(res, 303, "", { Location: "/login", "Set-Cookie": "ls=; HttpOnly; Path=/; Max-Age=0" });
 
+  // Password recovery: always answers the same way so it cannot be used to discover which emails have accounts.
+  if (path === "/forgot" && req.method === "GET") return send(res, 200, forgotPage(), html);
+  if (path === "/forgot" && req.method === "POST") {
+    const email = String((await form()).get("email") || "").trim().toLowerCase();
+    const keys = ["forgot-ip:" + ip, "forgot-email:" + email];
+    const message = mailConfigured(e) && publicUrl ? "If that email has an account, a reset link is on its way. It expires in 1 hour."
+      : "Email isn't set up on this server yet. Ask a manager to send you a reset link.";
+    if (keys.some(k => blocked(k, 5)) || !validEmail(email)) return send(res, 200, forgotPage(message), html);
+    keys.forEach(fail);
+    const users = await readUsers();
+    if (Object.hasOwn(users, email) && mailConfigured(e) && publicUrl) {
+      try { await sendAccountMail("reset", email, publicUrl + "/reset?token=" + await createToken(email, "reset")); } catch (error) { console.error("Reset email failed:", error.message); }
+    }
+    return send(res, 200, forgotPage(message), html);
+  }
+  if (path === "/reset" && req.method === "GET") {
+    const token = url.searchParams.get("token") || "", t = await peekToken(token);
+    return t ? send(res, 200, resetPage(token, t.type === "invite"), html) : send(res, 400, invalidLink(), html);
+  }
+  if (path === "/reset" && req.method === "POST") {
+    const f = await form(), token = String(f.get("token") || ""), password = String(f.get("password") || "");
+    if (blocked("reset-ip:" + ip, 20)) return send(res, 429, invalidLink(), html);
+    fail("reset-ip:" + ip);
+    const t = await peekToken(token);
+    if (!t) return send(res, 400, invalidLink(), html);
+    if (password !== String(f.get("confirm") || "")) return send(res, 400, resetPage(token, t.type === "invite", "The passwords don't match."), html);
+    if (!strongEnough(password, t.email)) return send(res, 400, resetPage(token, t.type === "invite", "Use at least 12 characters, and not your email address."), html);
+    const used = await consumeToken(token);
+    if (!used) return send(res, 400, invalidLink(), html);
+    await setPassword(used.email)(password);
+    return send(res, 303, "", { Location: "/login?done=1" });
+  }
+
   const bearer = Boolean(req.headers.authorization) && req.headers.authorization === "Bearer " + runToken;
   const users = await readUsers();
-  const email = sessionEmail(req).toLowerCase();
-  const signedIn = Boolean(email) && Object.hasOwn(users, email);
+  const session = readSession(req);
+  const signedIn = Boolean(session) && Object.hasOwn(users, session.email) && Boolean(users[session.email].hash) && (users[session.email].v || 0) === session.v;
+  const email = signedIn ? session.email : "";
   const service = bearer && (path === "/api/scheduled" || path === "/mcp");
   if (!signedIn && !service) {
-    if (path.startsWith("/api/") || path === "/mcp") return send(res, 401, JSON.stringify({ error: "Sign-in required." }), { "Content-Type": "application/json" });
+    if (path.startsWith("/api/") || path.startsWith("/host/") || path === "/mcp") return reply(res, 401, { error: "Sign-in required." });
     return send(res, 303, "", { Location: "/login" });
   }
+  const sameOrigin = () => { const origin = req.headers.origin; return Boolean(origin) && new URL(origin).host === req.headers.host; };
+  if (signedIn && req.method !== "GET" && req.method !== "HEAD" && !sameOrigin()) return reply(res, 403, { error: "Cross-site request blocked." });
+
+  if (path.startsWith("/host/")) {
+    if (!signedIn) return reply(res, 401, { error: "Sign-in required." });
+    const body = req.method === "POST" ? JSON.parse((await readBody(req, 20000)).toString() || "{}") : {};
+    if (path === "/host/change-password" && req.method === "POST") {
+      if (blocked("pw-" + email, 5)) return reply(res, 429, { error: "Too many attempts. Try again later." });
+      if (!(await checkPassword(users[email], String(body.current || "")))) { fail("pw-" + email); return reply(res, 400, { error: "Your current password is incorrect." }); }
+      if (!strongEnough(body.next, email)) return reply(res, 400, { error: "Use at least 12 characters, and not your email address." });
+      await setPassword(email)(String(body.next));
+      return send(res, 200, JSON.stringify({ ok: true }), { ...json, "Set-Cookie": cookieFor(email, (await readUsers())[email].v) });
+    }
+    const state = await (await asWorker(email, "/api/state")).json();
+    if (state.viewer?.role !== "manager") return reply(res, 403, { error: "Manager access required." });
+    const origin = req.headers.origin || "", base = publicUrl || origin;
+    const deliver = async (kind, to) => {
+      const link = base + "/reset?token=" + await createToken(to, kind === "invite" ? "invite" : "reset");
+      if (!mailConfigured(e)) return { emailed: false, link };
+      try { await sendAccountMail(kind, to, link, state.viewer.name); return { emailed: true }; }
+      catch (error) { console.error("Email failed:", error.message); return { emailed: false, link, mailError: "The email could not be sent." }; }
+    };
+    if (path === "/host/users" && req.method === "GET") {
+      const out = {}; for (const [address, u] of Object.entries(users)) out[address] = u.hash ? "active" : "invited";
+      return reply(res, 200, { users: out, mail: mailConfigured(e) });
+    }
+    const target = String(body.email || "").trim().toLowerCase();
+    if (path === "/host/invite" && req.method === "POST") {
+      if (!validEmail(target)) return reply(res, 400, { error: "Enter a valid email address." });
+      const profile = await asWorker(email, "/api/profile", "POST", JSON.stringify({ ...body, email: target }));
+      if (!profile.ok) return reply(res, profile.status, await profile.json().catch(() => ({ error: "Could not save the profile." })));
+      if (Object.hasOwn(users, target) && users[target].hash) return reply(res, 200, { ok: true, existing: true });
+      await addPendingUser(target);
+      return reply(res, 200, { ok: true, ...(await deliver("invite", target)) });
+    }
+    if (path === "/host/reset-link" && req.method === "POST") {
+      if (!Object.hasOwn(users, target) || target === email) return reply(res, 400, { error: "Choose another user's account." });
+      return reply(res, 200, { ok: true, ...(await deliver(users[target].hash ? "reset" : "invite", target)) });
+    }
+    if (path === "/host/revoke" && req.method === "POST") {
+      if (!Object.hasOwn(users, target) || target === email) return reply(res, 400, { error: "Choose another user's account." });
+      await removeUser(target);
+      return reply(res, 200, { ok: true });
+    }
+    return reply(res, 404, { error: "Route unavailable." });
+  }
+
   const headers = new Headers();
   for (const [name, value] of Object.entries(req.headers)) {
     if (["host", "connection", "content-length", "transfer-encoding", "cookie", "oai-authenticated-user-email"].includes(name) || Array.isArray(value)) continue;
     headers.set(name, value);
   }
-  if (signedIn) {
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      const origin = req.headers.origin;
-      if (!origin || new URL(origin).host !== req.headers.host) return send(res, 403, JSON.stringify({ error: "Cross-site request blocked." }), { "Content-Type": "application/json" });
-    }
-    headers.set("oai-authenticated-user-email", email);
-  }
+  if (signedIn) headers.set("oai-authenticated-user-email", email);
   const body = req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req);
   const response = await worker.fetch(new Request(new URL(req.url, "http://localhost"), { method: req.method, headers, body }), env);
   const out = {}; response.headers.forEach((v, k) => { out[k] = v; });
   if (out["content-type"]?.startsWith("text/html")) {
-    const page = (await response.text()).replace('<div class="spacer"></div>', '<div class="spacer"></div><form method="post" action="/logout" style="margin:0 10px 10px"><button class="btn outline sm" style="width:100%">Sign out</button></form>');
+    const doc = (await response.text()).replace('<div class="spacer"></div>', '<div class="spacer"></div><form method="post" action="/logout" style="margin:0 10px 10px"><button class="btn outline sm" style="width:100%">Sign out</button></form>');
     delete out["content-length"];
-    return send(res, response.status, page, out);
+    return send(res, response.status, doc, out);
   }
   res.writeHead(response.status, { ...security, ...out });
   if (!response.body) return res.end();
   Readable.fromWeb(response.body).pipe(res);
 }
 http.createServer((req, res) => handler(req, res).catch(error => {
-  if (!res.headersSent) send(res, error.status || 500, JSON.stringify({ error: error.status ? error.message : "Server error." }), { "Content-Type": "application/json" });
+  if (!res.headersSent) send(res, error.status || 500, JSON.stringify({ error: error.status ? error.message : "Server error." }), json);
   else res.end();
   if (!error.status) console.error(error);
 })).listen(port, e.HOST || "127.0.0.1", () => console.log("LiteraSift listening on " + (e.HOST || "127.0.0.1") + ":" + port));

@@ -59,3 +59,9 @@ On the VPS, run once (as root): `curl -fsSL https://raw.githubusercontent.com/sr
 "Export PDF" on the queue (current filter) and the "PDF" buttons on Batches and Search & Pull build a document with a cover page and, for each article, its details (PMID, journal, DOI, portfolio, molecules, reviewer, status, retraction/access status) plus a screenshot of its PubMed page. Exports are split into parts of 40 articles. Reviewers can export only their own assignments. The PDF writer is built into the Worker and needs no libraries.
 
 Screenshots come from a Browserless-compatible endpoint (`SCREENSHOT_ENDPOINT`/`SCREENSHOT_TOKEN`) or, on the VPS, from a local Chromium: run `bash /opt/literasift-src/deploy/enable-screenshots.sh` once. Articles without a screenshot are exported with a placeholder.
+
+## Accounts and password recovery (VPS)
+
+Managers add reviewers on the Team tab ("Save and invite"). The reviewer gets a single-use link (valid 7 days) to set their own password; there is no need to share passwords. Every user can change their password on the Account tab, and anyone can use "Forgot your password?" on the sign-in page (link valid 1 hour, always answered the same way so accounts cannot be discovered). Resetting or changing a password signs out every other session. Managers can also send a new link or revoke a user's sign-in.
+
+Links are emailed when SMTP is configured in `/etc/literasift.env` (`SMTP_HOST`, `SMTP_PORT` (465, implicit TLS), `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM`) and `PUBLIC_URL` is set; otherwise the manager is shown the link to send themselves, and the sign-in page's reset form says to ask a manager. Passwords need at least 12 characters and are stored as scrypt hashes. `literasift-user` still works for the first account or recovery from the server.

@@ -424,7 +424,7 @@ async function api(request, env, path) {
   if (!viewer && !service) return json({ error:"Your account needs a Literature Bench profile." }, 403);
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email);
-    return json({ viewer, config:{ screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+    return json({ viewer, config:{ accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -617,6 +617,7 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 <div><div class="top"><div><h1 id="heading">LiteraSift</h1><p id="subhead"></p></div><button class="btn outline icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button></div>
 <main id="content"><div class="skel"></div><div class="skel"></div><div class="skel"></div></main></div></div>
 <div id="toast" role="status"></div>
+<dialog id="linkdlg"><h2 id="linktitle"></h2><p id="linknote" class="sub"></p><div style="display:grid;gap:12px"><input id="linkvalue" readonly aria-label="Link"><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" id="linkcopy">Copy link</button><button type="button" class="btn outline" id="linkshare">Share…</button><button type="button" class="btn outline" id="linkclose">Done</button></div></div></dialog>
 <dialog id="dialog"><h2>Screen citation</h2><p id="citation" class="sub"></p><form id="review"><label>Status<select name="status"><option>Pending</option><option>In review</option><option>Full text needed</option><option>Complete</option></select></label><label>Decision notes<textarea name="note" rows="4"></textarea></label><div style="display:flex;gap:8px"><button class="btn">Save decision</button><button type="button" class="btn outline" id="close">Cancel</button></div></form></dialog>
 <script>
 const $ = id => document.getElementById(id);
@@ -629,12 +630,13 @@ const paths = {
   Batches:'<path d="m12 3 9 5-9 5-9-5 9-5z"/><path d="m3 13 9 5 9-5"/>',
   Watchlists:'<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   Settings:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  Account:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
   Team:'<circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0M17 4a4 4 0 0 1 0 8M22 21a7 7 0 0 0-4-6"/>',
   moon:'<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>', sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks."};
+const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -657,7 +659,7 @@ const oaGroup=a=>!a.oaCheckedAt?"unchecked":a.oaIsOpen?"open":"closed";
 let toastTimer;
 const message = (value, error=false) => { const t=$("toast"); t.textContent=value; t.className="show"+(error?" err":""); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.className="",error?6000:2800); };
 async function api(route, body) {
-  const res = await fetch("/api/"+route, body === undefined ? {} : {
+  const res = await fetch(route.startsWith("/")?route:"/api/"+route, body === undefined ? {} : {
     method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)
   });
   const result = await res.json();
@@ -708,7 +710,7 @@ function applyFilter(items){
 function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=manager?["Overview","Search & Pull","My Queue","All Assignments","Batches","Watchlists","Team","Settings"]:["My Queue"];
+  const tabs=(manager?["Overview","Search & Pull","My Queue","All Assignments","Batches","Watchlists","Team","Settings"]:["My Queue"]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
   const open=mine.filter(a=>a.status!=="Complete").length;
@@ -752,8 +754,22 @@ function render() {
       "Unpaywall requires a contact email on each request; it is sent to Unpaywall only. Every article with a DOI gets an open-access status (gold, hybrid, green, bronze or closed). Permissively licensed PDFs are stored, other open copies are linked. Closed articles are re-checked every 30 days."+(data.config.unpaywallFromEnv?" The email is set by the server environment (UNPAYWALL_EMAIL).":""))+
     panel("Article screenshots",'<div class="row"><span>Status</span>'+(data.config.screenshots?badge("Active","green"):badge("Not configured","amber"))+'</div>',data.config.screenshots?"Every article's PubMed page is captured and embedded in PDF exports.":"PDF exports include a screenshot of each article once capture is enabled. On the VPS, run: bash /opt/literasift-src/deploy/enable-screenshots.sh")+
     panel("What Unpaywall adds across the site",'<div class="row"><span>Overview</span><span class="sub">Open-access share and breakdown</span></div><div class="row"><span>Queues</span><span class="sub">OA badge on every citation and an access filter</span></div><div class="row"><span>Full text</span><span class="sub">Fallback when PubMed Central has no eligible copy</span></div><div class="row"><span>CSV export</span><span class="sub">OA status, licence and link columns</span></div>');
-  if(tab==="Team") html=panel("Add or update a reviewer",'<form class="grid" data-route="profile"><label>Name<input name="name" required></label><label>Sign-in email<input type="email" name="email" required></label><label>Portfolio<input name="portfolio" placeholder="All portfolios"></label><label>Open assignment limit<input type="number" name="capacity" min="1" max="500" value="25" required></label><label>Availability<select name="active"><option value="true">Active</option><option value="false">Unavailable</option></select></label><div><button class="btn">Save reviewer</button></div></form>')+
-    panel("Reviewers",table(["Name","Email","Role","Portfolio","Open"],data.profiles.map(p=>[esc(p.name),esc(p.email),badge(p.role,p.role==="manager"?"blue":""),esc(p.portfolio||"All"),items.filter(a=>a.reviewer===p.email&&a.status!=="Complete").length]),"No profiles."),"",true);
+  if(tab==="Account") html=panel("Change password",'<form class="grid" data-route="/host/change-password"><label>Current password<input type="password" name="current" autocomplete="current-password" required></label><label>New password<input type="password" name="next" autocomplete="new-password" minlength="12" required></label><label>Confirm new password<input type="password" name="confirm" autocomplete="new-password" minlength="12" required></label><div><button class="btn">Change password</button></div></form>',"At least 12 characters. Changing it signs you out everywhere else.")+
+    panel("Your account",'<div class="row"><span>Name</span><b>'+esc(data.viewer.name)+'</b></div><div class="row"><span>Email</span><b>'+esc(data.viewer.email)+'</b></div><div class="row"><span>Role</span>'+badge(data.viewer.role,data.viewer.role==="manager"?"blue":"")+'</div>');
+  if(tab==="Team"){
+    const hosted=data.config.accounts, accts=data.accounts.users;
+    html=panel(hosted?"Invite or update a reviewer":"Add or update a reviewer",'<form class="grid" data-route="'+(hosted?"/host/invite":"profile")+'"><label>Name<input name="name" required></label><label>Sign-in email<input type="email" name="email" required></label><label>Portfolio<input name="portfolio" placeholder="All portfolios"></label><label>Open assignment limit<input type="number" name="capacity" min="1" max="500" value="25" required></label><label>Availability<select name="active"><option value="true">Active</option><option value="false">Unavailable</option></select></label><div><button class="btn">'+(hosted?"Save and invite":"Save reviewer")+'</button></div></form>',
+        hosted?(data.accounts.mail?"New reviewers get an email with a link to set their password.":"Email delivery isn't configured, so you'll be shown a link to send to each new reviewer yourself."):"")+
+      panel("Team",table(hosted?["Name","Email","Role","Portfolio","Open","Sign-in",""]:["Name","Email","Role","Portfolio","Open"],data.profiles.map(p=>{
+        const row=[esc(p.name),esc(p.email),badge(p.role,p.role==="manager"?"blue":""),esc(p.portfolio||"All"),items.filter(a=>a.reviewer===p.email&&a.status!=="Complete").length];
+        if(hosted){
+          const st=accts[p.email];
+          row.push(st==="active"?badge("Active","green"):st==="invited"?badge("Invited","amber"):badge("No account"));
+          row.push(p.email===data.viewer.email?"":'<button class="btn outline sm" data-resetlink="'+esc(p.email)+'">'+(st==="active"?"Reset password":"Send invite")+'</button> '+(st?'<button class="btn outline sm" data-revoke="'+esc(p.email)+'">Revoke</button>':""));
+        }
+        return row;
+      }),"No profiles."),"",true);
+  }
   if(tab==="Batches") html=panel("Backfill a date range",watchOptions?
     '<form class="grid" data-route="import"><label>Watchlist<select name="watch">'+watchOptions+'</select></label><label>From<input name="from" type="date" required></label><label>Through<input name="to" type="date" required></label><div><button class="btn">Import citations</button></div></form>':
     '<div class="empty">Save a watchlist before importing a batch.</div>')+
@@ -772,7 +788,16 @@ function animate(){
   });
   requestAnimationFrame(()=>document.querySelectorAll("[data-width]").forEach(el=>el.style.width=el.dataset.width+"%"));
 }
-async function refresh(){data=await api("state");render();}
+async function refresh(){
+  data=await api("state");
+  data.accounts={users:{},mail:false};
+  if(data.config.accounts&&data.viewer.role==="manager")data.accounts=await api("/host/users").catch(()=>data.accounts);
+  render();
+}
+function showLink(title,note,link){
+  $("linktitle").textContent=title;$("linknote").textContent=note;$("linkvalue").value=link;
+  $("linkshare").style.display=navigator.share?"":"none";$("linkdlg").showModal();$("linkvalue").select();
+}
 function download(id) {
   const run=data.runs.find(r=>r.id===id);
   const cell=value=>'"'+String(value??"").replace(/^[=+@\\-]/,"'$&").replaceAll('"','""')+'"';
@@ -799,8 +824,22 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun]");
+  const target=event.target.closest("[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-resetlink],[data-revoke]");
   if(!target)return;
+  if(target.dataset.resetlink){
+    target.disabled=true;
+    api("/host/reset-link",{email:target.dataset.resetlink}).then(async r=>{
+      if(r.emailed)message("Email sent to "+target.dataset.resetlink+".");
+      else showLink("Link for "+target.dataset.resetlink,(r.mailError?r.mailError+" ":"")+"Send this link to them yourself. It works once.",r.link);
+      await refresh();
+    }).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    return;
+  }
+  if(target.dataset.revoke){
+    if(!confirm("Remove sign-in access for "+target.dataset.revoke+"? Their assignments stay."))return;
+    api("/host/revoke",{email:target.dataset.revoke}).then(()=>{message("Access revoked.");return refresh();}).catch(e=>message(e.message,true));
+    return;
+  }
   if(target.dataset.pdf||target.dataset.pdfrun){
     const run=target.dataset.pdfrun&&data.runs.find(r=>r.id===target.dataset.pdfrun);
     const mine=new Set(data.assignments.map(a=>a.pmid));
@@ -821,6 +860,9 @@ document.addEventListener("click",event=>{
   }
 });
 $("close").onclick=()=>$("dialog").close();
+$("linkclose").onclick=()=>$("linkdlg").close();
+$("linkcopy").onclick=async()=>{try{await navigator.clipboard.writeText($("linkvalue").value);message("Link copied.");}catch{$("linkvalue").select();message("Press and hold the link to copy it.");}};
+$("linkshare").onclick=()=>navigator.share({title:"LiteraSift",url:$("linkvalue").value}).catch(()=>{});
 document.addEventListener("submit",async event=>{
   event.preventDefault();
   const form=event.target, button=form.querySelector("button");
@@ -832,9 +874,15 @@ document.addEventListener("submit",async event=>{
     body.safetyOnly=body.safety==="on";
     body.rows=body.list.split(/\\r?\\n/).map(line=>line.split(/[,;\\t]/).map(x=>x.trim()).filter(Boolean)).filter(n=>n.length).map(n=>({molecule:n[0],synonyms:n.slice(1)}));
   }
+  if(route==="/host/change-password"){
+    if(body.next!==body.confirm){message("The new passwords don't match.",true);return;}
+    delete body.confirm;
+  }
   button.disabled=true;message(route==="import"||route==="pull"?"Retrieving PubMed citations…":"Saving…");
   try {const result=await api(route,body);if(route==="review")$("dialog").close();await refresh();
-    message(route==="recheck-access"?"Open-access check queued for all articles.":route==="import"?"Batch imported.":route==="pull"?result.count+" articles pulled for "+(result.molecule||result.portfolio)+".":route==="watches"?result.created+" molecule watchlists saved."+(result.skipped.length?" Skipped (invalid or too long): "+result.skipped.join(", "):""):"Saved.");}
+    if(route==="/host/invite"&&result.link)showLink("Invite link for "+body.email,(result.mailError?result.mailError+" ":"Email isn't configured. ")+"Send this link to them yourself. It works once and expires in 7 days.",result.link);
+    if(route==="/host/change-password")form.reset();
+    message(route==="/host/invite"?(result.existing?"Profile updated.":result.emailed?"Invite emailed to "+body.email+".":"Profile saved."):route==="/host/change-password"?"Password changed.":route==="recheck-access"?"Open-access check queued for all articles.":route==="import"?"Batch imported.":route==="pull"?result.count+" articles pulled for "+(result.molecule||result.portfolio)+".":route==="watches"?result.created+" molecule watchlists saved."+(result.skipped.length?" Skipped (invalid or too long): "+result.skipped.join(", "):""):"Saved.");}
   catch(error){message(error.message,true);if(route==="review")$("dialog").close();if(route==="import"||route==="pull")await refresh().catch(()=>{});}
   finally{button.disabled=false;}
 });

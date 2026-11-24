@@ -22,6 +22,21 @@ CONF
 mkdir -p /root/.ssh && chmod 700 /root/.ssh
 [ -f /root/.ssh/literasift_deploy ] || ssh-keygen -q -t ed25519 -N '' -C literasift-vps -f /root/.ssh/literasift_deploy
 
+# Public address used in emailed links, and placeholders for optional email delivery.
+DOMAIN="${DOMAIN:-literasift.tech}"
+if [ -f /etc/literasift.env ]; then
+  grep -q '^PUBLIC_URL=' /etc/literasift.env || echo "PUBLIC_URL=https://$DOMAIN" >> /etc/literasift.env
+  grep -q 'SMTP_HOST' /etc/literasift.env || cat >> /etc/literasift.env <<'ENVMAIL'
+# Optional: email invites and password resets (SMTP over TLS, port 465). Without these, managers are shown links to share.
+#SMTP_HOST=smtp.example.com
+#SMTP_PORT=465
+#SMTP_USER=
+#SMTP_PASS=
+#MAIL_FROM=LiteraSift <noreply@example.com>
+ENVMAIL
+  systemctl restart literasift 2>/dev/null || true
+fi
+
 cat > /usr/local/bin/literasift-update <<'UPD'
 #!/usr/bin/env bash
 # Deploys the latest commit of the configured branch. Safe to run any time: it does nothing if already current,
