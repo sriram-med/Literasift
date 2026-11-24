@@ -65,6 +65,9 @@ async function importWatch(env, watch, from, to) {
         pubmedRetracted:(citation.pubtype || []).includes("Retracted Publication"),
         url:"https://pubmed.ncbi.nlm.nih.gov/" + id + "/" };
     }
+    await new Promise(resolve => setTimeout(resolve, 350));
+    const details = await fetchPubmedDetails(ids).catch(() => ({}));
+    for (const id of ids) if (details[id]) Object.assign(articles[id], details[id], { abstractSource:details[id].abstract ? "PubMed" : "", abstractCheckedAt:new Date().toISOString() });
   }
   return write(env, state => {
     for (const [id, article] of Object.entries(articles)) state.articles[id] = { ...state.articles[id], ...article };
@@ -126,10 +129,124 @@ async function captureFromPmc(env, article) {
   const file = filename + "." + format;
   const url = pmcOrigin + "/" + filename + "/" + file;
   const response = await fetch(url, {signal:AbortSignal.timeout(25000)});
-  if (!response.ok || !response.body) throw new Error("PMC file returned HTTP " + response.status);
+  if (!response.ok) throw new Error("PMC file returned HTTP " + response.status);
+  const bytes = await response.arrayBuffer();
   const key = "evidence/" + article.id + "/" + file;
-  await env.BUCKET.put(key, response.body, {httpMetadata:{contentType:format === "pdf" ? "application/pdf" : "application/xml"}});
-  return {fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:item.license_code, fullTextSource:url, fullTextOrigin:"PMC"};
+  await env.BUCKET.put(key, bytes, {httpMetadata:{contentType:format === "pdf" ? "application/pdf" : "application/xml"}});
+  let text = "";
+  try { text = format === "pdf" ? await pdfToText(env, bytes) : xmlToText(new TextDecoder().decode(bytes)); } catch { /* text extraction is best effort */ }
+  return {fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:item.license_code, fullTextSource:url, fullTextOrigin:"PMC", _text:text};
+}
+// ---- Extraction: abstracts/metadata (PubMed, Europe PMC, OpenAlex), full-text text + key passages, optional GROBID for PDFs ----
+const safetyTerms = ["adverse","toxicity","toxic","hepatotoxic","nephrotoxic","cardiotoxic","neurotoxic","death","fatal","overdose","reaction","syndrome","injury",
+  "failure","hypersensitivity","anaphyla","rash","pregnan","withdrawal","contraindicat","interaction","side effect","safety","harm","hospitali","discontinu","serious"];
+const decodeXml = value => String(value || "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+  .replace(/&#(\d+);/g, (m, n) => String.fromCodePoint(Number(n))).replace(/&#x([0-9a-f]+);/gi, (m, n) => String.fromCodePoint(parseInt(n, 16))).replace(/&amp;/g, "&");
+const xmlText = value => decodeXml(String(value || "").replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+function parsePubmedXml(xml) {
+  const out = {};
+  for (const block of xml.split("<PubmedArticle>").slice(1)) {
+    const pmid = /<PMID[^>]*>(\d+)<\/PMID>/.exec(block)?.[1];
+    if (!pmid) continue;
+    const abstract = [...block.matchAll(/<AbstractText([^>]*)>([\s\S]*?)<\/AbstractText>/g)]
+      .map(m => { const label = /Label="([^"]*)"/.exec(m[1])?.[1]; return (label ? label + ": " : "") + xmlText(m[2]); }).filter(Boolean).join("\n");
+    const authors = [...block.matchAll(/<Author[ >][\s\S]*?<\/Author>/g)].map(m => {
+      const last = /<LastName>([^<]*)</.exec(m[0])?.[1], initials = /<Initials>([^<]*)</.exec(m[0])?.[1], group = /<CollectiveName>([^<]*)</.exec(m[0])?.[1];
+      return xmlText(group || [last, initials].filter(Boolean).join(" "));
+    }).filter(Boolean).slice(0, 12);
+    const list = re => [...block.matchAll(re)].map(m => xmlText(m[1])).filter(Boolean);
+    out[pmid] = { abstract, authors, meshTerms:[...new Set(list(/<DescriptorName[^>]*>([^<]+)</g))].slice(0, 30),
+      keywords:[...new Set(list(/<Keyword[^>]*>([\s\S]*?)<\/Keyword>/g))].slice(0, 20), pubTypes:[...new Set(list(/<PublicationType[^>]*>([^<]+)</g))].slice(0, 8) };
+  }
+  return out;
+}
+async function fetchPubmedDetails(ids) {
+  const url = new URL("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi");
+  url.search = new URLSearchParams({ db:"pubmed", tool:"literature_bench", retmode:"xml", id:ids.join(",") });
+  const response = await fetch(url, { signal:AbortSignal.timeout(25000) });
+  if (!response.ok) throw new Error("PubMed efetch returned HTTP " + response.status);
+  return parsePubmedXml(await response.text());
+}
+const epmcBase = "https://www.ebi.ac.uk/europepmc/webservices/rest";
+async function europePmcCore(article) {
+  const url = new URL(epmcBase + "/search");
+  url.search = new URLSearchParams({ query:"EXT_ID:" + article.id + " AND SRC:MED", resultType:"core", format:"json", pageSize:"1" });
+  const response = await fetch(url, { signal:AbortSignal.timeout(20000) });
+  if (!response.ok) throw new Error("Europe PMC returned HTTP " + response.status);
+  return (await response.json()).resultList?.result?.[0] || null;
+}
+async function openAlexWork(env, article) {
+  const url = new URL("https://api.openalex.org/works/pmid:" + encodeURIComponent(article.id));
+  const mailto = env.CROSSREF_EMAIL || env.UNPAYWALL_EMAIL;
+  if (mailto) url.searchParams.set("mailto", mailto);
+  const response = await fetch(url, { signal:AbortSignal.timeout(20000) });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error("OpenAlex returned HTTP " + response.status);
+  return response.json();
+}
+const invertedToText = index => {
+  const words = [];
+  for (const [word, positions] of Object.entries(index || {})) for (const p of positions) words[p] = word;
+  return words.filter(Boolean).join(" ");
+};
+// One pass of metadata enrichment: abstract, authors, MeSH, keywords, publication types, citations, topic.
+async function enrichMetadata(env, article, coreOnce) {
+  const fields = {}, errors = [];
+  let got = false;
+  try {
+    const details = (await fetchPubmedDetails([article.id]))[article.id];
+    if (details) { got = true; Object.assign(fields, details); if (details.abstract) fields.abstractSource = "PubMed"; }
+  } catch (error) { errors.push(error.message); }
+  const core = await coreOnce();
+  if (core) {
+    got = true;
+    if (!fields.abstract && core.abstractText) { fields.abstract = xmlText(core.abstractText); fields.abstractSource = "Europe PMC"; }
+    if (!fields.keywords?.length && core.keywordList?.keyword) fields.keywords = core.keywordList.keyword.slice(0, 20);
+    if (!fields.meshTerms?.length && core.meshHeadingList?.meshHeading) fields.meshTerms = core.meshHeadingList.meshHeading.map(m => m.descriptorName).filter(Boolean).slice(0, 30);
+    if (core.citedByCount !== undefined) fields.citedBy = Number(core.citedByCount);
+  }
+  try {
+    const work = await openAlexWork(env, article);
+    if (work) {
+      got = true;
+      if (work.cited_by_count !== undefined) fields.citedBy = Math.max(fields.citedBy || 0, Number(work.cited_by_count));
+      fields.topic = work.primary_topic?.display_name || "";
+      fields.workType = work.type || "";
+      const text = invertedToText(work.abstract_inverted_index);
+      if (!fields.abstract && !article.abstract && text) { fields.abstract = text; fields.abstractSource = "OpenAlex"; }
+    }
+  } catch (error) { errors.push(error.message); }
+  if (got) { fields.enrichedAt = new Date().toISOString(); fields.abstractCheckedAt = fields.enrichedAt; }
+  if (errors.length) fields.enrichError = errors.join("; ");
+  return fields;
+}
+// Text of the main sections from JATS (PMC / Europe PMC) or TEI (GROBID) XML.
+function xmlToText(xml) {
+  const cleaned = String(xml).replace(/<xref\b[^>]*>[\s\S]*?<\/xref>/g, "").replace(/<ref\b[^>]*>[\s\S]*?<\/ref>/g, "").replace(/<table-wrap\b[\s\S]*?<\/table-wrap>/g, "");
+  const body = /<body\b[\s\S]*?<\/body>/.exec(cleaned)?.[0] || /<text\b[\s\S]*?<\/text>/.exec(cleaned)?.[0] || "";
+  const abstract = /<abstract\b[\s\S]*?<\/abstract>/.exec(cleaned)?.[0] || "";
+  return [abstract, body].flatMap(part => [...part.matchAll(/<(title|head|p)\b[^>]*>([\s\S]*?)<\/\1>/g)].map(m => xmlText(m[2]))).filter(t => t.length > 1).join("\n").replace(/[ \t]+([.,;:)])/g, "$1");
+}
+function keyPassages(text, molecules) {
+  const names = molecules.map(m => m.toLowerCase()).filter(Boolean);
+  const out = [];
+  for (const sentence of String(text).replace(/[ \t]+/g, " ").split(/(?<=[.!?])\s+(?=[A-Z(])|\n/)) {
+    const lower = sentence.toLowerCase();
+    if ((!names.length || names.some(n => lower.includes(n))) && safetyTerms.some(t => lower.includes(t)) && sentence.length > 30) {
+      out.push(sentence.trim().slice(0, 400));
+      if (out.length >= 6) break;
+    }
+  }
+  return out;
+}
+// Optional GROBID service (Apache-2.0, self-hosted): turns a stored PDF into structured text.
+async function pdfToText(env, bytes) {
+  if (!env.GROBID_URL) return "";
+  const form = new FormData();
+  form.append("input", new Blob([bytes], { type:"application/pdf" }), "article.pdf");
+  const response = await fetch(String(env.GROBID_URL).replace(/\/+$/, "") + "/api/processFulltextDocument", { method:"POST", body:form, signal:AbortSignal.timeout(120000) });
+  if (!response.ok) throw new Error("GROBID returned HTTP " + response.status);
+  return xmlToText(await response.text());
 }
 // Unpaywall: one lookup per article gives open-access status for the whole site and, where the licence allows, a stored PDF.
 const openLicenses = ["cc0","cc-by","cc-by-sa","cc-by-nd"];
@@ -176,16 +293,35 @@ async function captureFromUnpaywall(env, article, reason, lookupOnce) {
       if (bytes.byteLength > maxPdfBytes || new TextDecoder().decode(bytes.slice(0, 5)) !== "%PDF-") continue;
       const key = "evidence/" + article.id + "/unpaywall.pdf";
       await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:"application/pdf" } });
+      let text = "";
+      try { text = await pdfToText(env, bytes); } catch { /* text extraction is best effort */ }
       return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:license(location), fullTextSource:location.url_for_pdf,
-        fullTextOrigin:"Unpaywall", fullTextVersion:location.version || "" };
+        fullTextOrigin:"Unpaywall", fullTextVersion:location.version || "", _text:text };
     } catch { /* try the next location */ }
   }
   const link = locations.map(l => l.url_for_landing_page || l.url).find(u => /^https:\/\//.test(u || ""));
   return link ? { fullTextStatus:"Open access link only", fullTextLink:link } : { fullTextStatus:"No downloadable open-access copy" };
 }
-async function captureFullText(env, article, lookupOnce) {
+// Europe PMC full-text XML: stored only when its record reports an open-access article under a permissive licence.
+async function captureFromEuropePmc(env, article, coreOnce, reason) {
+  const core = await coreOnce();
+  const license = String(core?.license || "").toLowerCase().trim().replace(/\s+/g, "-");
+  const id = core?.pmcid || article.pmcid;
+  if (!core || core.isOpenAccess !== "Y" || !openLicenses.includes(license) || !/^PMC[0-9]+$/.test(id || "")) return { fullTextStatus:reason };
+  const response = await fetch(epmcBase + "/" + id + "/fullTextXML", { signal:AbortSignal.timeout(25000) });
+  if (!response.ok) return { fullTextStatus:reason };
+  const bytes = await response.arrayBuffer();
+  const xml = new TextDecoder().decode(bytes);
+  if (bytes.byteLength > 15 * 1024 * 1024 || !/<article\b/.test(xml)) return { fullTextStatus:reason };
+  const key = "evidence/" + article.id + "/europepmc.xml";
+  await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:"application/xml" } });
+  return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:license, fullTextSource:epmcBase + "/" + id + "/fullTextXML", fullTextOrigin:"Europe PMC", _text:xmlToText(xml) };
+}
+async function captureFullText(env, article, lookupOnce, coreOnce) {
   const pmc = await captureFromPmc(env, article);
   if (pmc.fullTextStatus === "Captured") return pmc;
+  const europe = await captureFromEuropePmc(env, article, coreOnce, pmc.fullTextStatus);
+  if (europe.fullTextStatus === "Captured") return europe;
   return captureFromUnpaywall(env, article, pmc.fullTextStatus, lookupOnce);
 }
 // Crossref update notices (publisher and Retraction Watch sources) for the article's DOI.
@@ -342,7 +478,12 @@ async function exportPdf(env, state, viewer, manager, body) {
       "DOI: " + (article.doi || "-") + " · " + article.url,
       "Portfolio: " + item.portfolio + ((item.molecules || []).length ? " · Molecules: " + item.molecules.join(", ") : ""),
       "Reviewer: " + (item.reviewer || "Unassigned") + " · Status: " + item.status + (item.note ? " · Note: " + item.note : ""),
-      "Retraction check: " + (article.retractionStatus || "Pending") + " · Access: " + (article.oaStatus || "Pending") + " · Full text: " + (article.fullTextStatus || "Pending")];
+      "Retraction check: " + (article.retractionStatus || "Pending") + " · Access: " + (article.oaStatus || "Pending") + " · Full text: " + (article.fullTextStatus || "Pending") +
+        (article.citedBy !== undefined ? " · Cited by: " + article.citedBy : "")];
+    if ((article.authors || []).length) lines.push("Authors: " + article.authors.join(", "));
+    if ((article.meshTerms || []).length) lines.push("MeSH: " + article.meshTerms.slice(0, 12).join("; "));
+    if (article.abstract) lines.push("Abstract: " + article.abstract.replace(/\s+/g, " ").slice(0, 1800));
+    for (const passage of (article.keyPassages || []).slice(0, 4)) lines.push("Key passage: " + passage);
     sections.push({ title:article.title, lines, png });
   }
   if (!sections.length) return null;
@@ -375,17 +516,24 @@ async function collectEvidence(baseEnv, ids) {
   const needsFullText = a => !a.fullTextStatus || a.fullTextStatus === "Retry needed" ||
     (Boolean(env.UNPAYWALL_EMAIL) && ["No PMC record","No eligible PMC file"].includes(a.fullTextStatus));
   const needsScreen = a => enabled && !a.screenshotKey;
+  const needsEnrich = a => !a.enrichedAt;
   const needsOa = a => Boolean(env.UNPAYWALL_EMAIL) && (!a.oaCheckedAt ||
     (!a.oaIsOpen && Date.now() - Date.parse(a.oaCheckedAt) > oaRecheckMs));
   const needsRetraction = a => !a.retractionCheckedAt || Date.now() - Date.parse(a.retractionCheckedAt) > retractionRecheckMs;
-  const pending = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a))
+  const pending = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a) || needsEnrich(a))
     .sort((a,b)=>String(a.evidenceAttempt || "").localeCompare(String(b.evidenceAttempt || ""))).slice(0,4);
   for (const article of pending) {
     const status = {evidenceAttempt:new Date().toISOString()};
     let lookup; // at most one Unpaywall request per article per pass
     const lookupOnce = async () => (lookup ||= await unpaywallLookup(env,article));
+    let core;
+    const coreOnce = async () => (core ||= { value:await europePmcCore(article).catch(() => null) }).value;
+    if (needsEnrich(article)) {
+      try { Object.assign(status,await enrichMetadata(env,article,coreOnce)); }
+      catch (error) { status.enrichError = error.message; }
+    }
     if (needsFullText(article)) {
-      try { Object.assign(status,await captureFullText(env,article,lookupOnce)); }
+      try { Object.assign(status,await captureFullText(env,article,lookupOnce,coreOnce)); }
       catch (error) { Object.assign(status,{fullTextStatus:"Retry needed",fullTextError:error.message}); }
     }
     if (needsScreen(article)) {
@@ -400,11 +548,21 @@ async function collectEvidence(baseEnv, ids) {
       try { Object.assign(status,await checkRetraction(env,article)); }
       catch (error) { status.retractionError = error.message; }
     }
+    if (status._text) {
+      const molecules = [...new Set(state.assignments.filter(a => a.pmid === article.id).flatMap(a => a.molecules || []))];
+      try {
+        const textKey = "evidence/" + article.id + "/fulltext.txt";
+        await env.BUCKET.put(textKey, status._text.slice(0, 2_000_000), { httpMetadata:{ contentType:"text/plain; charset=utf-8" } });
+        status.fullTextTextKey = textKey;
+        status.keyPassages = keyPassages(status._text, molecules);
+      } catch { /* best effort */ }
+    }
+    delete status._text;
     await write(env, data => Object.assign(data.articles[article.id],status));
   }
   const queued = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a)).length;
   return {processed:pending.length, queued, unattempted:articles.filter(a=>!a.evidenceAttempt).length,
-    screenshotConfigured:enabled, unpaywallConfigured:Boolean(env.UNPAYWALL_EMAIL)};
+    screenshotConfigured:enabled, unpaywallConfigured:Boolean(env.UNPAYWALL_EMAIL), grobidConfigured:Boolean(env.GROBID_URL)};
 }
 
 async function api(request, env, path) {
@@ -424,7 +582,7 @@ async function api(request, env, path) {
   if (!viewer && !service) return json({ error:"Your account needs a Literature Bench profile." }, 403);
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email);
-    return json({ viewer, config:{ accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+    return json({ viewer, config:{ grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -595,6 +753,8 @@ td{padding:12px 14px;vertical-align:top;border-bottom:1px solid var(--border)}tb
 .badge{display:inline-flex;align-items:center;gap:4px;border-radius:99px;padding:1px 9px;font-size:12px;font-weight:500;white-space:nowrap;background:var(--accent);color:var(--muted);border:1px solid var(--border)}
 .badge.blue{background:var(--blue-soft);color:var(--blue);border-color:transparent}.badge.amber{background:var(--amber-soft);color:var(--amber);border-color:transparent}
 .badge.green{background:var(--green-soft);color:var(--green);border-color:transparent}.badge.red{background:var(--red-soft);color:var(--red);border-color:transparent}
+mark{border-radius:3px;padding:0 2px;color:inherit}mark.mol{background:#fde68a}mark.ae{background:#fecaca}[data-theme=dark] mark.mol{background:#78350f}[data-theme=dark] mark.ae{background:#7f1d1d}
+details.abs{margin-top:8px}details.abs summary{cursor:pointer;color:var(--brand);font-size:13px}details.abs div{margin-top:6px;max-width:70ch;font-size:13px;line-height:1.55}
 .title{font-weight:500;color:var(--fg)}.sub{color:var(--muted);font-size:12px}.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
 .bar{height:8px;border-radius:99px;background:var(--accent);overflow:hidden;border:1px solid var(--border)}.bar i{display:block;height:100%;background:linear-gradient(90deg,#0f766e,#2dd4bf);width:0;transition:width .9s cubic-bezier(.2,.8,.2,1)}
 .row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 0}.row+.row{border-top:1px solid var(--border)}
@@ -618,7 +778,7 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 <main id="content"><div class="skel"></div><div class="skel"></div><div class="skel"></div></main></div></div>
 <div id="toast" role="status"></div>
 <dialog id="linkdlg"><h2 id="linktitle"></h2><p id="linknote" class="sub"></p><div style="display:grid;gap:12px"><input id="linkvalue" readonly aria-label="Link"><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" id="linkcopy">Copy link</button><button type="button" class="btn outline" id="linkshare">Share…</button><button type="button" class="btn outline" id="linkclose">Done</button></div></div></dialog>
-<dialog id="dialog"><h2>Screen citation</h2><p id="citation" class="sub"></p><form id="review"><label>Status<select name="status"><option>Pending</option><option>In review</option><option>Full text needed</option><option>Complete</option></select></label><label>Decision notes<textarea name="note" rows="4"></textarea></label><div style="display:flex;gap:8px"><button class="btn">Save decision</button><button type="button" class="btn outline" id="close">Cancel</button></div></form></dialog>
+<dialog id="dialog"><h2>Screen citation</h2><p id="citation" class="sub"></p><div id="detail" style="max-height:38vh;overflow:auto;margin-bottom:12px"></div><form id="review"><label>Status<select name="status"><option>Pending</option><option>In review</option><option>Full text needed</option><option>Complete</option></select></label><label>Decision notes<textarea name="note" rows="4"></textarea></label><div style="display:flex;gap:8px"><button class="btn">Save decision</button><button type="button" class="btn outline" id="close">Cancel</button></div></form></dialog>
 <script>
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -672,12 +832,19 @@ const table=(headers,rows,empty)=>rows.length?
   '<div class="empty">'+empty+"</div>";
 const panel=(title,body,sub,flush)=>"<section><header><h2>"+title+"</h2>"+(sub?"<p>"+sub+"</p>":"")+"</header><div class='body'"+(flush?" style='padding:8px 0 0'":"")+">"+body+"</div></section>";
 const statusColor={"Pending":"","In review":"blue","Full text needed":"amber","Complete":"green"};
+function mark(text,molecules){
+  const names=(molecules||[]).filter(Boolean), terms=(data.config.terms||[]).concat(names);
+  if(!terms.length)return esc(text);
+  const re=new RegExp("("+terms.map(t=>t.replace(/[.*+?^()|\\[\\]\\\\]/g,"\\\\$&")).join("|")+")","gi");
+  return String(text).split(re).map((part,i)=>i%2?'<mark class="'+(names.some(n=>n.toLowerCase()===part.toLowerCase())?"mol":"ae")+'">'+esc(part)+"</mark>":esc(part)).join("");
+}
 const badge=(text,color="")=>'<span class="badge '+color+'">'+esc(text)+'</span>';
 const flagged=item=>["Retracted","Expression of concern"].includes(item?.retractionStatus);
 function evidenceChips(item){
   const chips=[];
   if(flagged(item))chips.push(badge(item.retractionStatus,"red"));
   else if(item.retractionStatus==="Correction")chips.push(badge("Correction","amber"));
+  if(item.citedBy!==undefined)chips.push(badge("Cited "+item.citedBy+"×"));
   if(item.oaStatus)chips.push('<span class="badge '+(oaColor[item.oaStatus]||"")+'" title="'+esc((item.oaLicense?"Licence: "+item.oaLicense+". ":"")+(item.oaVersion?"Version: "+item.oaVersion+". ":"")+(item.oaHostType?"Host: "+item.oaHostType+".":""))+'">'+esc(oaLabel(item))+'</span>');
   chips.push(item.fullTextKey?'<a class="badge green" href="/api/full-text/'+esc(item.id)+'">Full text</a>':item.fullTextLink?'<a class="badge blue" target="_blank" rel="noopener" href="'+esc(item.fullTextLink)+'">Open-access link</a>':badge(item.fullTextStatus||"Full text pending"));
   chips.push(item.screenshotKey?'<a class="badge green" href="/api/screenshot/'+esc(item.id)+'">Screenshot</a>':badge(item.screenshotStatus||"Screenshot pending"));
@@ -686,7 +853,8 @@ function evidenceChips(item){
 function queueRows(items){
   return table(["Article","Portfolio","Reviewer","Status",""],items.slice(0,200).map(a=>{
     const item=data.articles[a.pmid]||{};
-    return ['<a class="title" target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><div class="sub">PMID '+esc(a.pmid)+' · '+esc(item.journal)+' · '+esc(item.date)+'</div>'+evidenceChips({...item,id:a.pmid}),
+    return ['<a class="title" target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><div class="sub">PMID '+esc(a.pmid)+' · '+esc(item.journal)+' · '+esc(item.date)+((item.authors||[]).length?' · '+esc(item.authors.slice(0,3).join(", ")+(item.authors.length>3?" et al.":"")):"")+'</div>'+evidenceChips({...item,id:a.pmid})+
+        (item.abstract?'<details class="abs"><summary>Abstract</summary><div>'+mark(item.abstract.slice(0,2500),a.molecules)+'</div></details>':""),
       esc(a.portfolio)+((a.molecules||[]).length?'<div class="chips">'+a.molecules.map(m=>badge(m)).join("")+"</div>":""),
       a.reviewer?esc(a.reviewer):badge("Unassigned","amber"),badge(a.status,statusColor[a.status]),
       '<button class="btn outline sm" data-review="'+esc(a.id)+'">Review</button>'];
@@ -753,6 +921,8 @@ function render() {
       '<form data-route="recheck-access" style="margin-top:10px"><button class="btn outline">Re-check open access for all articles</button></form>',
       "Unpaywall requires a contact email on each request; it is sent to Unpaywall only. Every article with a DOI gets an open-access status (gold, hybrid, green, bronze or closed). Permissively licensed PDFs are stored, other open copies are linked. Closed articles are re-checked every 30 days."+(data.config.unpaywallFromEnv?" The email is set by the server environment (UNPAYWALL_EMAIL).":""))+
     panel("Article screenshots",'<div class="row"><span>Status</span>'+(data.config.screenshots?badge("Active","green"):badge("Not configured","amber"))+'</div>',data.config.screenshots?"Every article's PubMed page is captured and embedded in PDF exports.":"PDF exports include a screenshot of each article once capture is enabled. On the VPS, run: bash /opt/literasift-src/deploy/enable-screenshots.sh")+
+    panel("Extraction sources",['PubMed (E-utilities): citations, abstracts, authors, MeSH terms','PubMed Central open-access bucket: full text under open licences','Europe PMC: abstracts, keywords, citation counts, full-text XML for open-licensed articles','OpenAlex: citation counts, topics, abstract fallback','Crossref and PubMed: retraction notices','Unpaywall: open-access status and PDF fallback'].map(t=>'<div class="row"><span>'+esc(t)+'</span>'+badge("On","green")+'</div>').join("")+
+      '<div class="row"><span>GROBID: structured text from PDFs (self-hosted, optional)</span>'+(data.config.grobid?badge("On","green"):badge("Not configured","amber"))+'</div>',"All sources are free and open; none needs an account. Full text is stored only when its licence allows it. Key passages are sentences mentioning the molecule and a safety term.")+
     panel("What Unpaywall adds across the site",'<div class="row"><span>Overview</span><span class="sub">Open-access share and breakdown</span></div><div class="row"><span>Queues</span><span class="sub">OA badge on every citation and an access filter</span></div><div class="row"><span>Full text</span><span class="sub">Fallback when PubMed Central has no eligible copy</span></div><div class="row"><span>CSV export</span><span class="sub">OA status, licence and link columns</span></div>');
   if(tab==="Account") html=panel("Change password",'<form class="grid" data-route="/host/change-password"><label>Current password<input type="password" name="current" autocomplete="current-password" required></label><label>New password<input type="password" name="next" autocomplete="new-password" minlength="12" required></label><label>Confirm new password<input type="password" name="confirm" autocomplete="new-password" minlength="12" required></label><div><button class="btn">Change password</button></div></form>',"At least 12 characters. Changing it signs you out everywhere else.")+
     panel("Your account",'<div class="row"><span>Name</span><b>'+esc(data.viewer.name)+'</b></div><div class="row"><span>Email</span><b>'+esc(data.viewer.email)+'</b></div><div class="row"><span>Role</span>'+badge(data.viewer.role,data.viewer.role==="manager"?"blue":"")+'</div>');
@@ -801,10 +971,10 @@ function showLink(title,note,link){
 function download(id) {
   const run=data.runs.find(r=>r.id===id);
   const cell=value=>'"'+String(value??"").replace(/^[=+@\\-]/,"'$&").replaceAll('"','""')+'"';
-  const rows=[["PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Molecules","Reviewer","Status","Full text","Screenshot","Retraction check","OA status","OA licence","OA link"]];
+  const rows=[["PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Molecules","Reviewer","Status","Full text","Screenshot","Retraction check","OA status","OA licence","OA link","Cited by","Abstract","Key passages"]];
   run.ids.forEach(pmid=>{
     const a=data.articles[pmid], item=data.assignments.find(x=>x.pmid===pmid&&x.portfolio===run.portfolio);
-    rows.push([pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,(item?.molecules||[]).join("; "),item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending",a.retractionStatus||"Pending",a.oaStatus||"Pending",a.oaLicense||"",a.oaUrl||""]);
+    rows.push([pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,(item?.molecules||[]).join("; "),item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending",a.retractionStatus||"Pending",a.oaStatus||"Pending",a.oaLicense||"",a.oaUrl||"",a.citedBy??"",a.abstract||"",(a.keyPassages||[]).join(" | ")]);
   });
   const url=URL.createObjectURL(new Blob([rows.map(row=>row.map(cell).join(",")).join("\\r\\n")],{type:"text/csv"}));
   const link=document.createElement("a");link.href=url;link.download="pubmed-"+run.from+"-"+run.to+".csv";link.click();
@@ -853,7 +1023,13 @@ document.addEventListener("click",event=>{
   if(target.dataset.export)download(target.dataset.export);
   if(target.dataset.review){
     active=data.assignments.find(a=>a.id===target.dataset.review);
-    $("citation").textContent=data.articles[active.pmid].title;
+    const art=data.articles[active.pmid];
+    $("citation").textContent=art.title;
+    $("detail").innerHTML=(art.abstract?'<div class="sub" style="margin-bottom:4px">Abstract'+(art.abstractSource?" ("+esc(art.abstractSource)+")":"")+'</div><div style="font-size:13px;line-height:1.55">'+mark(art.abstract,active.molecules)+'</div>':'<div class="sub">No abstract available yet.</div>')+
+      ((art.keyPassages||[]).length?'<div class="sub" style="margin:10px 0 4px">Key passages from the full text</div>'+art.keyPassages.map(t=>'<div style="font-size:13px;margin-bottom:6px">“'+mark(t,active.molecules)+'”</div>').join(""):"")+
+      ((art.meshTerms||[]).length?'<div class="chips">'+art.meshTerms.slice(0,12).map(t=>badge(t)).join("")+'</div>':"")+
+      ((art.authors||[]).length?'<div class="sub" style="margin-top:8px">'+esc(art.authors.join(", "))+'</div>':"")+
+      (art.fullTextKey?'<div style="margin-top:8px"><a href="/api/full-text/'+esc(active.pmid)+'">Download full text</a></div>':"");
     $("review").elements.status.value=active.status;
     $("review").elements.note.value=active.note||"";
     $("dialog").showModal();

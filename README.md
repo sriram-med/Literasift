@@ -65,3 +65,7 @@ Screenshots come from a Browserless-compatible endpoint (`SCREENSHOT_ENDPOINT`/`
 Managers add reviewers on the Team tab ("Save and invite"). The reviewer gets a single-use link (valid 7 days) to set their own password; there is no need to share passwords. Every user can change their password on the Account tab, and anyone can use "Forgot your password?" on the sign-in page (link valid 1 hour, always answered the same way so accounts cannot be discovered). Resetting or changing a password signs out every other session. Managers can also send a new link or revoke a user's sign-in.
 
 Links are emailed when SMTP is configured in `/etc/literasift.env` (`SMTP_HOST`, `SMTP_PORT` (465, implicit TLS), `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM`) and `PUBLIC_URL` is set; otherwise the manager is shown the link to send themselves, and the sign-in page's reset form says to ask a manager. Passwords need at least 12 characters and are stored as scrypt hashes. `literasift-user` still works for the first account or recovery from the server.
+
+## Extraction sources
+
+Abstracts, authors, MeSH terms and citation counts are pulled from PubMed, Europe PMC and OpenAlex; full text from PMC, Europe PMC and Unpaywall (open-licensed only); PDFs can be turned into text by a self-hosted GROBID (`GROBID_URL`). Reviewers see the abstract with the molecule and safety terms highlighted, plus key passages from the full text. See `docs/OPEN_SOURCE.md` for the full list, licences and what was deliberately not integrated.
