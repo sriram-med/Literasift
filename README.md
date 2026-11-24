@@ -45,7 +45,7 @@ Never commit runtime secrets. This runner does not move the website, authenticat
 `server/` runs the same `worker/index.js` on Node 22: file storage under `/var/lib/literasift`, cookie sign-in (scrypt-hashed passwords in `users.json`), and an in-process hourly scheduler, so no cron job is needed. Caddy provides HTTPS.
 
 ```sh
-DOMAIN=literasift.tech ADMIN_EMAIL=you@example.com bash deploy/build-installer.sh   # writes dist/install-literasift.sh
+DOMAIN=literasift.tech ADMIN_EMAIL=you@example.com REPO_BRANCH=main bash deploy/build-installer.sh   # writes dist/install-literasift.sh
 ```
 
-Run `dist/install-literasift.sh` as root on a fresh Ubuntu VPS (or supply it as a Hostinger post-install script; it must stay under 48 KB). It installs Node, Caddy and the service, generates `SESSION_SECRET` and `RUN_TOKEN` into `/etc/literasift.env`, and writes the first password to `/root/literasift-admin.txt`. The first person to sign in becomes the manager; add reviewers on the Team tab, then give each a password with `literasift-user set reviewer@example.com`. Point the domain's A record at the VPS before the first start so Caddy can obtain its certificate.
+Run `dist/install-literasift.sh` as root on a fresh Ubuntu VPS (or supply it as a Hostinger post-install script). It clones the repository, so the repository must be readable from the VPS during install; `literasift-update` later pulls and restarts. It installs Node, Caddy and the service, generates `SESSION_SECRET` and `RUN_TOKEN` into `/etc/literasift.env`, and writes the first password to `/root/literasift-admin.txt`. The first person to sign in becomes the manager; add reviewers on the Team tab, then give each a password with `literasift-user set reviewer@example.com`. Point the domain's A record at the VPS before the first start so Caddy can obtain its certificate.

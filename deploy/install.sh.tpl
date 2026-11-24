@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# LiteraSift installer for a fresh Ubuntu VPS (run as root). Self-extracting: the app archive follows the __ARCHIVE__ marker.
+# LiteraSift installer for a fresh Ubuntu VPS (run as root). Clones the app from Git, so the repository must be readable from the VPS.
 set -euo pipefail
 exec > >(tee -a /var/log/literasift-install.log) 2>&1
 DOMAIN="__DOMAIN__"
 ADMIN_EMAIL="__ADMIN_EMAIL__"
+REPO_URL="__REPO_URL__"
+REPO_BRANCH="__REPO_BRANCH__"
 export DEBIAN_FRONTEND=noninteractive
 echo "== LiteraSift install $(date -u +%FT%TZ)"
 
 apt-get update -y
-apt-get install -y curl ca-certificates openssl ufw caddy
+apt-get install -y curl ca-certificates openssl ufw caddy git
 if ! node -v 2>/dev/null | grep -qE '^v(2[2-9]|[3-9][0-9])'; then
   apt-get install -y nodejs || true
   if ! node -v 2>/dev/null | grep -qE '^v(2[2-9]|[3-9][0-9])'; then
@@ -20,8 +22,9 @@ node -v
 
 id literasift >/dev/null 2>&1 || useradd --system --home /opt/literasift --shell /usr/sbin/nologin literasift
 mkdir -p /opt/literasift /var/lib/literasift
-ARCHIVE_LINE=$(awk '/^__ARCHIVE__$/ {print NR + 1; exit 0; }' "$0")
-tail -n +"$ARCHIVE_LINE" "$0" | base64 -d | tar -xz -C /opt/literasift
+rm -rf /opt/literasift-src
+git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" /opt/literasift-src
+cp -r /opt/literasift-src/package.json /opt/literasift-src/worker /opt/literasift-src/server /opt/literasift/
 chown -R root:root /opt/literasift
 chown -R literasift:literasift /var/lib/literasift
 chmod 700 /var/lib/literasift
@@ -86,6 +89,16 @@ exec runuser -u literasift -- env DATA_DIR=/var/lib/literasift node /opt/literas
 CLI
 chmod +x /usr/local/bin/literasift-user
 
+cat > /usr/local/bin/literasift-update <<UPD
+#!/usr/bin/env bash
+set -euo pipefail
+git -C /opt/literasift-src fetch --depth 1 origin "$REPO_BRANCH"
+git -C /opt/literasift-src reset --hard FETCH_HEAD
+cp -r /opt/literasift-src/package.json /opt/literasift-src/worker /opt/literasift-src/server /opt/literasift/
+systemctl restart literasift
+UPD
+chmod +x /usr/local/bin/literasift-update
+
 if [ -n "$ADMIN_EMAIL" ] && [ -z "$(literasift-user list | grep -x "$ADMIN_EMAIL" || true)" ]; then
   umask 077
   PASS=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)A1
@@ -104,4 +117,3 @@ systemctl enable caddy
 systemctl restart caddy
 echo "== Done. Credentials (if created): /root/literasift-admin.txt"
 exit 0
-__ARCHIVE__
