@@ -32,11 +32,25 @@ function allocate(state, item) {
     .filter(p => p.open < p.capacity).sort((a, b) => a.open - b.open || a.email.localeCompare(b.email))[0];
   if (reviewer) item.reviewer = reviewer.email;
 }
-async function importWatch(env, watch, from, to) {
+const addDays = (value, days) => new Date(Date.parse(value) + days * 86400000).toISOString().slice(0, 10);
+// A search over the 9,999-record limit is split into halves of the date range until every part fits.
+async function searchIds(watch, from, to, depth = 0) {
   const date = value => value.replaceAll("-", "/");
   const term = "(" + watch.query + ") AND (" + date(from) + "[crdt]:" + date(to) + "[crdt])";
   const { esearchresult: result } = await pubmed("esearch", { term, retmode: "json", retmax: "9999" });
-  if (!result || Number(result.count) !== result.idlist.length) throw new Error("Search exceeds the batch limit or was incomplete. Use a shorter date range.");
+  if (!result?.idlist) throw new Error("PubMed search was incomplete.");
+  if (Number(result.count) === result.idlist.length) return result.idlist;
+  const days = (Date.parse(to) - Date.parse(from)) / 86400000;
+  if (days < 1 || depth > 12) throw new Error("A single day exceeds the 9,999 record batch limit. Narrow the query.");
+  const middle = addDays(from, Math.floor(days / 2));
+  await new Promise(resolve => setTimeout(resolve, 350));
+  const left = await searchIds(watch, from, middle, depth + 1);
+  await new Promise(resolve => setTimeout(resolve, 350));
+  const right = await searchIds(watch, addDays(middle, 1), to, depth + 1);
+  return [...new Set([...left, ...right])];
+}
+async function importWatch(env, watch, from, to) {
+  const result = { idlist: await searchIds(watch, from, to) };
   const articles = {};
   for (let offset = 0; offset < result.idlist.length; offset += 100) {
     const ids = result.idlist.slice(offset, offset + 100);
@@ -54,12 +68,17 @@ async function importWatch(env, watch, from, to) {
   }
   return write(env, state => {
     for (const [id, article] of Object.entries(articles)) state.articles[id] = { ...state.articles[id], ...article };
-    const run = { id:crypto.randomUUID(), portfolio:watch.portfolio, from, to, count:result.idlist.length,
+    const run = { id:crypto.randomUUID(), portfolio:watch.portfolio, molecule:watch.molecule || "", from, to, count:result.idlist.length,
       ids:result.idlist, time:new Date().toISOString(), query:watch.query, status:"Imported" };
     state.runs.unshift(run);
     for (const id of result.idlist) {
-      if (state.assignments.some(a => a.pmid === id && a.portfolio === watch.portfolio)) continue;
-      const item = { id:crypto.randomUUID(), pmid:id, portfolio:watch.portfolio, reviewer:"", status:"Pending" };
+      // One assignment per citation and portfolio; further matching molecules are tagged onto it.
+      const existing = state.assignments.find(a => a.pmid === id && a.portfolio === watch.portfolio);
+      if (existing) {
+        if (watch.molecule && !(existing.molecules || []).includes(watch.molecule) && (existing.molecules || []).length < 20) (existing.molecules ||= []).push(watch.molecule);
+        continue;
+      }
+      const item = { id:crypto.randomUUID(), pmid:id, portfolio:watch.portfolio, molecules:watch.molecule ? [watch.molecule] : [], reviewer:"", status:"Pending" };
       allocate(state, item);
       state.assignments.push(item);
     }
@@ -69,11 +88,21 @@ async function importWatch(env, watch, from, to) {
 async function execute(env, watch, from, to) {
   try { return await importWatch(env, watch, from, to); }
   catch (error) {
-    await write(env, state => state.runs.unshift({ id:crypto.randomUUID(), portfolio:watch.portfolio, from, to,
+    await write(env, state => state.runs.unshift({ id:crypto.randomUUID(), portfolio:watch.portfolio, molecule:watch.molecule || "", from, to,
       query:watch.query, status:"Failed", error:error.message, time:new Date().toISOString(), ids:[], count:0 }));
     throw error;
   }
 }
+const safetyFilter = '("adverse effects"[sh] OR "drug-related side effects and adverse reactions"[MeSH Terms] OR safety[tiab] OR toxicity[tiab] OR "adverse event*"[tiab] OR "adverse reaction*"[tiab] OR "adverse drug reaction*"[tiab] OR "side effect*"[tiab])';
+function buildQuery(names, safetyOnly) {
+  const clean = [...new Set(names.map(n => String(n || "").replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim()).filter(Boolean))];
+  if (!clean.length || clean.length > 30 || clean.some(n => n.length > 100)) return "";
+  const terms = clean.map(n => '"' + n + '"[tiab] OR "' + n + '"[MeSH Terms] OR "' + n + '"[Supplementary Concept]');
+  const query = "(" + terms.join(" OR ") + ")" + (safetyOnly ? " AND " + safetyFilter : "");
+  return query.length <= 1500 ? query : "";
+}
+const watchKey = w => w.portfolio + "\u0000" + (w.molecule || "");
+const maxWatchesPerRun = 10;
 const pmcOrigin = "https://pmc-oa-opendata.s3.amazonaws.com";
 async function captureFromPmc(env, article) {
   if (!/^PMC[0-9]+$/.test(article.pmcid)) return { fullTextStatus:"No PMC record" };
@@ -253,14 +282,17 @@ async function api(request, env, path) {
   }
   if (path === "/api/scheduled" && (service || manager)) {
     const results = [];
-    for (const watch of state.watches) {
-      const previous = state.runs.find(r => r.portfolio === watch.portfolio && r.query === watch.query && r.status === "Imported");
-      const to = new Date(Date.parse(day()) - 86400000).toISOString().slice(0,10);
-      if (previous?.to >= to) continue;
+    const to = new Date(Date.parse(day()) - 86400000).toISOString().slice(0,10);
+    const same = watch => r => r.portfolio === watch.portfolio && (r.molecule || "") === (watch.molecule || "") && r.query === watch.query;
+    // Watchlists never attempted go first, then the least recently attempted; at most maxWatchesPerRun run per call.
+    const due = state.watches.map(watch => ({ watch, previous:state.runs.find(r => same(watch)(r) && r.status === "Imported"),
+        attempt:state.runs.find(same(watch))?.time || "" }))
+      .filter(({ previous }) => !(previous?.to >= to)).sort((a, b) => a.attempt.localeCompare(b.attempt));
+    for (const { watch, previous } of due.slice(0, maxWatchesPerRun)) {
       try { results.push(await execute(env, watch, previous?.to || to, to)); }
-      catch (error) { results.push({ portfolio:watch.portfolio, error:error.message }); }
+      catch (error) { results.push({ portfolio:watch.portfolio, molecule:watch.molecule || "", error:error.message }); }
     }
-    return json({ results, evidence:await collectEvidence(env) });
+    return json({ results, remaining:Math.max(0, due.length - maxWatchesPerRun), evidence:await collectEvidence(env) });
   }
   if (!manager) return json({ error:"Manager access required." },403);
   if (path === "/api/evidence") return json(await collectEvidence(env));
@@ -277,14 +309,30 @@ async function api(request, env, path) {
       data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data,a));
     });
   } else if (path === "/api/watch") {
-    const watch = { portfolio:String(body.portfolio || "").trim(), query:String(body.query || "").trim() };
+    const watch = { portfolio:String(body.portfolio || "").trim(), molecule:String(body.molecule || "").trim().slice(0,100), query:String(body.query || "").trim() };
     if (!watch.portfolio || !watch.query || watch.query.length > 1500) return json({error:"Enter a portfolio and a PubMed query."},400);
     await write(env, data => {
-      data.watches = data.watches.filter(w => w.portfolio !== watch.portfolio);
+      data.watches = data.watches.filter(w => watchKey(w) !== watchKey(watch));
       data.watches.push(watch);
     });
+  } else if (path === "/api/watches") {
+    const portfolio = String(body.portfolio || "").trim();
+    if (!portfolio || !Array.isArray(body.rows) || !body.rows.length || body.rows.length > 500) return json({error:"Enter a portfolio and 1 to 500 molecules."},400);
+    const created = [], skipped = [];
+    for (const row of body.rows) {
+      const names = [row?.molecule, ...(Array.isArray(row?.synonyms) ? row.synonyms : [])];
+      const molecule = String(row?.molecule || "").trim().slice(0,100);
+      const query = molecule && buildQuery(names, body.safetyOnly === true);
+      if (query) created.push({ portfolio, molecule, query }); else skipped.push(molecule || "(blank)");
+    }
+    await write(env, data => {
+      const keys = new Set(created.map(watchKey));
+      data.watches = data.watches.filter(w => !keys.has(watchKey(w))).concat(created);
+    });
+    return json({ created:created.length, skipped });
   } else if (path === "/api/import") {
-    const watch = state.watches.find(w => w.portfolio === body.portfolio);
+    const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
+    const watch = state.watches.find(w => w.portfolio === portfolio && (w.molecule || "") === molecule);
     const valid = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) &&
       !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0,10) === value;
     if (!watch || !valid(body.from) || !valid(body.to) || body.from > body.to || body.to > day()) {
@@ -324,7 +372,7 @@ function queue(items) {
   return table(["Article","Portfolio","Reviewer","Status",""],items.map(a=>{
     const item=data.articles[a.pmid];
     return [(["Retracted","Expression of concern"].includes(item.retractionStatus)?'<span class="alert">'+esc(item.retractionStatus)+'</span><br>':'')+'<a target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><br><small>PMID '+esc(a.pmid)+' · '+esc(item.journal)+'</small><br>'+(item.fullTextKey?'<a href="/api/full-text/'+esc(a.pmid)+'">Download full text</a>':(item.fullTextLink?'<a target="_blank" rel="noopener" href="'+esc(item.fullTextLink)+'">Open-access link</a>':'<small>'+esc(item.fullTextStatus || "Full text pending")+'</small>'))+' · '+(item.screenshotKey?'<a href="/api/screenshot/'+esc(a.pmid)+'">Screenshot</a>':'<small>'+esc(item.screenshotStatus || "Screenshot pending")+'</small>'),
-      esc(a.portfolio),esc(a.reviewer || "Unassigned"),'<span class="tag">'+esc(a.status)+'</span>',
+      esc(a.portfolio)+((a.molecules||[]).length?'<br><small>'+esc(a.molecules.join(", "))+'</small>':''),esc(a.reviewer || "Unassigned"),'<span class="tag">'+esc(a.status)+'</span>',
       '<button data-review="'+esc(a.id)+'">Review</button>'];
   }),"No articles in this queue.");
 }
@@ -335,26 +383,26 @@ function render() {
   $("identity").textContent=data.viewer.name+" · "+data.viewer.role;
   $("nav").innerHTML=tabs.map(x=>'<button data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+x+'</button>').join("");
   const items=data.assignments;
-  const watchOptions=data.watches.map(w=>'<option>'+esc(w.portfolio)+'</option>').join("");
+  const watchOptions=data.watches.map(w=>'<option value="'+esc(encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||""))+'">'+esc(w.portfolio+(w.molecule?" · "+w.molecule:""))+'</option>').join("");
   if(tab==="Overview"){
     const metrics=[["Unique citations",Object.keys(data.articles).length],["Assigned",items.filter(a=>a.reviewer).length],["Unassigned",items.filter(a=>!a.reviewer).length],["Complete",items.filter(a=>a.status==="Complete").length]];
     $("content").innerHTML='<div class="cards">'+metrics.map(([label,num])=>'<div class="card"><b>'+num+'</b><span>'+label+'</span></div>').join("")+'</div>'+panel("All assignments",queue(items));
   }
   if(tab==="My Queue") $("content").innerHTML=panel("My assignments",queue(items.filter(a=>a.reviewer===data.viewer.email)));
-  if(tab==="Watchlists") $("content").innerHTML=panel("PubMed watchlists",'<form data-route="watch"><label>Portfolio<input name="portfolio" required></label><label>PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><button>Save watchlist</button></form>'+table(["Portfolio","Query"],data.watches.map(w=>[esc(w.portfolio),esc(w.query)]),"Add a product or portfolio watchlist to start."));
+  if(tab==="Watchlists") $("content").innerHTML=panel("PubMed watchlists",'<form data-route="watch"><label>Portfolio<input name="portfolio" required></label><label>Molecule<input name="molecule" placeholder="Optional"></label><label class="wide">PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><button>Save watchlist</button></form>')+panel("Add molecules in bulk",'<p>One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs. A PubMed query is built for each line.</p><form data-route="watches"><label>Portfolio<input name="portfolio" required></label><label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label><span><input type="checkbox" name="safety"> Safety-related articles only</span></label><button>Save molecules</button></form>')+panel("Saved watchlists ("+data.watches.length+")",table(["Portfolio","Molecule","Query"],data.watches.map(w=>[esc(w.portfolio),esc(w.molecule||""),'<small>'+esc(w.query)+'</small>']),"Add a product or portfolio watchlist to start."));
   if(tab==="Team") $("content").innerHTML=panel("Reviewer profiles",'<form data-route="profile"><label>Name<input name="name" required></label><label>Sign-in email<input type="email" name="email" required></label><label>Portfolio<input name="portfolio" placeholder="All portfolios"></label><label>Open assignment limit<input type="number" name="capacity" min="1" max="500" value="25" required></label><label>Availability<select name="active"><option value="true">Active</option><option value="false">Unavailable</option></select></label><button>Save reviewer</button></form>'+table(["Name","Email","Role","Portfolio","Open"],data.profiles.map(p=>[esc(p.name),esc(p.email),esc(p.role),esc(p.portfolio||"All"),items.filter(a=>a.reviewer===p.email&&a.status!=="Complete").length]),"No profiles."));
   if(tab==="Batches") $("content").innerHTML=panel("Backfill a date range",watchOptions?
-    '<form data-route="import"><label>Portfolio<select name="portfolio">'+watchOptions+'</select></label><label>From<input name="from" type="date" required></label><label>Through<input name="to" type="date" required></label><button>Import citations</button></form>':
-    '<p>Save a watchlist before importing a batch.</p>')+panel("Batch archive",'<form data-route="evidence"><button>Process pending evidence</button></form>'+table(["Portfolio","Create Date range","Citations","Status","Manifest"],data.runs.map(r=>[esc(r.portfolio),esc(r.from)+" to "+esc(r.to),r.count,esc(r.error||r.status),r.status==="Imported"?'<button data-export="'+esc(r.id)+'">CSV</button>':""]),"No batches yet."));
+    '<form data-route="import"><label>Watchlist<select name="watch">'+watchOptions+'</select></label><label>From<input name="from" type="date" required></label><label>Through<input name="to" type="date" required></label><button>Import citations</button></form>':
+    '<p>Save a watchlist before importing a batch.</p>')+panel("Batch archive",'<form data-route="evidence"><button>Process pending evidence</button></form>'+table(["Portfolio","Create Date range","Citations","Status","Manifest"],data.runs.map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" to "+esc(r.to),r.count,esc(r.error||r.status),r.status==="Imported"?'<button data-export="'+esc(r.id)+'">CSV</button>':""]),"No batches yet."));
 }
 async function refresh(){data=await api("state");render();}
 function download(id) {
   const run=data.runs.find(r=>r.id===id);
   const cell=value=>'"'+String(value??"").replace(/^[=+@\-]/,"'$&").replaceAll('"','""')+'"';
-  const rows=[["PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Reviewer","Status","Full text","Screenshot","Retraction check"]];
+  const rows=[["PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Molecules","Reviewer","Status","Full text","Screenshot","Retraction check"]];
   run.ids.forEach(pmid=>{
     const a=data.articles[pmid], item=data.assignments.find(x=>x.pmid===pmid&&x.portfolio===run.portfolio);
-    rows.push([pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending",a.retractionStatus||"Pending"]);
+    rows.push([pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,(item?.molecules||[]).join("; "),item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending",a.retractionStatus||"Pending"]);
   });
   const url=URL.createObjectURL(new Blob([rows.map(row=>row.map(cell).join(",")).join("\\r\\n")],{type:"text/csv"}));
   const link=document.createElement("a");link.href=url;link.download="pubmed-"+run.from+"-"+run.to+".csv";link.click();
@@ -380,8 +428,13 @@ document.addEventListener("submit",async event=>{
   if(body.active)body.active=body.active==="true";
   const route=form.dataset.route || "review";
   if(route==="review")body.id=active.id;
+  if(route==="watches"){
+    body.safetyOnly=body.safety==="on";
+    body.rows=body.list.split(/\\r?\\n/).map(line=>line.split(/[,;\\t]/).map(x=>x.trim()).filter(Boolean)).filter(n=>n.length).map(n=>({molecule:n[0],synonyms:n.slice(1)}));
+  }
   button.disabled=true;message(route==="import"?"Retrieving PubMed citations…":"Saving…");
-  try {await api(route,body);if(route==="review")$("dialog").close();await refresh();message(route==="import"?"Batch imported.":"Saved.");}
+  try {const result=await api(route,body);if(route==="review")$("dialog").close();await refresh();
+    message(route==="import"?"Batch imported.":route==="watches"?result.created+" molecule watchlists saved."+(result.skipped.length?" Skipped (invalid or too long): "+result.skipped.join(", "):""):"Saved.");}
   catch(error){message(error.message,true);if(route==="review")$("dialog").close();if(route==="import")await refresh().catch(()=>{});}
   finally{button.disabled=false;}
 });

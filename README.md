@@ -27,6 +27,15 @@ Keep the website and storage on Sites while running the scheduler on your VPS. C
 
 - Retraction checks need no setup. Each article's DOI is checked against [Crossref](https://www.crossref.org/documentation/retrieve-metadata/retraction-watch/) update notices (publisher and Retraction Watch sources) and PubMed's own "Retracted Publication" flag, then re-checked every 30 days. Retracted items and expressions of concern get a red badge in the review table and a CSV column. Set `CROSSREF_EMAIL` (falls back to `UNPAYWALL_EMAIL`) to use Crossref's polite pool.
 
+## Molecule watchlists
+
+A portfolio can hold many watchlists, one per molecule. On the Watchlists tab, paste one molecule per line (molecule first, then synonyms, brands or salts, separated by commas or tabs) to build up to 500 PubMed queries at once. Each query matches the names in title/abstract, MeSH and supplementary concepts. Tick "Safety-related articles only" to add an adverse-effects filter. Saving a molecule again replaces its query.
+
+- A citation matching several molecules in one portfolio is one assignment, tagged with every matching molecule.
+- A search over PubMed's 9,999-record limit is split into smaller date ranges automatically.
+- Each scheduled call imports up to 10 watchlists (never-attempted or least recently attempted first); the runner script repeats until none remain.
+- Backfills on the Batches tab are per molecule.
+
 Run `node --env-file=/path/to/private.env scripts/run-watchlists.mjs`. Confirm exit status zero and check the site's Batches tab before scheduling it with cron or a systemd timer. Each invocation processes up to four pending evidence records, so run it periodically to clear the evidence queue. The importer uses the last complete India calendar day and skips portfolio/date windows already imported. Use the Batches tab for historical backfills.
 
 Never commit runtime secrets. This runner does not move the website, authentication, or storage to the VPS.
