@@ -105,12 +105,13 @@ http.createServer((req, res) => handler(req, res).catch(error => {
 // In-process scheduler (replaces the cron-driven run-watchlists.mjs used with Sites).
 async function runScheduled() {
   const results = []; let last;
-  for (let call = 0; call < 100; call++) {
+  for (let call = 0; call < 300; call++) {
     const response = await worker.fetch(new Request("http://localhost/api/scheduled", { method: "POST", headers: { Authorization: "Bearer " + runToken }, body: "{}" }), env);
     last = await response.json();
     if (!response.ok || !Array.isArray(last.results)) throw new Error(last?.error || "Scheduler call failed.");
     results.push(...last.results);
-    if (!last.remaining || !last.results.some(r => !r.error)) break;
+    const progressed = last.results.some(r => !r.error) || last.evidence?.processed > 0;
+    if ((!last.remaining && !last.evidence?.unattempted) || !progressed) break;
   }
   console.log(JSON.stringify({ time: new Date().toISOString(), batches: results.length, failed: results.filter(r => r.error).length, remaining: last?.remaining || 0, evidence: last?.evidence }));
 }

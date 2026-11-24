@@ -330,6 +330,26 @@ async function api(request, env, path) {
       data.watches = data.watches.filter(w => !keys.has(watchKey(w))).concat(created);
     });
     return json({ created:created.length, skipped });
+  } else if (path === "/api/pull") {
+    // One step: build the query for a molecule, save it as a watchlist, and import the date range.
+    const valid = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) &&
+      !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0,10) === value;
+    const molecule = String(body.molecule || "").trim().slice(0,100);
+    const synonyms = String(body.synonyms || "").split(/[,;\n]/).map(x => x.trim()).filter(Boolean);
+    const portfolio = String(body.portfolio || "").trim().slice(0,100) || molecule;
+    const query = molecule && buildQuery([molecule, ...synonyms], body.safetyOnly === true);
+    if (!query) return json({error:"Enter a molecule name (up to 30 names, 100 characters each)."},400);
+    if (!valid(body.from) || !valid(body.to) || body.from > body.to || body.to > day()) {
+      return json({error:"Choose a valid date range through today."},400);
+    }
+    const watch = { portfolio, molecule, query };
+    await write(env, data => {
+      data.watches = data.watches.filter(w => watchKey(w) !== watchKey(watch));
+      data.watches.push(watch);
+    });
+    const run = await execute(env, watch, body.from, body.to);
+    await collectEvidence(env, run.ids);
+    return json(run);
   } else if (path === "/api/import") {
     const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
     const watch = state.watches.find(w => w.portfolio === portfolio && (w.molecule || "") === molecule);
@@ -414,6 +434,7 @@ const paths = {
   Overview:'<rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>',
   "My Queue":'<path d="M3 6h.01M3 12h.01M3 18h.01M8 6h13M8 12h13M8 18h13"/>',
   "All Assignments":'<path d="M3 6h18M3 12h18M3 18h12"/>',
+  "Search & Pull":'<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
   Batches:'<path d="m12 3 9 5-9 5-9-5 9-5z"/><path d="m3 13 9 5 9-5"/>',
   Watchlists:'<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   Team:'<circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0M17 4a4 4 0 0 1 0 8M22 21a7 7 0 0 0-4-6"/>',
@@ -421,7 +442,7 @@ const paths = {
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity."};
+const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity."};
 let data, tab, active, filt={q:"",status:"",portfolio:""}, shown=[];
 let toastTimer;
 const message = (value, error=false) => { const t=$("toast"); t.textContent=value; t.className="show"+(error?" err":""); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.className="",error?6000:2800); };
@@ -474,7 +495,7 @@ function applyFilter(items){
 function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=manager?["Overview","My Queue","All Assignments","Batches","Watchlists","Team"]:["My Queue"];
+  const tabs=manager?["Overview","Search & Pull","My Queue","All Assignments","Batches","Watchlists","Team"]:["My Queue"];
   if(!tabs.includes(tab))tab=tabs[0];
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
   const open=mine.filter(a=>a.status!=="Complete").length;
@@ -497,6 +518,11 @@ function render() {
         '<div class="row"><span>Full-text fetch needs retry</span>'+badge(retry,retry?"amber":"")+'</div>'+
         '<div class="row"><span>Flagged “Full text needed” by reviewers</span>'+badge(items.filter(a=>a.status==="Full text needed").length,"blue")+'</div>')+'</div>'+
       panel("Recent batches",table(["Watchlist","Range","Citations","Status"],data.runs.slice(0,6).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red")]),"No batches yet."),"",true);
+  }
+  if(tab==="Search & Pull"){
+    const today=new Date().toISOString().slice(0,10), start=new Date(Date.now()-30*864e5).toISOString().slice(0,10);
+    html=panel("Pull articles for a molecule",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Pull articles</button></div></form>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+
+      panel("Recent pulls",table(["Watchlist","Date range","Citations","Status"],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red")]),"No pulls yet."),"",true);
   }
   if(tab==="My Queue") html=queueView(mine);
   if(tab==="All Assignments") html=queueView(items);
@@ -574,10 +600,10 @@ document.addEventListener("submit",async event=>{
     body.safetyOnly=body.safety==="on";
     body.rows=body.list.split(/\\r?\\n/).map(line=>line.split(/[,;\\t]/).map(x=>x.trim()).filter(Boolean)).filter(n=>n.length).map(n=>({molecule:n[0],synonyms:n.slice(1)}));
   }
-  button.disabled=true;message(route==="import"?"Retrieving PubMed citations…":"Saving…");
+  button.disabled=true;message(route==="import"||route==="pull"?"Retrieving PubMed citations…":"Saving…");
   try {const result=await api(route,body);if(route==="review")$("dialog").close();await refresh();
-    message(route==="import"?"Batch imported.":route==="watches"?result.created+" molecule watchlists saved."+(result.skipped.length?" Skipped (invalid or too long): "+result.skipped.join(", "):""):"Saved.");}
-  catch(error){message(error.message,true);if(route==="review")$("dialog").close();if(route==="import")await refresh().catch(()=>{});}
+    message(route==="import"?"Batch imported.":route==="pull"?result.count+" articles pulled for "+(result.molecule||result.portfolio)+".":route==="watches"?result.created+" molecule watchlists saved."+(result.skipped.length?" Skipped (invalid or too long): "+result.skipped.join(", "):""):"Saved.");}
+  catch(error){message(error.message,true);if(route==="review")$("dialog").close();if(route==="import"||route==="pull")await refresh().catch(()=>{});}
   finally{button.disabled=false;}
 });
 refresh().catch(error=>message(error.message,true));
