@@ -15,6 +15,7 @@ the project's own LICENSE before redistributing anything.
 | [Unpaywall API](https://unpaywall.org/products/api) | Open-access status for every article; PDF fallback | See the Unpaywall section of the README |
 | [Crossref API](https://www.crossref.org/documentation/retrieve-metadata/retraction-watch/) with Retraction Watch data | Retraction / correction / expression-of-concern notices | Checked at import and every 30 days |
 | [GROBID](https://github.com/grobidOrg/grobid) (self-hosted, optional) | Structured text from PDFs (TEI) so key passages can be found in PDFs too | Set `GROBID_URL`, e.g. `http://127.0.0.1:8070`; calls `/api/processFulltextDocument` |
+| [Semantic Scholar API](https://api.semanticscholar.org/) | Extra source of open-access PDF copies (repository copies others miss) | Last full-text tier; optional `SEMANTIC_SCHOLAR_KEY` for higher limits; response shape checked only against third-party docs |
 | [PubTator 3](https://www.ncbi.nlm.nih.gov/research/pubtator3/) (NCBI) | Text-mined diseases and chemicals per article ("Conditions mentioned", extra highlight terms) | `publications/export/biocjson` per PMID, best-effort |
 | [RxNorm / RxNav](https://lhncbc.nlm.nih.gov/RxNav/APIs/RxNormAPIs.html) (NLM) | Brand names and ingredient names for a molecule | "Suggest synonyms & brands" on Search & Pull |
 | [PubChem PUG REST](https://pubchem.ncbi.nlm.nih.gov/docs/pug-rest) | Chemical synonyms (INN/USAN spellings, trade names) | Same button; names with digits or codes are filtered out |
@@ -39,7 +40,7 @@ These are Python libraries. LiteraSift does the equivalent in JavaScript, so add
 
 | Tool / source | Why not |
 |---|---|
-| Semantic Scholar API (TLDR summaries) | Reliable use needs an API key and has tight shared limits; not verified here |
+| Semantic Scholar TLDR summaries | Not needed; only the open-access PDF field is used |
 | CORE API (open-access full-text aggregator) | Needs a registered API key; Unpaywall, PMC and Europe PMC already cover most open copies |
 | bioRxiv / medRxiv APIs, Europe PMC preprints | Preprints use non-PMID identifiers, which the data model does not support yet |
 | scispaCy and other Python NLP models | Would need a Python runtime and model downloads; PubTator3 provides entity extraction as a service |

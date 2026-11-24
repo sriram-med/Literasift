@@ -85,3 +85,7 @@ Search & Pull now drives the whole chain. After a pull, a "Full-text extraction"
 ## More sources (synonyms, safety context, citations)
 
 On Search & Pull, "Suggest synonyms & brands" proposes names from RxNorm and PubChem (tap a chip to add it), and after a pull a panel shows the most-reported FDA FAERS reactions for the molecule as context. Articles also get PubTator3 "Conditions mentioned" (used as extra highlight terms), and any list can be exported as RIS or BibTeX for reference managers. See `docs/OPEN_SOURCE.md` for sources, what was considered and left out, and what is unverified.
+
+## Articles with no free full text
+
+Full text is fetched from PubMed Central, Europe PMC, Unpaywall and Semantic Scholar, in that order. Many articles (closed journals) have no legal free copy, and the app never bypasses paywalls. For those: a missing DOI is looked up in Europe PMC and OpenAlex and the article is re-checked; each article shows a "Publisher page" link; "Retrieval list (CSV)" exports the listed articles without stored full text (DOI links, PubMed links, access status) for a library or document-delivery request; and "Flag for manual retrieval" sets them to "Full text needed" so reviewers can see what is outstanding. When a new source is added, earlier "not found" results are retried once automatically.

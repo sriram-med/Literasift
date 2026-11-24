@@ -210,12 +210,15 @@ async function enrichMetadata(env, article, coreOnce) {
     if (!fields.keywords?.length && core.keywordList?.keyword) fields.keywords = core.keywordList.keyword.slice(0, 20);
     if (!fields.meshTerms?.length && core.meshHeadingList?.meshHeading) fields.meshTerms = core.meshHeadingList.meshHeading.map(m => m.descriptorName).filter(Boolean).slice(0, 30);
     if (core.citedByCount !== undefined) fields.citedBy = Number(core.citedByCount);
+    if (!article.doi && /^10\.\d{4,9}\/\S+$/.test(core.doi || "")) fields.doi = core.doi;
   }
   try {
     const work = await openAlexWork(env, article);
     if (work) {
       got = true;
       if (work.cited_by_count !== undefined) fields.citedBy = Math.max(fields.citedBy || 0, Number(work.cited_by_count));
+      const workDoi = String(work.doi || "").replace(/^https?:\/\/doi\.org\//i, "");
+      if (!article.doi && !fields.doi && validDoi(workDoi)) fields.doi = workDoi;
       fields.topic = work.primary_topic?.display_name || "";
       fields.workType = work.type || "";
       const text = invertedToText(work.abstract_inverted_index);
@@ -400,12 +403,38 @@ async function captureFromEuropePmc(env, article, coreOnce, reason) {
   await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:"application/xml" } });
   return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:license, fullTextSource:epmcBase + "/" + id + "/fullTextXML", fullTextOrigin:"Europe PMC", fullTextRestricted:!openLicenses.includes(license), _text:xmlToText(xml) };
 }
+// Semantic Scholar (free API, optional SEMANTIC_SCHOLAR_KEY): repository copies that other sources may miss.
+async function captureFromSemanticScholar(env, article, reason) {
+  const url = "https://api.semanticscholar.org/graph/v1/paper/PMID:" + encodeURIComponent(article.id) + "?fields=openAccessPdf";
+  const response = await fetch(url, { headers:env.SEMANTIC_SCHOLAR_KEY ? { "x-api-key":env.SEMANTIC_SCHOLAR_KEY } : {}, signal:AbortSignal.timeout(15000) });
+  if (!response.ok) return { fullTextStatus:reason }; // 404 = unknown paper, 429 = rate limited: not an error, just no extra source
+  const pdf = (await response.json()).openAccessPdf;
+  if (!/^https:\/\//.test(pdf?.url || "")) return { fullTextStatus:reason };
+  const license = String(pdf.license || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const permissive = ["cc0", "ccby", "ccbysa", "ccbynd"].includes(license);
+  if (!env.ALLOW_RESTRICTED && !permissive) return { fullTextStatus:reason };
+  try {
+    const file = await fetch(pdf.url, { signal:AbortSignal.timeout(25000), headers:{ Accept:"application/pdf" } });
+    if (!file.ok) return { fullTextStatus:reason };
+    const bytes = await file.arrayBuffer();
+    if (bytes.byteLength > maxPdfBytes || new TextDecoder().decode(bytes.slice(0, 5)) !== "%PDF-") return { fullTextStatus:reason };
+    const key = "evidence/" + article.id + "/semanticscholar.pdf";
+    await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:"application/pdf" } });
+    let text = "";
+    try { text = await pdfToText(env, bytes); } catch { /* best effort */ }
+    return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:pdf.license || "unspecified", fullTextSource:pdf.url, fullTextOrigin:"Semantic Scholar", fullTextRestricted:!permissive, _text:text };
+  } catch { return { fullTextStatus:reason }; }
+}
+const fullTextTier = 4; // bump when a new source is added so earlier "not found" results are tried once more
 async function captureFullText(env, article, lookupOnce, coreOnce) {
   const pmc = await captureFromPmc(env, article);
   if (pmc.fullTextStatus === "Captured") return pmc;
   const europe = await captureFromEuropePmc(env, article, coreOnce, pmc.fullTextStatus);
   if (europe.fullTextStatus === "Captured") return europe;
-  return captureFromUnpaywall(env, article, pmc.fullTextStatus, lookupOnce);
+  const unpaywall = await captureFromUnpaywall(env, article, pmc.fullTextStatus, lookupOnce);
+  if (unpaywall.fullTextStatus === "Captured") return unpaywall;
+  const scholar = await captureFromSemanticScholar(env, article, unpaywall.fullTextStatus).catch(() => ({ fullTextStatus:unpaywall.fullTextStatus }));
+  return scholar.fullTextStatus === "Captured" ? scholar : unpaywall;
 }
 // Crossref update notices (publisher and Retraction Watch sources) for the article's DOI.
 const noticeTypes = { retraction:"Retracted", withdrawal:"Retracted", removal:"Retracted",
@@ -648,17 +677,18 @@ async function collectEvidence(baseEnv, ids) {
   const articles = ids ? ids.map(id=>state.articles[id]).filter(Boolean) : Object.values(state.articles);
   const enabled = Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN));
   const needsFullText = a => !a.fullTextStatus || a.fullTextStatus === "Retry needed" ||
-    (Boolean(env.UNPAYWALL_EMAIL) && ["No PMC record","No eligible PMC file"].includes(a.fullTextStatus));
+    (Boolean(env.UNPAYWALL_EMAIL) && ["No PMC record","No eligible PMC file"].includes(a.fullTextStatus)) ||
+    (!a.fullTextKey && (a.fullTextTier || 0) < fullTextTier) || (Boolean(a.doi) && /^No DOI/.test(a.fullTextStatus || ""));
   // Local captures made before screenshotKind existed may be saved error pages, so they are taken again.
   const needsScreen = a => enabled && (!a.screenshotKey || (Boolean(env.SCREENSHOT_FN) && !a.screenshotKind));
   const needsEnrich = a => !a.enrichedAt;
   const needsEntities = a => !a.entitiesCheckedAt;
-  const needsOa = a => Boolean(env.UNPAYWALL_EMAIL) && (!a.oaCheckedAt ||
+  const needsOa = a => Boolean(env.UNPAYWALL_EMAIL) && (!a.oaCheckedAt || (a.oaStatus === "No DOI" && Boolean(a.doi)) ||
     (!a.oaIsOpen && Date.now() - Date.parse(a.oaCheckedAt) > oaRecheckMs));
-  const needsRetraction = a => !a.retractionCheckedAt || Date.now() - Date.parse(a.retractionCheckedAt) > retractionRecheckMs;
+  const needsRetraction = a => !a.retractionCheckedAt || (a.retractionStatus === "No DOI to check" && Boolean(a.doi)) || Date.now() - Date.parse(a.retractionCheckedAt) > retractionRecheckMs;
   const pending = articles.filter(a=>needsFullText(a) || needsScreen(a) || needsRetraction(a) || needsOa(a) || needsEnrich(a) || needsEntities(a))
     .sort((a,b)=>String(a.evidenceAttempt || "").localeCompare(String(b.evidenceAttempt || ""))).slice(0,4);
-  for (const article of pending) {
+  for (let article of pending) {
     const status = {evidenceAttempt:new Date().toISOString()};
     let lookup; // at most one Unpaywall request per article per pass
     const lookupOnce = async () => (lookup ||= await unpaywallLookup(env,article));
@@ -668,12 +698,13 @@ async function collectEvidence(baseEnv, ids) {
       try { Object.assign(status,await enrichMetadata(env,article,coreOnce)); }
       catch (error) { status.enrichError = error.message; }
     }
+    if (status.doi) article = { ...article, doi:status.doi };
     if (needsEntities(article)) {
       try { Object.assign(status,await fetchEntities(article)); }
       catch (error) { status.entitiesError = error.message; }
     }
     if (needsFullText(article)) {
-      try { Object.assign(status,await captureFullText(env,article,lookupOnce,coreOnce)); }
+      try { Object.assign(status,await captureFullText(env,article,lookupOnce,coreOnce)); status.fullTextTier = fullTextTier; }
       catch (error) { Object.assign(status,{fullTextStatus:"Retry needed",fullTextError:error.message}); }
     }
     if (needsOa(article)) {
@@ -743,6 +774,20 @@ async function api(request, env, path) {
   }
   if (request.method !== "POST") return json({ error:"Route unavailable." }, 404);
   const body = await request.json().catch(() => ({}));
+  if (path === "/api/bulk-status" && viewer) {
+    if (!["Pending","In review","Complete","Full text needed"].includes(body.status)) return json({error:"Invalid status."},400);
+    const ids = new Set(Array.isArray(body.ids) ? body.ids.map(String).slice(0, 5000) : []);
+    const updated = await write(env, data => {
+      let count = 0;
+      for (const a of data.assignments) {
+        if (!ids.has(a.pmid) || (!manager && a.reviewer !== email) || a.status === "Complete" || a.status === body.status) continue;
+        a.status = body.status; count++;
+        (a.history ||= []).push({ status:a.status, note:"Bulk update", by:email, at:new Date().toISOString() });
+      }
+      return count;
+    });
+    return json({ ok:true, updated });
+  }
   if (path === "/api/review" && viewer) {
     if (!["Pending","In review","Complete","Full text needed"].includes(body.status)) return json({error:"Invalid status."},400);
     await write(env, data => {
@@ -1118,6 +1163,7 @@ function evidenceChips(item){
   else if(item.retractionStatus==="Correction")chips.push(badge("Correction","amber"));
   if(item.citedBy!==undefined)chips.push(badge("Cited "+item.citedBy+"×"));
   if(item.oaStatus)chips.push('<span class="badge '+(oaColor[item.oaStatus]||"")+'" title="'+esc((item.oaLicense?"Licence: "+item.oaLicense+". ":"")+(item.oaVersion?"Version: "+item.oaVersion+". ":"")+(item.oaHostType?"Host: "+item.oaHostType+".":""))+'">'+esc(oaLabel(item))+'</span>');
+  if(!item.fullTextKey&&!item.fullTextLink&&item.doi)chips.push('<a class="badge blue" target="_blank" rel="noopener" href="'+esc("https://doi.org/"+encodeURI(item.doi))+'" title="Opens the publisher page; use your own subscription if you have one">Publisher page</a>');
   if(item.fullTextKey&&item.fullTextRestricted)chips.push('<span class="badge amber" title="Open-access copy under a restrictive licence: internal screening use only">Restricted licence'+(item.fullTextLicense?" · "+esc(item.fullTextLicense):"")+'</span>');
   chips.push(item.fullTextKey?'<a class="badge green" href="/api/full-text/'+esc(item.id)+'">Full text</a>':item.fullTextLink?'<a class="badge blue" target="_blank" rel="noopener" href="'+esc(item.fullTextLink)+'">Open-access link</a>':badge(item.fullTextStatus||"Full text pending"));
   chips.push(item.screenshotKey?'<a class="badge green" href="/api/screenshot/'+esc(item.id)+'">Screenshot</a>':badge(item.screenshotStatus||"Screenshot pending"));
@@ -1141,7 +1187,7 @@ function queueView(items){
     '<select data-filter="status" aria-label="Status"><option value="">All statuses</option>'+["Pending","In review","Full text needed","Complete"].map(s=>'<option'+(filt.status===s?" selected":"")+'>'+s+"</option>").join("")+"</select>"+
     '<select data-filter="oa" aria-label="Access"><option value="">All access</option>'+[["open","Open access"],["closed","Closed access"],["unchecked","Not yet checked"]].map(([v,l])=>'<option value="'+v+'"'+(filt.oa===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
     '<select data-filter="ft" aria-label="Full text"><option value="">All full-text states</option>'+[["stored","Full text stored"],["link","Open-access link only"],["none","No full text"]].map(([v,l])=>'<option value="'+v+'"'+(filt.ft===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
-    '<button class="btn outline" data-pdf="queue" title="Download the filtered list as a PDF with a snapshot of each article">Export PDF</button><button class="btn outline" data-zip="queue" title="Download stored full texts for the filtered list as a ZIP">Full texts (ZIP)</button><button class="btn outline" data-cite="ris" data-scope="queue" title="Citations for EndNote, Zotero or Mendeley">Citations (RIS)</button>'+
+    '<button class="btn outline" data-pdf="queue" title="Download the filtered list as a PDF with a snapshot of each article">Export PDF</button><button class="btn outline" data-zip="queue" title="Download stored full texts for the filtered list as a ZIP">Full texts (ZIP)</button><button class="btn outline" data-cite="ris" data-scope="queue" title="Citations for EndNote, Zotero or Mendeley">Citations (RIS)</button><button class="btn outline" data-retrieval="csv" title="CSV of the listed articles that have no stored full text, with DOI links, for a library or document-delivery request">Retrieval list (CSV)</button><button class="btn outline" data-retrieval="flag" title="Set the listed articles without stored full text to Full text needed">Flag for manual retrieval</button>'+
     '<select data-filter="portfolio" aria-label="Portfolio"><option value="">All portfolios</option>'+portfolios.map(p=>'<option'+(filt.portfolio===p?" selected":"")+'>'+esc(p)+"</option>").join("")+"</select></div>"+
     '<div id="qtable">'+queueRows(applyFilter(items))+"</div></section>";
 }
@@ -1280,8 +1326,24 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke]");
+  const target=event.target.closest("[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke]");
   if(!target)return;
+  if(target.dataset.retrieval){
+    const list=applyFilter(shown).filter(a=>!(data.articles[a.pmid]||{}).fullTextKey);
+    if(!list.length){message("Every article in this list already has full text stored.");return;}
+    if(target.dataset.retrieval==="flag"){
+      target.disabled=true;
+      api("bulk-status",{ids:list.map(a=>a.pmid),status:"Full text needed"}).then(r=>{message(r.updated+" article"+(r.updated===1?"":"s")+" flagged.");return refresh();}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+      return;
+    }
+    const cell=v=>'"'+String(v??"").replace(/^[=+@\\-]/,"'$&").replaceAll('"','""')+'"';
+    const rows=[["PMID","Title","Journal","Date","DOI","DOI link","PubMed link","Access","Full-text status","Portfolio","Molecules","Reviewer"]].concat(list.map(a=>{const x=data.articles[a.pmid]||{};
+      return [a.pmid,x.title,x.journal,x.date,x.doi,x.doi?"https://doi.org/"+x.doi:"",x.url,x.oaStatus||"",x.fullTextStatus||"",a.portfolio,(a.molecules||[]).join("; "),a.reviewer||""];}));
+    const link=document.createElement("a");link.href=URL.createObjectURL(new Blob([rows.map(r=>r.map(cell).join(",")).join("\\r\\n")],{type:"text/csv"}));
+    link.download="literasift-retrieval-list.csv";link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
+    message(list.length+" articles listed.");
+    return;
+  }
   if(target.dataset.cite){
     const run=target.dataset.scope!=="queue"&&data.runs.find(r=>r.id===target.dataset.scope);
     const mine=new Set(data.assignments.map(a=>a.pmid));
