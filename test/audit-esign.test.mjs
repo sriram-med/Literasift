@@ -574,3 +574,13 @@ test("patient-reported posts: masked, screened, assigned, and a case from one is
   assert.match(worker.caseNarrativeText(worker.normalizeCase(made.case.data), ""), /patient or consumer in a Reddit post/);
   assert.ok(!worker.e2bBatch([made.case], {}).includes('displayName="literatureReference"'));
 });
+
+test("record cards and tile sheets show the source, the search query and when it was retrieved", async () => {
+  const { recordCardHtml, tilesHtml } = await import("../server/screenshots.mjs");
+  const a = { id: "34567890", title: "T", pullQuery: '"aciclovir"[tiab] AND humans[mh]', pullRange: "2026-10-01 to 2026-11-20", pullAt: "2026-11-25T04:49:12Z" };
+  const card = recordCardHtml(a);
+  for (const text of ["PubMed®", "Search query", "aciclovir&quot;[tiab] AND humans[mh]", "2026-10-01 to 2026-11-20", "2026-11-25 04:49 UTC", "retrieved through the NCBI E-utilities API"]) assert.ok(card.includes(text), text);
+  assert.ok(card.includes("not a capture of the PubMed web page"));
+  const sheet = tilesHtml({ portfolio: "P", molecule: "m", query: "q1", from: "2026-10-01", to: "2026-11-20", source: "PubMed", time: "2026-11-25T04:49:12Z" }, [a]);
+  assert.ok(sheet.includes("PubMed®") && sheet.includes("2026-11-25 04:49 UTC") && sheet.includes("q1"));
+});

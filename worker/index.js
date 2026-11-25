@@ -93,7 +93,7 @@ async function importWatch(env, watch, from, to) {
     for (const id of ids) if (details[id]) Object.assign(articles[id], details[id], { abstractSource:details[id].abstract ? "PubMed" : "", abstractCheckedAt:new Date().toISOString() });
   }
   return write(env, state => {
-    for (const [id, article] of Object.entries(articles)) state.articles[id] = { ...state.articles[id], ...article, pullQuery:watch.query, pullRange:from + " to " + to };
+    for (const [id, article] of Object.entries(articles)) state.articles[id] = { ...state.articles[id], ...article, pullQuery:watch.query, pullRange:from + " to " + to, pullAt:new Date().toISOString() };
     const run = { id:crypto.randomUUID(), source:"PubMed", portfolio:watch.portfolio, molecule:watch.molecule || "", from, to, count:result.idlist.length,
       ids:result.idlist, time:new Date().toISOString(), query:watch.query, status:"Imported" };
     state.runs.unshift(run);
@@ -182,7 +182,7 @@ async function importPmidList(env, list, portfolio, molecule) {
   }
   const today = day(), ids = Object.keys(articles);
   const run = await write(env, state => {
-    for (const [id, article] of Object.entries(articles)) state.articles[id] = { ...state.articles[id], ...article, pullQuery:"PMID list (" + list.length + ")", pullRange:today };
+    for (const [id, article] of Object.entries(articles)) state.articles[id] = { ...state.articles[id], ...article, pullQuery:"PMID list (" + list.length + ")", pullRange:today, pullAt:new Date().toISOString() };
     const made = { id:crypto.randomUUID(), source:"PubMed", portfolio, molecule, from:today, to:today, count:ids.length, ids, time:new Date().toISOString(), query:"PMID list (" + list.length + " requested)", status:"Imported" };
     state.runs.unshift(made);
     for (const id of ids) {
@@ -1997,7 +1997,7 @@ async function collectEvidence(baseEnv, ids) {
     (Boolean(env.UNPAYWALL_EMAIL) && ["No PMC record","No eligible PMC file"].includes(a.fullTextStatus)) ||
     (!a.fullTextKey && (a.fullTextTier || 0) < fullTextTier) || (Boolean(a.doi) && /^No DOI/.test(a.fullTextStatus || ""));
   // Local captures made before screenshotKind existed may be saved error pages, so they are taken again.
-  const needsScreen = a => enabled && a.source !== "Social media" && (!a.screenshotKey || (Boolean(env.SCREENSHOT_FN) && !a.screenshotKind));
+  const needsScreen = a => enabled && a.source !== "Social media" && (!a.screenshotKey || (Boolean(env.SCREENSHOT_FN) && a.screenshotKind !== "record2"));
   // PDFs stored before a text reader was available are read once (pdf.js on the host, or GROBID).
   const needsPdfText = a => Boolean(env.PDF_TEXT_FN || env.GROBID_URL) && Boolean(a.fullTextKey) && /\.pdf$/i.test(a.fullTextKey) && !a.fullTextTextKey && !a.pdfTextTried;
   const needsEnrich = a => !a.enrichedAt || (a.enrichVersion || 0) < 2;
