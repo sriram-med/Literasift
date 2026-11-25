@@ -2068,6 +2068,13 @@ const groupFromWord = w => {
   return { neonate:"Neonate", newborn:"Neonate", infant:"Infant", toddler:"Infant", child:"Child", paediatric:"Child", pediatric:"Child", adolescent:"Adolescent", elderly:"Elderly", "older adult":"Elderly" }[word] || "";
 };
 const SERIOUS_FLAGS = ["serious", "death", "life_threatening", "hospitalization", "disability", "congenital_anomaly", "other_medically_important"];
+// The listedness dropdown and the expectedness field used by the exports are one value; a choice that differs from a stored label-passage decision is marked as a manual override.
+function syncListedness(e) {
+  const chosen = hasVal(e.listedness) ? v(e.listedness) : hasVal(e.expectedness) ? v(e.expectedness) : "";
+  if (chosen) { e.listedness = icsrField(chosen, "edited"); e.expectedness = icsrField(chosen, "edited"); }
+  if (e.listedness_assessment && chosen && ({ listed:"Listed", unlisted:"Unlisted", unknown:"Unknown" }[e.listedness_assessment.decision] || "") !== chosen) e.listedness_assessment = { ...e.listedness_assessment, manual_override:true };
+  return e;
+}
 function normalizeCase(input) {
   const data = input && typeof input === "object" ? input : {};
   const fixField = f => icsrField(f?.value, ["proposed", "accepted", "edited", "rejected"].includes(f?.state) ? f.state : "edited", Array.isArray(f?.evidence) ? f.evidence.slice(0, 5) : []);
@@ -2084,7 +2091,7 @@ function normalizeCase(input) {
     general_comments:String(data.general_comments || "").slice(0, 4000), sender_comments:String(data.sender_comments || "").slice(0, 4000),
     products:(data.products || []).slice(0, 30).map(p => ({ ...group(p, FIELDS.product), role:["suspect", "concomitant", "interacting"].includes(p?.role) ? p.role : "suspect", start_not_reported:p?.start_not_reported === true,
       dechallenge_basis:["reported", "unknown", "unreported", "not_applicable"].includes(p?.dechallenge_basis) ? p.dechallenge_basis : "", rechallenge_basis:["reported", "unknown", "unreported", "not_applicable"].includes(p?.rechallenge_basis) ? p.rechallenge_basis : "", start_day:Number.isFinite(p?.start_day) ? p.start_day : null, stop_day:Number.isFinite(p?.stop_day) ? p.stop_day : null })),
-    events:(data.events || []).slice(0, 30).map(e => ({ ...group(e, FIELDS.event), onset_not_reported:e?.onset_not_reported === true, ime_flag:e?.ime_flag === true, onset_day:Number.isFinite(e?.onset_day) ? e.onset_day : null, needs_medical_judgment:(e?.needs_medical_judgment || []).map(String).slice(0, 10), manifestations:(e?.manifestations || []).slice(0, 20), extraction_ref:String(e?.extraction_ref || ""), listedness_assessment:e?.listedness_assessment || null, seriousness:Object.fromEntries(SERIOUS_FLAGS.map(k => [k, Boolean(e?.seriousness?.[k])])) })),
+    events:(data.events || []).slice(0, 30).map(e => ({ ...group(e, FIELDS.event), onset_not_reported:e?.onset_not_reported === true, ime_flag:e?.ime_flag === true, onset_day:Number.isFinite(e?.onset_day) ? e.onset_day : null, needs_medical_judgment:(e?.needs_medical_judgment || []).map(String).slice(0, 10), manifestations:(e?.manifestations || []).slice(0, 20), extraction_ref:String(e?.extraction_ref || ""), listedness_assessment:e?.listedness_assessment || null, seriousness:Object.fromEntries(SERIOUS_FLAGS.map(k => [k, Boolean(e?.seriousness?.[k])])) })).map(syncListedness),
     labs:Array.isArray(data.labs) ? data.labs.slice(0, 100) : [], source_documents:(data.source_documents || []).slice(0, 20).map(d => ({ filename:String(d?.filename || "").slice(0, 200), media_type:d?.media_type || null, size_bytes:Number(d?.size_bytes) || 0, source_type:d?.source_type || "unknown" })),
     source_summary:String(data.source_summary || "").slice(0, 20000), warnings:(data.warnings || []).map(String).slice(0, 20), special_situations:(data.special_situations || []).map(String).slice(0, 30),
     // LiteraSift extensions (PV Nexus ignores unknown keys): care given for the event, and factors that confound the assessment.
@@ -3176,6 +3183,69 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"upload.fulltext", target:"PMID " + id, detail:{ type:ext, bytes:bytes.length, text_read:Boolean(text) } });
     return json({ ok:true, textRead:Boolean(text), events:(status.events || []).length });
   }
+  if (["/api/users-bulk", "/api/user-update", "/api/route-back", "/api/case-route"].includes(path) && viewer) {
+    const at = new Date().toISOString(), roleOf = r => ROLES.includes(r) ? r : "screener";
+    if (path === "/api/users-bulk" || path === "/api/user-update") {
+      if (!manager) return json({ error:"Manager access required." }, 403);
+      if (path === "/api/user-update") {
+        const target = String(body.email || "").trim().toLowerCase(), prof = state.profiles.find(p => p.email === target);
+        if (!prof) return json({ error:"Unknown team member." }, 404);
+        if (prof.role === "manager" && (body.active === false)) return json({ error:"The owner profile cannot be deactivated." }, 400);
+        const cap = body.capacity === undefined ? prof.capacity : Number(body.capacity);
+        if (!Number.isInteger(cap) || cap < 1 || cap > 500) return json({ error:"Capacity must be a whole number from 1 to 500." }, 400);
+        await write(env, data => { const x = data.profiles.find(q => q.email === target); if (body.active !== undefined) x.active = body.active !== false; x.capacity = cap; if (body.name) x.name = String(body.name).trim().slice(0, 100); if (body.portfolio !== undefined) x.portfolio = String(body.portfolio).trim().slice(0, 100);
+          for (const k of ["awayFrom", "awayUntil"]) if (body[k] !== undefined) { if (/^\d{4}-\d{2}-\d{2}$/.test(body[k])) x[k] = body[k]; else delete x[k]; }
+          if (x.active) data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data, a)); });
+        await audit(env, { by:email, action:"user.updated", target, detail:{ active:body.active, capacity:cap, portfolio:body.portfolio } });
+        return json({ ok:true });
+      }
+      const rows = Array.isArray(body.rows) ? body.rows.slice(0, 100) : [], results = [], seen = new Set();
+      if (!rows.length) return json({ error:"Add at least one person." }, 400);
+      const plan = rows.map((r, i) => { const addr = String(r?.email || "").trim().toLowerCase(), name = String(r?.name || "").trim().slice(0, 100), cap = r?.capacity === undefined || r.capacity === "" ? 50 : Number(r.capacity), role = String(r?.role || "screener").trim();
+        const problem = !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(addr) ? "Invalid email" : !name ? "Name is required" : seen.has(addr) ? "Listed twice" : !Number.isInteger(cap) || cap < 1 || cap > 500 ? "Capacity must be 1-500" : !ROLES.includes(role) ? "Role must be one of " + ROLES.join(", ") : "";
+        seen.add(addr); return { row:i + 1, email:addr, name, portfolio:String(r?.portfolio || "").trim().slice(0, 100), capacity:cap, role, problem }; });
+      await write(env, data => { for (const x of plan) {
+        if (x.problem) { results.push({ row:x.row, email:x.email, ok:false, error:x.problem }); continue; }
+        const old = data.profiles.find(q => q.email === x.email);
+        if (old && old.role === "manager") { results.push({ row:x.row, email:x.email, ok:false, error:"The owner profile cannot be changed here" }); continue; }
+        if (old) Object.assign(old, { name:x.name, portfolio:x.portfolio, capacity:x.capacity, active:true }); else data.profiles.push({ email:x.email, name:x.name, role:"reviewer", portfolio:x.portfolio, capacity:x.capacity, active:true });
+        const scope = x.portfolio || "*"; data.memberships = (data.memberships || []).filter(m => !(m.email === x.email && m.portfolio === scope && m.role === x.role)); data.memberships.push({ email:x.email, portfolio:scope, role:x.role, by:email, at });
+        results.push({ row:x.row, email:x.email, ok:true, created:!old, role:x.role, portfolio:scope }); }
+        data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data, a)); });
+      await audit(env, { by:email, action:"user.bulk_created", target:results.filter(r => r.ok).length + " people", detail:{ people:results.filter(r => r.ok).map(r => r.email + " (" + r.role + ")").join("; ").slice(0, 1500), failed:results.filter(r => !r.ok).length } });
+      return json({ ok:true, results, created:results.filter(r => r.ok && r.created).length, updated:results.filter(r => r.ok && !r.created).length, failed:results.filter(r => !r.ok).length });
+    }
+    const reason = String(body.reason || "").trim();
+    if (reason.length < 5) return json({ error:"Give a reason of at least 5 characters." }, 400);
+    if (path === "/api/route-back") {
+      const item = state.assignments.find(a => a.id === body.id);
+      if (!item || !mayAccess(state, viewer, item)) return json({ error:"Assignment not found." }, 404);
+      const roles = rolesIn(state, email, item.portfolio);
+      if (!(isPortfolioManager(state, viewer, item.portfolio) || roles.has("qc") || roles.has("medical_reviewer"))) return json({ error:"Only a manager, QC or medical reviewer can route an assignment back." }, 403);
+      const to = String(body.to || "screening");
+      if (!["screening", "qc"].includes(to)) return json({ error:"Route back to screening or QC." }, 400);
+      if (to === "qc" && !item.disposition) return json({ error:"There is no disposition to send back to QC." }, 409);
+      await write(env, data => { const a = data.assignments.find(x => x.id === item.id); (a.history ||= []).push({ status:a.status, note:"Routed back to " + to + ": " + reason.slice(0, 200) + (to === "screening" && a.disposition ? " (previous disposition: " + a.disposition.value + ")" : ""), by:email, at });
+        if (to === "screening") { a.disposition = null; a.qc = null; a.status = "Pending"; a.returnedAt = at; a.dueAt = addDays(day(), Number(data.settings?.screeningSlaDays ?? 7)); } else { a.qc = { ...(a.qc || {}), status:"pending", returned:false, routedBackBy:email }; } });
+      await audit(env, { by:email, action:"review.routed_back", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ portfolio:item.portfolio, to, reason:reason.slice(0, 300) } });
+      return json({ ok:true });
+    }
+    const ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), picked = (state.cases || []).filter(c => ids.has(c.id) && caseVisible(state, viewer, c));
+    if (!picked.length) return json({ error:"Choose at least one case." }, 400);
+    const target = body.assignee === undefined ? undefined : String(body.assignee || "").trim().toLowerCase(), status = body.status === undefined || body.status === "" ? undefined : String(body.status);
+    if (target === undefined && status === undefined) return json({ error:"Choose a person or a status to route to." }, 400);
+    if (target && !state.profiles.some(p => p.email === target && p.active)) return json({ error:"Choose an active team member." }, 400);
+    if (status !== undefined && !caseStatuses.includes(status)) return json({ error:"Unknown status." }, 400);
+    if (picked.some(c => !(isPortfolioManager(state, viewer, c.portfolio) || rolesIn(state, email, c.portfolio).has("medical_reviewer")))) return json({ error:"Only a manager or medical reviewer of the portfolio can route cases." }, 403);
+    const moved = [];
+    await write(env, data => { for (const id of ids) { const c = (data.cases || []).find(x => x.id === id); if (!c || !picked.some(p => p.id === id)) continue;
+      const parts = []; if (target !== undefined && (c.assignee || "") !== target) { c.assignee = target || undefined; c.assignedAt = target ? at : undefined; parts.push("assigned to " + (target || "nobody")); }
+      if (status && status !== c.status) { parts.push("status " + c.status + " to " + status); c.status = status; if (status === "Draft" || status === "Ready for medical review") { delete c.approval; if (c.data) delete c.data.approval; c.locked = false; } }
+      if (!parts.length) continue; refreshDue(data, c); c.updatedAt = at; (c.history ||= []).push({ at, by:email, action:"routed: " + parts.join(", ") + ". " + reason.slice(0, 200) });
+      pushVersion(c, { at, by:email, action:"routed", hash:c.versions?.at(-1)?.hash || "", note:parts.join(", ") + ": " + reason.slice(0, 200) }); moved.push(c.number + " " + parts.join(", ")); } });
+    if (moved.length) await audit(env, { by:email, action:"case.routed", target:moved.length + " cases", detail:{ changes:moved.slice(0, 50).join("; "), reason:reason.slice(0, 300) } });
+    return json({ ok:true, moved:moved.length });
+  }
   if (["/api/disposition", "/api/qc-decision", "/api/reassign", "/api/membership-save", "/api/extract", "/api/extraction-decide", "/api/allocate-bulk"].includes(path) && viewer) {
     const today = day(), at = new Date().toISOString();
     const EXCLUSION_REASONS = ["No individual patient (aggregate or study data only)", "No adverse event", "No suspect product", "Not a drug safety report (review, background, or editorial)", "Duplicate of another record", "Outside the portfolio scope", "Other (explain in the note)"];
@@ -4104,7 +4174,7 @@ const paths = {
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
+const subtitles = {Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -4211,7 +4281,7 @@ function renderCase(){
   {const d=curCase.data;d.sender=d.sender||{};["type","organisation","name","email","phone","address","country"].forEach(k=>{if(!d.sender[k])d.sender[k]=blankField();});["organisation","department","address","email","phone"].forEach(k=>{if(!d.reporter[k])d.reporter[k]=blankField();});if(!d.patient.age_group)d.patient.age_group=blankField();d.general_comments=d.general_comments||"";d.sender_comments=d.sender_comments||"";}
   const art=data.articles[curCase.pmid]||{};
   $("casehead").innerHTML='<div><b style="font-size:18px">'+esc(curCase.number)+'</b> <span class="sub">from PMID '+esc(curCase.pmid)+'</span><div class="sub">'+esc(art.title||"")+'</div></div><button type="button" class="btn outline sm" data-backtolit="1" title="Open the article in LiteraSift">Open article in LiteraSift</button><label style="min-width:240px">Status<select id="casestatus">'+data.config.caseStatuses.map(s=>'<option'+(s===curCase.status?" selected":"")+'>'+esc(s)+'</option>').join("")+'</select></label>';
-  $("casebody").innerHTML=caseForm();
+  $("casebody").innerHTML=serBar()+caseForm();
   $("caseassess").innerHTML=assessmentHtml(curAssess);
   loadReview();
   $("caseerr").textContent="";
@@ -4232,7 +4302,8 @@ function renderDispo(){
     (d.by?'<div class="sub" style="margin-top:6px">Recorded by '+esc(d.by)+" · "+esc(new Date(d.at).toLocaleString())+'</div>':"")+'</div>'+
     (qc?'<div class="card" style="padding:12px;margin-bottom:12px"><div class="sub">Independent QC</div><div>'+badge(qc.status==="pending"?"Waiting for QC":qc.status==="returned"?"Returned":"Approved",qc.status==="returned"?"red":qc.status==="approved"?"green":"blue")+' '+esc(qc.reviewer?"by "+qc.reviewer:"no QC reviewer available yet")+'</div>'+(qc.note?'<div class="sub" style="margin-top:4px">'+esc(qc.note)+'</div>':"")+
       (qc.status==="pending"&&a.reviewer!==me&&(qc.reviewer===me||mgr)?'<label style="margin-top:8px">QC note<textarea id="qcnote" rows="2"></textarea></label><div style="display:flex;gap:8px;margin-top:8px"><button type="button" class="btn" data-qcdec="approve">Approve</button><button type="button" class="btn outline" data-qcdec="return">Return to screener</button></div>':"")+'</div>':"")+
-    (mgr?'<div class="card" style="padding:12px;margin-bottom:12px"><div class="sub">Reassign</div><div class="grid" style="display:grid;gap:8px"><select id="reassignto">'+(data.profiles||[]).filter(p=>p.active).map(p=>'<option value="'+esc(p.email)+'"'+(p.email===a.reviewer?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select><input id="reassignreason" placeholder="Reason (required)"><button type="button" class="btn outline sm" data-reassign="1">Reassign</button></div></div>':"");
+    (mgr?'<div class="card" style="padding:12px;margin-bottom:12px"><div class="sub">Reassign</div><div class="grid" style="display:grid;gap:8px"><select id="reassignto">'+(data.profiles||[]).filter(p=>p.active).map(p=>'<option value="'+esc(p.email)+'"'+(p.email===a.reviewer?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select><input id="reassignreason" placeholder="Reason (required)"><button type="button" class="btn outline sm" data-reassign="1">Reassign</button></div></div>':"")+
+    ((mgr||(qc&&qc.reviewer===me))&&(a.disposition||qc)?'<div class="card" style="padding:12px;margin-bottom:12px"><div class="sub">Route back</div><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px"><button type="button" class="btn outline sm" data-p4="back|screening">Send back to screening</button>'+(a.disposition?'<button type="button" class="btn outline sm" data-p4="back|qc">Send back to QC</button>':"")+'</div><div class="sub" style="margin-top:4px">The screener redoes the disposition; the reason is kept in the history and audit trail.</div></div>':"");
 }
 const EVCAT={ae:["Adverse event candidate","green"],manifestation:["Manifestation","amber"],indication:["Indication",""],history:["Past history",""],lab:["Laboratory finding",""],alternative:["Alternative cause","blue"]};
 async function loadExtraction(){
@@ -4310,6 +4381,7 @@ async function loadReview(){
     (c.link?"":'<div style="display:flex;gap:6px;margin-top:4px"><button type="button" class="btn outline sm" data-p3="dup|'+esc(c.caseId)+'|follow_up">This is a follow-up</button><button type="button" class="btn outline sm" data-p3="dup|'+esc(c.caseId)+'|duplicate">Duplicate</button><button type="button" class="btn outline sm" data-p3="dup|'+esc(c.caseId)+'|not_duplicate">Not a duplicate</button></div>')+'</div>').join(""):'<div class="sub">No potential duplicates found. Nothing is linked without a reviewer confirming it.</div>')+'</div>';
   h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Listedness against reference safety information</b>'+(rsi.length?'<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap"><select id="rsisel" aria-label="Reference safety information">'+rsi.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.product+" v"+x.version+(x.market?" ("+x.market+")":""))+'</option>').join("")+'</select><select id="rsievent" aria-label="Event">'+d.events.map((e,i)=>'<option value="'+i+'">'+esc(e.verbatim&&e.verbatim.value||"event "+(i+1))+'</option>').join("")+'</select><button type="button" class="btn outline sm" data-p3="lsug">Find label passages</button></div><div id="lresult" class="sub"></div>':'<div class="sub">No reference safety information is loaded. A manager can add authorised RSI text below; listedness stays unknown until a reviewer decides against it.</div>')+
     '<details style="margin-top:6px"><summary class="sub">Add reference safety information (manager)</summary><input id="rsiprod" placeholder="Product" style="width:100%;margin-top:4px"><input id="rsiver" placeholder="Version" style="width:48%"><input id="rsimarket" placeholder="Market" style="width:48%"><textarea id="rsitext" rows="4" placeholder="Authorised text (e.g. SmPC section 4.8)" style="width:100%"></textarea><button type="button" class="btn sm" data-p3="rsisave">Save RSI version</button></details></div>';
+  if(data.viewer.role==="manager"||(data.memberships||[]).some(m=>m.email===data.viewer.email&&m.role==="medical_reviewer"))h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Route this case</b><div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px"><button type="button" class="btn outline sm" data-p4="caseroute|draft">Send back to Draft (clears approval)</button><select id="routeto" aria-label="Person">'+(data.profiles||[]).filter(p=>p.active).map(p=>'<option value="'+esc(p.email)+'"'+(p.email===curCase.assignee?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select><button type="button" class="btn outline sm" data-p4="caseroute|person">Reassign case</button></div></div>';
   h+='<div class="card" style="padding:10px"><b>Version history</b>'+versions.map(v=>'<div class="sub">v'+v.n+" · "+esc(v.action)+" · "+esc(v.by||"")+" · "+esc(String(v.at||"").slice(0,16).replace("T"," "))+(v.note?" · "+esc(v.note):"")+'</div>').join("")+'</div>';
   box.innerHTML=h;
 }
@@ -4337,6 +4409,53 @@ async function p3action(target){
   }catch(e){message(e.message,true);}
 }
 async function refreshCase(){await refresh();const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}}
+
+function adminHtml(){
+  const today=new Date().toISOString().slice(0,10), people=(data.profiles||[]), act=people.filter(p=>p.active), mem=data.memberships||[];
+  const openA=(data.assignments||[]).filter(a=>!["Complete","Full text needed"].includes(a.status)), unassigned=openA.filter(a=>!a.reviewer);
+  const closedC=c=>c.status==="Sent to PV Nexus"||c.status==="Closed: not a valid ICSR", openC=(data.cases||[]).filter(c=>!closedC(c));
+  const stat=(label,n,tone)=>'<div class="card" style="padding:10px 12px"><div class="sub">'+label+'</div><b style="font-size:20px;color:'+(tone&&n?"var(--red)":"inherit")+'">'+n+'</b></div>';
+  const tiles='<div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:14px">'+stat("Active people",act.length)+stat("Unassigned citations",unassigned.length,1)+stat("Overdue citations",openA.filter(a=>a.dueAt&&a.dueAt<today).length,1)+stat("Open cases",openC.length)+stat("Cases without owner",openC.filter(c=>!c.assignee).length,1)+stat("Ready for medical review",openC.filter(c=>c.status==="Ready for medical review").length)+'</div>';
+  const personOpts=sel=>'<option value="">Nobody</option>'+act.map(p=>'<option value="'+esc(p.email)+'"'+(p.email===sel?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("");
+  const roleOf=p=>[...new Set(mem.filter(m=>m.email===p.email).map(m=>m.role.replace("_"," ")+(m.portfolio==="*"?"":" ("+m.portfolio+")")))].join(", ")||(p.role==="manager"?"owner":"screener");
+  const addUsers=panel("Add several people at once",'<div class="sub" style="margin-bottom:6px">One person per line: <b>name, email, role, portfolio, open limit</b>. Roles: screener, medical_reviewer, qc, manager. Portfolio and limit are optional (blank portfolio means all). Existing people are updated.</div><textarea id="adm_rows" rows="6" style="width:100%" placeholder="Meera Rao, meera@example.org, medical_reviewer, Antivirals, 30"></textarea><div style="margin-top:8px"><button type="button" class="btn" data-p4="bulkusers">Create people</button></div><div id="adm_result" class="sub" style="margin-top:8px"></div><div class="sub" style="margin-top:6px">Sign-in invitations are sent from the Team tab.</div>');
+  const peopleRows=people.map(p=>{const own=openA.filter(a=>a.reviewer===p.email).length, cs=openC.filter(c=>c.assignee===p.email).length;
+    return [esc(p.name||"")+'<div class="sub">'+esc(p.email)+'</div>',esc(roleOf(p)),esc(p.portfolio||"All"),own+" citations · "+cs+" cases",'<input type="number" min="1" max="500" value="'+esc(p.capacity||"")+'" style="width:76px" id="adm_cap_'+esc(p.email)+'" aria-label="Open limit">',p.active?badge("Active","green"):badge("Inactive",""),p.role==="manager"?"":'<button type="button" class="btn outline sm" data-p4="usersave|'+esc(p.email)+'">Save limit</button> <button type="button" class="btn outline sm" data-p4="useractive|'+esc(p.email)+'|'+(p.active?"0":"1")+'">'+(p.active?"Deactivate":"Activate")+'</button>'];});
+  const peoplePanel=panel("People and workload",table(["Person","Roles","Portfolio","Open work","Limit","Status",""],peopleRows,"No people yet."),"Deactivated people keep their history but receive no new work.",true);
+  const alloc=panel("Allocate citations",'<div class="row"><span><b>'+unassigned.length+'</b> citation'+(unassigned.length===1?"":"s")+' unassigned. Automatic allocation uses availability, open workload against each limit, and overdue work.</span><button type="button" class="btn" data-p4="autoalloc"'+(unassigned.length?"":" disabled")+'>Allocate all automatically</button></div>'+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0"><select id="adm_to" aria-label="Move to">'+personOpts("").replace("Nobody","Move selected to…")+'</select><input id="adm_reason" placeholder="Reason (required)" style="min-width:220px"><button type="button" class="btn outline" data-p4="reassign">Reassign selected</button><button type="button" class="btn outline" data-p4="selall|adm_a">Select all shown</button></div>'+
+    table(["","Citation","Portfolio","Assigned to","Due","Status"],openA.slice(0,200).map(a=>{const art=data.articles[a.pmid]||{};return ['<input type="checkbox" class="adm_a" value="'+esc(a.id)+'" aria-label="Select">',esc((art.title||"PMID "+a.pmid).slice(0,90))+'<div class="sub">PMID '+esc(a.pmid)+'</div>',esc(a.portfolio),a.reviewer?esc(((people.find(p=>p.email===a.reviewer)||{}).name)||a.reviewer):badge("Unassigned","red"),esc(a.dueAt||""),esc(a.status)];}),"No open citations."),"",false);
+  const route=panel("Cases: reassign or route back",'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"><select id="adm_cto" aria-label="Person"><option value="__keep">Keep owner</option>'+personOpts("").replace("Nobody","Unassigned")+'</select><select id="adm_cstatus" aria-label="Status"><option value="">Keep status</option><option>Draft</option><option>Ready for medical review</option></select><input id="adm_creason" placeholder="Reason (required)" style="min-width:220px"><button type="button" class="btn outline" data-p4="routecases">Route selected</button><button type="button" class="btn outline" data-p4="selall|adm_c">Select all shown</button></div><div class="sub" style="margin-bottom:6px">Choosing Draft sends a case back to its owner for rework and clears any approval.</div>'+
+    table(["","Case","Event","Owner","Status","Serious"],openC.slice(0,200).map(c=>{const ser=(c.data.events||[]).some(e=>Object.values(e.seriousness||{}).some(Boolean));return ['<input type="checkbox" class="adm_c" value="'+esc(c.id)+'" aria-label="Select">','<b>'+esc(c.number)+'</b><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.portfolio||"")+'</div>',esc((((c.data.events||[])[0]||{}).verbatim||{}).value||"—"),c.assignee?esc(((people.find(p=>p.email===c.assignee)||{}).name)||c.assignee):badge("Unassigned","red"),badge(c.status,c.status==="Ready for medical review"?"blue":""),ser?badge("Serious","red"):""];}),"No open cases."),"",false);
+  const sys=panel("System",'<div class="row"><span>LiteraSift v0.01 · Developed by Dr Sriram</span><span class="sub">Audit trail is in the Audit tab; backups and migration: docs/WORKBENCH.md</span></div>');
+  return tiles+addUsers+peoplePanel+alloc+route+sys;
+}
+async function p4action(target){
+  const [act,a1,a2]=target.dataset.p4.split("|"), checked=cls=>[...document.querySelectorAll("."+cls+":checked")].map(x=>x.value), done=async m=>{await refresh();message(m);};
+  try{
+    if(act==="bulkusers"){const rows=$("adm_rows").value.split(NL).map(l=>l.trim()).filter(Boolean).map(l=>{const c=l.split(",").map(x=>x.trim());return{name:c[0],email:c[1],role:c[2]||"screener",portfolio:c[3]||"",capacity:c[4]||""};});
+      if(!rows.length)return message("Add at least one line.",true);const r=await api("users-bulk",{rows});
+      await refresh();message(r.created+" created, "+r.updated+" updated"+(r.failed?", "+r.failed+" failed":"")+".",r.failed>0);
+      if($("adm_result"))$("adm_result").innerHTML=r.results.map(x=>(x.ok?badge("ok","green"):badge("failed","red"))+" line "+x.row+" "+esc(x.email)+" "+esc(x.ok?x.role:x.error)).join("<br>");return;}
+    if(act==="usersave"){await api("user-update",{email:a1,capacity:Number($("adm_cap_"+a1).value)});await done("Limit saved.");return;}
+    if(act==="useractive"){await api("user-update",{email:a1,active:a2==="1"});await done(a2==="1"?"Activated.":"Deactivated.");return;}
+    if(act==="autoalloc"){const r=await api("allocate-bulk",{});await done(r.allocated+" allocated"+(r.unallocated?", "+r.unallocated+" could not be allocated (no available person)":"")+".");return;}
+    if(act==="selall"){document.querySelectorAll("."+a1).forEach(x=>{x.checked=true;});return;}
+    if(act==="reassign"){const ids=checked("adm_a"),to=$("adm_to").value;if(!ids.length)return message("Tick the citations to move.",true);if(!to)return message("Choose who to move them to.",true);await api("reassign",{ids,to,reason:$("adm_reason").value});await done(ids.length+" reassigned.");return;}
+    if(act==="routecases"){const ids=checked("adm_c"),to=$("adm_cto").value,status=$("adm_cstatus").value;if(!ids.length)return message("Tick the cases to route.",true);const body={ids,reason:$("adm_creason").value};if(to!=="__keep")body.assignee=to;if(status)body.status=status;await api("case-route",body);await done("Routed "+ids.length+" case"+(ids.length===1?"":"s")+".");return;}
+    if(act==="back"){const why=prompt("Why is this being sent back? (recorded)","");if(!why)return;await api("route-back",{id:active.id,to:a1,reason:why});await refresh();active=data.assignments.find(x=>x.id===active.id)||active;message("Sent back to "+a1+".");renderDispo();return;}
+    if(act==="caseroute"){const why=prompt("Why is this case being sent back? (recorded)","");if(!why)return;const body={ids:[curCase.id],reason:why};if(a1==="draft")body.status="Draft";else body.assignee=$("routeto").value;await api("case-route",body);await refreshCase();message("Case routed.");return;}
+  }catch(e){message(e.message,true);}
+}
+function serBar(){
+  const keys=["serious","death","life_threatening","hospitalization","disability","congenital_anomaly","other_medically_important"], ev=curCase.data.events||[];
+  return '<div class="card" style="padding:10px;margin-bottom:12px"><b>Case seriousness</b> <span class="sub">Tick a criterion to mark it on every event; adjust single events below. Serious is set whenever any criterion applies.</span><div class="chips" style="margin-top:6px">'+keys.map(k=>'<label class="check"><input type="checkbox" data-serall="'+k+'"'+(ev.length&&ev.every(e=>e.seriousness&&e.seriousness[k])?" checked":"")+'>&nbsp;'+k.replace(/_/g," ")+'</label>').join("")+'</div></div>';
+}
+function serToggle(el){
+  const k=el.dataset.serall,on=el.checked;curCase.data.events.forEach(e=>{e.seriousness[k]=on;e.seriousness.serious=k==="serious"?on:Object.keys(e.seriousness).some(x=>x!=="serious"&&e.seriousness[x]);});
+  document.querySelectorAll('[data-kind="flag"]').forEach(x=>{const m=(x.dataset.path||"").split(".");if(m[0]!=="events"||m[2]!=="seriousness")return;const e=curCase.data.events[Number(m[1])];if(e&&m[3] in e.seriousness)x.checked=Boolean(e.seriousness[m[3]]);});
+}
+document.addEventListener("change",e=>{if(e.target.dataset&&e.target.dataset.serall)serToggle(e.target);});
 const covBadge=c=>({reconciled:badge("Reconciled","green"),zero_results:badge("Zero results",""),partial:badge("Partially imported","amber"),failed:badge("Failed","red"),running:badge("Running","blue"),legacy:badge("Imported (earlier)","")}[c]||badge(c||"legacy",""));
 async function loadBatches(){
   const box=$("batchcov");if(!box)return;
@@ -4601,7 +4720,7 @@ function applyFilter(items){
 function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Synchrony","Batches","Watchlists","Team","Audit","Settings"]:["My Queue","Synchrony"]).concat(data.config.accounts?["Account"]:[]);
+  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Synchrony","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Queue","Synchrony"]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   libNumbers=null;
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
@@ -4645,7 +4764,7 @@ function render() {
     const closed=c=>c.status==="Sent to PV Nexus"||c.status==="Closed: not a valid ICSR", openCases=all.filter(c=>!closed(c));
     const left=c=>c.dueAt?Math.round((Date.parse(c.dueAt)-Date.parse(today))/864e5):null;
     const signed=c=>(c.signatures||[]).some(x=>!x.superseded);
-    const filters={all:["Open",openCases],mine:["Mine",openCases.filter(c=>c.assignee===me)],unassigned:["Unassigned",openCases.filter(c=>!c.assignee)],overdue:["Overdue",openCases.filter(c=>left(c)!==null&&left(c)<0)],soon:["Due in 3 days",openCases.filter(c=>left(c)!==null&&left(c)>=0&&left(c)<=3)],review:["Ready for review",openCases.filter(c=>c.status==="Ready for medical review")],signed:["Signed",all.filter(signed)],done:["Closed or sent",all.filter(closed)]};
+    const filters={all:["Open",openCases],mine:["Mine",openCases.filter(c=>c.assignee===me)],unassigned:["Unassigned",openCases.filter(c=>!c.assignee)],serious:["Serious",openCases.filter(c=>(c.data.events||[]).some(e=>Object.values(e.seriousness||{}).some(Boolean)))],overdue:["Overdue",openCases.filter(c=>left(c)!==null&&left(c)<0)],soon:["Due in 3 days",openCases.filter(c=>left(c)!==null&&left(c)>=0&&left(c)<=3)],review:["Ready for review",openCases.filter(c=>c.status==="Ready for medical review")],signed:["Signed",all.filter(signed)],done:["Closed or sent",all.filter(closed)]};
     if(!filters[synFilter])synFilter="all";
     const shown=filters[synFilter][1], stColor={"Ready for medical review":"blue","Sent to PV Nexus":"green"}, manager=data.viewer.role==="manager";
     const people=(data.profiles||[]).filter(p=>p.active);
@@ -4658,7 +4777,7 @@ function render() {
       const a=c.assessment||{},d=c.data,sp=(d.products.find(p=>p.role==="suspect")||{name:{}}).name.value||"—",ev=((d.events[0]||{}).verbatim||{}).value||"—",art=data.articles[c.pmid]||{},dl=left(c);
       const who=manager?'<select data-assignsel="'+esc(c.id)+'" aria-label="Assignee"><option value="">Unassigned</option>'+people.map(p=>'<option value="'+esc(p.email)+'"'+(p.email===c.assignee?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select>':esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||"Unassigned");
       const due=c.dueAt?badge((dl<0?Math.abs(dl)+" d overdue":dl===0?"due today":dl+" d left")+" · "+c.dueAt,closed(c)?"":dl<0?"red":dl<=3?"amber":"green"):'<span class="sub">no date</span>';
-      return ['<b>'+esc(c.number)+'</b>'+(signed(c)?' <span class="badge green" title="Signed">signed</span>':""),'<a href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,80))+'</a><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.molecule||"")+'</div>',esc(sp)+" · "+esc(ev),who,due,badge(c.status,stColor[c.status]||""),(a.valid?badge("Valid","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"))+'<div class="sub">QC '+(a.score??"")+' / 100</div>','<button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>'];});
+      return ['<b>'+esc(c.number)+'</b>'+(signed(c)?' <span class="badge green" title="Signed">signed</span>':"")+((c.data.events||[]).some(e=>Object.values(e.seriousness||{}).some(Boolean))?' <span class="badge red">serious</span>':""),'<a href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,80))+'</a><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.molecule||"")+'</div>',esc(sp)+" · "+esc(ev),who,due,badge(c.status,stColor[c.status]||""),(a.valid?badge("Valid","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"))+'<div class="sub">QC '+(a.score??"")+' / 100</div>','<button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>'];});
     const S=data.series||{total:0,events:[],products:[],countries:[],sex:[],ages:[],monthly:[],serious:[],fatal:[],trend:{hikes:[]}};
     const bars=(list)=>list.length?list.map(x=>'<div class="row" title="'+esc(x.cases.join(", "))+'"><span>'+esc(x.key)+'</span><span class="sub">'+x.count+' case'+(x.count===1?"":"s")+' · '+esc(x.cases.slice(0,4).join(", "))+(x.cases.length>4?"…":"")+'</span></div>').join(""):'<div class="empty">No data yet.</div>';
     const months=S.monthly.map(m=>'<span class="badge'+((S.trend.hikes||[]).includes(m.month)?" red":"")+'" title="'+esc(m.cases.join(", "))+'">'+esc(m.month)+': '+m.count+'</span>').join(" ");
@@ -4755,6 +4874,7 @@ function render() {
     panel("What Unpaywall adds across the site",'<div class="row"><span>Overview</span><span class="sub">Open-access share and breakdown</span></div><div class="row"><span>Queues</span><span class="sub">OA badge on every citation and an access filter</span></div><div class="row"><span>Full text</span><span class="sub">Fallback when PubMed Central has no eligible copy</span></div><div class="row"><span>CSV export</span><span class="sub">OA status, licence and link columns</span></div>');
   if(tab==="Account") html=panel("Change password",'<form class="grid" data-route="/host/change-password"><label>Current password<input type="password" name="current" autocomplete="current-password" required></label><label>New password<input type="password" name="next" autocomplete="new-password" minlength="12" required></label><label>Confirm new password<input type="password" name="confirm" autocomplete="new-password" minlength="12" required></label><div><button class="btn">Change password</button></div></form>',"At least 12 characters. Changing it signs you out everywhere else.")+
     panel("Your account",'<div class="row"><span>Name</span><b>'+esc(data.viewer.name)+'</b></div><div class="row"><span>Email</span><b>'+esc(data.viewer.email)+'</b></div><div class="row"><span>Role</span>'+badge(data.viewer.role,data.viewer.role==="manager"?"blue":"")+'</div>');
+  if(tab==="Admin")html=adminHtml();
   if(tab==="Team"){
     const hosted=data.config.accounts, accts=data.accounts.users;
     const pfList=[...new Set([...data.watches.map(w=>w.portfolio),...data.assignments.map(a=>a.portfolio)])].sort(), mem=data.memberships||[];
@@ -4849,7 +4969,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -5038,6 +5158,7 @@ document.addEventListener("click",event=>{
   if(target.dataset.qcdec){target.disabled=true;api("qc-decision",{id:active.id,decision:target.dataset.qcdec,note:$("qcnote")?$("qcnote").value:""}).then(async()=>{await refresh();message("QC decision recorded.");active=data.assignments.find(x=>x.id===active.id)||active;renderDispo();}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}
   if(target.dataset.reassign){api("reassign",{ids:[active.id],to:$("reassignto").value,reason:$("reassignreason").value}).then(async()=>{await refresh();message("Reassigned.");$("dialog").close();}).catch(e=>message(e.message,true));return;}
   if(target.dataset.p3){p3action(target);return;}
+  if(target.dataset.p4){p4action(target);return;}
   if(target.dataset.exdec){const [action,eid]=target.dataset.exdec.split("|");let reason="";if(action==="exclude"){reason=prompt("Why is this not captured? (recorded)","");if(!reason)return;}api("extraction-decide",{id:active.id,eventId:eid,action,reason}).then(()=>loadExtraction()).catch(e=>message(e.message,true));return;}
   if(target.dataset.resume){target.disabled=true;message("Resuming the import…");api("import-resume",{runId:target.dataset.resume,retryFailed:true}).then(async r=>{await refresh();message("Import is now "+r.coverage.replace("_"," ")+(r.gaps.length?" with "+r.gaps.length+" gap"+(r.gaps.length===1?"":"s"):"")+".",r.coverage!=="reconciled"&&r.coverage!=="zero_results");}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}
   if(target.dataset.evretry){target.disabled=true;message("Retrying only what is missing…");api("evidence-retry",{runId:target.dataset.evretry}).then(async r=>{await refresh();message(r.retried+" PMID"+(r.retried===1?"":"s")+" retried; "+r.readiness.pending+" still pending.");}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}
