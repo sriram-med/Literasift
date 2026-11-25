@@ -185,3 +185,8 @@ Uploads up to 40 MB need `deploy/enable-uploads.sh` on an existing server (new i
 - **Reporter, sender and comments:** reporter organisation, department, address, e-mail and phone; sender type, organisation and contact (defaults in Settings); the reporter's and sender's general comments.
 - **CIOMS I** follows the PV Nexus export layout (sections 0 to X, one row per event, an assessment block per event). **E2B(R3) XML** carries the same data: age group, reporter and sender, comments, and one causality assessment per reaction and suspect drug.
 - **Unpaywall:** up to five open locations are tried, including open landing pages that name their PDF in the standard `citation_pdf_url` tag.
+
+## Getting closed articles, legally
+
+Retrieval tries PMC, Europe PMC, Unpaywall (several locations, including open landing pages), Semantic Scholar and, new, an openly licensed **preprint** of the same paper (exact title match; marked as a preprint because it may differ from the published version).
+What stays closed appears on **Batches > Closed articles waiting for a full text**: a link through your library proxy, a **Copy request** note for the author, and **Match and upload** for many PDFs at once (name each file with its PMID or DOI). Nothing scrapes publisher sites or shadow libraries.

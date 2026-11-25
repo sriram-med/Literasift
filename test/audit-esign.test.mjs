@@ -453,3 +453,23 @@ test("CIOMS I lists every event with its own causality, and E2B XML carries repo
     const r = spawnSync("xmllint", ["--noout", "--schema", ICH_DIR + "/MCCI_IN200100UV01.xsd", tmp + "/c.xml"], { encoding: "utf8" }); assert.equal(r.status, 0, r.stderr);
   }
 });
+
+test("a preprint of the same paper is used as a legal open copy, marked as a preprint, and only when its title matches exactly", async () => {
+  const t = await setup();
+  const realFetch = globalThis.fetch, article = { id: "77", title: "Aciclovir neurotoxicity in patients on haemodialysis: a case series" };
+  const mock = (title, license = "cc by") => async url => {
+    const u = String(url);
+    if (u.includes("/search")) return new Response(JSON.stringify({ resultList: { result: [{ id: "PPR123456", title: title + ".", isOpenAccess: "Y", license }] } }), { status: 200 });
+    if (u.includes("/PPR123456/fullTextXML")) return new Response("<article><body><p>" + FULL_TEXT + "</p></body></article>", { status: 200 });
+    return new Response("", { status: 404 });
+  };
+  try {
+    globalThis.fetch = mock(article.title);
+    const hit = await worker.captureFromPreprint(t.env, article, "Open access link only");
+    assert.equal(hit.fullTextStatus, "Captured"); assert.equal(hit.fullTextVersion, "preprint"); assert.match(hit.fullTextOrigin, /Preprint/); assert.ok(hit._text.includes("Case presentation"));
+    globalThis.fetch = mock("A different paper with another title entirely, on another subject");
+    assert.equal((await worker.captureFromPreprint(t.env, article, "kept")).fullTextStatus, "kept");
+    globalThis.fetch = mock(article.title, "all rights reserved");
+    assert.equal((await worker.captureFromPreprint(t.env, article, "kept")).fullTextStatus, "kept");
+  } finally { globalThis.fetch = realFetch; }
+});

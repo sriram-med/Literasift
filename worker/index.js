@@ -490,7 +490,27 @@ async function captureFromSemanticScholar(env, article, reason) {
     return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:pdf.license || "unspecified", fullTextSource:pdf.url, fullTextOrigin:"Semantic Scholar", fullTextRestricted:!permissive, _text:text };
   } catch { return { fullTextStatus:reason }; }
 }
-const fullTextTier = 4; // bump when a new source is added so earlier "not found" results are tried once more
+const fullTextTier = 5; // bump when a new source is added so earlier "not found" results are tried once more
+// A preprint of the same paper, when its own open licence allows storage (Europe PMC indexes bioRxiv, medRxiv and others). It may differ from the published version, so it is marked as a preprint.
+const normTitle = t => String(t || "").toLowerCase().replace(/<[^>]+>/g, " ").replace(/[^a-z0-9]+/g, " ").trim();
+async function captureFromPreprint(env, article, reason) {
+  const title = normTitle(article.title);
+  if (title.length < 25) return { fullTextStatus:reason };
+  const url = new URL(epmcBase + "/search");
+  url.search = new URLSearchParams({ query:'TITLE:"' + String(article.title).replace(/["\\]/g, " ").slice(0, 200) + '" AND SRC:PPR', resultType:"core", format:"json", pageSize:"5" });
+  const response = await fetch(url, { signal:AbortSignal.timeout(20000) });
+  if (!response.ok) return { fullTextStatus:reason };
+  const hit = ((await response.json()).resultList?.result || []).find(r => normTitle(r.title) === title && r.isOpenAccess === "Y" && /^PPR\d+$/.test(r.id || ""));
+  const license = String(hit?.license || "").toLowerCase().trim().replace(/\s+/g, "-");
+  if (!hit || !(env.ALLOW_RESTRICTED || openLicenses.includes(license))) return { fullTextStatus:reason };
+  const file = await fetch(epmcBase + "/" + hit.id + "/fullTextXML", { signal:AbortSignal.timeout(25000) });
+  if (!file.ok) return { fullTextStatus:reason };
+  const bytes = await file.arrayBuffer(), xml = new TextDecoder().decode(bytes);
+  if (bytes.byteLength > 15 * 1024 * 1024 || !/<article\b/.test(xml)) return { fullTextStatus:reason };
+  const key = "evidence/" + article.id + "/preprint.xml";
+  await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:"application/xml" } });
+  return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:license, fullTextSource:epmcBase + "/" + hit.id + "/fullTextXML", fullTextOrigin:"Preprint (Europe PMC)", fullTextVersion:"preprint", fullTextRestricted:!openLicenses.includes(license), _text:xmlToText(xml) };
+}
 async function captureFullText(env, article, lookupOnce, coreOnce) {
   const pmc = await captureFromPmc(env, article);
   if (pmc.fullTextStatus === "Captured") return pmc;
@@ -499,7 +519,9 @@ async function captureFullText(env, article, lookupOnce, coreOnce) {
   const unpaywall = await captureFromUnpaywall(env, article, pmc.fullTextStatus, lookupOnce);
   if (unpaywall.fullTextStatus === "Captured") return unpaywall;
   const scholar = await captureFromSemanticScholar(env, article, unpaywall.fullTextStatus).catch(() => ({ fullTextStatus:unpaywall.fullTextStatus }));
-  return scholar.fullTextStatus === "Captured" ? scholar : unpaywall;
+  if (scholar.fullTextStatus === "Captured") return scholar;
+  const preprint = await captureFromPreprint(env, article, unpaywall.fullTextStatus).catch(() => ({ fullTextStatus:unpaywall.fullTextStatus }));
+  return preprint.fullTextStatus === "Captured" ? preprint : unpaywall;
 }
 // Crossref update notices (publisher and Retraction Watch sources) for the article's DOI.
 const noticeTypes = { retraction:"Retracted", withdrawal:"Retracted", removal:"Retracted",
@@ -3199,6 +3221,13 @@ function render() {
     '<form class="grid" data-route="import"><label>Watchlist<select name="watch">'+watchOptions+'</select></label><label>From<input name="from" type="date" required></label><label>Through<input name="to" type="date" required></label><div><button class="btn">Import citations</button></div></form>':
     '<div class="empty">Save a watchlist before importing a batch.</div>')+
     panel("Batch archive",'<form data-route="evidence" style="margin:0 0 8px"><button class="btn outline">Process pending evidence</button></form>'+table(["Watchlist","Date range","Citations","Status","Manifest"],data.runs.map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-export="'+esc(r.id)+'">CSV</button> <button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF</button> <button class="btn outline sm" data-zip="'+esc(r.id)+'">ZIP</button>':""]),"No batches yet."));
+  if(tab==="Batches"){
+    const closedList=Object.values(data.articles).filter(a=>!a.fullTextKey&&a.title&&data.assignments.some(x=>x.pmid===a.id)).slice(0,200), prefix=data.config.proxyPrefix||"";
+    html+=panel("Closed articles waiting for a full text ("+closedList.length+(closedList.length===200?"+":"")+")",
+      '<div class="row"><span>Download the PDFs you are licensed to use, name each file with its PMID or DOI, and add them all at once.</span><span style="display:flex;gap:8px;flex-wrap:wrap"><input type="file" id="bulkft" multiple accept=".pdf,.xml"><button type="button" class="btn" data-bulkft="1">Match and upload</button></span></div><div id="bulkftresult" class="sub" style="padding:6px 0"></div>'+
+      table(["Article","Status","Get it","Ask the author"],closedList.map(a=>{const link=a.doi?"https://doi.org/"+a.doi:a.url||"";return ['<a href="'+esc(a.url||"#")+'" target="_blank" rel="noopener">'+esc(String(a.title).slice(0,90))+'</a><div class="sub">PMID '+esc(a.id)+(a.doi?" · "+esc(a.doi):"")+'</div>',esc(a.fullTextStatus||"Pending"),(prefix&&link?'<a class="btn outline sm" href="'+esc(prefix+link)+'" target="_blank" rel="noopener">Via your library</a>':'<span class="sub">set a proxy in Settings</span>'),'<button type="button" class="btn outline sm" data-authornote="'+esc(a.id)+'">Copy request</button>'];}),"Every article in the queues has a full text."),
+      "Open-access sources are tried automatically (PMC, Europe PMC, Unpaywall, Semantic Scholar, preprints). What is left is closed. Only use copies you are licensed to use.");
+  }
   $("content").innerHTML=html;
   animate();
   drawProgress();
@@ -3260,7 +3289,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -3303,6 +3332,20 @@ document.addEventListener("click",event=>{
     api("case-assess",{id:c.id}).then(r=>{if($("dialog").open)$("dialog").close();openCaseData(c,r.assessment);}).catch(e=>message(e.message,true));return;
   }
   if(target.dataset.backtolit){const item=(data.assignments||[]).find(x=>x.pmid===curCase.pmid);if(!item){message("That article is not in your queue.",true);return;}$("casedlg").close();const open=document.querySelector('[data-review="'+item.id+'"]');if(open)open.click();else{tab=data.viewer.role==="manager"?"All Assignments":"My Queue";render();}return;}
+  if(target.dataset.authornote){
+    const a=data.articles[target.dataset.authornote]||{},first=(a.authors||[])[0]||"author",note="Dear "+first+",\\n\\nI am writing to ask whether you could share a copy of your article \\""+(a.title||"")+"\\" ("+[a.journal,a.date].filter(Boolean).join(", ")+(a.doi?", DOI "+a.doi:"")+"). We review the safety literature for medicines and cannot access this article through our subscriptions. A PDF of the accepted or published version would be very helpful.\\n\\nThank you,\\n"+data.viewer.name;
+    (navigator.clipboard?navigator.clipboard.writeText(note):Promise.reject()).then(()=>message("Request note copied. Paste it into an email to the corresponding author.")).catch(()=>{prompt("Copy this request note:",note);});return;
+  }
+  if(target.dataset.bulkft){
+    const files=[...($("bulkft").files||[])];if(!files.length){message("Choose the files first.",true);return;}
+    const byDoi=new Map(Object.values(data.articles).filter(a=>a.doi).map(a=>[a.doi.toLowerCase(),a.id]));
+    const match=name=>{const base=name.replace(/\\.(pdf|xml)$/i,"");const pm=/(?:^|\\D)(\\d{6,9})(?:\\D|$)/.exec(base);if(pm&&data.articles[pm[1]])return pm[1];const d=/(10\\.\\d{4,9})[_\\/-]([^\\s]+)/.exec(base);if(d){const doi=(d[1]+"/"+d[2].replace(/_/g,"/")).toLowerCase();for(const [k,id] of byDoi)if(k===doi||doi.startsWith(k)||k.replace(/[\\/\\-_.]/g,"")===doi.replace(/[\\/\\-_.]/g,""))return id;}return "";};
+    target.disabled=true;const out=$("bulkftresult");out.textContent="Working…";let ok=0;const bad=[];
+    (async()=>{for(const f of files){const id=match(f.name);if(!id){bad.push(f.name+" (no PMID or DOI in the name matches an article)");continue;}if(f.size>20000000){bad.push(f.name+" (over 20 MB)");continue;}
+      try{const buf=await f.arrayBuffer();let bin="";const u=new Uint8Array(buf);for(let i=0;i<u.length;i+=8192)bin+=String.fromCharCode.apply(null,u.subarray(i,i+8192));await api("fulltext-upload",{pmid:id,base64:btoa(bin)});ok++;out.textContent=ok+" uploaded…";}catch(e){bad.push(f.name+" ("+e.message+")");}}
+      out.innerHTML=ok+" uploaded."+(bad.length?'<br><b style="color:var(--red)">Not added:</b> '+bad.map(esc).join("; "):"");message(ok+" full text"+(ok===1?"":"s")+" added.",bad.length>0);await refresh();})().finally(()=>{target.disabled=false;});
+    return;
+  }
   if(target.dataset.ftupload||target.dataset.ftpaste){
     const id=target.dataset.ftupload||target.dataset.ftpaste, done=r=>{message("Full text added"+(r.textRead?"; "+r.events+" event"+(r.events===1?"":"s")+" detected.":". Its text could not be read, so events come from the abstract."));return refresh().then(()=>{const open=document.querySelector('[data-review="'+active.id+'"]');if(open){$("dialog").close();open.click();}});};
     if(target.dataset.ftpaste){target.disabled=true;api("fulltext-upload",{pmid:id,text:$("ftpaste").value}).then(done).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}
@@ -3576,7 +3619,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  libraryLayout, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  libraryLayout, captureFromPreprint, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);
