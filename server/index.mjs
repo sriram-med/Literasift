@@ -208,6 +208,16 @@ async function handler(req, res) {
       await record(email, "account.invite", target, "role reviewer");
       return reply(res, 200, { ok: true, ...(await deliver("invite", target)) });
     }
+    if (path === "/host/set-password" && req.method === "POST") {
+      // The manager chooses a starting password; the person can change it afterwards under Account.
+      const password = String(body.password || "");
+      if (!validEmail(target) || target === email) return reply(res, 400, { error: "Choose another person's email address." });
+      if (!(state.profiles || []).some(p => p.email === target)) return reply(res, 404, { error: "Add this person to the team first." });
+      if (!strongEnough(password, target)) return reply(res, 400, { error: "Use at least 12 characters, and not the email address." });
+      await setPassword(target)(password);
+      await record(email, "account.password_set", target, "set by manager; the person can change it");
+      return reply(res, 200, { ok: true });
+    }
     if (path === "/host/reset-link" && req.method === "POST") {
       if (!Object.hasOwn(users, target) || target === email) return reply(res, 400, { error: "Choose another user's account." });
       await record(email, "account.reset-link", target);
