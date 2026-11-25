@@ -838,14 +838,21 @@ async function exportPdf(env, state, viewer, manager, body) {
     const article = state.articles[id];
     const item = state.assignments.find(a => a.pmid === id && (manager || a.reviewer === viewer.email));
     if (!article || !item) continue;
+    // A PDF always carries an up-to-date snapshot: one made before the current record-card layout is taken again first (needs the screenshot service on the server).
+    let fresh = article;
+    if (env.SCREENSHOT_FN && article.source !== "Social media" && (!article.screenshotKey || article.screenshotKind !== "record2")) {
+      try { const status = await captureScreenshot(env, article); await write(env, data => Object.assign(data.articles[id], status)); fresh = { ...article, ...status }; } catch { /* the earlier snapshot, if any, is used */ }
+    }
     let png = null;
-    if (article.screenshotKey) { const object = await env.BUCKET.get(article.screenshotKey); if (object) png = new Uint8Array(await object.arrayBuffer()); }
+    if (fresh.screenshotKey) { const object = await env.BUCKET.get(fresh.screenshotKey); if (object) png = new Uint8Array(await object.arrayBuffer()); }
     const lines = ["Source: " + articleSource(article) + " · PMID " + id + " · " + [article.journal, article.date].filter(Boolean).join(" · "),
       "DOI: " + (article.doi || "-") + " · " + article.url,
       "Portfolio: " + item.portfolio + ((item.molecules || []).filter(m => m !== item.portfolio).length ? " · Molecules: " + item.molecules.join(", ") : ""),
       "Reviewer: " + (item.reviewer || "Unassigned") + " · Status: " + item.status + (item.note ? " · Note: " + item.note : ""),
       "Retraction check: " + (article.retractionStatus || "Pending") + " · Access: " + (article.oaStatus || "Pending") + " · Full text: " + (article.fullTextStatus || "Pending") +
         (article.citedBy !== undefined ? " · Cited by: " + article.citedBy : "")];
+    if (article.pullQuery) lines.push("Search query: " + article.pullQuery + " · Date range: " + (article.pullRange || "-") + " · Retrieved: " + (article.pullAt ? article.pullAt.slice(0, 16).replace("T", " ") + " UTC" : "-"));
+    if (fresh.screenshotAt) lines.push("Snapshot taken: " + fresh.screenshotAt.slice(0, 16).replace("T", " ") + " UTC");
     if ((article.authors || []).length) lines.push("Authors: " + article.authors.join(", "));
     if ((article.meshTerms || []).length) lines.push("MeSH: " + article.meshTerms.slice(0, 12).join("; "));
     if (article.abstract) lines.push("Abstract: " + article.abstract.replace(/\s+/g, " ").slice(0, 1800));
@@ -2457,6 +2464,30 @@ async function apiCore(request, env, path) {
     if (format === "e2b") return new Response(e2bBatch(list, state.articles, { sender:state.settings?.senderId, receiver:state.settings?.receiverId }), { headers:{ "Content-Type":"application/xml", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-E2B-R3-' + stamp + '.xml"' } });
     return new Response(lineListing(list, state.articles), { headers:{ "Content-Type":"text/csv; charset=utf-8", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-line-listing-' + stamp + '.csv"' } });
   }
+  if (path === "/api/library-delete" && viewer) {
+    if (!manager) return json({ error:"Manager access required." }, 403);
+    const reason = String(body.reason || "").trim();
+    if (reason.length < 5) return json({ error:"Give a reason of at least 5 characters. It is recorded in the audit trail." }, 400);
+    const wanted = [...new Set((Array.isArray(body.pmids) ? body.pmids : []).map(String))].filter(id => state.articles[id]).slice(0, 2000);
+    if (!wanted.length) return json({ error:"Nothing to delete." }, 400);
+    // Articles behind a case are kept: a case, its signatures and its audit trail refer to the source article.
+    const withCase = new Set((state.cases || []).map(c => c.pmid)), blocked = wanted.filter(id => withCase.has(id)), doomed = wanted.filter(id => !withCase.has(id));
+    const names = ["pubmed.png", "fulltext.txt", "pmc.pdf", "pmc.xml", "europepmc.xml", "unpaywall.pdf", "wiley.pdf", "elsevier.xml", "core.pdf", "core.txt", "rxiv.xml", "preprint.xml", "uploaded.pdf", "uploaded.xml", "uploaded.txt"];
+    const files = new Set();
+    for (const id of doomed) { const a = state.articles[id]; for (const key of [a.fullTextKey, a.fullTextTextKey, a.screenshotKey]) if (key) files.add(key); for (const name of names) files.add("evidence/" + id + "/" + name); }
+    if (typeof env.BUCKET.delete === "function") for (const key of files) { try { await env.BUCKET.delete(key); } catch { /* an object that is already gone is fine */ } }
+    const titles = doomed.slice(0, 20).map(id => id + ": " + String(state.articles[id].title || "").slice(0, 80));
+    if (doomed.length) {
+      const gone = new Set(doomed);
+      await write(env, data => {
+        for (const id of gone) delete data.articles[id];
+        data.assignments = data.assignments.filter(a => !gone.has(a.pmid));
+        for (const run of data.runs || []) if ((run.ids || []).some(id => gone.has(id))) { run.ids = run.ids.filter(id => !gone.has(id)); run.count = run.ids.length; }
+      });
+      await audit(env, { by:email, action:"library.deleted", entityType:"Library", entityId:doomed.length + " article" + (doomed.length === 1 ? "" : "s"), detail:{ reason, pmids:doomed.slice(0, 200).join(", "), titles:titles.join(" | "), files_removed:files.size, kept_because_of_cases:blocked.length } });
+    }
+    return json({ ok:true, deleted:doomed.length, kept:blocked });
+  }
   if ((path === "/api/memory-list" || path === "/api/memory-delete") && viewer) {
     if (!manager) return json({ error:"Manager access required." }, 403);
     const entries = memoryEntries(state);
@@ -3374,7 +3405,7 @@ function render() {
     const byCountry=libMode==="country", lvl1=byCountry?"country":"molecule";
     const modeBar='<div class="sub" style="margin-bottom:10px">Browse by <button class="btn sm'+(byCountry?" outline":"")+'" data-libmode="range">Date range</button> <button class="btn sm'+(byCountry?"":" outline")+'" data-libmode="country">Country</button> '+(byCountry?"Country is the patient's (from case reports), otherwise the first author's, otherwise the journal's. It decides the regulator and marketing authorisation.":"")+'</div>';
     const crumbs='<div class="sub" style="margin-bottom:12px"><button class="btn outline sm" data-libopen="/">Library</button>'+(p0?' / <button class="btn outline sm" data-libopen="'+esc(p0)+'">'+esc(p0)+'</button>':"")+(p1?' / <button class="btn outline sm" data-libopen="'+esc(p0+"/"+p1)+'">'+esc(p1)+'</button>':"")+(p2?' / <b>'+esc(p2)+'</b>':"")+'</div>';
-    const actions=path=>'<button class="btn outline sm" data-libzip="'+esc(path)+'">ZIP</button> <button class="btn outline sm" data-libpdf="'+esc(path)+'">PDF</button> <button class="btn outline sm" data-libris="'+esc(path)+'">RIS</button>';
+    const actions=path=>'<button class="btn outline sm" data-libzip="'+esc(path)+'">ZIP</button> <button class="btn outline sm" data-libpdf="'+esc(path)+'">PDF</button> <button class="btn outline sm" data-libris="'+esc(path)+'">RIS</button>'+(data.viewer.role==="manager"?' <button class="btn outline sm" data-libdel="'+esc(path)+'" style="color:var(--red)">Delete</button>':"");
     const idsOf=obj=>new Set(Object.values(obj).flatMap(x=>x instanceof Set?[...x]:[...idsOf(x)]));
     const reg=id=>(data.config.sources||[]).find(x=>x.id===id)||{label:id,note:""};
     const regulator=c=>{const hit=(data.config.countryInfo||{})[c];return hit?hit:"";};
@@ -3530,7 +3561,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -3712,6 +3743,15 @@ document.addEventListener("click",event=>{
     api("delete-watch",{watch:target.dataset.delwatch}).then(()=>{message("Watchlist deleted.");return refresh();}).catch(e=>message(e.message,true));
     return;
   }
+  if(target.dataset.libdel||target.dataset.articledel){
+    const ids=target.dataset.articledel?[target.dataset.articledel]:libIds(target.dataset.libdel);
+    if(!ids.length){message("Nothing to delete here.",true);return;}
+    if(!confirm("Delete "+ids.length+" article"+(ids.length===1?"":"s")+" from the library? Their stored files, screenshots and queue entries are removed. Articles that have an ICSR case are kept. This is recorded in the audit trail and cannot be undone."))return;
+    const reason=prompt("Reason for deleting (recorded in the audit trail):","");if(!reason)return;
+    target.disabled=true;
+    api("library-delete",{pmids:ids,reason}).then(async r=>{await refresh();if($("dialog").open)$("dialog").close();if(!target.dataset.articledel&&target.dataset.libdel!=="/"&&!libIds(target.dataset.libdel).length){libPath="/";}render();message(r.deleted+" article"+(r.deleted===1?"":"s")+" deleted. Recorded in the audit trail."+(r.kept.length?" Kept because they have cases: "+r.kept.join(", ")+".":""),r.kept.length>0);}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    return;
+  }
   if(target.dataset.libzip||target.dataset.libpdf||target.dataset.libris){
     const kind=target.dataset.libzip?"zip":target.dataset.libpdf?"pdf":"ris", path=target.dataset[kind==="zip"?"libzip":kind==="pdf"?"libpdf":"libris"];
     const ids=libIds(path), name=path==="/"?"LiteraSift library":path.replace("/"," ").replace(/_to_/g," to ");
@@ -3811,7 +3851,7 @@ document.addEventListener("click",event=>{
       ((art.linkOut||[]).length?'<div class="sub" style="margin:10px 0 4px">PubMed LinkOut'+(art.pubmedCitedBy!==undefined?" · cited by "+art.pubmedCitedBy+" in PubMed":"")+'</div><div class="chips">'+art.linkOut.map(l=>'<a class="badge '+(l.free?"green":"blue")+'" target="_blank" rel="noopener" href="'+esc(l.url)+'">'+esc((l.free?"Free: ":"")+l.provider)+'</a>').join("")+'</div>':"")+
       '<div style="margin-top:10px"><button type="button" class="btn outline sm" data-newcase="'+esc(active.pmid)+'">Send to Synchrony</button> '+(data.cases||[]).filter(c=>c.pmid===active.pmid).map(c=>'<a href="#" data-opencase="'+esc(c.id)+'">'+esc(c.number)+'</a>').join(" · ")+'</div>'+
       (art.fullTextKey?'<div style="margin-top:8px"><a href="/api/full-text/'+esc(active.pmid)+'">Download full text</a>'+(art.fullTextOrigin==="Uploaded"?' <span class="sub">(uploaded by '+esc(art.fullTextUploadedBy||"")+')</span>':"")+'</div>':"")+
-      closedAccessHtml(art);
+      closedAccessHtml(art)+(data.viewer.role==="manager"?'<div style="margin-top:12px"><button type="button" class="btn outline sm" data-articledel="'+esc(active.pmid)+'" style="color:var(--red)">Delete this article from the library</button></div>':"");
     $("review").elements.status.value=active.status;
     $("review").elements.note.value=active.note||"";
     $("dialog").showModal();

@@ -1,6 +1,6 @@
 // File-backed stand-in for the R2 bucket binding used by worker/index.js (get/put with conditional writes).
 import { createReadStream } from "node:fs";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -26,6 +26,15 @@ export class FileBucket {
       arrayBuffer: async () => { const b = await readFile(file); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); },
       writeHttpMetadata(headers) { if (meta.httpMetadata?.contentType) headers.set("Content-Type", meta.httpMetadata.contentType); },
     };
+  }
+  // Removes one object. The audit log and the state file can never be deleted this way.
+  async delete(key) {
+    if (/^(audit2?\/|bench\.json$|ime\/|users)/.test(String(key))) throw new Error("This object cannot be deleted.");
+    const name = this.#name(key);
+    const run = async () => { for (const file of [join(this.dir, name), join(this.dir, name + ".meta")]) await unlink(file).catch(() => {}); };
+    const result = this.#lock.then(run, run);
+    this.#lock = result.catch(() => {});
+    return result;
   }
   put(key, value, options = {}) {
     const run = async () => {

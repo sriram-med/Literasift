@@ -615,3 +615,68 @@ test("coding memory can be listed, entries deleted, or all cleared; cases are un
   assert.equal(log[0].detail.reason, "Wrong mapping"); assert.equal(log[1].detail.reason, "Reset after audit"); assert.equal(log[1].detail.entries, 1); assert.equal(log[0].actor, "user:" + MANAGER);
   assert.equal((await worker.verifyAuditChain(t.env)).ok, true);
 });
+
+import { deflateSync } from "node:zlib";
+const tinyPng = () => { // 2x2 RGBA PNG
+  const crcT = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+  const crc = buf => { let c = 0xffffffff; for (const b of buf) c = crcT[(c ^ b) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+  const chunk = (type, data) => { const out = Buffer.alloc(12 + data.length); out.writeUInt32BE(data.length, 0); out.write(type, 4); data.copy(out, 8); out.writeUInt32BE(crc(out.subarray(4, 8 + data.length)), 8 + data.length); return out; };
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(2, 0); ihdr.writeUInt32BE(2, 4); ihdr[8] = 8; ihdr[9] = 6;
+  const raw = Buffer.concat([0, 1].map(() => Buffer.concat([Buffer.from([0]), Buffer.from([255, 0, 0, 255, 0, 255, 0, 255])])));
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", ihdr), chunk("IDAT", deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]);
+};
+
+test("a PDF export takes a fresh snapshot when the stored one is out of date, and prints the search query and retrieval time", async () => {
+  const calls = [], png = tinyPng();
+  const t = await setup({ SCREENSHOT_FN: async article => { calls.push(article.id); return { bytes: png, kind: "record2" }; } });
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
+  await t.BUCKET.put("evidence/1/pubmed.png", "old-card");
+  Object.assign(bench.articles["1"], { screenshotKey: "evidence/1/pubmed.png", screenshotKind: "record", pullQuery: '"aciclovir"[tiab]', pullRange: "2026-10-01 to 2026-11-20", pullAt: "2026-11-25T04:49:12Z" });
+  await t.BUCKET.put("bench.json", JSON.stringify(bench));
+  const res = await worker.fetch(new Request("http://localhost/api/export", { method: "POST", headers: { "oai-authenticated-user-email": MANAGER, "Content-Type": "application/json" }, body: JSON.stringify({ pmids: ["1"], title: "T" }) }), t.env);
+  assert.equal(res.status, 200); const pdf = new TextDecoder("latin1").decode(await res.arrayBuffer());
+  assert.deepEqual(calls, ["1"]); assert.ok(pdf.includes("Search query:") && pdf.includes("2026-11-25 04:49 UTC") && pdf.includes("Snapshot taken:"));
+  assert.ok(!pdf.includes("could not be embedded") && !pdf.includes("not captured yet"));
+  assert.equal(JSON.parse(await readFile(benchFile(t.dir), "utf8")).articles["1"].screenshotKind, "record2");
+  await worker.fetch(new Request("http://localhost/api/export", { method: "POST", headers: { "oai-authenticated-user-email": MANAGER, "Content-Type": "application/json" }, body: JSON.stringify({ pmids: ["1"], title: "T" }) }), t.env);
+  assert.deepEqual(calls, ["1"], "an up-to-date snapshot is not taken again");
+});
+
+test("articles can be deleted from the library by a manager with a reason; files go, cases protect, the audit trail records it", async () => {
+  const t = await setup(); await seedWithEvents(t);
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
+  bench.articles["2"] = { id: "2", title: "Second article", fullTextKey: "evidence/2/pmc.pdf", screenshotKey: "evidence/2/pubmed.png" }; bench.assignments.push({ id: "a2", pmid: "2", portfolio: "Antivirals", molecules: ["aciclovir"], reviewer: REVIEWER, status: "Pending" });
+  bench.runs = [{ id: "r", ids: ["1", "2"], count: 2, status: "Imported", portfolio: "Antivirals", from: "2026-01-01", to: "2026-01-02" }];
+  await t.BUCKET.put("bench.json", JSON.stringify(bench)); await t.BUCKET.put("evidence/2/pmc.pdf", "%PDF-"); await t.BUCKET.put("evidence/2/pubmed.png", "png");
+  await t.call(MANAGER, "/api/case-create", { pmid: "1" });
+  assert.equal((await t.call(REVIEWER, "/api/library-delete", { pmids: ["2"], reason: "cleanup please" })).status, 403);
+  assert.equal((await t.call(MANAGER, "/api/library-delete", { pmids: ["2"], reason: "no" })).status, 400);
+  const r = await t.call(MANAGER, "/api/library-delete", { pmids: ["1", "2", "999"], reason: "Out of scope after review" });
+  assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal(r.body.deleted, 1); assert.deepEqual(r.body.kept, ["1"]);
+  const after = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
+  assert.ok(after.articles["1"] && !after.articles["2"]); assert.ok(!after.assignments.some(a => a.pmid === "2")); assert.deepEqual(after.runs[0].ids, ["1"]); assert.equal(after.runs[0].count, 1);
+  assert.equal(await t.BUCKET.get("evidence/2/pmc.pdf"), null); assert.equal(await t.BUCKET.get("evidence/2/pubmed.png"), null);
+  const log = (await readFile(monthFile(t.dir), "utf8")).trim().split("\n").map(JSON.parse).find(e => e.action === "library.deleted");
+  assert.equal(log.detail.reason, "Out of scope after review"); assert.match(log.detail.titles, /2: Second article/); assert.equal(log.detail.kept_because_of_cases, 1); assert.equal(log.actor, "user:" + MANAGER);
+  await assert.rejects(() => t.BUCKET.delete("audit2/head.json"), /cannot be deleted/); await assert.rejects(() => t.BUCKET.delete("bench.json"), /cannot be deleted/);
+  assert.equal((await worker.verifyAuditChain(t.env)).ok, true);
+});
+
+test("the on-disk library folder gets the new snapshot and loses deleted articles", async () => {
+  const { mirrorLibrary } = await import("../server/library.mjs");
+  const { readdir, stat: statFile, utimes } = await import("node:fs/promises");
+  const t = await setup(), root = t.dir + "/library";
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
+  await t.BUCKET.put("evidence/1/pubmed.png", "old-card");
+  bench.articles["1"] = { ...bench.articles["1"], screenshotKey: "evidence/1/pubmed.png", screenshotAt: "2026-11-01T00:00:00Z" };
+  bench.runs = [{ id: "r", ids: ["1"], count: 1, status: "Imported", portfolio: "Antivirals", molecule: "aciclovir", from: "2026-01-01", to: "2026-01-31", source: "PubMed" }];
+  await t.BUCKET.put("bench.json", JSON.stringify(bench));
+  const files = async () => { const out = []; const walk = async d => { for (const e of await readdir(d, { withFileTypes: true })) e.isDirectory() ? await walk(d + "/" + e.name) : out.push(d + "/" + e.name); }; await walk(root).catch(() => {}); return out; };
+  await mirrorLibrary(worker, t.env, root);
+  const png = (await files()).find(f => f.endsWith("_record.png")); assert.ok(png); assert.equal(await readFile(png, "utf8"), "old-card");
+  await utimes(png, new Date("2026-10-01"), new Date("2026-10-01"));
+  await t.BUCKET.put("evidence/1/pubmed.png", "new-card"); bench.articles["1"].screenshotAt = "2026-11-25T00:00:00Z"; await t.BUCKET.put("bench.json", JSON.stringify(bench));
+  await mirrorLibrary(worker, t.env, root); assert.equal(await readFile(png, "utf8"), "new-card");
+  delete bench.articles["1"]; bench.assignments = []; bench.runs[0].ids = []; await t.BUCKET.put("bench.json", JSON.stringify(bench));
+  await mirrorLibrary(worker, t.env, root); assert.deepEqual((await files()).filter(f => /PMID_/.test(f)), []);
+});
