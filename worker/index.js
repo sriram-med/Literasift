@@ -1009,7 +1009,9 @@ function buildQuery(names, safetyOnly) {
   const query = "(" + terms.join(" OR ") + ")" + (safetyOnly ? " AND " + safetyFilter : "");
   return query.length <= 1500 ? query : "";
 }
-const keepOwner = (data, watch) => { const old = data.watches.find(w => watchKey(w) === watchKey(watch)); if (old?.owner && !watch.owner) watch.owner = old.owner; };
+const keepOwner = (data, watch) => { const old = data.watches.find(w => watchKey(w) === watchKey(watch)); if (old?.owner && !watch.owner) watch.owner = old.owner; if (old?.client && !watch.client) watch.client = old.client; };
+// A client groups molecules. The link lives on the watchlist, so every article pulled for the molecule inherits it.
+const clientIdFor = (state, a) => { const mol = (a.molecules || [])[0] || ""; const w = state.watches.find(x => x.portfolio === a.portfolio && (x.molecule || "") === mol) || state.watches.find(x => x.portfolio === a.portfolio && x.molecule && (a.molecules || []).includes(x.molecule)) || state.watches.find(x => x.portfolio === a.portfolio && !x.molecule); return w?.client || ""; };
 const watchKey = w => w.portfolio + "\u0000" + (w.molecule || "");
 const maxWatchesPerRun = 10;
 const pmcOrigin = "https://pmc-oa-opendata.s3.amazonaws.com";
@@ -3471,6 +3473,9 @@ const auditRules = {
   "/api/settings":b => ({ action:"settings.update", target:Object.keys(b).join(", "), detail:"storeRestricted" in b ? "storeRestricted=" + b.storeRestricted : "" }),
   "/api/assign-ranges":(b, r) => ({ action:"assign.ranges", target:decodeWatch(b.watch), detail:(b.ranges || []).map(x => "#" + x.from + "-" + x.to + " to " + x.owner).join("; ") + " (" + (b.order || "relevance") + ", " + (b.pool || "open") + "): " + Object.values(r.per || {}).reduce((n, v) => n + v, 0) + " assigned" }),
   "/api/delete-watch":b => ({ action:"watch.delete", target:decodeWatch(b.watch), detail:"" }),
+  "/api/client-save":(b, r) => ({ action:"client.save", target:String(b.name || "").slice(0, 80), detail:b.id ? "edited" : "created" }),
+  "/api/client-delete":b => ({ action:"client.delete", target:String(b.id || ""), detail:"" }),
+  "/api/client-assign":b => ({ action:"client.assign", target:decodeWatch(b.watch), detail:b.client ? "to client " + b.client : "unlinked" }),
   "/api/assign-molecule":(b, r) => ({ action:"molecule.assign", target:decodeWatch(b.watch), detail:"to " + (b.owner || "auto") + ", " + (r.moved ?? 0) + " articles" + (b.reassign ? " (including reassigned)" : "") }),
   "/api/recheck-access":() => ({ action:"access.recheck", target:"all articles", detail:"" }),
   "/api/profile":b => ({ action:"profile.save", target:b.email, detail:"limit " + b.capacity + ", " + (b.active === false ? "unavailable" : "active") }),
@@ -3509,8 +3514,8 @@ async function apiCore(request, env, path) {
   const manager = viewer?.role === "manager";
   if (!viewer && !service) return json({ error:"Your account needs a Literature Bench profile." }, 403);
   if (request.method === "GET" && path === "/api/state") {
-    const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
-    return json({ viewer, library:manager ? libraryLayout(state) : [],
+    const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules), client:clientIdFor(state, a) }));
+    return json({ viewer, clients:(state.clients || []).map(c => ({ ...c, molecules:state.watches.filter(w => w.client === c.id).map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "" })) })), library:manager ? libraryLayout(state) : [],
       cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
       dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], meddraInfo:state.meddra || null, stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c), triage:triageFor(state, c) }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
       monitoring:monitoringCounts(state, viewer),
@@ -4628,6 +4633,32 @@ async function apiCore(request, env, path) {
     const names = Array.isArray(body.names) ? body.names.map(String) : [];
     try { return json({ result:await faersReactions(names) }); } catch (error) { return json({ error:error.message }, 502); }
   }
+  if (path === "/api/client-save") {
+    const name = String(body.name || "").trim().slice(0, 80), id = String(body.id || "");
+    if (!name) return json({error:"Enter a client name."},400);
+    if ((state.clients || []).some(c => c.id !== id && c.name.toLowerCase() === name.toLowerCase())) return json({error:"A client with that name already exists."},400);
+    const saved = await write(env, data => {
+      data.clients ||= [];
+      let c = id && data.clients.find(x => x.id === id);
+      if (!c) { c = { id:crypto.randomUUID(), created:new Date().toISOString() }; data.clients.push(c); }
+      c.name = name; c.contact = String(body.contact || "").trim().slice(0, 120); c.note = String(body.note || "").trim().slice(0, 400);
+      return c.id;
+    });
+    return json({ ok:true, id:saved });
+  }
+  if (path === "/api/client-delete") {
+    const id = String(body.id || "");
+    if (!(state.clients || []).some(c => c.id === id)) return json({error:"Client not found."},404);
+    await write(env, data => { data.clients = data.clients.filter(c => c.id !== id); data.watches.forEach(w => { if (w.client === id) delete w.client; }); });
+    return json({ ok:true });
+  }
+  if (path === "/api/client-assign") {
+    const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent), client = String(body.client || "");
+    if (!state.watches.some(w => w.portfolio === portfolio && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
+    if (client && !(state.clients || []).some(c => c.id === client)) return json({error:"Choose a client."},400);
+    await write(env, data => { const w = data.watches.find(x => x.portfolio === portfolio && (x.molecule || "") === molecule); if (client) w.client = client; else delete w.client; });
+    return json({ ok:true });
+  }
   if (path === "/api/assign-molecule") {
     const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
     const owner = String(body.owner || "").trim().toLowerCase();
@@ -4712,6 +4743,7 @@ async function apiCore(request, env, path) {
     return json(resumed);
   } else if (path === "/api/watch") {
     const watch = { portfolio:String(body.portfolio || "").trim(), molecule:String(body.molecule || "").trim().slice(0,100), query:String(body.query || "").trim() };
+    if (body.client && (state.clients || []).some(c => c.id === body.client)) watch.client = body.client;
     if (!watch.portfolio || !watch.query || watch.query.length > 1500) return json({error:"Enter a portfolio and a PubMed query."},400);
     await write(env, data => { keepOwner(data, watch); commitWatch(data, watch, email); });
     await audit(env, { by:email, action:"watch.save", target:watch.portfolio + (watch.molecule ? " · " + watch.molecule : ""), detail:{ version:watch.versions.at(-1).version } });
@@ -4725,7 +4757,7 @@ async function apiCore(request, env, path) {
       const names = namesWithDictionary(state, portfolio, [row?.molecule, ...(Array.isArray(row?.synonyms) ? row.synonyms : [])].filter(Boolean));
       const molecule = String(row?.molecule || "").trim().slice(0,100);
       const query = molecule && buildQuery(names, body.safetyOnly === true);
-      if (query) created.push({ portfolio, molecule, query, ...(bulkOwner ? { owner:bulkOwner } : {}) }); else skipped.push(molecule || "(blank)");
+      if (query) created.push({ portfolio, molecule, query, ...(bulkOwner ? { owner:bulkOwner } : {}), ...(body.client && (state.clients || []).some(c => c.id === body.client) ? { client:body.client } : {}) }); else skipped.push(molecule || "(blank)");
     }
     await write(env, data => {
       created.forEach(w => { keepOwner(data, w); commitWatch(data, w, email); });
@@ -4798,6 +4830,33 @@ aside{background:var(--side);color:var(--side-fg);padding:18px 14px;display:flex
 .navbtn:hover{background:var(--side-hover);color:#fff}.navbtn[aria-current]{background:var(--side-hover);color:#fff;box-shadow:inset 2px 0 0 #3cc3ab}
 .navbtn .n{margin-left:auto;font-size:12px;background:#0e6a5d;color:#fff;border-radius:99px;padding:0 7px}
 .spacer{flex:1}
+aside nav{display:flex;flex-direction:column;gap:2px;overflow-y:auto;min-height:0;flex:0 1 auto}aside .brand,aside .who,aside form{flex:none}
+aside{overflow:hidden}
+aside .btn.outline{color:#fff;border-color:#ffffff40;background:#ffffff12}aside .btn.outline:hover{background:#ffffff26}
+.top .btn.outline{box-shadow:0 1px 0 #fff inset,0 2px 4px #0d151214}
+/* 3D language: raised surfaces, soft layered shadows, a little perspective on hover */
+.card,.clientcard,.qstat,.clientgrp{box-shadow:0 1px 0 #ffffffb3 inset,0 1px 2px #0d15120f,0 8px 18px -8px #0d151233;transform-style:preserve-3d}
+section{box-shadow:0 1px 0 #ffffffb3 inset,0 1px 2px #0d15120d,0 10px 24px -14px #0d151240}
+.tilt{transition:transform .25s cubic-bezier(.2,.8,.2,1),box-shadow .25s;will-change:transform}
+.tilt:hover{box-shadow:0 1px 0 #ffffffb3 inset,0 2px 4px #0d151214,0 18px 34px -12px #0d151255}
+.btn{box-shadow:0 1px 0 #ffffff40 inset,0 2px 0 #0000001f,0 4px 10px -4px #0d151259}.btn:active{transform:translateY(1px) scale(.99);box-shadow:0 1px 0 #00000026 inset}
+.btn.outline{box-shadow:0 1px 0 #ffffffb3 inset,0 2px 0 #0d15120d}
+.logo{box-shadow:0 1px 0 #ffffff66 inset,0 3px 0 #08463c,0 8px 14px -4px #0008}
+.tile3d{display:grid;place-items:center;width:38px;height:38px;border-radius:11px;flex:none;font-weight:700;font-size:16px;color:#fff;background:linear-gradient(145deg,#19a08b,#0e6a5d 60%,#0a4f45);box-shadow:0 1px 0 #ffffff59 inset,0 3px 0 #08463c,0 10px 16px -6px #0e6a5d99;text-shadow:0 1px 1px #0004;transform:perspective(200px) rotateX(8deg) rotateY(-8deg);transition:transform .3s}
+.tile3d:hover,summary:hover .tile3d,.clientcard:hover .tile3d{transform:perspective(200px) rotateX(0) rotateY(0) translateY(-2px)}
+.chip3d{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);background:linear-gradient(var(--card),var(--accent));border-radius:99px;padding:3px 10px;font-size:12px;font-weight:500;cursor:pointer;box-shadow:0 1px 0 #ffffffb3 inset,0 2px 0 #0d15120f;color:var(--fg)}.chip3d:hover{border-color:var(--red);color:var(--red)}
+.qstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:14px;margin:6px 0 18px;perspective:900px}
+.qstat{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:12px 16px;display:flex;flex-direction:column}.qstat b{font-size:26px;line-height:32px;font-weight:600;font-variant-numeric:tabular-nums}
+.clientgrp{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:18px;overflow:hidden}
+.clientgrp>summary{display:flex;align-items:center;gap:14px;padding:14px 18px;cursor:pointer;list-style:none;background:linear-gradient(var(--card),var(--accent))}.clientgrp>summary::-webkit-details-marker{display:none}
+.cg-main{display:flex;flex-direction:column;flex:1}.cg-main b{font-size:16px;letter-spacing:-.01em}.cg-prog{display:flex;align-items:center;gap:8px;width:170px}.cg-prog .bar{flex:1}
+.molgrp{border-top:1px solid var(--border)}.molgrp>summary{display:flex;align-items:center;gap:10px;padding:10px 18px;cursor:pointer;list-style:none;background:var(--accent)}.molgrp>summary::-webkit-details-marker{display:none}
+.mol-dot{width:9px;height:9px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#5fe0c8,#0e6a5d);box-shadow:0 2px 3px #0e6a5d80}
+.qwrap{background:none;border:0;box-shadow:none;overflow:visible}.qwrap>.filters{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:16px}
+.clientgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:18px;margin-bottom:18px;perspective:1100px}
+.clientcard{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:18px}.cc-head{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+.cc-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px}.cc-stats div{display:flex;flex-direction:column}.cc-stats b{font-size:20px;font-variant-numeric:tabular-nums}
+.cc-add{display:flex;gap:8px}.cc-add select{flex:1;min-width:0}
 .who{border-top:1px solid #ffffff1a;padding:12px 10px 0;font-size:13px;color:#fff}.who small{display:block;color:var(--side-label)}
 .top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 32px;min-height:72px;background:var(--bg);position:sticky;top:0;z-index:5}
 .top h1{margin:0;font-size:24px;line-height:30px;font-weight:600;letter-spacing:-.025em}.top p{margin:0;color:var(--muted);font-size:13px}
@@ -4841,7 +4900,7 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 #toast.show{transform:none;opacity:1}#toast.err{background:var(--red);color:#fff}
 .skel{height:14px;border-radius:6px;background:linear-gradient(90deg,var(--accent),var(--border),var(--accent));background-size:200% 100%;animation:sh 1.2s infinite;margin:12px 0}@keyframes sh{to{background-position:-200% 0}}
 @media(max-width:860px){.shell{grid-template-columns:1fr}aside{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center}.brand{padding:4px 10px}.who,.spacer{display:none}.navbtn{width:auto}.grid2{grid-template-columns:1fr}.top,main{padding-left:16px;padding-right:16px}}
-@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}.tile3d{transform:none}}
 </style>
 <div class="shell"><aside><div class="brand"><span class="logo"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18M6 12h12M10 19h4"/></svg></span>LiteraSift</div><nav id="nav" aria-label="LiteraSift"></nav><div class="spacer"></div><div class="who" id="identity"></div></aside>
 <div><div class="top"><div><h1 id="heading">LiteraSift</h1><p id="subhead"></p></div><input id="gsearch" type="search" placeholder="Search drugs, brands, cases, citations…" aria-label="Search everything" style="margin-left:auto;margin-right:8px;width:min(340px,40vw);border-radius:999px;padding:9px 16px"><span class="sub" style="margin-right:8px;white-space:nowrap">v0.01 · Dr Sriram</span><button class="btn outline icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button></div>
@@ -4873,13 +4932,14 @@ const paths = {
   Team:'<circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0M17 4a4 4 0 0 1 0 8M22 21a7 7 0 0 0-4-6"/>',
   Discover:'<circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2 5-5 2 2-5z"/>',
   Search:'<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
+  Clients:'<path d="M3 21h18M5 21V7l7-4 7 4v14M9 21v-6h6v6M9 10h.01M15 10h.01"/>',
   Admin:'<rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
   Archive:'<path d="M3 4h18v4H3zM5 8v12h14V8M10 12h4"/>',
   moon:'<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>', sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
+const subtitles = {Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -5647,7 +5707,7 @@ async function extractRun(runId){
   }catch(e){message(e.message,true);}
   extracting=null;drawProgress();
 }
-let data, tab, active, filt={q:"",status:"",portfolio:"",oa:"",ft:"",special:"",sort:"relevance",source:"",country:"",ime:""}, shown=[];
+let data, tab, active, filt={q:"",status:"",portfolio:"",oa:"",ft:"",special:"",sort:"relevance",source:"",country:"",ime:"",client:""}, shown=[];
 const NL=String.fromCharCode(10);
 const tbadge=(text,color,title)=>'<span class="badge '+(color||"")+'" title="'+esc(title||"")+'">'+esc(text)+'</span>';
 function factsHtml(f,mols){
@@ -5741,10 +5801,26 @@ function queueRows(items){
       '<button class="btn outline sm" data-review="'+esc(a.id)+'">Review</button>']);
   }),"No articles match.")+(items.length>200?'<p class="sub" style="padding:10px 14px">Showing 200 of '+items.length+". Refine the filters to narrow the list.</p>":"");
 }
+function queueBody(list){
+  if(!list.length)return '<div class="empty">No articles match.</div>';
+  const clients=data.clients||[], byC={};
+  list.forEach(a=>{const c=a.client||"", m=(a.molecules||[])[0]||a.portfolio;((byC[c]||={})[m]||=[]).push(a);});
+  const order=clients.map(c=>c.id).filter(id=>byC[id]).concat(byC[""]?[""]:[]);
+  return order.map(cid=>{
+    const name=cid?((clients.find(c=>c.id===cid)||{}).name||"Client"):"No client assigned", mols=byC[cid], all=Object.values(mols).flat(), done=all.filter(a=>a.status==="Complete").length, pct=all.length?Math.round(done/all.length*100):0, open=all.length-done;
+    return '<details class="clientgrp" open><summary><span class="tile3d" aria-hidden="true">'+esc(name.slice(0,1).toUpperCase())+'</span><span class="cg-main"><b>'+esc(name)+'</b><span class="sub">'+Object.keys(mols).length+' molecule'+(Object.keys(mols).length===1?"":"s")+' · '+all.length+' articles · '+open+' open</span></span><span class="cg-prog"><span class="sub">'+pct+'%</span><span class="bar"><i style="width:'+pct+'%"></i></span></span></summary>'+
+      Object.entries(mols).sort((x,y)=>x[0].localeCompare(y[0])).map(([m,arr])=>{const d=arr.filter(a=>a.status==="Complete").length;return '<details class="molgrp" open><summary><span class="mol-dot"></span><b>'+esc(m)+'</b><span class="sub">'+d+' of '+arr.length+' complete</span></summary><div class="tablewrap">'+queueRows(arr)+'</div></details>';}).join("")+'</details>';
+  }).join("");
+}
+function queueStrip(items){
+  const t=todayStr(), c=(f)=>items.filter(f).length;
+  const cell=(label,n,tone)=>'<div class="qstat tilt"><span class="sub">'+label+'</span><b'+(tone&&n?' style="color:var(--'+tone+')"':"")+'>'+n+'</b></div>';
+  return '<div class="qstrip">'+cell("Open",c(isOpenItem),"")+cell("Due today",c(a=>isOpenItem(a)&&a.dueAt===t),"amber")+cell("Overdue",c(a=>isOpenItem(a)&&a.dueAt&&a.dueAt<t),"red")+cell("QC returned",c(a=>a.qc&&a.qc.status==="returned"),"red")+cell("Complete",c(a=>a.status==="Complete"),"green")+'</div>';
+}
 function queueView(items){
   shown=items;
   const portfolios=[...new Set(items.map(a=>a.portfolio))].sort();
-  return '<section><div class="filters"><input data-filter="q" placeholder="Search title, PMID, molecule…" value="'+esc(filt.q)+'" aria-label="Search">'+(filt.special?'<button type="button" class="badge blue" data-clearspecial="1" style="cursor:pointer" title="Clear this filter">'+esc({unassigned:"Unassigned",overdue:"Overdue",qcreturned:"QC returned",qcpending:"Waiting for QC",pendingevidence:"Evidence pending"}[filt.special]||filt.special)+' ×</button>':"")+
+  return queueStrip(items)+'<section class="qwrap"><div class="filters"><input data-filter="q" placeholder="Search title, PMID, molecule…" value="'+esc(filt.q)+'" aria-label="Search">'+(filt.special?'<button type="button" class="badge blue" data-clearspecial="1" style="cursor:pointer" title="Clear this filter">'+esc({unassigned:"Unassigned",overdue:"Overdue",qcreturned:"QC returned",qcpending:"Waiting for QC",pendingevidence:"Evidence pending"}[filt.special]||filt.special)+' ×</button>':"")+
     '<select data-filter="status" aria-label="Status"><option value="">All statuses</option>'+["Pending","In review","Full text needed","Awaiting QC","QC returned","Complete"].map(s=>'<option'+(filt.status===s?" selected":"")+'>'+s+"</option>").join("")+"</select>"+
     '<select data-filter="oa" aria-label="Access"><option value="">All access</option>'+[["open","Open access"],["closed","Closed access"],["unchecked","Not yet checked"]].map(([v,l])=>'<option value="'+v+'"'+(filt.oa===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
     '<select data-filter="ft" aria-label="Full text"><option value="">All full-text states</option>'+[["stored","Full text stored"],["link","Open-access link only"],["none","No full text"]].map(([v,l])=>'<option value="'+v+'"'+(filt.ft===v?" selected":"")+'>'+l+"</option>").join("")+"</select>"+
@@ -5753,8 +5829,9 @@ function queueView(items){
     '<select data-filter="ime" aria-label="Important medical events"><option value="">All events</option><option value="ime"'+(filt.ime==="ime"?" selected":"")+'>Important medical events only</option><option value="icsr"'+(filt.ime==="icsr"?" selected":"")+'>ICSR candidates only</option></select>'+
     '<select data-filter="source" aria-label="Source"><option value="">All sources</option><option value="pubmed"'+(filt.source==="pubmed"?" selected":"")+'>PubMed only</option><option value="agency"'+(filt.source==="agency"?" selected":"")+'>Government agencies</option></select>'+
     '<select data-filter="sort" aria-label="Sort"><option value="likely"'+(filt.sort==="likely"?" selected":"")+'>Sort: likely cases first</option><option value="relevance"'+(filt.sort==="relevance"?" selected":"")+'>Sort: most relevant</option><option value="newest"'+(filt.sort==="newest"?" selected":"")+'>Sort: newest</option><option value="oldest"'+(filt.sort==="oldest"?" selected":"")+'>Sort: oldest</option>'+(libNumbers?'<option value="number"'+(filt.sort==="number"?" selected":"")+'>Sort: library number</option>':"")+'</select>'+
+    ((data.clients||[]).length?'<select data-filter="client" aria-label="Client"><option value="">All clients</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'"'+(filt.client===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'<option value="none"'+(filt.client==="none"?" selected":"")+'>No client</option></select>':"")+
     '<select data-filter="portfolio" aria-label="Portfolio"><option value="">All portfolios</option>'+portfolios.map(p=>'<option'+(filt.portfolio===p?" selected":"")+'>'+esc(p)+"</option>").join("")+"</select></div>"+
-    '<div id="qtable">'+queueRows(applyFilter(items))+"</div></section>";
+    '<div id="qtable">'+queueBody(applyFilter(items))+"</div></section>";
 }
 const specialOk=a=>!filt.special||({unassigned:!a.reviewer,overdue:isOpenItem(a)&&a.dueAt&&a.dueAt<todayStr(),qcreturned:a.qc&&a.qc.status==="returned",qcpending:a.qc&&a.qc.status==="pending",pendingevidence:((data.monitoring||{}).pendingEvidenceIds||[]).includes(a.pmid)}[filt.special]);
 const DISPO_LABEL={potential_icsr:"Potential ICSR",full_text_needed:"Full text needed",aggregate_safety:"Aggregate safety relevance",excluded:"Excluded"};
@@ -5764,19 +5841,35 @@ function applyFilter(items){
   const q=filt.q.trim().toLowerCase();
   const pm=a=>Number(a.pmid)||0, num=a=>libNumbers?libNumbers[a.pmid]||0:0;
   const order=filt.sort==="number"&&libNumbers?(x,y)=>num(x)-num(y):filt.sort==="newest"?(x,y)=>pm(y)-pm(x):filt.sort==="oldest"?(x,y)=>pm(x)-pm(y):(x,y)=>(y.score||0)-(x.score||0)||pm(y)-pm(x);
-  return items.filter(a=>(!filt.status||a.status===filt.status)&&(!filt.portfolio||a.portfolio===filt.portfolio)&&(!filt.oa||oaGroup(data.articles[a.pmid]||{})===filt.oa)&&(!filt.ft||ftGroup(data.articles[a.pmid]||{})===filt.ft)&&(!filt.source||(filt.source==="pubmed")===(sourceOf(data.articles[a.pmid])==="PubMed"))&&(!filt.country||(artCountry(data.articles[a.pmid])||"Unknown")===filt.country)&&(!filt.ime||(filt.ime==="ime"?(data.articles[a.pmid]&&data.articles[a.pmid].imeCount>0):(data.articles[a.pmid]&&data.articles[a.pmid].caseFacts&&data.articles[a.pmid].caseFacts.minimum.verdict==="Valid ICSR candidate")))&&
+  return items.filter(a=>(!filt.client||(filt.client==="none"?!a.client:a.client===filt.client))&&(!filt.status||a.status===filt.status)&&(!filt.portfolio||a.portfolio===filt.portfolio)&&(!filt.oa||oaGroup(data.articles[a.pmid]||{})===filt.oa)&&(!filt.ft||ftGroup(data.articles[a.pmid]||{})===filt.ft)&&(!filt.source||(filt.source==="pubmed")===(sourceOf(data.articles[a.pmid])==="PubMed"))&&(!filt.country||(artCountry(data.articles[a.pmid])||"Unknown")===filt.country)&&(!filt.ime||(filt.ime==="ime"?(data.articles[a.pmid]&&data.articles[a.pmid].imeCount>0):(data.articles[a.pmid]&&data.articles[a.pmid].caseFacts&&data.articles[a.pmid].caseFacts.minimum.verdict==="Valid ICSR candidate")))&&
     (!q||(a.pmid+" "+(data.articles[a.pmid]?.title||"")+" "+(a.molecules||[]).join(" ")).toLowerCase().includes(q))&&specialOk(a)).sort(filt.sort==="likely"?(x,y)=>Number(isLikely(y))-Number(isLikely(x))||(y.score||0)-(x.score||0):order);
 }
-function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
+function clientsHtml(){
+  const clients=data.clients||[], items=data.assignments, wk=w=>encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||"");
+  const free=data.watches.filter(w=>!w.client);
+  const watchOpts=list=>list.map(w=>'<option value="'+esc(wk(w))+'">'+esc(w.portfolio+(w.molecule?" · "+w.molecule:""))+'</option>').join("");
+  const cards=clients.map(c=>{
+    const mine=items.filter(a=>a.client===c.id), done=mine.filter(a=>a.status==="Complete").length, pct=mine.length?Math.round(done/mine.length*100):0;
+    const chips=data.watches.filter(w=>w.client===c.id).map(w=>'<form data-route="client-assign" style="display:inline"><input type="hidden" name="watch" value="'+esc(wk(w))+'"><input type="hidden" name="client" value=""><button class="chip3d" title="Remove from this client">'+esc(w.molecule||w.portfolio)+' <span aria-hidden="true">×</span></button></form>').join("");
+    return '<div class="clientcard tilt"><div class="cc-head"><span class="tile3d">'+esc(c.name.slice(0,1).toUpperCase())+'</span><div><b>'+esc(c.name)+'</b><div class="sub">'+esc(c.contact||"No contact set")+'</div></div><form data-route="client-delete" style="margin-left:auto"><input type="hidden" name="id" value="'+esc(c.id)+'"><button class="btn outline sm">Remove</button></form></div>'+
+      '<div class="cc-stats"><div><b>'+data.watches.filter(w=>w.client===c.id).length+'</b><span class="sub">molecules</span></div><div><b>'+mine.length+'</b><span class="sub">articles</span></div><div><b>'+(mine.length-done)+'</b><span class="sub">open</span></div><div><b>'+pct+'%</b><span class="sub">complete</span></div></div><div class="bar"><i style="width:'+pct+'%"></i></div>'+
+      '<div class="chips" style="margin:12px 0">'+(chips||'<span class="sub">No molecules yet.</span>')+'</div>'+
+      (free.length?'<form data-route="client-assign" class="cc-add"><input type="hidden" name="client" value="'+esc(c.id)+'"><select name="watch" aria-label="Molecule">'+watchOpts(free)+'</select><button class="btn sm">Add molecule</button></form>':"")+'</div>';
+  }).join("");
+  return panel("Add a client",'<form class="grid" data-route="client-save"><label>Client name<input name="name" required maxlength="80" placeholder="e.g. Acme Pharma"></label><label>Contact (optional)<input name="contact" maxlength="120" placeholder="Name or email"></label><div><button class="btn">Add client</button></div></form>',"Assign molecules to a client below. Every queue groups articles by client, then by molecule.")+
+    (clients.length?'<div class="clientgrid">'+cards+'</div>':'<div class="empty">No clients yet. Add one above, then assign molecules to it.</div>')+
+    (free.length&&clients.length?panel("Molecules without a client ("+free.length+")",free.map(w=>'<span class="badge">'+esc(w.molecule||w.portfolio)+'</span>').join(" ")):"");
+}
+function stat(label,value,icon,warn){return '<div class="card tilt'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Synchrony","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Queue","Synchrony"]).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
+  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Clients","Synchrony","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Queue","Synchrony"]).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   libNumbers=null;
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
   const open=mine.filter(a=>a.status!=="Complete").length;
   $("identity").innerHTML="<b>"+esc(data.viewer.name)+"</b><small>"+esc(data.viewer.email)+" · "+esc(data.viewer.role)+"</small>";
-  const NAVG={Overview:0,"My Queue":0,"All Assignments":0,Synchrony:0,"Search & Pull":1,Search:1,Discover:1,Library:1,Batches:1,Watchlists:1,Archive:1,Team:2,Admin:2,Audit:2,Settings:2,Account:2}, NAVL=["Work","Sources","Team"];
+  const NAVG={Overview:0,"My Queue":0,"All Assignments":0,Clients:0,Synchrony:0,"Search & Pull":1,Search:1,Discover:1,Library:1,Batches:1,Watchlists:1,Archive:1,Team:2,Admin:2,Audit:2,Settings:2,Account:2}, NAVL=["Work","Sources","Team"];
   const navTabs=tabs.map((x,i)=>[x,i]).sort((a,b)=>(NAVG[a[0]]||0)-(NAVG[b[0]]||0)||a[1]-b[1]).map(x=>x[0]);
   let lastG=-1;
   $("nav").innerHTML=navTabs.map(x=>{const g=NAVG[x]||0,head=g!==lastG?'<div class="navlabel">'+NAVL[g]+'</div>':"";lastG=g;return head+'<button class="navbtn" data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+ic(x)+x+(x==="My Queue"&&open?'<span class="n">'+open+"</span>":"")+'</button>';}).join("");
@@ -5890,8 +5983,8 @@ function render() {
   if(tab==="All Assignments") html=queueView(items);
   if(tab==="Watchlists") html=panel("Product dictionaries",'<div id="dictbox"></div><form class="grid" data-route="dictionary-save" style="margin-top:12px"><label>Portfolio<input id="dictpf" name="portfolio" required list="pfopts"></label><label class="wide">Products, one per line: name | generics | brands | salts | aliases (names separated by commas)<textarea id="dicttext" name="productsText" rows="5" placeholder="aciclovir | acyclovir | Zovirax, Zovir | aciclovir sodium | ACV"></textarea></label><div><button class="btn">Save dictionary</button></div></form>',"A product listed here is searched under all its names. A name can belong to one product only. Saving a dictionary does not change a watchlist until you preview and apply a new query version.")+
     panel("Query versions",(data.watches.length?'<div class="grid" style="margin-bottom:10px"><label>Watchlist<select id="wsel">'+watchOptions+'</select></label><label>Effective from<input id="wefrom" type="date"></label><label class="wide">Note<input id="wnote" placeholder="Why the query changes"></label><div><button type="button" class="btn outline" id="wprevbtn" data-wpreview="1">Preview change from dictionary</button></div></div><div id="wprev"></div>':'<div class="empty">Save a watchlist first.</div>')+table(["Watchlist","Version","Effective from","By","Note"],data.watches.flatMap(w=>(w.versions||[{version:1,query:w.query,effectiveFrom:"initial",by:"",note:""}]).slice().reverse().slice(0,3).map(v=>[esc(w.portfolio+(w.molecule?" · "+w.molecule:"")),"v"+v.version,esc(v.effectiveFrom==="0000-00-00"?"start":v.effectiveFrom),esc(v.by||""),esc(v.note||"")])),"No versions yet."),"Versions apply prospectively. An import records the version and the exact query it ran with.")+
-    panel("Add a watchlist",'<form class="grid" data-route="watch"><label>Portfolio<input name="portfolio" required></label><label>Molecule<input name="molecule" placeholder="Optional"></label><label class="wide">PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><div><button class="btn">Save watchlist</button></div></form>')+
-    panel("Add molecules in bulk",'<form class="grid" data-route="watches"><label>Portfolio<input name="portfolio" required></label><label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label>Assign all to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Save molecules</button></div></form>',"One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs.")+
+    panel("Add a watchlist",'<form class="grid" data-route="watch"><label>Portfolio<input name="portfolio" required></label><label>Molecule<input name="molecule" placeholder="Optional"></label>'+((data.clients||[]).length?'<label>Client<select name="client"><option value="">No client</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>').join("")+'</select></label>':"")+'<label class="wide">PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><div><button class="btn">Save watchlist</button></div></form>')+
+    panel("Add molecules in bulk",'<form class="grid" data-route="watches"><label>Portfolio<input name="portfolio" required></label>'+((data.clients||[]).length?'<label>Client<select name="client"><option value="">No client</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>').join("")+'</select></label>':"")+'<label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label>Assign all to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Save molecules</button></div></form>',"One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs.")+
     panel("Assign a molecule to an employee",watchOptions?'<form class="grid" data-route="assign-molecule"><label>Molecule<select name="watch">'+watchOptions+'</select></label><label>Employee<select name="owner">'+peopleOptions("","Unassign (auto)")+'</select></label><label class="check"><input type="checkbox" name="reassign">&nbsp;Also move articles already assigned to someone else</label><div><button class="btn">Assign</button></div></form>':'<div class="empty">Save a watchlist first.</div>',
       "The employee receives every pulled article for the molecule that is not yet complete, and every article pulled for it from now on. Their open-article limit does not apply to owned molecules.")+
     panel("Assign by number",watchOptions?'<div class="grid"><label>Molecule<select id="rkwatch">'+watchOptions+'</select></label><label>Order<select id="rkorder"><option value="relevance">Most relevant first</option><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></label><label>Articles<select id="rkpool"><option value="open">All not yet complete</option><option value="unassigned">Unassigned only</option></select></label></div><div id="rkrows" style="margin-top:12px"></div><div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0"><button type="button" class="btn outline" data-rkadd="1">Add range</button><button type="button" class="btn outline" data-rkpreview="1">Preview ranked list</button><button type="button" class="btn" data-rkapply="1">Assign</button></div><div id="rkpreview"></div>':'<div class="empty">Save a watchlist first.</div>',
@@ -5932,6 +6025,7 @@ function render() {
   if(tab==="Search")html=searchHtml();
   if(tab==="Discover")html=discoverHtml();
   if(tab==="Archive")html=archiveHtml();
+  if(tab==="Clients")html=clientsHtml();
   if(tab==="Team"){
     const hosted=data.config.accounts, accts=data.accounts.users;
     const pfList=[...new Set([...data.watches.map(w=>w.portfolio),...data.assignments.map(a=>a.portfolio)])].sort(), mem=data.memberships||[];
@@ -6021,12 +6115,16 @@ function setTheme(mode){
 }
 setTheme((()=>{try{return localStorage.getItem("literasift-theme");}catch{}})()||(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"));
 $("gsearch").addEventListener("keydown",e=>{if(e.key==="Enter")globalSearch();});
+(()=>{const reduce=matchMedia("(prefers-reduced-motion: reduce)").matches;if(reduce)return;
+  document.addEventListener("pointermove",e=>{const el=e.target.closest&&e.target.closest(".tilt");document.querySelectorAll(".tilt.live").forEach(x=>{if(x!==el){x.classList.remove("live");x.style.transform="";}});
+    if(!el)return;const r=el.getBoundingClientRect(),px=(e.clientX-r.left)/r.width-.5,py=(e.clientY-r.top)/r.height-.5;el.classList.add("live");el.style.transform="perspective(900px) rotateX("+(-py*5).toFixed(2)+"deg) rotateY("+(px*6).toFixed(2)+"deg) translateY(-2px)";});
+  document.addEventListener("pointerleave",()=>document.querySelectorAll(".tilt.live").forEach(x=>{x.classList.remove("live");x.style.transform="";}),true);})();
 $("theme").onclick=()=>setTheme(document.documentElement.dataset.theme==="dark"?"light":"dark");
 document.addEventListener("input",event=>{
   const key=event.target.dataset?.filter;
   if(!key)return;
   filt[key]=event.target.value;
-  $("qtable").innerHTML=queueRows(applyFilter(shown));
+  $("qtable").innerHTML=queueBody(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
   const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
@@ -6366,6 +6464,7 @@ document.addEventListener("submit",async event=>{
   if(body.active)body.active=body.active==="true";
   if(body.storeRestricted)body.storeRestricted=body.storeRestricted==="true";
   const route=form.dataset.route || "review";
+  if(route==="client-delete"&&!confirm("Remove this client? Its molecules are kept."))return;
   if(route==="assign-molecule")body.reassign=body.reassign==="on";
   if(route==="review")body.id=active.id;
   if(route==="dictionary-save"){body.products=String(body.productsText||"").split(NL).map(l=>l.split("|").map(x=>x.trim())).filter(c=>c[0]).map(c=>({name:c[0],generics:c[1]||"",brands:c[2]||"",salts:c[3]||"",aliases:c[4]||""}));delete body.productsText;}
