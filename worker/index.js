@@ -3239,7 +3239,7 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"upload.fulltext", target:"PMID " + id, detail:{ type:ext, bytes:bytes.length, text_read:Boolean(text) } });
     return json({ ok:true, textRead:Boolean(text), events:(status.events || []).length });
   }
-  if (["/api/search", "/api/case-tag", "/api/folder-save", "/api/folder-delete", "/api/case-folder", "/api/case-archive", "/api/case-restore", "/api/case-delete"].includes(path) && viewer) {
+  if (["/api/search", "/api/case-tag", "/api/folder-save", "/api/folder-delete", "/api/case-folder", "/api/case-archive", "/api/case-restore", "/api/cases-delete"].includes(path) && viewer) {
     const at = new Date().toISOString(), ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), medical = c => isPortfolioManager(state, viewer, c.portfolio) || rolesIn(state, email, c.portfolio).has("medical_reviewer");
     const editable = c => caseVisible(state, viewer, c) && (medical(c) || c.assignee === email || c.createdBy === email), chosen = pred => (state.cases || []).filter(c => ids.has(c.id) && pred(c));
     if (path === "/api/search") {
@@ -3881,7 +3881,7 @@ async function apiCore(request, env, path) {
     if (path === "/api/case-delete") {
       if (!manager) return json({ error:"Manager access required." }, 403);
       if ((current.signatures || []).length) return json({ error:"Signed cases cannot be deleted. Supersede the signature and close the case instead." }, 409);
-      await write(env, d => { d.cases = d.cases.filter(c => c.id !== current.id); });
+      await write(env, d => { d.cases = d.cases.filter(c => c.id !== current.id); (d.deletedCases ||= []).push({ number:current.number, pmid:current.pmid, portfolio:current.portfolio || "", status:current.status, hash:(current.versions || []).at(-1)?.hash || "", createdAt:current.createdAt, deletedAt:new Date().toISOString(), deletedBy:email, reason:"deleted from the case form" }); });
       await audit(env, { by:email, action:"case.delete", target:current.number, detail:"" });
       return json({ ok:true });
     }
@@ -4637,7 +4637,7 @@ async function p5action(target){
     if(act==="delcase"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const cs=list.map(i=>(data.cases||[]).find(c=>c.id===i)).filter(Boolean);
       const why=prompt("Why are you permanently deleting "+cs.length+" case"+(cs.length===1?"":"s")+"? (recorded in the audit trail)","");if(!why)return;
       const typed=prompt(cs.length===1?"Type the case number "+cs[0].number+" to confirm:":"Type DELETE "+cs.length+" to confirm:","");if(!typed)return;
-      const r=await api("case-delete",{ids:list,reason:why,confirm:typed});
+      const r=await api("cases-delete",{ids:list,reason:why,confirm:typed});
       if(confirm(r.deleted+" deleted. Also delete the pulled citation"+(r.pmids.length===1?"":"s")+" (PMID "+r.pmids.join(", ")+") from the library?")){try{await api("library-delete",{pmids:r.pmids,reason:why});}catch(e){message(e.message,true);}}
       await again("Deleted.");return;}
     if(act==="delpulled"){const list=ids("srch_a");if(!list.length)return message("Tick the citations first.",true);if(!confirm("Delete "+list.length+" pulled citation"+(list.length===1?"":"s")+" with their stored files? Citations with a case are kept. This cannot be undone."))return;const why=prompt("Reason (recorded in the audit trail):","");if(!why)return;const r=await api("library-delete",{pmids:list,reason:why});await again(r.deleted+" deleted"+((r.kept||[]).length?", "+r.kept.length+" kept because they have a case":"")+".");return;}

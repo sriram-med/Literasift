@@ -59,15 +59,15 @@ test("archive hides a case from working lists and editing until restored; the ar
 
 test("only a manager deletes cases, with a reason and the case number typed; approved cases must be archived first; a tombstone and audit entry remain", async () => {
   const t = await setup();
-  assert.equal((await t.call(MEDICAL, "/api/case-delete", { ids: ["c2"], reason: "Pulled in error", confirm: "LS-2" })).status, 403);
-  assert.equal((await t.call(MANAGER, "/api/case-delete", { ids: ["c2"], reason: "Pulled in error", confirm: "wrong" })).status, 400);
-  assert.equal((await t.call(MANAGER, "/api/case-delete", { ids: ["c2"], reason: "x", confirm: "LS-2" })).status, 400);
-  const r = (await t.call(MANAGER, "/api/case-delete", { ids: ["c2"], reason: "Pulled in error, wrong product", confirm: "LS-2" })).body; assert.equal(r.deleted, 1); assert.deepEqual(r.pmids, ["2"]);
+  assert.equal((await t.call(MEDICAL, "/api/cases-delete", { ids: ["c2"], reason: "Pulled in error", confirm: "LS-2" })).status, 403);
+  assert.equal((await t.call(MANAGER, "/api/cases-delete", { ids: ["c2"], reason: "Pulled in error", confirm: "wrong" })).status, 400);
+  assert.equal((await t.call(MANAGER, "/api/cases-delete", { ids: ["c2"], reason: "x", confirm: "LS-2" })).status, 400);
+  const r = (await t.call(MANAGER, "/api/cases-delete", { ids: ["c2"], reason: "Pulled in error, wrong product", confirm: "LS-2" })).body; assert.equal(r.deleted, 1); assert.deepEqual(r.pmids, ["2"]);
   let s = await t.state(); assert.deepEqual(s.cases.map(c => c.number), ["LS-1", "LS-3"]); assert.equal(s.deletedCases[0].number, "LS-2"); assert.equal(s.deletedCases[0].deletedBy, MANAGER);
   s.cases[0].versions = [{ n: 1, action: "approved", hash: "h" }]; await t.BUCKET.put("bench.json", JSON.stringify(s));
-  assert.equal((await t.call(MANAGER, "/api/case-delete", { ids: ["c1"], reason: "Pulled in error", confirm: "LS-1" })).status, 409);
+  assert.equal((await t.call(MANAGER, "/api/cases-delete", { ids: ["c1"], reason: "Pulled in error", confirm: "LS-1" })).status, 409);
   await t.call(MANAGER, "/api/case-archive", { ids: ["c1"], reason: "Archive before deletion" });
-  assert.equal((await t.call(MANAGER, "/api/case-delete", { ids: ["c1"], reason: "Pulled in error", confirm: "LS-1" })).status, 200);
+  assert.equal((await t.call(MANAGER, "/api/cases-delete", { ids: ["c1"], reason: "Pulled in error", confirm: "LS-1" })).status, 200);
   assert.ok((await auditActions(t)).filter(a => a === "case.deleted").length === 2);
   assert.equal((await t.call(MANAGER, "/api/library-delete", { pmids: ["2"], reason: "Remove the pulled citation" })).body.deleted, 1, "after the case is gone the pulled citation can be deleted");
 });
