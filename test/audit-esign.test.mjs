@@ -473,3 +473,44 @@ test("a preprint of the same paper is used as a legal open copy, marked as a pre
     assert.equal((await worker.captureFromPreprint(t.env, article, "kept")).fullTextStatus, "kept");
   } finally { globalThis.fetch = realFetch; }
 });
+
+test("optional retrieval tiers (CORE, Wiley TDM, Elsevier TDM, bioRxiv/medRxiv) use only the user's keys and store only real full texts", async () => {
+  const t = await setup(), realFetch = globalThis.fetch, calls = [];
+  const pdf = tinyPdf(["Case presentation", "A 54-year-old man developed Hepatic Failure after aciclovir."]);
+  const route = async (url, init = {}) => {
+    const u = String(url); calls.push([u, init.headers]);
+    if (u.startsWith("https://api.wiley.com/")) return init.headers["Wiley-TDM-Client-Token"] === "good-token-0123456789" ? new Response(pdf, { status: 200 }) : new Response("", { status: 403 });
+    if (u.startsWith("https://api.elsevier.com/")) return init.headers["X-ELS-APIKey"] === "good-key-0123456789ab" ? new Response("<full-text-retrieval-response><originalText><ce:sections><ce:section><ce:section-title>Case presentation</ce:section-title><ce:para>A 54-year-old man developed Hepatic Failure after aciclovir.</ce:para></ce:section></ce:sections></originalText></full-text-retrieval-response>", { status: 200 }) : new Response("", { status: 401 });
+    if (u.startsWith("https://api.core.ac.uk/v3/search/works")) return new Response(JSON.stringify({ results: [{ id: 5, doi: "10.1234/core-doi", title: "x", downloadUrl: "https://repo.example.org/a.pdf" }] }), { status: 200 });
+    if (u === "https://repo.example.org/a.pdf") return new Response(pdf, { status: 200 });
+    if (u.startsWith("https://api.biorxiv.org/details/")) return new Response(JSON.stringify({ collection: [{ jatsxml: "https://www.biorxiv.org/content/early/x.source.xml", license: "cc_by" }] }), { status: 200 });
+    if (u.endsWith("x.source.xml")) return new Response("<article><body><p>" + FULL_TEXT + "</p></body></article>", { status: 200 });
+    return new Response("", { status: 404 });
+  };
+  try {
+    globalThis.fetch = route;
+    const w = { id: "1", doi: "10.1002/abc.123" }, e = { id: "2", doi: "10.1016/j.test.2021.1" }, c = { id: "3", doi: "10.1234/core-doi", title: "x" }, r = { id: "4", doi: "10.1101/2021.01.01.123456" };
+    assert.equal((await worker.captureFromWiley({ ...t.env, WILEY_TDM_TOKEN: "" }, w, "r")).fullTextStatus, "r");                       // no key: nothing is called
+    assert.equal((await worker.captureFromWiley({ ...t.env, WILEY_TDM_TOKEN: "good-token-0123456789" }, { ...w, doi: "10.5555/other" }, "r")).fullTextStatus, "r");   // not a Wiley DOI
+    assert.equal((await worker.captureFromWiley({ ...t.env, WILEY_TDM_TOKEN: "bad" }, w, "r")).fullTextStatus, "Not covered by your Wiley access");
+    const ok = await worker.captureFromWiley({ ...t.env, WILEY_TDM_TOKEN: "good-token-0123456789" }, w, "r");
+    assert.equal(ok.fullTextStatus, "Captured"); assert.equal(ok.fullTextRestricted, true); assert.equal(ok.fullTextOrigin, "Wiley TDM");
+    assert.equal((await worker.captureFromElsevier({ ...t.env, ELSEVIER_API_KEY: "bad" }, e, "r")).fullTextStatus, "Not covered by your Elsevier access");
+    const els = await worker.captureFromElsevier({ ...t.env, ELSEVIER_API_KEY: "good-key-0123456789ab" }, e, "r"); assert.equal(els.fullTextStatus, "Captured"); assert.match(els._text, /Case presentation/);
+    assert.equal((await worker.captureFromCore({ ...t.env, CORE_API_KEY: "" }, c, "r")).fullTextStatus, "r");
+    const core = await worker.captureFromCore({ ...t.env, CORE_API_KEY: "core-key-0123456789" }, c, "r"); assert.equal(core.fullTextStatus, "Captured"); assert.equal(core.fullTextOrigin, "CORE");
+    const rx = await worker.captureFromRxiv({ ...t.env, ALLOW_RESTRICTED: false }, r, "r"); assert.equal(rx.fullTextStatus, "Captured"); assert.equal(rx.fullTextVersion, "preprint");
+    const authHeader = calls.find(([u]) => u.includes("core.ac.uk"))[1].Authorization; assert.equal(authHeader, "Bearer core-key-0123456789");
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test("retrieval keys are saved only by managers, validated, hidden from the page, and removable", async () => {
+  const t = await setup();
+  assert.equal((await t.call(REVIEWER, "/api/settings", { coreApiKey: "abcdefghij0123456789" })).status, 403);
+  assert.equal((await t.call(MANAGER, "/api/settings", { coreApiKey: "short" })).status, 400);
+  assert.equal((await t.call(MANAGER, "/api/settings", { coreApiKey: "abcdefghij0123456789", wileyTdmToken: "wiley-token-0123456789" })).status, 200);
+  const state = await (await worker.fetch(new Request("http://localhost/api/state", { headers: { "oai-authenticated-user-email": MANAGER } }), t.env)).json();
+  assert.equal(state.config.retrievalKeys.core, true); assert.equal(state.config.retrievalKeys.wiley, true); assert.ok(!JSON.stringify(state).includes("abcdefghij0123456789"));
+  await t.call(MANAGER, "/api/settings", { coreApiKey: null });
+  assert.equal(JSON.parse(await readFile(benchFile(t.dir), "utf8")).settings.coreApiKey, undefined);
+});

@@ -190,3 +190,7 @@ Uploads up to 40 MB need `deploy/enable-uploads.sh` on an existing server (new i
 
 Retrieval tries PMC, Europe PMC, Unpaywall (several locations, including open landing pages), Semantic Scholar and, new, an openly licensed **preprint** of the same paper (exact title match; marked as a preprint because it may differ from the published version).
 What stays closed appears on **Batches > Closed articles waiting for a full text**: a link through your library proxy, a **Copy request** note for the author, and **Match and upload** for many PDFs at once (name each file with its PMID or DOI). Nothing scrapes publisher sites or shadow libraries.
+
+## More full-text sources (optional, with your own keys)
+
+Settings > **Publisher and aggregator access** takes a free **CORE** API key (open repository copies), a **Wiley** text-mining token and an **Elsevier** API key (plus optional institution token). Wiley and Elsevier return only what your institution is licensed to read; if your licence is tied to your campus network they may refuse requests from this server, and the article then shows "Not covered by your ... access". bioRxiv and medRxiv DOIs are read through their own API. Texts from licensed publishers are stored as restricted. Design after paperscraper (MIT); see `THIRD_PARTY_NOTICES.md`.

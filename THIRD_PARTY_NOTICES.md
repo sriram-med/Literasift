@@ -54,3 +54,9 @@ or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHO
 
 The E2B(R3) XML is checked in the test suite against the ICH ICSR XSD files as bundled in https://github.com/devopam/icsrmaker (Apache-2.0, `schemas/`). The schema files
 are not copied into this repository; the test skips when they are absent. That project's own generator was read for orientation only.
+
+## paperscraper
+
+The design of the Wiley, Elsevier and bioRxiv retrieval tiers follows https://github.com/jannisborn/paperscraper (`paperscraper/pdf/fallbacks.py`), re-implemented in JavaScript.
+
+MIT License. Copyright (c) 2020 Jannis Born and contributors. Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files, to deal in the Software without restriction, subject to the above copyright notice and this permission notice being included in all copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.

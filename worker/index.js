@@ -34,6 +34,8 @@ const ncbiParams = env => {
 const withSettings = (base, state) => Object.assign(Object.create(base), {
   UNPAYWALL_EMAIL:base.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail || "", ALLOW_RESTRICTED:state.settings?.storeRestricted !== false,
   NCBI_EMAIL:base.NCBI_EMAIL || state.settings?.ncbiEmail || "", NCBI_API_KEY:base.NCBI_API_KEY || state.settings?.ncbiApiKey || "",
+  CORE_API_KEY:base.CORE_API_KEY || state.settings?.coreApiKey || "", WILEY_TDM_TOKEN:base.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken || "",
+  ELSEVIER_API_KEY:base.ELSEVIER_API_KEY || state.settings?.elsevierApiKey || "", ELSEVIER_INSTTOKEN:base.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken || "",
   PV_NEXUS_URL:base.PV_NEXUS_URL || state.settings?.pvNexusUrl || "", PV_NEXUS_TOKEN:base.PV_NEXUS_TOKEN || state.settings?.pvNexusToken || "" });
 async function pubmed(env, operation, params) {
   await ncbiThrottle(env);
@@ -362,6 +364,11 @@ function xmlToText(xml) {
   const abstract = /<abstract\b[\s\S]*?<\/abstract>/.exec(cleaned)?.[0] || "";
   return [abstract, body].flatMap(part => [...part.matchAll(/<(title|head|p)\b[^>]*>([\s\S]*?)<\/\1>/g)].map(m => xmlText(m[2]))).filter(t => t.length > 1).join("\n").replace(/[ \t]+([.,;:)])/g, "$1");
 }
+// Elsevier's full-text XML names its parts ce:section-title, ce:para and ce:simple-para (abstract and body).
+function elsevierText(xml) {
+  const cleaned = String(xml).replace(/<ce:cross-refs?\b[^>]*>[\s\S]*?<\/ce:cross-refs?>/g, "").replace(/<ce:bibliography\b[\s\S]*?<\/ce:bibliography>/g, "");
+  return [...cleaned.matchAll(/<(ce:section-title|ce:para|ce:simple-para|dc:description)\b[^>]*>([\s\S]*?)<\/\1>/g)].map(m => xmlText(m[2])).filter(t => t.length > 1).join("\n").replace(/[ \t]+([.,;:)])/g, "$1");
+}
 function keyPassages(text, molecules) {
   const names = molecules.map(m => m.toLowerCase()).filter(Boolean);
   const out = [];
@@ -490,7 +497,7 @@ async function captureFromSemanticScholar(env, article, reason) {
     return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:pdf.license || "unspecified", fullTextSource:pdf.url, fullTextOrigin:"Semantic Scholar", fullTextRestricted:!permissive, _text:text };
   } catch { return { fullTextStatus:reason }; }
 }
-const fullTextTier = 5; // bump when a new source is added so earlier "not found" results are tried once more
+const fullTextTier = 6; // bump when a new source is added so earlier "not found" results are tried once more
 // A preprint of the same paper, when its own open licence allows storage (Europe PMC indexes bioRxiv, medRxiv and others). It may differ from the published version, so it is marked as a preprint.
 const normTitle = t => String(t || "").toLowerCase().replace(/<[^>]+>/g, " ").replace(/[^a-z0-9]+/g, " ").trim();
 async function captureFromPreprint(env, article, reason) {
@@ -511,6 +518,74 @@ async function captureFromPreprint(env, article, reason) {
   await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:"application/xml" } });
   return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:license, fullTextSource:epmcBase + "/" + hit.id + "/fullTextXML", fullTextOrigin:"Preprint (Europe PMC)", fullTextVersion:"preprint", fullTextRestricted:!openLicenses.includes(license), _text:xmlToText(xml) };
 }
+const storeFile = async (env, article, name, bytes, type) => { const key = "evidence/" + article.id + "/" + name; await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:type } }); return key; };
+// ---- Retrieval through official programme interfaces. Wiley and Elsevier text-mining APIs use the user's own token and only return what their institution is entitled to
+// (design after paperscraper, MIT, Copyright (c) 2020 Jannis Born et al.). CORE aggregates open repository copies. bioRxiv/medRxiv publish their own full-text XML. ----
+const wileyDoi = doi => /^10\.(1002|1111)\//.test(doi || ""), elsevierDoi = doi => /^10\.(1016|1053)\//.test(doi || "");
+async function captureFromWiley(env, article, reason) {
+  if (!env.WILEY_TDM_TOKEN || !validDoi(article.doi) || !wileyDoi(article.doi)) return { fullTextStatus:reason };
+  const response = await fetch("https://api.wiley.com/onlinelibrary/tdm/v1/articles/" + encodeURIComponent(article.doi), { headers:{ "Wiley-TDM-Client-Token":env.WILEY_TDM_TOKEN }, redirect:"follow", signal:AbortSignal.timeout(60000) });
+  if (!response.ok) return { fullTextStatus:response.status === 403 || response.status === 401 ? "Not covered by your Wiley access" : reason };
+  const bytes = await response.arrayBuffer();
+  if (bytes.byteLength > maxPdfBytes || new TextDecoder().decode(bytes.slice(0, 5)) !== "%PDF-") return { fullTextStatus:reason };
+  const key = await storeFile(env, article, "wiley.pdf", bytes, "application/pdf");
+  let text = ""; try { text = await pdfToText(env, bytes); } catch { /* best effort */ }
+  return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:"Publisher licence via your Wiley text-mining token", fullTextSource:"Wiley TDM API", fullTextOrigin:"Wiley TDM", fullTextRestricted:true, _text:text };
+}
+async function captureFromElsevier(env, article, reason) {
+  if (!env.ELSEVIER_API_KEY || !validDoi(article.doi) || !elsevierDoi(article.doi)) return { fullTextStatus:reason };
+  const response = await fetch("https://api.elsevier.com/content/article/doi/" + article.doi + "?httpAccept=text%2Fxml", { headers:{ "X-ELS-APIKey":env.ELSEVIER_API_KEY, ...(env.ELSEVIER_INSTTOKEN ? { "X-ELS-Insttoken":env.ELSEVIER_INSTTOKEN } : {}), Accept:"application/xml" }, signal:AbortSignal.timeout(60000) });
+  if (!response.ok) return { fullTextStatus:response.status === 403 || response.status === 401 ? "Not covered by your Elsevier access" : reason };
+  const bytes = await response.arrayBuffer(), xml = new TextDecoder().decode(bytes);
+  // An entitlement problem returns a short abstract-only record; real full text has a body.
+  if (bytes.byteLength > 15 * 1024 * 1024 || !/<full-text-retrieval-response\b/.test(xml) || !/<(ce:sections|xocs:rawtext|originalText)\b/.test(xml)) return { fullTextStatus:"Not covered by your Elsevier access" };
+  const key = await storeFile(env, article, "elsevier.xml", bytes, "application/xml");
+  return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:"Publisher licence via your Elsevier text-mining key", fullTextSource:"Elsevier TDM API", fullTextOrigin:"Elsevier TDM", fullTextRestricted:true, _text:elsevierText(xml) };
+}
+async function captureFromCore(env, article, reason) {
+  if (!env.CORE_API_KEY) return { fullTextStatus:reason };
+  const title = normTitle(article.title), q = validDoi(article.doi) ? 'doi:"' + article.doi + '"' : title.length >= 25 ? 'title:"' + title.slice(0, 180) + '"' : "";
+  if (!q) return { fullTextStatus:reason };
+  const response = await fetch("https://api.core.ac.uk/v3/search/works?" + new URLSearchParams({ q, limit:"5" }), { headers:{ Authorization:"Bearer " + env.CORE_API_KEY }, signal:AbortSignal.timeout(25000) });
+  if (!response.ok) return { fullTextStatus:reason }; // 401 bad key, 429 daily limit: not an error for the article
+  const results = (await response.json()).results || [];
+  const hit = results.find(r => (validDoi(article.doi) && String(r.doi || "").toLowerCase() === article.doi.toLowerCase()) || normTitle(r.title) === title);
+  if (!hit) return { fullTextStatus:reason };
+  const url = hit.downloadUrl || (hit.links || []).find(l => l.type === "download")?.url || "";
+  if (/^https:\/\//.test(url)) {
+    try {
+      const file = await fetch(url, { signal:AbortSignal.timeout(30000), headers:{ Accept:"application/pdf" } }), bytes = await file.arrayBuffer();
+      if (file.ok && bytes.byteLength <= maxPdfBytes && new TextDecoder().decode(bytes.slice(0, 5)) === "%PDF-") {
+        const key = await storeFile(env, article, "core.pdf", bytes, "application/pdf");
+        let text = String(hit.fullText || ""); if (text.length < 1500) { try { text = await pdfToText(env, bytes); } catch { /* best effort */ } }
+        return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:"Open repository copy (check the repository licence)", fullTextSource:url, fullTextOrigin:"CORE", fullTextRestricted:true, _text:text };
+      }
+    } catch { /* fall back to CORE's own text */ }
+  }
+  if (String(hit.fullText || "").length >= 1500) {
+    const text = String(hit.fullText), key = await storeFile(env, article, "core.txt", new TextEncoder().encode(text), "text/plain; charset=utf-8");
+    return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:"Open repository copy (check the repository licence)", fullTextSource:"https://core.ac.uk/works/" + hit.id, fullTextOrigin:"CORE", fullTextRestricted:true, _text:text };
+  }
+  return { fullTextStatus:reason };
+}
+// bioRxiv and medRxiv DOIs (10.1101/...): their API names the JATS full-text XML of the preprint, with its licence.
+async function captureFromRxiv(env, article, reason) {
+  if (!validDoi(article.doi) || !/^10\.1101\//.test(article.doi)) return { fullTextStatus:reason };
+  for (const server of ["biorxiv", "medrxiv"]) {
+    const details = await fetch("https://api.biorxiv.org/details/" + server + "/" + article.doi + "/na/json", { signal:AbortSignal.timeout(20000) }).then(r => r.ok ? r.json() : null).catch(() => null);
+    const item = details?.collection?.slice(-1)[0];
+    if (!item?.jatsxml || !/^https:\/\//.test(item.jatsxml)) continue;
+    const license = String(item.license || "").toLowerCase().replace(/_/g, "-").replace(/\s+/g, "-");
+    if (!(env.ALLOW_RESTRICTED || openLicenses.includes(license))) continue;
+    const file = await fetch(item.jatsxml, { signal:AbortSignal.timeout(30000) });
+    if (!file.ok) continue;
+    const bytes = await file.arrayBuffer(), xml = new TextDecoder().decode(bytes);
+    if (bytes.byteLength > 15 * 1024 * 1024 || !/<article\b/.test(xml)) continue;
+    const key = await storeFile(env, article, "rxiv.xml", bytes, "application/xml");
+    return { fullTextStatus:"Captured", fullTextKey:key, fullTextLicense:license, fullTextSource:item.jatsxml, fullTextOrigin:server === "medrxiv" ? "medRxiv" : "bioRxiv", fullTextVersion:"preprint", fullTextRestricted:!openLicenses.includes(license), _text:xmlToText(xml) };
+  }
+  return { fullTextStatus:reason };
+}
 async function captureFullText(env, article, lookupOnce, coreOnce) {
   const pmc = await captureFromPmc(env, article);
   if (pmc.fullTextStatus === "Captured") return pmc;
@@ -520,6 +595,12 @@ async function captureFullText(env, article, lookupOnce, coreOnce) {
   if (unpaywall.fullTextStatus === "Captured") return unpaywall;
   const scholar = await captureFromSemanticScholar(env, article, unpaywall.fullTextStatus).catch(() => ({ fullTextStatus:unpaywall.fullTextStatus }));
   if (scholar.fullTextStatus === "Captured") return scholar;
+  // Optional tiers that need the user's own keys or apply to particular publishers; each failing one leaves the earlier reason in place.
+  for (const tier of [captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv]) {
+    const result = await tier(env, article, unpaywall.fullTextStatus).catch(() => null);
+    if (result?.fullTextStatus === "Captured") return result;
+    if (result && /^Not covered by your/.test(result.fullTextStatus)) unpaywall.fullTextStatus = result.fullTextStatus;
+  }
   const preprint = await captureFromPreprint(env, article, unpaywall.fullTextStatus).catch(() => ({ fullTextStatus:unpaywall.fullTextStatus }));
   return preprint.fullTextStatus === "Captured" ? preprint : unpaywall;
 }
@@ -2128,7 +2209,7 @@ async function apiCore(request, env, path) {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
       cases:await Promise.all((state.cases || []).filter(c => manager || c.createdBy === email || c.assignee === email).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
-      series:seriesSummary((state.cases || []).filter(c => manager || c.createdBy === email || c.assignee === email)), config:{ sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      series:seriesSummary((state.cases || []).filter(c => manager || c.createdBy === email || c.assignee === email)), config:{ retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -2400,6 +2481,7 @@ async function apiCore(request, env, path) {
     if ("pvNexusUrl" in body && body.pvNexusUrl && !/^https?:\/\/[^\s/]+(\/\S*)?$/.test(String(body.pvNexusUrl).trim())) return json({error:"Enter the PV Nexus API address, like https://pv-nexus.example.com"},400);
     if (typeof body.pvNexusToken === "string" && body.pvNexusToken.length > 300) return json({error:"That token is too long."},400);
     if ("ncbiEmail" in body && body.ncbiEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(body.ncbiEmail).trim())) return json({error:"Enter a valid contact email for NCBI."},400);
+    for (const key of ["coreApiKey", "wileyTdmToken", "elsevierApiKey", "elsevierInsttoken"]) if (typeof body[key] === "string" && body[key].trim() && !/^[A-Za-z0-9._\-]{16,300}$/.test(body[key].trim())) return json({ error:"That does not look like a valid key or token." }, 400);
     if (typeof body.ncbiApiKey === "string" && body.ncbiApiKey.trim() && !/^[A-Za-z0-9]{20,64}$/.test(body.ncbiApiKey.trim())) return json({error:"That does not look like an NCBI API key (letters and digits only)."},400);
     if ("unpaywallEmail" in body && email && (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || email.length > 200)) return json({error:"Enter a valid contact email for Unpaywall."},400);
     await write(env, data => {
@@ -2417,6 +2499,7 @@ async function apiCore(request, env, path) {
       if ("pvNexusUrl" in body) settings.pvNexusUrl = String(body.pvNexusUrl || "").trim();
       if (body.pvNexusToken === null) delete settings.pvNexusToken;
       else if (typeof body.pvNexusToken === "string" && body.pvNexusToken.trim()) settings.pvNexusToken = body.pvNexusToken.trim();
+      for (const key of ["coreApiKey", "wileyTdmToken", "elsevierApiKey", "elsevierInsttoken"]) { if (body[key] === null) delete settings[key]; else if (typeof body[key] === "string" && body[key].trim()) settings[key] = body[key].trim(); }
       if (body.ncbiApiKey === null) delete settings.ncbiApiKey;
       else if (typeof body.ncbiApiKey === "string" && body.ncbiApiKey.trim()) settings.ncbiApiKey = body.ncbiApiKey.trim();
       if ("storeRestricted" in body) {
@@ -3187,6 +3270,7 @@ function render() {
       "There is no open worldwide source for marketing-authorisation status, so this table is yours to maintain. The country decides the regulator, whether the product is authorised there, and the reporting clock shown on ICSR cases (default 15 days for serious and 90 for non-serious cases unless a row says otherwise; confirm with local regulations). Statuses are read as Authorised, Not authorised, Withdrawn or Under review.")+
     panel("PV Nexus (ICSR processing)",'<form class="grid" data-route="settings"><label>PV Nexus API address (optional)<input name="pvNexusUrl" value="'+esc((data.config.pvNexus||{}).url||"")+'" placeholder="https://your-pv-nexus-backend"'+((data.config.pvNexus||{}).urlFromEnv?" disabled":"")+'></label><label>API token (optional)<input type="password" name="pvNexusToken" autocomplete="off" placeholder="'+((data.config.pvNexus||{}).tokenSet?"Token is set; leave blank to keep it":"Sent as a Bearer token if your gateway needs one")+'"></label><div><button class="btn">Save</button>'+((data.config.pvNexus||{}).tokenSet?' <button type="button" class="btn outline" data-pvremove="1">Remove token</button>':"")+'</div></form>',
       "ICSR cases are assessed here with a port of PV Nexus's deterministic rules (validity, QC, causality suggestion, follow-up questions), checked to give identical results. If you enter the address of a PV Nexus backend, the same checks are run by it instead, and LiteraSift falls back to the local rules if it is unreachable.")+
+    panel("Publisher and aggregator access",'<form class="grid" data-route="settings"><label>CORE API key (free, core.ac.uk)<input type="password" name="coreApiKey" autocomplete="off" placeholder="'+((data.config.retrievalKeys||{}).core?"Set; leave blank to keep":"Paste your CORE key")+'"></label><label>Wiley text-mining token<input type="password" name="wileyTdmToken" autocomplete="off" placeholder="'+((data.config.retrievalKeys||{}).wiley?"Set; leave blank to keep":"Wiley-TDM-Client-Token")+'"></label><label>Elsevier API key<input type="password" name="elsevierApiKey" autocomplete="off" placeholder="'+((data.config.retrievalKeys||{}).elsevier?"Set; leave blank to keep":"X-ELS-APIKey")+'"></label><label>Elsevier institution token (optional)<input type="password" name="elsevierInsttoken" autocomplete="off" placeholder="'+((data.config.retrievalKeys||{}).elsevierInst?"Set; leave blank to keep":"X-ELS-Insttoken")+'"></label><div><button class="btn">Save</button> '+Object.entries({coreApiKey:"core",wileyTdmToken:"wiley",elsevierApiKey:"elsevier",elsevierInsttoken:"elsevierInst"}).filter(([,k])=>(data.config.retrievalKeys||{})[k]).map(([f,k])=>'<button type="button" class="btn outline sm" data-keyremove="'+f+'">Remove '+esc(k)+'</button>').join(" ")+'</div></form>',"Extra places to look for full texts, each used only with a key you hold. CORE searches open repository copies. The Wiley and Elsevier text-mining services return only what your institution is licensed to read, and may refuse requests from this server if your licence is tied to your campus network. Those texts are stored as restricted. Leave all blank to skip.")+
     panel("Closed-access articles",'<form class="grid" data-route="settings"><label class="wide">Library proxy address (optional)<input name="proxyPrefix" value="'+esc(data.config.proxyPrefix||"")+'" placeholder="https://ezproxy.your-library.edu/login?url="></label><div><button class="btn">Save</button></div></form>',"For articles behind a paywall. With your library's proxy address, every closed article gets an Open with your institution link that signs in through your library. You can then download the PDF and upload it on the article, or paste the text; it flows into event detection and Synchrony like any other full text. LiteraSift does not bypass paywalls.")+
     panel("Synchrony (ICSR workbench)",'<form class="grid" data-route="settings"><label>Add full-text articles automatically<select name="autoIcsr"><option value="on"'+(data.config.autoIcsr?" selected":"")+'>On: draft a case for each article with stored full text and detected events</option><option value="off"'+(data.config.autoIcsr?"":" selected")+'>Off: add them with the button on the Synchrony tab</option></select></label><label>Assign new cases automatically<select name="autoAssignCases"><option value="on"'+(data.config.autoAssignCases?" selected":"")+'>On: molecule owner, else the reviewer with the fewest open cases</option><option value="off"'+(data.config.autoAssignCases?"":" selected")+'>Off: managers assign by hand</option></select></label><label>Sender organisation<input name="senderOrg" value="'+esc((data.config.sender||{}).org||"")+'" placeholder="Your company"></label><label>Sender contact name<input name="senderName" value="'+esc((data.config.sender||{}).name||"")+'"></label><label>Sender e-mail<input name="senderEmail" value="'+esc((data.config.sender||{}).email||"")+'"></label><label>Sender phone<input name="senderPhone" value="'+esc((data.config.sender||{}).phone||"")+'"></label><label>Sender country<input name="senderCountry" value="'+esc((data.config.sender||{}).country||"")+'"></label><label>E2B sender identifier<input name="senderId" value="'+esc((data.config.e2b||{}).sender||"")+'" placeholder="Your organisation ID (N.2.r.2)"></label><label>E2B receiver identifier<input name="receiverId" value="'+esc((data.config.e2b||{}).receiver||"")+'" placeholder="Regulator or partner ID (N.2.r.3)"></label><div><button class="btn">Save</button></div></form>',"E2B(R3) files carry these identifiers in the message header.")+
     panel("NCBI / PubMed access",'<form class="grid" data-route="settings"><label>Contact email for NCBI<input type="email" name="ncbiEmail" value="'+esc((data.config.ncbi||{}).email||"")+'" placeholder="you@example.com"'+((data.config.ncbi||{}).emailFromEnv?" disabled":"")+'></label><label>NCBI API key (optional)<input type="password" name="ncbiApiKey" autocomplete="off" placeholder="'+((data.config.ncbi||{}).keySet?"Key is set; leave blank to keep it":"Paste a free key to allow 10 requests a second")+'"'+((data.config.ncbi||{}).keyFromEnv?" disabled":"")+'></label><div><button class="btn">Save</button>'+(((data.config.ncbi||{}).keySet&&!(data.config.ncbi||{}).keyFromEnv)?' <button type="button" class="btn outline" data-ncbiremove="1">Remove key</button>':"")+'</div></form>',
@@ -3289,7 +3373,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -3391,6 +3475,7 @@ document.addEventListener("click",event=>{
     })();
     return;
   }
+  if(target.dataset.keyremove){api("settings",{[target.dataset.keyremove]:null}).then(()=>{message("Key removed.");return refresh();}).catch(e=>message(e.message,true));return;}
   if(target.dataset.ncbiremove){api("settings",{ncbiApiKey:null}).then(()=>{message("API key removed.");return refresh();}).catch(e=>message(e.message,true));return;}
   if(target.dataset.rkadd){const rows=document.querySelectorAll(".rkrow"),last=rows.length?Number(rows[rows.length-1].querySelector(".rkt").value):0;rkAddRow(last?last+1:1,"");return;}
   if(target.dataset.rkdel){target.closest(".rkrow").remove();return;}
@@ -3619,7 +3704,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  libraryLayout, captureFromPreprint, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  libraryLayout, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);

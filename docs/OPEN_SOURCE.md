@@ -95,3 +95,8 @@ Cloned shallowly for study into a folder outside this repository (they are large
 ## What is deliberately not integrated: tools that scrape paywalled articles
 
 Shadow libraries (Sci-Hub and similar), browser extensions that fetch pirated copies, and scripts that log in with other people's institutional credentials are not integrated. They infringe publishers' copyright and licence terms, a PV system holding such copies would be hard to defend in an inspection, and an unlawful source is a poor basis for regulatory records. For closed articles use the legal routes built in: your library proxy, your own licensed download uploaded to the article, author requests, and interlibrary or document-delivery services.
+
+## paperscraper (jannisborn/paperscraper, MIT, commit `4fae7f6`): integrated, selectively
+
+The official-interface fallbacks of paperscraper's PDF module are integrated as optional retrieval tiers, re-implemented in JavaScript: **Wiley text-mining API** and **Elsevier text-mining API** (each only with a token or key the user holds; they return only what the user's institution is licensed to read), and the **bioRxiv/medRxiv** details API (preprint full-text XML under its stated licence). **CORE** (free API key) was added alongside. Keys are set under Settings > Publisher and aggregator access and are never sent to the page.
+Not integrated: paperscraper's search over local dumps (bulk downloads), and its generic publisher page fetching, which does not respect paywalls and is the part that raises terms-of-use concerns.
