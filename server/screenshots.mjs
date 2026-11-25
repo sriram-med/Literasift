@@ -20,7 +20,24 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#71717a;ma
 <h2>Abstract</h2><div class="abs">${a.abstract ? esc(a.abstract.slice(0, 4000)) : "<i>No abstract available.</i>"}</div>
 ${(a.meshTerms || []).length ? `<h2>MeSH terms</h2><div>${chips(a.meshTerms)}</div>` : ""}
 ${(a.keywords || []).length ? `<h2>Keywords</h2><div>${chips(a.keywords)}</div>` : ""}
-<h2>Record</h2>${row("DOI", a.doi)}${row("PubMed", a.url)}${row("Retraction check", a.retractionStatus)}${row("Access", a.oaStatus)}${row("Full text", a.fullTextStatus)}${row("Cited by", a.citedBy)}${row("Captured", new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC")}`;
+<h2>Record</h2>${row("Search query", a.pullQuery)}${row("Date range", a.pullRange)}${row("DOI", a.doi)}${row("PubMed", a.url)}${row("Retraction check", a.retractionStatus)}${row("Access", a.oaStatus)}${row("Full text", a.fullTextStatus)}${row("Cited by", a.citedBy)}${row("Captured", new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC")}`;
+}
+
+// A sheet of article tiles for one pull, headed with the search query and the date range, for reports and audits.
+export function tilesHtml(run, articles, limit = 60) {
+  const shown = articles.slice(0, limit), chip = (t, hot) => `<span class="chip${hot ? " hot" : ""}">${esc(t)}</span>`;
+  const tile = a => `<div class="tile"><div class="pm">PMID ${esc(a.id)}${a.retractionStatus && /retract/i.test(a.retractionStatus) ? ' <b class="warn">RETRACTED</b>' : ""}</div><div class="tt">${esc(a.title)}</div><div class="mt">${esc([a.journal, a.date].filter(Boolean).join(" · "))}</div>` +
+    `<div>${chip(a.fullTextKey ? "Full text stored" : a.oaStatus || "No full text")}${a.affiliationCountry ? chip(a.affiliationCountry) : ""}${(a.events || []).slice(0, 3).map(e => chip(e.term, e.ime)).join("")}</div></div>`;
+  return `<!doctype html><meta charset="utf-8"><style>
+*{box-sizing:border-box}body{margin:0;padding:32px 36px;width:1200px;background:#fafafa;color:#18181b;font:14px/1.45 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+.brand{color:#0f766e;font-weight:700;font-size:13px;text-transform:uppercase;letter-spacing:.04em;border-bottom:2px solid #0f766e;padding-bottom:8px;display:flex;justify-content:space-between}
+.head{margin:16px 0 20px}.head h1{font-size:22px;margin:0 0 6px}.kv{display:flex;gap:10px;margin:3px 0}.kv b{width:110px;flex:none;color:#52525b}.q{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background:#fff;border:1px solid #e4e4e7;border-radius:6px;padding:4px 8px;word-break:break-all}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.tile{background:#fff;border:1px solid #e4e4e7;border-radius:10px;padding:12px}.pm{font-size:11px;color:#71717a;font-weight:600}.tt{font-weight:600;margin:3px 0;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.mt{font-size:12px;color:#52525b;margin-bottom:6px}
+.chip{display:inline-block;background:#f4f4f5;border:1px solid #e4e4e7;border-radius:99px;padding:0 8px;margin:0 4px 4px 0;font-size:11px}.chip.hot{background:#fee2e2;border-color:#fecaca;color:#991b1b}.warn{color:#b91c1c}.foot{margin-top:14px;color:#71717a;font-size:12px}</style>
+<div class="brand"><span>LiteraSift · Article tiles</span><span>generated ${esc(new Date().toISOString().slice(0, 16).replace("T", " "))} UTC</span></div>
+<div class="head"><h1>${esc([run.portfolio, run.molecule].filter(Boolean).join(" · ") || "Pull")}</h1>
+<div class="kv"><b>Search query</b><span class="q">${esc(run.query || "(not recorded)")}</span></div><div class="kv"><b>Date range</b><span>${esc(run.from)} → ${esc(run.to)}</span></div><div class="kv"><b>Source</b><span>${esc(run.source || "PubMed")} · ${esc(String(run.count ?? articles.length))} records</span></div></div>
+<div class="grid">${shown.map(tile).join("")}</div>${articles.length > shown.length ? `<div class="foot">Showing the first ${shown.length} of ${articles.length} records.</div>` : ""}`;
 }
 
 export async function makeScreenshotFn() {
@@ -39,6 +56,14 @@ export async function makeScreenshotFn() {
       return { bytes: await page.screenshot({ fullPage: true, type: "png", timeout: 30000 }), kind: "record" };
     } finally { await context.close().catch(() => {}); }
   };
+  const tiles = async (run, articles) => {
+    if (!browser?.isConnected()) browser = await chromium.launch({ args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+    const context = await browser.newContext({ viewport: { width: 1200, height: 800 }, javaScriptEnabled: false });
+    try { const page = await context.newPage(); await page.setContent(tilesHtml(run, articles), { waitUntil: "load" }); return await page.screenshot({ fullPage: true, type: "png", timeout: 30000 }); }
+    finally { await context.close().catch(() => {}); }
+  };
   // One capture at a time.
-  return article => (queue = queue.catch(() => {}).then(() => capture(article)));
+  const fn = article => (queue = queue.catch(() => {}).then(() => capture(article)));
+  fn.tiles = (run, articles) => (queue = queue.catch(() => {}).then(() => tiles(run, articles)));
+  return fn;
 }

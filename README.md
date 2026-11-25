@@ -158,3 +158,15 @@ Therapy start dates and onset dates are rarely given. If the article does not gi
 against QC and follow-up, and a stated time to onset (for example "10 days after starting") is used for the temporal assessment.
 The event picker adds MedDRA fields (LLT, PT, HLT, HLGT, SOC, version, status) with suggestions from the EMA IME list and from earlier reviewed codings (the PV Nexus coding-memory approach).
 Always confirm codes in a licensed MedDRA source.
+
+## Synchrony (ICSR workbench)
+
+Synchrony is LiteraSift's case workbench (the **Synchrony** tab, linked both ways: "Send to Synchrony" in the article review dialog, "Open article in LiteraSift" in the case).
+
+- **Intake:** articles with stored full text and detected events become draft cases, pre-filled with verbatim source sentences (see above). Full-text retrieval uses PMC, Europe PMC, Unpaywall and Semantic Scholar; scanned PDFs can be read with OCR (`deploy/enable-ocr.sh`) and PDF text with pdf.js (`deploy/enable-pdf-text.sh`).
+- **Tracker and assigner:** each case is assigned automatically (molecule owner, else the reviewer with the fewest open cases and room left); managers can reassign or press "Assign unassigned now". The reporting due date comes from country, seriousness and marketing-authorisation record. Views: open, mine, unassigned, overdue, due in 3 days, ready for review, signed, closed.
+- **Multi-user:** accounts, roles, per-case visibility, e-signatures and the audit trail apply to cases.
+- **Exports:** E2B(R3) XML (ICH ICSR, HL7 v3; one case or a batch; the structure is checked against the ICH XSD in the tests, but run it through your gateway's validator before submitting), CIOMS I (PDF form), HL7 FHIR R4 AdverseEvent bundle, line listing (CSV), PV Nexus ICSR JSON, and a full package (ZIP with all of these and the source article).
+- **Event IME matching:** upload the EMA IME list as .xlsx, .csv or .json in Settings. The .xlsx workbook is read directly (no extra software). Matches fill the PT, PT code and SOC in the event picker.
+- **Case series summary:** counts by event, product, country, age and sex with the cases behind every figure, and a monthly trend flag (median + MAD).
+- **Tile screenshot:** on Search & Pull, "Tile screenshot" renders a PNG of the article tiles for a pull, headed with its search query and date range (needs `deploy/enable-screenshots.sh`).

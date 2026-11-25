@@ -83,3 +83,11 @@ Cloned shallowly for study into a folder outside this repository (they are large
 | [allenai/scispacy](https://github.com/allenai/scispacy) | Apache-2.0 | `eacccd4` | Not integrated: needs a Python runtime and model downloads. A candidate for a separate optional service. |
 | [devopam/icsrmaker](https://github.com/devopam/icsrmaker) | Apache-2.0 | `4824f11` | Reference for a future E2B(R3) XML export (not built yet). |
 | [KarelDO/BioDEX](https://github.com/KarelDO/BioDEX) | MIT | `f6e4f49` | Reference: a labelled corpus of adverse-event reports from articles, useful for measuring extraction accuracy later. |
+
+## Three more repositories reviewed (November 2026)
+
+| Repository | Licence | Commit | Result |
+|---|---|---|---|
+| [niharnandala/pharmacovigilance-verified-safety-report-agent](https://github.com/niharnandala/pharmacovigilance-verified-safety-report-agent) | MIT | `bc424ec` | **Integrated (idea and rule).** Count first with plain code, then check any text against the counts; the median + MAD hike rule drives the monthly trend flag in Synchrony's case series summary. No model is used. |
+| [akhiranandan-04/AutoPADER-AI](https://github.com/akhiranandan-04/AutoPADER-AI) | none stated | `f99b75c` | **Ideas only; no code copied** (no licence file means all rights reserved). Used: deterministic statistics with an evidence list for every figure (each line in the series summary names the cases it counts), and expedited-versus-routine reporting clocks. |
+| [soluchi07/ADE-project](https://github.com/soluchi07/ADE-project) | none stated | `ca4aa1a` | **Ideas only; no code copied.** Its finding that confidence thresholds change precision and recall, and its SIDER label check, are noted as future work for scoring detected events. |

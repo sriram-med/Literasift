@@ -40,3 +40,17 @@ portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF 
 ## pdf.js (optional, installed separately)
 
 `deploy/enable-pdf-text.sh` installs `pdfjs-dist` from npm (Mozilla pdf.js, Apache License 2.0, https://github.com/mozilla/pdf.js). It is not copied into this repository.
+
+## pharmacovigilance-verified-safety-report-agent
+
+The trend rule in `robustHikes` (median plus two scaled median absolute deviations, MAD x 1.4826, instead of mean and standard deviation) follows
+https://github.com/niharnandala/pharmacovigilance-verified-safety-report-agent (`src/analysis.py`). It is re-implemented in JavaScript.
+
+MIT License. Copyright (c) 2026 NiharNandala. Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+documentation files, to deal in the Software without restriction, subject to the above copyright notice and this permission notice being included in all copies
+or substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+## ICH E2B(R3) schemas (test use only)
+
+The E2B(R3) XML is checked in the test suite against the ICH ICSR XSD files as bundled in https://github.com/devopam/icsrmaker (Apache-2.0, `schemas/`). The schema files
+are not copied into this repository; the test skips when they are absent. That project's own generator was read for orientation only.

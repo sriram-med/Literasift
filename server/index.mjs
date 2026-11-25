@@ -9,6 +9,7 @@ import { addPendingUser, checkPassword, consumeToken, createToken, peekToken, re
 import { mailConfigured, sendMail } from "./mail.mjs";
 import { makeScreenshotFn } from "./screenshots.mjs";
 import { makePdfTextFn } from "./pdftext.mjs";
+import { makeOcrFn, looksScanned } from "./ocr.mjs";
 import { mirrorLibrary } from "./library.mjs";
 
 const e = process.env;
@@ -20,9 +21,12 @@ const publicUrl = String(e.PUBLIC_URL || "").replace(/\/+$/, "");
 const env = { BUCKET: new FileBucket(dataDir + "/objects"), RUN_TOKEN: runToken, UNPAYWALL_EMAIL: e.UNPAYWALL_EMAIL, CROSSREF_EMAIL: e.CROSSREF_EMAIL,
   SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN, HOST_ACCOUNTS: true, AUDIT_ANCHOR_KEY: e.AUDIT_ANCHOR_KEY || createHmac("sha256", secret).update("literasift-audit-anchor").digest("hex"), LIBRARY_PATH: dataDir + "/library" };
 
-const pdfTextFn = await makePdfTextFn();
-if (pdfTextFn) env.PDF_TEXT_FN = pdfTextFn;
-console.log(pdfTextFn ? "PDF text: on" : "PDF text: off (run deploy/enable-pdf-text.sh to read PDF full texts)");
+const pdfTextFn = await makePdfTextFn(), ocrFn = await makeOcrFn();
+if (pdfTextFn || ocrFn) env.PDF_TEXT_FN = async bytes => {
+  const text = pdfTextFn ? await pdfTextFn(bytes).catch(() => "") : "";
+  return ocrFn && looksScanned(text) ? (await ocrFn(bytes).catch(() => "")) || text : text;
+};
+console.log(pdfTextFn ? "PDF text: on" : "PDF text: off (run deploy/enable-pdf-text.sh to read PDF full texts)", "|", ocrFn ? "OCR: on" : "OCR: off (run deploy/enable-ocr.sh to read scanned PDFs)");
 const screenshotFn = await makeScreenshotFn();
 if (screenshotFn) env.SCREENSHOT_FN = screenshotFn;
 console.log(screenshotFn ? "Local screenshots: on" : "Local screenshots: off (run deploy/enable-screenshots.sh to turn on)");
@@ -168,6 +172,16 @@ async function handler(req, res) {
     if (path === "/host/users" && req.method === "GET") {
       const out = {}; for (const [address, u] of Object.entries(users)) out[address] = u.hash ? "active" : "invited";
       return reply(res, 200, { users: out, mail: mailConfigured(e) });
+    }
+    if (path === "/host/run-tiles" && req.method === "GET") {
+      // A PNG sheet of the article tiles for one pull, headed with its search query and date range.
+      if (!env.SCREENSHOT_FN?.tiles) return reply(res, 503, { error: "Screenshots are not enabled on this server. Run deploy/enable-screenshots.sh." });
+      const run = (state.runs || []).find(r => r.id === url.searchParams.get("run"));
+      if (!run) return reply(res, 404, { error: "Pull not found." });
+      const articles = (run.ids || []).map(id => state.articles[id]).filter(Boolean);
+      const png = await env.SCREENSHOT_FN.tiles(run, articles);
+      await record(email, "export.tiles", [run.portfolio, run.molecule].filter(Boolean).join(" · "), run.from + " to " + run.to + ", " + articles.length + " articles");
+      return send(res, 200, png, { "Content-Type": "image/png", "Cache-Control": "private, no-store", "Content-Disposition": 'inline; filename="literasift-tiles-' + String(run.molecule || run.portfolio || "pull").replace(/[^A-Za-z0-9_-]+/g, "_") + "-" + run.from + "-to-" + run.to + '.png"' });
     }
     const target = String(body.email || "").trim().toLowerCase();
     if (path === "/host/invite" && req.method === "POST") {

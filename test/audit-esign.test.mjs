@@ -387,3 +387,10 @@ test("case series summary counts from the case fields and flags months above the
   assert.deepEqual(s.events[0], { key: "Confusion", count: 2, cases: ["A", "B"] });
   assert.equal(s.countries[0].key, "India"); assert.equal(s.ages[0].key, "65 and over");
 });
+
+test("OCR helper: scanned PDFs (no text layer) are recognised; the reader is optional", async () => {
+  const { makeOcrFn, looksScanned } = await import("../server/ocr.mjs");
+  assert.equal(looksScanned(""), true); assert.equal(looksScanned("  \n "), true); assert.equal(looksScanned("x".repeat(500)), false);
+  const ocr = await makeOcrFn();
+  assert.ok(ocr === null || typeof ocr === "function");
+});
