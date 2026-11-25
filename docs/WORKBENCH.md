@@ -74,3 +74,11 @@ Coverage is a ledger of search windows per watchlist, day and date field. A day 
 Settings: `OPENFDA_API_KEY` (optional, raises the openFDA rate limit), `CAUSALITY_ENDPOINT` and `CAUSALITY_TOKEN` (optional BioBERT service, see `services/causality/README`), the Unpaywall contact email (Settings tab).
 
 Not incorporated: AI-Powered-Pharmacovigilance-via-Literature-Monitoring is CC BY-NC-ND 4.0 (non-commercial, no derivatives), so none of its code or text is used.
+
+## MedDRA (licensed)
+A manager with a MedDRA licence loads the release in **Settings, MedDRA dictionary**: choose the release zip from the MSSO (the MedAscii folder with `llt.asc`, `mdhier.asc`, `meddra_release.asc`), tick the licence confirmation and upload. The release is parsed into a compact index kept in private storage (`meddra/index.json`), never in the repository, the state document, exports or the audit trail (the audit entry records the version, counts and who loaded it). No endpoint lists or downloads the dictionary; people can only search it a few terms at a time.
+- **Coding suggestions** in the case form give LLT, PT, HLT, HLGT and SOC with codes; "Search MedDRA…" searches any wording. Exact matches rank first, non-current LLTs are marked, and nothing is guessed.
+- **Drafts** propose a coding only for exact term matches, marked "Proposed (MedDRA x.y, exact term match; reviewer to confirm)".
+- **E2B(R3)** reports the reaction as the LLT code (`E.i.2.1b`) with the MedDRA version (`E.i.2.1a`); validation checks each code exists in the loaded release, warns about PT-only codes and version differences.
+- **New release:** loading it replaces the old one; "Check cases against this release" lists events whose code is missing, whose LLT is no longer current, whose PT changed, or that were coded with an older version. Case codes are never changed automatically.
+- Group the case list by SOC; searches also match PT, LLT and SOC wording.

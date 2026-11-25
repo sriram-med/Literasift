@@ -7,3 +7,9 @@ node_modules/
 *ime-meddra*.json
 ime/
 docs/video/frames*/
+
+# MedDRA release files are licensed: never commit them
+*.asc
+meddra/
+MedAscii/
+MedDRA_*.zip

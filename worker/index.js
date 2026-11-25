@@ -956,7 +956,7 @@ const E2B_PROFILES = {
   EU:{ label:"EU (EMA / EudraVigilance) E2B(R3)", batchReceiver:"EMA", messageReceiver:"EMA", supportedForFinal:true, medDraRequired:true },
   FDA:{ label:"FDA E2B(R3), postmarket (review only)", batchReceiver:"ZZFDA", messageReceiver:"CDER", supportedForFinal:false, medDraRequired:true,
     note:"FDA regional elements (for example FDA.C.1.7.1 local criteria report type and FDA.C.1.12 combination product flag) are required by the FDA regional guide but are not generated in this release, so FDA files are for review only." } };
-function validateE2b(rec, article, profileName = "ICH") {
+function validateE2b(rec, article, profileName = "ICH", dict = null) {
   const profile = E2B_PROFILES[profileName] || E2B_PROFILES.ICH, c = normalizeCase(rec.data), issues = [];
   const add = (severity, field, path, message) => issues.push({ severity, field, path, message, profile:profileName });
   const date = x => /^\d{4}-\d{2}-\d{2}$/.test(x);
@@ -976,9 +976,14 @@ function validateE2b(rec, article, profileName = "ICH") {
   events.forEach((e, i) => {
     const at = "events[" + i + "]";
     if (v(e.verbatim).length > 250) add("error", "E.i.1.1a", at + ".verbatim", "The reaction as reported is limited to 250 characters.");
-    if (!hasVal(e.pt_code)) add(profile.medDraRequired ? "error" : "warning", "E.i.2.1b", at + ".pt_code", "No MedDRA PT code for \"" + v(e.verbatim) + "\"." + (profile.medDraRequired ? " This profile requires MedDRA coding; code it in your licensed MedDRA browser." : ""));
-    else if (!/^\d{8}$/.test(v(e.pt_code))) add("error", "E.i.2.1b", at + ".pt_code", "A MedDRA code has 8 digits.");
-    if (hasVal(e.pt_code) && !hasVal(e.meddra_version)) add("error", "E.i.2.1a", at + ".meddra_version", "The MedDRA version is needed with a code.");
+    const codeV = v(e.llt_code) || v(e.pt_code), codeField = hasVal(e.llt_code) ? "llt_code" : "pt_code";
+    if (!codeV) add(profile.medDraRequired ? "error" : "warning", "E.i.2.1b", at + ".pt_code", "No MedDRA PT code for \"" + v(e.verbatim) + "\"." + (profile.medDraRequired ? " This profile requires MedDRA coding; code it in your licensed MedDRA browser." : ""));
+    else if (!/^\d{8}$/.test(codeV)) add("error", "E.i.2.1b", at + "." + codeField, "A MedDRA code has 8 digits.");
+    else {
+      if (!hasVal(e.llt_code)) add("warning", "E.i.2.1b", at + ".llt_code", "Only a PT code is recorded for \"" + v(e.verbatim) + "\". E2B(R3) reports the reaction as a low level term (LLT); add the LLT code.");
+      if (dict) { const known = hasVal(e.llt_code) ? dict.llt.has(v(e.llt_code)) : Boolean(dict.pt[v(e.pt_code)]); if (!known) add("error", "E.i.2.1b", at + "." + codeField, "The code " + codeV + " is not in the loaded MedDRA " + dict.version + " release."); else if (hasVal(e.meddra_version) && v(e.meddra_version) !== dict.version) add("warning", "E.i.2.1a", at + ".meddra_version", "Coded with MedDRA " + v(e.meddra_version) + "; the loaded release is " + dict.version + "."); }
+    }
+    if (codeV && !hasVal(e.meddra_version)) add("error", "E.i.2.1a", at + ".meddra_version", "The MedDRA version is needed with a code.");
     if (!hasVal(e.outcome)) add("error", "E.i.7", at + ".outcome", "The outcome is required; record \"unknown\" if it is not known.");
     if (!e.seriousness?.serious && !hasVal(e.seriousness_basis)) add("warning", "E.i.3.2", at + ".seriousness", "Seriousness has not been assessed for \"" + v(e.verbatim) + "\".");
     if (!hasVal(e.onset_date) && !hasVal(e.time_to_onset) && !e.onset_not_reported) add("warning", "E.i.4", at + ".onset_date", "No onset date or time to onset for \"" + v(e.verbatim) + "\".");
@@ -1751,7 +1756,9 @@ async function inflateRaw(bytes) {
   const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
-async function unzipEntries(buffer) {
+const XLSX_PART = /^xl\/(workbook\.xml|sharedStrings\.xml|worksheets\/sheet\d+\.xml|_rels\/workbook\.xml\.rels)$/;
+const utf8Text = bytes => new TextDecoder().decode(bytes);
+async function unzipEntries(buffer, accept = XLSX_PART, decode = utf8Text) {
   const bytes = new Uint8Array(buffer), view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let end = -1;
   for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 70000); i--) if (view.getUint32(i, true) === 0x06054b50) { end = i; break; }
@@ -1763,9 +1770,9 @@ async function unzipEntries(buffer) {
     const method = view.getUint16(pos + 10, true), size = view.getUint32(pos + 20, true), nameLength = view.getUint16(pos + 28, true), extraLength = view.getUint16(pos + 30, true), commentLength = view.getUint16(pos + 32, true), local = view.getUint32(pos + 42, true);
     const name = decoder.decode(bytes.subarray(pos + 46, pos + 46 + nameLength));
     pos += 46 + nameLength + extraLength + commentLength;
-    if (!/^xl\/(workbook\.xml|sharedStrings\.xml|worksheets\/sheet\d+\.xml|_rels\/workbook\.xml\.rels)$/.test(name)) continue;
+    if (!accept.test(name)) continue;
     const start = local + 30 + view.getUint16(local + 26, true) + view.getUint16(local + 28, true), data = bytes.subarray(start, start + size);
-    entries.set(name, decoder.decode(method === 0 ? data : await inflateRaw(data)));
+    entries.set(name, decode(method === 0 ? data : await inflateRaw(data)));
   }
   return entries;
 }
@@ -2114,7 +2121,7 @@ const FIELDS = {
   patient:["identifier", "age", "age_unit", "age_group", "sex", "weight", "country"], reporter:["identifier", "qualification", "country", "contactable", "organisation", "department", "address", "email", "phone"],
   sender:["type", "organisation", "name", "email", "phone", "address", "country"],
   product:["name", "dose", "frequency", "route", "indication", "start_date", "stop_date", "action_taken", "dechallenge", "rechallenge"],
-  event:["verbatim", "onset_date", "stop_date", "outcome", "expectedness", "coded_term", "time_to_onset", "llt", "pt", "pt_code", "hlt", "hlgt", "soc", "meddra_version", "coding_status",
+  event:["verbatim", "onset_date", "stop_date", "outcome", "expectedness", "coded_term", "time_to_onset", "llt", "llt_code", "pt", "pt_code", "hlt", "hlgt", "soc", "meddra_version", "coding_status",
     "seriousness_basis", "causality_reporter", "causality_reviewer", "causality_method", "temporal_relationship", "alternative_causes", "concomitant_factors", "objective_evidence", "listedness", "assessed_term", "rsi", "causality_rationale", "reviewer_comment"] };
 const WHO_UMC = ["Certain", "Probable/Likely", "Possible", "Unlikely", "Conditional/Unclassified", "Unassessable/Unclassifiable"];
 const AGE_GROUPS = ["Foetus", "Neonate", "Infant", "Child", "Adolescent", "Adult", "Elderly"];
@@ -2567,6 +2574,65 @@ function causalityPrefill(c, event) {
   const who = { temporal:a.q2 === "yes" ? true : a.q2 === "no" ? false : null, dechallengePositive:a.q3 === "yes", rechallengePositive:a.q4 === "yes", alternativeUnlikely:hasVal(event.alternative_causes) ? false : null, plausible:null };
   return { answers:a, basis, who };
 }
+
+// ---- MedDRA (licensed). A customer with a MedDRA licence uploads the release (the MedAscii files) in Settings; it is kept in private storage with the other data and is never part of this repository.
+// LLT, PT, HLT, HLGT and SOC come from the licensed release itself. Nothing is guessed: a coding is proposed only from an exact term match or a search the reviewer confirms. ----
+const MEDDRA_KEY = "meddra/index.json", MEDDRA_FILE = /(?:^|\/)(llt|mdhier|meddra_release|pt|hlt|hlgt|soc)\.asc$/i;
+const meddraText = bytes => { try { return new TextDecoder("utf-8", { fatal:true }).decode(bytes); } catch { return new TextDecoder("windows-1252").decode(bytes); } };
+function parseMeddraAscii(files) {
+  const rows = name => String(files.get(name) || "").split(/\r?\n/).filter(l => l.trim()).map(l => l.split("$"));
+  const llt = rows("llt.asc"), hier = rows("mdhier.asc"), release = rows("meddra_release.asc")[0] || [];
+  if (!llt.length || !hier.length) throw new Error("The release must contain llt.asc and mdhier.asc (the MedAscii folder).");
+  const version = String(release[0] || "").trim(), language = String(release[1] || "").trim();
+  if (!/^\d{1,2}\.\d$/.test(version)) throw new Error("meddra_release.asc is missing or has no version number (for example 27.1).");
+  const pt = {}, hlt = {}, hlgt = {}, soc = {};
+  for (const r of hier) { const [ptc, hltc, hlgtc, socc, ptn, hltn, hlgtn, socn, abbr, , , primary] = r; if (!/^\d+$/.test(ptc || "")) continue; hlt[hltc] = hltn; hlgt[hlgtc] = hlgtn; soc[socc] = [socn, abbr || ""]; if (!pt[ptc] || primary === "Y") pt[ptc] = [ptn, hltc, hlgtc, socc]; }
+  const llts = []; let orphans = 0;
+  for (const r of llt) { const [code, name, ptc, , , , , , , cur] = r; if (!/^\d+$/.test(code || "") || !name) continue; if (!pt[ptc]) { orphans++; continue; } llts.push([code, name, ptc, cur === "N" ? 0 : 1]); }
+  if (!llts.length) throw new Error("No usable low level terms were found in llt.asc.");
+  return { version, language, llt:llts, pt, hlt, hlgt, soc, counts:{ llt:llts.length, pt:Object.keys(pt).length, hlt:Object.keys(hlt).length, hlgt:Object.keys(hlgt).length, soc:Object.keys(soc).length, orphanLlt:orphans } };
+}
+let meddraCache = null;
+function buildMeddraIdx(j) {
+  const llt = new Map(), byName = new Map(), names = [];
+  for (const [code, name, pt, cur] of j.llt) { llt.set(code, { code, name, pt, current:cur !== 0 }); const n = imeNorm(name); if (!byName.has(n)) byName.set(n, []); byName.get(n).push(code); names.push({ code, n, current:cur !== 0, tokens:new Set(n.split(" ").filter(w => w.length > 1)) }); }
+  return { ...j, llt, byName, names, ptByName:new Map(Object.entries(j.pt).map(([c, x]) => [imeNorm(x[0]), c])) };
+}
+async function loadMeddra(env) {
+  const o = await env.BUCKET.get(MEDDRA_KEY); if (!o) return null;
+  const text = await o.text(); if (!text || text.length < 10) return null;
+  const sig = text.length + ":" + text.slice(0, 80);
+  if (meddraCache?.sig !== sig) { try { meddraCache = { sig, idx:buildMeddraIdx(JSON.parse(text)) }; } catch { return null; } }
+  return meddraCache.idx;
+}
+function meddraCoding(idx, code) {
+  const l = idx.llt.get(code); if (!l) return null; const p = idx.pt[l.pt] || [], socr = idx.soc[p[3]] || [];
+  return { llt:{ code:l.code, name:l.name, current:l.current }, pt:{ code:l.pt, name:p[0] || "" }, hlt:{ code:p[1] || "", name:idx.hlt[p[1]] || "" }, hlgt:{ code:p[2] || "", name:idx.hlgt[p[2]] || "" }, soc:{ code:p[3] || "", name:socr[0] || "", abbrev:socr[1] || "" }, version:idx.version };
+}
+function meddraSuggest(idx, text, n = 8) {
+  const w = imeNorm(text); if (w.length < 2) return [];
+  const out = [], seen = new Set(), push = (code, match, score) => { const c = meddraCoding(idx, code); if (!c || seen.has(code)) return; seen.add(code); out.push({ ...c, match, score:Number(score.toFixed(2)) }); };
+  const exact = (idx.byName.get(w) || []).slice().sort((a, b) => Number(idx.llt.get(b).current) - Number(idx.llt.get(a).current)); for (const c of exact) push(c, "exact term", 1);
+  const ptc = idx.ptByName.get(w); if (ptc) for (const e of idx.names) if (idx.llt.get(e.code).pt === ptc && e.n === w) { push(e.code, "exact term", 1); break; }
+  if (out.length < n) {
+    const want = new Set(w.split(" ").filter(x => x.length > 1)), scored = [];
+    for (const e of idx.names) { if (seen.has(e.code)) continue; let common = 0; for (const t of want) if (e.tokens.has(t)) common++; if (!common) continue; const score = common / Math.max(want.size, e.tokens.size) + (e.n.includes(w) || w.includes(e.n) ? .2 : 0) - (e.current ? 0 : .1); if (score >= .34) scored.push([score, e.code]); }
+    scored.sort((a, b) => b[0] - a[0] || a[1].localeCompare(b[1]));
+    for (const [score, code] of scored) { if (out.length >= n) break; push(code, "similar wording", Math.min(.99, score)); }
+  }
+  return out.slice(0, n);
+}
+// Exact matches only: the draft proposes the coding, the reviewer confirms or changes it.
+function applyMeddraProposals(data, idx) {
+  if (!idx) return 0; let n = 0;
+  for (const e of data.events || []) {
+    if (!hasVal(e.verbatim) || hasVal(e.pt_code) || hasVal(e.llt_code)) continue;
+    const hit = (idx.byName.get(imeNorm(v(e.verbatim))) || []).find(c => idx.llt.get(c).current) || (idx.byName.get(imeNorm(v(e.verbatim))) || [])[0]; const c = hit && meddraCoding(idx, hit); if (!c) continue;
+    const ev = e.verbatim.evidence || [], put = (k, val) => { e[k] = { value:String(val), normalized_value:null, state:"proposed", evidence:ev }; };
+    put("llt", c.llt.name); put("llt_code", c.llt.code); put("pt", c.pt.name); put("pt_code", c.pt.code); put("hlt", c.hlt.name); put("hlgt", c.hlgt.name); put("soc", c.soc.name); put("meddra_version", c.version); put("coding_status", "Proposed (MedDRA " + c.version + ", exact term match; reviewer to confirm)"); n++;
+  }
+  return n;
+}
 function parseSearch(q) {
   const terms = [], re = /(-?)(?:(\w+):)?(?:"([^"]+)"|(\S+))/g; let m;
   while ((m = re.exec(String(q || "").slice(0, 300)))) { const field = m[2] && ["pmid", "case", "drug", "event", "tag", "status", "portfolio", "author", "journal", "doi", "patient", "assignee", "title", "text"].includes(m[2].toLowerCase()) ? m[2].toLowerCase() : "", text = (m[3] || m[4] || "").toLowerCase(); const word = field || !m[2] ? text : (m[2] + ":" + text).toLowerCase(); if (word) terms.push({ neg:m[1] === "-", field, text:word }); }
@@ -2574,7 +2640,7 @@ function parseSearch(q) {
 }
 function searchFields(state, c, a) {
   const d = c.data || {}, evs = d.events || [], prods = d.products || [], folder = (state.caseFolders || []).find(f => f.id === c.folderId);
-  return { case:[c.number], pmid:[c.pmid], drug:[...prods.map(p => v(p.name)), c.molecule], event:evs.flatMap(e => [v(e.verbatim), v(e.pt)]), tag:(c.tags || []).map(t => t.tag), status:[c.status, c.archived ? "archived" : ""], portfolio:[c.portfolio], assignee:[c.assignee, ((state.profiles || []).find(p => p.email === c.assignee) || {}).name],
+  return { case:[c.number], pmid:[c.pmid], drug:[...prods.map(p => v(p.name)), c.molecule], event:evs.flatMap(e => [v(e.verbatim), v(e.pt), v(e.llt), v(e.soc)]), tag:(c.tags || []).map(t => t.tag), status:[c.status, c.archived ? "archived" : ""], portfolio:[c.portfolio], assignee:[c.assignee, ((state.profiles || []).find(p => p.email === c.assignee) || {}).name],
     patient:[v(d.patient?.identifier), v(d.patient?.age), v(d.patient?.sex), ...(d.patient?.medical_history || []).map(h => h.value)], author:a?.authors || [], journal:[a?.journal], doi:[a?.doi], title:[a?.title], text:[a?.abstract, d.narrative?.text, c.notes, d.general_comments, folder?.name] };
 }
 function runSearch(state, viewer, body, kb) {
@@ -2699,7 +2765,7 @@ function e2bCase(rec, article, opts = {}) {
     const start = hl7Date(v(e.onset_date)), stop = hl7Date(v(e.stop_date));
     return `<subjectOf2 typeCode="SBJ"><observation classCode="OBS" moodCode="EVN"><id root="${reactionIds[ei]}"/><code code="29" codeSystem="${OID.obs}" displayName="reaction"/>` +
       (start || stop ? `<effectiveTime xsi:type="IVL_TS">${start ? `<low value="${start}"/>` : ""}${stop ? `<high value="${stop}"/>` : ""}</effectiveTime>` : "") +
-      `<value xsi:type="CE"${hasVal(e.pt_code) ? ` code="${xmlEsc(v(e.pt_code))}" codeSystem="${OID.meddra}"${hasVal(e.meddra_version) ? ` codeSystemVersion="${xmlEsc(v(e.meddra_version))}"` : ""}` : ""}><originalText>${xmlEsc(v(e.verbatim))}</originalText></value>` +
+      `<value xsi:type="CE"${(hasVal(e.llt_code) || hasVal(e.pt_code)) ? ` code="${xmlEsc(v(e.llt_code) || v(e.pt_code))}" codeSystem="${OID.meddra}"${hasVal(e.meddra_version) ? ` codeSystemVersion="${xmlEsc(v(e.meddra_version))}"` : ""}` : ""}><originalText>${xmlEsc(v(e.verbatim))}</originalText></value>` +
       (outcome ? `<outboundRelationship2 typeCode="PERT">${obs("27", "outcome", `<value xsi:type="CE" code="${outcome}" codeSystem="2.16.840.1.113883.3.989.2.1.1.11"/>`)}</outboundRelationship2>` : "") + `</observation></subjectOf2>` + (crit ? crit.split("</observation>").filter(Boolean).map(o => `<subjectOf2 typeCode="SBJ">${o}</observation></subjectOf2>`).join("") : "");
   }).join("");
   const drugs = drugList.map((x, di) => {
@@ -3446,7 +3512,7 @@ async function apiCore(request, env, path) {
     const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
       cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
-      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c), triage:triageFor(state, c) }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
+      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], meddraInfo:state.meddra || null, stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c), triage:triageFor(state, c) }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
       monitoring:monitoringCounts(state, viewer),
       series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
@@ -3610,6 +3676,38 @@ async function apiCore(request, env, path) {
     await env.BUCKET.put(cacheKey, JSON.stringify(out), { httpMetadata:{ contentType:"application/json" } });
     await audit(env, { by:email, action:"faers.context", target:drug + (event ? " / " + event : ""), detail:{ rows:rows.length, signals:rows.filter(r => r.signal).length } });
     return json(out);
+  }
+  if (["/api/meddra-upload", "/api/meddra-clear", "/api/meddra-search", "/api/meddra-recheck"].includes(path) && viewer) {
+    const at = new Date().toISOString();
+    if (path === "/api/meddra-search") {
+      const q = String(body.q || "").trim().slice(0, 120); if (q.length < 3) return json({ error:"Type at least 3 characters." }, 400);
+      const idx = await loadMeddra(env); if (!idx) return json({ error:"No MedDRA release is loaded. A manager loads it in Settings." }, 404);
+      return json({ version:idx.version, results:meddraSuggest(idx, q, 10) });
+    }
+    if (!manager && !(path === "/api/meddra-recheck" && (state.memberships || []).some(m => m.email === email && m.role === "medical_reviewer"))) return json({ error:"Manager access required." }, 403);
+    if (path === "/api/meddra-clear") {
+      if (typeof env.BUCKET.delete === "function") await env.BUCKET.delete(MEDDRA_KEY); else await env.BUCKET.put(MEDDRA_KEY, "");
+      meddraCache = null; const old = state.meddra; await write(env, data => { delete data.meddra; });
+      await audit(env, { by:email, action:"meddra.removed", target:old ? "MedDRA " + old.version : "MedDRA", detail:"Case codes were not changed." }); return json({ ok:true });
+    }
+    if (path === "/api/meddra-recheck") {
+      const idx = await loadMeddra(env); if (!idx) return json({ error:"No MedDRA release is loaded." }, 404);
+      const problems = [];
+      for (const c of state.cases || []) { if (!caseVisible(state, viewer, c) || c.archived) continue; (c.data?.events || []).forEach((e, i) => { const llt = v(e.llt_code), pt = v(e.pt_code); if (!llt && !pt) return; const issue = [];
+        if (llt) { const l = idx.llt.get(llt); if (!l) issue.push("LLT " + llt + " is not in release " + idx.version); else { if (!l.current) issue.push("LLT is no longer current"); if (pt && l.pt !== pt) issue.push("PT is now " + (idx.pt[l.pt]?.[0] || l.pt)); } } else if (!idx.pt[pt]) issue.push("PT " + pt + " is not in release " + idx.version);
+        if (v(e.meddra_version) && v(e.meddra_version) !== idx.version) issue.push("coded with " + v(e.meddra_version)); if (issue.length) problems.push({ caseId:c.id, number:c.number, eventIndex:i, verbatim:v(e.verbatim), issues:issue }); }); }
+      return json({ version:idx.version, checked:(state.cases || []).length, problems:problems.slice(0, 300) });
+    }
+    // upload
+    if (body.licence !== true) return json({ error:"Confirm that your organisation holds a MedDRA licence before loading a release." }, 400);
+    let parsed;
+    try { const files = await unzipEntries(Uint8Array.from(atob(String(body.base64 || "")), c => c.charCodeAt(0)).buffer, MEDDRA_FILE, meddraText); const byName = new Map([...files].map(([name, text]) => [name.split("/").pop().toLowerCase(), text])); parsed = parseMeddraAscii(byName); }
+    catch (error) { return json({ error:"Could not read that MedDRA release: " + String(error.message).slice(0, 200) }, 400); }
+    const text = JSON.stringify(parsed); await env.BUCKET.put(MEDDRA_KEY, text, { httpMetadata:{ contentType:"application/json" } }); meddraCache = null;
+    const info = { version:parsed.version, language:parsed.language, counts:parsed.counts, loadedAt:at, by:email, filename:String(body.filename || "").slice(0, 120), sha256:await sha256Hex(text), licenceConfirmedBy:email };
+    await write(env, data => { data.meddra = info; });
+    await audit(env, { by:email, action:"meddra.loaded", target:"MedDRA " + info.version + " " + info.language, detail:{ ...info.counts, filename:info.filename, licence_confirmed:true } });
+    return json({ ok:true, info });
   }
   if (path === "/api/route" && viewer) {
     const stage = String(body.stage || ""), to = String(body.to || "").trim().toLowerCase(), reason = String(body.reason || "").trim(), ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), at = new Date().toISOString();
@@ -3889,14 +3987,14 @@ async function apiCore(request, env, path) {
         if (x.assessment.overall === "uncertain" && String(force[p.id] || "").trim().length < 5) { skipped.push({ patient:p.id, reason:"Some criteria are uncertain. Confirm them and give a reason (5+ characters) to create the draft anyway.", uncertain:Object.entries(x.assessment.criteria).filter(([, c]) => c.status === "uncertain").map(([k]) => k) }); continue; }
         prepared.push({ p, assessment:x.assessment, forced:x.assessment.overall === "uncertain" ? String(force[p.id]).trim() : "" });
       }
-      const ime = await loadIme(env), cfg = withSettings(env, state);
+      const ime = await loadIme(env), midx = await loadMeddra(env), cfg = withSettings(env, state);
       const outcome = await write(env, data => {
         const done = [];
         for (const { p, assessment, forced } of prepared) {
           const idem = ["draft", item.pmid, p.id, item.portfolio].join("|"), old = (data.cases || []).find(c => c.provenance?.idempotencyKey === idem);
           if (old) { done.push({ existing:true, number:old.number, patient:p.id }); continue; }
           const number = allocateCaseNumber(data), a = data.assignments.find(x => x.id === item.id);
-          const caseData = caseFromPatient(data.articles[item.pmid], p, ex, a, data.settings || {}, { criteria:assessment, decisions:a.extractionDecisions || {}, ime });
+          const caseData = caseFromPatient(data.articles[item.pmid], p, ex, a, data.settings || {}, { criteria:assessment, decisions:a.extractionDecisions || {}, ime }); applyMeddraProposals(caseData, midx);
           caseData.case_id = number;
           const rec = { id:crypto.randomUUID(), number, pmid:item.pmid, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"", data:caseData, createdBy:email, createdAt:at, updatedAt:at, assignee:a.medicalReviewer || pickMedical(data, item.portfolio) || item.reviewer || email, stage:"medical_review", intake:"patient-draft",
             provenance:{ evidence:evidenceRef(data.articles[item.pmid]), idempotencyKey:idem, patientId:p.id, patientLabel:p.label, extractionVersion:ex.version, extractedAt:ex.createdAt, fullTextSha256:ex.source.fullTextSha256, assignmentId:item.id, criteriaOverall:assessment.overall, forced },
@@ -4041,7 +4139,7 @@ async function apiCore(request, env, path) {
       return json({ narrative });
     }
     if (path === "/api/e2b-validate") {
-      const issues = validateE2b(rec, state.articles[rec.pmid], profileName), xml = e2bBatch([rec], state.articles, { profile:profileName, watermark:"VALIDATION COPY" }), xsd = await structuralXsd(env, xml);
+      const issues = validateE2b(rec, state.articles[rec.pmid], profileName, await loadMeddra(env)), xml = e2bBatch([rec], state.articles, { profile:profileName, watermark:"VALIDATION COPY" }), xsd = await structuralXsd(env, xml);
       const errors = issues.filter(i => i.severity === "error").length + xsd.errors.length;
       return json({ profile:{ id:profileName, ...E2B_PROFILES[profileName] }, issues, xsd, ok:errors === 0, errors, warnings:issues.filter(i => i.severity === "warning").length });
     }
@@ -4075,7 +4173,7 @@ async function apiCore(request, env, path) {
     // approval
     const profile = E2B_PROFILES[profileName];
     if (!profile.supportedForFinal) return json({ error:profile.label + ": " + profile.note, profile:profileName }, 409);
-    const issues = validateE2b(rec, state.articles[rec.pmid], profileName), blocking = issues.filter(i => i.severity === "error");
+    const issues = validateE2b(rec, state.articles[rec.pmid], profileName, await loadMeddra(env)), blocking = issues.filter(i => i.severity === "error");
     if (blocking.length) return json({ error:"The case has " + blocking.length + " validation error" + (blocking.length === 1 ? "" : "s") + " for the " + profileName + " profile. Fix them before approval.", issues:blocking }, 409);
     const hash = await caseDataHash(rec), approval = { status:"approved", by:email, at, hash, evidence:evidenceRef(state.articles[rec.pmid]), profile:profileName, note:String(body.note || "").slice(0, 500) };
     const entry = await recordVersion(env, { ...rec, approval }, "approved", email, "Approved for " + profileName + " output");
@@ -4287,7 +4385,7 @@ async function apiCore(request, env, path) {
     if (path === "/api/case-coding") {
       // Event picker: the EMA IME list gives a PT and SOC for known terms; earlier reviewed codings in your own cases are offered as hints, as in PV Nexus. Always confirm in a licensed MedDRA source.
       const verbatim = String(body.verbatim || "").trim().slice(0, 200);
-      if (!verbatim) return json({ ime:[], memory:[] });
+      if (!verbatim) return json({ ime:[], memory:[], meddra:[] });
       const ime = await loadIme(env), tokens = t => new Set(imeNorm(t).split(" ").filter(Boolean)), want = tokens(verbatim);
       const hits = ime ? detectEvents({ title:"", abstract:verbatim }, [], ime, state.settings?.imePromotions || [], []).filter(e => e.ime).map(e => ({ term:e.term, code:e.ime.code || "", soc:e.ime.soc || "", provenance:e.ime.provenance })) : [];
       const memory = [];
@@ -4297,7 +4395,8 @@ async function apiCore(request, env, path) {
         const score = imeNorm(entry.verbatim) === imeNorm(verbatim) ? 1 : want.size && have.size ? common / Math.max(want.size, have.size) : 0;
         if (score >= 0.25) memory.push({ verbatim:entry.verbatim, llt:entry.llt, pt:entry.pt, pt_code:entry.pt_code, hlt:entry.hlt, hlgt:entry.hlgt, soc:entry.soc, version:entry.version, score:Number(score.toFixed(2)), case:entry.case });
       }
-      return json({ ime:hits, memory:memory.sort((a, b) => b.score - a.score).slice(0, 5) });
+      const midx = await loadMeddra(env);
+      return json({ ime:hits, memory:memory.sort((a, b) => b.score - a.score).slice(0, 5), meddra:midx ? meddraSuggest(midx, verbatim, 8) : [], meddraVersion:midx?.version || "" });
     }
     if (path === "/api/case-assess") return json({ assessment:withRegulatory(await assessCase(cfg, body.data || current.data), state, { data:normalizeCase(body.data || current.data), molecule:current.molecule }) });
     if (path === "/api/case-save") {
@@ -4326,7 +4425,7 @@ async function apiCore(request, env, path) {
       if (final) {
         if (!["e2b", "cioms", "structured"].includes(format)) return json({ error:"Final output exists for E2B(R3) XML, CIOMS I and the structured case file." }, 400);
         if (!(await approvalValid(current))) return json({ error:current.approval?.status === "approved" ? "The case changed after it was approved. It must be approved again." : "A medical reviewer must approve the case before final output.", needsApproval:true }, 409);
-        if (format === "e2b") { if (current.approval.profile !== profileName) return json({ error:"The case was approved for the " + current.approval.profile + " profile, not " + profileName + "." }, 409); const blocking = validateE2b(current, article0, profileName).filter(i => i.severity === "error"); if (blocking.length) return json({ error:"Validation errors remain for the " + profileName + " profile.", issues:blocking }, 409); }
+        if (format === "e2b") { if (current.approval.profile !== profileName) return json({ error:"The case was approved for the " + current.approval.profile + " profile, not " + profileName + "." }, 409); const blocking = validateE2b(current, article0, profileName, await loadMeddra(env)).filter(i => i.severity === "error"); if (blocking.length) return json({ error:"Validation errors remain for the " + profileName + " profile.", issues:blocking }, 409); }
       }
       const watermark = final ? "FINAL: approved by " + current.approval.by + " " + current.approval.at + " (content sha256 " + current.approval.hash + "). Not transmitted." : "DRAFT: not approved for submission";
       await audit(env, { by:email, action:"case.export", target:current.number, detail:{ format, final, profile:format === "e2b" ? profileName : undefined } });
@@ -4336,7 +4435,7 @@ async function apiCore(request, env, path) {
       if (format === "cioms") { await logVersion(); return send(ciomsPdf(current, article0, final ? { final:true, approval:current.approval } : {}), "application/pdf", final ? "-CIOMS-I.pdf" : "-CIOMS-I-DRAFT.pdf"); }
       if (format === "structured") {
         await logVersion();
-        const issues = validateE2b(current, article0, profileName);
+        const issues = validateE2b(current, article0, profileName, await loadMeddra(env));
         return send(JSON.stringify({ case:{ number:current.number, status:current.status, pmid:current.pmid, portfolio:current.portfolio, provenance:current.provenance || null, approval:current.approval || null, final, watermark }, data:current.data, minimum_criteria:current.data.minimum_criteria || null, narrative:current.data.narrative || null,
           dates:current.data.dates, reportability:current.data.reportability, links:current.links || [], versions:(current.versions || []).map(({ n, at, by, action, hash, note }) => ({ n, at, by, action, hash, note })), validation:{ profile:profileName, issues } }, null, 2), "application/json", "-structured" + (final ? "" : "-DRAFT") + ".json");
       }
@@ -4821,7 +4920,7 @@ const caseInput=(label,path,type)=>{const f=gp(curCase.data,path)||{};return '<l
 const caseSelect=(label,path,options)=>{const f=gp(curCase.data,path)||{};return '<label>'+label+(f.state==="proposed"&&f.value?' <span class="badge amber">proposed</span>':"")+'<select data-kind="field" data-path="'+path+'">'+options.map(o=>'<option'+(o===(f.value||"")?" selected":"")+'>'+esc(o)+'</option>').join("")+'</select></label>';};
 const blankField=()=>({value:null,normalized_value:null,state:"edited",evidence:[]});
 const blankProduct=()=>({role:"concomitant",start_not_reported:false,name:blankField(),dose:blankField(),frequency:blankField(),route:blankField(),indication:blankField(),start_date:blankField(),stop_date:blankField(),action_taken:blankField(),dechallenge:blankField(),rechallenge:blankField()});
-const blankEvent=()=>({verbatim:blankField(),onset_date:blankField(),stop_date:blankField(),outcome:blankField(),expectedness:blankField(),coded_term:blankField(),time_to_onset:blankField(),causality_reporter:blankField(),causality_reviewer:blankField(),causality_method:blankField(),temporal_relationship:blankField(),alternative_causes:blankField(),concomitant_factors:blankField(),objective_evidence:blankField(),listedness:blankField(),assessed_term:blankField(),rsi:blankField(),causality_rationale:blankField(),reviewer_comment:blankField(),llt:blankField(),pt:blankField(),pt_code:blankField(),hlt:blankField(),hlgt:blankField(),soc:blankField(),meddra_version:blankField(),coding_status:blankField(),onset_not_reported:false,seriousness:{serious:false,death:false,life_threatening:false,hospitalization:false,disability:false,congenital_anomaly:false,other_medically_important:false}});
+const blankEvent=()=>({verbatim:blankField(),llt_code:blankField(),onset_date:blankField(),stop_date:blankField(),outcome:blankField(),expectedness:blankField(),coded_term:blankField(),time_to_onset:blankField(),causality_reporter:blankField(),causality_reviewer:blankField(),causality_method:blankField(),temporal_relationship:blankField(),alternative_causes:blankField(),concomitant_factors:blankField(),objective_evidence:blankField(),listedness:blankField(),assessed_term:blankField(),rsi:blankField(),causality_rationale:blankField(),reviewer_comment:blankField(),llt:blankField(),pt:blankField(),pt_code:blankField(),hlt:blankField(),hlgt:blankField(),soc:blankField(),meddra_version:blankField(),coding_status:blankField(),onset_not_reported:false,seriousness:{serious:false,death:false,life_threatening:false,hospitalization:false,disability:false,congenital_anomaly:false,other_medically_important:false}});
 function setField(o,p,val){const parts=p.split("."),last=parts.pop(),t=parts.reduce((x,k)=>x[k],o),f=t[last];if(f&&(f.value||"")!==val){f.value=val===""?null:val;f.state="edited";}}
 function collectCase(){
   const d=curCase.data, box=$("casebody");
@@ -4863,7 +4962,7 @@ function caseForm(){
     caseInput("Start date","products."+i+".start_date","date")+'<label class="check" style="align-self:end"><input type="checkbox" data-kind="flag" data-path="products.'+i+'.start_not_reported"'+(p.start_not_reported?" checked":"")+'>&nbsp;Start date not reported in the article (confirmed)</label>'+caseInput("Stop date","products."+i+".stop_date","date")+caseInput("Action taken","products."+i+".action_taken")+caseInput("Dechallenge","products."+i+".dechallenge")+caseInput("Rechallenge","products."+i+".rechallenge")+'</div></div>').join("");
   const events=d.events.map((e,i)=>'<div class="card" style="margin-bottom:10px;padding:12px"><div class="grid" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+
     caseInput("Event (verbatim)","events."+i+".verbatim")+caseInput("Coded term (MedDRA, if licensed)","events."+i+".coded_term")+caseInput("Onset date","events."+i+".onset_date","date")+'<label class="check" style="align-self:end"><input type="checkbox" data-kind="flag" data-path="events.'+i+'.onset_not_reported"'+(e.onset_not_reported?" checked":"")+'>&nbsp;Onset date not reported (confirmed)</label>'+caseInput("Time to onset (as stated)","events."+i+".time_to_onset")+caseInput("Stop date","events."+i+".stop_date","date")+caseInput("Outcome","events."+i+".outcome")+caseInput("Expectedness","events."+i+".expectedness")+'</div>'+
-    '<div class="sub" style="margin:10px 0 4px">MedDRA coding <button type="button" class="btn outline sm" data-codesuggest="'+i+'">Suggest coding</button> <span>Confirm against a licensed MedDRA source.</span></div><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(130px,1fr))">'+caseInput("LLT","events."+i+".llt")+caseInput("PT","events."+i+".pt")+caseInput("PT code","events."+i+".pt_code")+caseInput("HLT","events."+i+".hlt")+caseInput("HLGT","events."+i+".hlgt")+caseInput("SOC","events."+i+".soc")+caseInput("MedDRA version","events."+i+".meddra_version")+caseSelect("Coding status","events."+i+".coding_status",["","Proposed (IME list)","Proposed (earlier reviewed case)","Reviewed"])+'</div><div id="codesug'+i+'"></div>'+
+    '<div class="sub" style="margin:10px 0 4px">MedDRA coding <button type="button" class="btn outline sm" data-codesuggest="'+i+'">Suggest coding</button>'+(data.meddraInfo?' <button type="button" class="btn outline sm" data-p9="msearch|'+i+'">Search MedDRA…</button>':"")+' <span>Confirm against a licensed MedDRA source.</span></div><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(130px,1fr))">'+caseInput("LLT","events."+i+".llt")+caseInput("LLT code","events."+i+".llt_code")+caseInput("PT","events."+i+".pt")+caseInput("PT code","events."+i+".pt_code")+caseInput("HLT","events."+i+".hlt")+caseInput("HLGT","events."+i+".hlgt")+caseInput("SOC","events."+i+".soc")+caseInput("MedDRA version","events."+i+".meddra_version")+caseSelect("Coding status","events."+i+".coding_status",["","Proposed (IME list)","Proposed (earlier reviewed case)","Reviewed"])+'</div><div id="codesug'+i+'"></div>'+
     '<div class="sub" style="margin:12px 0 4px"><b>Causality assessment</b> for this event (WHO-UMC). The reviewer value is a suggestion until a medical reviewer confirms it.</div><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseSelect("Reporter causality","events."+i+".causality_reporter",[""].concat(data.config.whoUmc||[]).concat(["Not stated"]))+caseSelect("Reviewer causality (WHO-UMC)","events."+i+".causality_reviewer",[""].concat(data.config.whoUmc||[]))+caseSelect("Assessment method","events."+i+".causality_method",["","WHO-UMC","Naranjo","Other"])+caseSelect("Listedness / expectedness","events."+i+".listedness",["","Listed","Unlisted","Unknown"])+caseInput("Temporal relationship","events."+i+".temporal_relationship")+caseInput("Alternative causes","events."+i+".alternative_causes")+caseInput("Concomitant factors","events."+i+".concomitant_factors")+caseInput("Objective evidence","events."+i+".objective_evidence")+caseInput("Assessed reaction term","events."+i+".assessed_term")+caseInput("Reference safety information","events."+i+".rsi")+caseInput("Causality rationale","events."+i+".causality_rationale")+caseInput("Medical reviewer comment","events."+i+".reviewer_comment")+'</div>'+
     '<div class="chips" style="margin-top:8px">'+["serious","death","life_threatening","hospitalization","disability","congenital_anomaly","other_medically_important"].map(k=>'<label class="check"><input type="checkbox" data-kind="flag" data-path="events.'+i+'.seriousness.'+k+'"'+(e.seriousness[k]?" checked":"")+'>&nbsp;'+k.replace(/_/g," ")+'</label>').join("")+'</div></div>').join("");
   return '<h3 style="margin:0 0 8px">Patient</h3><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseInput("Identifier / initials","patient.identifier")+caseInput("Age","patient.age")+caseSelect("Age unit","patient.age_unit",["years","months","weeks","days","hours"])+caseSelect("Age group","patient.age_group",[""].concat(data.config.ageGroups||[]))+caseSelect("Sex","patient.sex",["","Male","Female","Unknown"])+caseInput("Weight (kg)","patient.weight")+caseSelect("Country where the event occurred","patient.country",[""].concat(data.config.countries||[]).concat(((gp(curCase.data,"patient.country")||{}).value&&!(data.config.countries||[]).includes(gp(curCase.data,"patient.country").value))?[gp(curCase.data,"patient.country").value]:[]))+'</div>'+
@@ -5107,9 +5206,10 @@ function caseRowCells(c){
   return ['<input type="checkbox" class="'+(tab==="Search"?"srch_c":tab==="Archive"?"arc_c":"syn_c")+'" value="'+esc(c.id)+'" aria-label="Select case">','<a href="#" data-opencase="'+esc(c.id)+'"><b>'+esc(c.number)+'</b></a>',esc((art.title||"PMID "+c.pmid).slice(0,70))+'<div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.portfolio||"")+'</div>',x.ser+x.crit,x.lis,x.fold,tagChips(c),stageBadge(caseStage(c))+" "+badge(c.status,""),esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||""),clockHtml(c),clinHtml(c),x.act];
 }
 const CASEHEAD=["","Case","Article","Seriousness","Listedness","Folder","Tags","Stage · status","Owner","Reporting timeline","Indication · action · DC · RC","Actions"];
-const GROUPS={triage:"Triage priority",sercat:"Seriousness × listedness",clock:"Reporting status",stage:"Stage",none:"No grouping",status:"Status",seriousness:"Seriousness",listedness:"Listedness",folder:"Folder",portfolio:"Portfolio",owner:"Owner",category:"Archive category"};
+const GROUPS={soc:"MedDRA SOC (first event)",triage:"Triage priority",sercat:"Seriousness × listedness",clock:"Reporting status",stage:"Stage",none:"No grouping",status:"Status",seriousness:"Seriousness",listedness:"Listedness",folder:"Folder",portfolio:"Portfolio",owner:"Owner",category:"Archive category"};
 function groupKey(c,by){
   const cl=caseCls(c);
+  if(by==="soc"){const e=(c.data.events||[])[0]||{};return(e.soc&&e.soc.value)||"Not coded";}
   if(by==="triage"){const t=((data.caseMeta||{})[c.id]||{}).triage;return t?t.label:"Unknown";}
   if(by==="sercat")return((data.caseMeta||{})[c.id]||{}).timeline?data.caseMeta[c.id].timeline.category:"Unclassified";if(by==="clock"){const t=((data.caseMeta||{})[c.id]||{}).timeline;return t?t.status.charAt(0).toUpperCase()+t.status.slice(1):"No date";}if(by==="stage")return(data.stages||{})[caseStage(c)]||caseStage(c);
   if(by==="status")return c.status;if(by==="seriousness")return cl.serious?"Serious":"Non-serious";if(by==="listedness")return cl.listed==="listed"?"Listed":cl.listed==="unlisted"?"Unlisted":"Listedness unknown";
@@ -5379,6 +5479,29 @@ async function p8action(target){
     if(act==="phi"){const r=await api("phi-scan",{caseId:curCase.id}),box=$("phires");box.innerHTML=r.clean?badge("No identifying data found","green")+' <span class="sub">'+esc(r.note)+'</span>':badge(r.findings.length+" field"+(r.findings.length===1?"":"s")+" with identifying data","red")+r.findings.map(f=>'<div class="sub"><b>'+esc(f.field)+'</b>: '+Object.entries(f.types).map(e=>esc(e[0])+" ×"+e[1]).join(", ")+'</div>').join("")+'<div class="sub">'+esc(r.note)+'</div>';return;}
   }catch(e){message(e.message,true);}
 }
+
+function meddraSettingsHtml(){
+  const m=data.meddraInfo,mgr=data.viewer.role==="manager";
+  return panel("MedDRA dictionary (licensed)",'<div class="row"><span>Status</span>'+(m?badge("Loaded: MedDRA "+m.version+" "+(m.language||""),"green"):badge("Not loaded","amber"))+'</div>'+
+    (m?'<div class="sub" style="margin:6px 0">'+m.counts.llt+' low level terms · '+m.counts.pt+' preferred terms · '+m.counts.hlt+' HLT · '+m.counts.hlgt+' HLGT · '+m.counts.soc+' SOC. Loaded '+esc(String(m.loadedAt).slice(0,10))+' by '+esc(m.by)+' from '+esc(m.filename||"upload")+'. Licence confirmed by '+esc(m.licenceConfirmedBy)+'.</div>':"")+
+    (mgr?'<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:10px 0"><input type="file" id="meddrafile" accept=".zip"><label class="check"><input type="checkbox" id="meddralic">&nbsp;My organisation holds a MedDRA licence</label><button type="button" class="btn" data-p9="mup">'+(m?"Load a new release":"Load release")+'</button>'+(m?'<button type="button" class="btn outline" data-p9="mrecheck">Check cases against this release</button><button type="button" class="btn outline" data-p9="mclear">Remove</button>':"")+'</div>':"")+
+    '<div id="mrecheck"></div>',
+    "Upload the release zip you downloaded from the MSSO (it contains the MedAscii folder with llt.asc, mdhier.asc and meddra_release.asc). It is kept in your private storage, never in the source code, and is not shared or offered for download. It powers coding suggestions (LLT, PT, HLT, HLGT, SOC), checks codes before export, and the E2B reaction code (LLT). MedDRA® is a registered trademark of the International Council for Harmonisation of Technical Requirements for Pharmaceuticals for Human Use (ICH); your licence terms apply to its use.");
+}
+async function p9action(target){
+  const parts=target.dataset.p9.split("|"),act=parts[0],a1=parts[1];
+  try{
+    if(act==="mup"){const file=$("meddrafile").files[0];if(!file)return message("Choose the MedDRA release zip first.",true);if(!$("meddralic").checked)return message("Confirm that your organisation holds a MedDRA licence.",true);
+      target.disabled=true;message("Reading the release… this can take a minute.");
+      const buf=await file.arrayBuffer(),u=new Uint8Array(buf);let bin="";for(let i=0;i<u.length;i+=8192)bin+=String.fromCharCode.apply(null,u.subarray(i,i+8192));
+      try{const r=await api("meddra-upload",{base64:btoa(bin),filename:file.name,licence:true});await refresh();message("MedDRA "+r.info.version+" loaded: "+r.info.counts.llt+" terms.");}finally{target.disabled=false;}return;}
+    if(act==="mclear"){if(!confirm("Remove the MedDRA release? Coding suggestions and code checks stop until a release is loaded. Codes already in cases are kept."))return;await api("meddra-clear",{});await refresh();message("MedDRA release removed.");return;}
+    if(act==="mrecheck"){const r=await api("meddra-recheck",{}),box=$("mrecheck");box.innerHTML=r.problems.length?badge(r.problems.length+" event"+(r.problems.length===1?"":"s")+" to review","amber")+table(["Case","Event","Issue"],r.problems.map(p=>['<a href="#" data-opencase="'+esc(p.caseId)+'">'+esc(p.number)+'</a>',esc(p.verbatim),esc(p.issues.join("; "))]),""):badge("All coded events match release "+esc(r.version),"green");return;}
+    if(act==="msearch"){collectCase();const i=Number(a1),ev=curCase.data.events[i],q=prompt("Search MedDRA for:",(ev.verbatim&&ev.verbatim.value)||"");if(!q)return;const r=await api("meddra-search",{q}),box=$("codesug"+i);
+      codeSug[i]=r.results.map(m=>meddraOption(m));box.innerHTML=codeSug[i].length?'<div class="chips" style="margin-top:6px">'+codeSug[i].map((c,j)=>'<button type="button" class="badge" style="cursor:pointer" data-codeapply="'+i+"|"+j+'">'+esc(c.label)+'</button>').join("")+'</div>':'<span class="sub">Nothing in MedDRA '+esc(r.version)+' matches that.</span>';return;}
+  }catch(e){message(e.message,true);}
+}
+function meddraOption(m){return{llt:m.llt.name,llt_code:m.llt.code,pt:m.pt.name,pt_code:m.pt.code,hlt:m.hlt.name,hlgt:m.hlgt.name,soc:m.soc.name,version:m.version,status:"Proposed (MedDRA "+m.version+", "+m.match+"; reviewer to confirm)",label:m.llt.name+" → "+m.pt.name+" · "+(m.soc.abbrev||m.soc.name)+(m.llt.current?"":" (not current)")+" · "+m.match};}
 const covBadge=c=>({reconciled:badge("Reconciled","green"),zero_results:badge("Zero results",""),partial:badge("Partially imported","amber"),failed:badge("Failed","red"),running:badge("Running","blue"),legacy:badge("Imported (earlier)","")}[c]||badge(c||"legacy",""));
 async function loadBatches(){
   const box=$("batchcov");if(!box)return;
@@ -5705,7 +5828,7 @@ function render() {
     const bars=(list)=>list.length?list.map(x=>'<div class="row" title="'+esc(x.cases.join(", "))+'"><span>'+esc(x.key)+'</span><span class="sub">'+x.count+' case'+(x.count===1?"":"s")+' · '+esc(x.cases.slice(0,4).join(", "))+(x.cases.length>4?"…":"")+'</span></div>').join(""):'<div class="empty">No data yet.</div>';
     const months=S.monthly.map(m=>'<span class="badge'+((S.trend.hikes||[]).includes(m.month)?" red":"")+'" title="'+esc(m.cases.join(", "))+'">'+esc(m.month)+': '+m.count+'</span>').join(" ");
     const fl=data.caseFolders||[],folderBar=panel("Folders",'<div class="chips"><button type="button" class="btn sm '+(synFolder?"outline":"")+'" data-synfolder="">All cases</button><button type="button" class="btn sm '+(synFolder==="__none"?"":"outline")+'" data-synfolder="__none">Not in a folder</button>'+fl.map(f=>'<span style="display:inline-flex;gap:2px"><button type="button" class="btn sm '+(synFolder===f.id?"":"outline")+'" data-synfolder="'+esc(f.id)+'">'+esc(f.name)+' ('+openCases.filter(c=>c.folderId===f.id).length+')</button>'+(manager?'<button type="button" class="btn outline sm" data-p5="delfolder|'+esc(f.id)+'" title="Delete folder" aria-label="Delete folder">x</button>':"")+'</span>').join("")+(canMedical()?'<button type="button" class="btn outline sm" data-p5="newfolder">+ New folder</button>':"")+'</div>');
-    html=tiles+categoryMatrix(openCases)+folderBar+bulkBar("syn_c")+panel("Case tracker",'<div style="padding:4px 0">'+groupSelect(synGroup,["none","triage","sercat","clock","stage","status","seriousness","listedness","folder","portfolio","owner"],"syn_group")+' <span class="sub">Seriousness, listedness and folder are dropdowns on each case. "From case data" uses the event fields.</span></div>',"")+groupedTables(shown,synGroup,["","Case","Article","Product · event","Seriousness","Listedness","Folder","Assignee","Reporting timeline","Indication · action · DC · RC","Status","Validity",""],rowOf,"No cases in this view.")+
+    html=tiles+categoryMatrix(openCases)+folderBar+bulkBar("syn_c")+panel("Case tracker",'<div style="padding:4px 0">'+groupSelect(synGroup,["none","soc","triage","sercat","clock","stage","status","seriousness","listedness","folder","portfolio","owner"],"syn_group")+' <span class="sub">Seriousness, listedness and folder are dropdowns on each case. "From case data" uses the event fields.</span></div>',"")+groupedTables(shown,synGroup,["","Case","Article","Product · event","Seriousness","Listedness","Folder","Assignee","Reporting timeline","Indication · action · DC · RC","Status","Validity",""],rowOf,"No cases in this view.")+
       panel("Intake and assignment",intake)+
       panel("Case series summary",'<div class="row"><span><b>'+S.total+'</b> case'+(S.total===1?'':'s')+' · <b>'+S.serious.length+'</b> serious · <b>'+S.fatal.length+'</b> fatal</span><span class="sub">Counted from the case fields. Hover a line to see which cases it counts.</span></div>'+
         '<div style="display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))"><div><h3 style="margin:8px 0">Events</h3>'+bars(S.events)+'</div><div><h3 style="margin:8px 0">Suspect products</h3>'+bars(S.products)+'</div><div><h3 style="margin:8px 0">Countries</h3>'+bars(S.countries)+'</div><div><h3 style="margin:8px 0">Age and sex</h3>'+bars(S.ages)+bars(S.sex)+'</div></div>'+
@@ -5771,7 +5894,7 @@ function render() {
       '<div class="row"><span>Status</span>'+(data.config.unpaywall?badge("Active","green"):badge("Not configured","amber"))+'</div>'+
       '<form data-route="recheck-access" style="margin-top:10px"><button class="btn outline">Re-check open access for all articles</button></form>',
       "Unpaywall requires a contact email on each request; it is sent to Unpaywall only. Every article with a DOI gets an open-access status (gold, hybrid, green, bronze or closed). Permissively licensed PDFs are stored, other open copies are linked. Closed articles are re-checked every 30 days."+(data.config.unpaywallFromEnv?" The email is set by the server environment (UNPAYWALL_EMAIL).":""))+
-    panel("Important medical events (IME list)",'<div class="row"><span>Status</span>'+(data.config.ime&&data.config.ime.loaded?badge("Loaded: MedDRA "+data.config.ime.version,"green"):badge("Not loaded","amber"))+'</div>'+
+    meddraSettingsHtml()+panel("Important medical events (IME list)",'<div class="row"><span>Status</span>'+(data.config.ime&&data.config.ime.loaded?badge("Loaded: MedDRA "+data.config.ime.version,"green"):badge("Not loaded","amber"))+'</div>'+
       (data.config.ime&&data.config.ime.loaded?'<div class="sub" style="margin:6px 0">'+esc(data.config.ime.reference||"")+(data.config.ime.released?" · released "+esc(data.config.ime.released):"")+' · '+data.config.ime.count+' terms ('+data.config.ime.added+' added in this version, '+data.config.ime.demoted+' demoted terms)</div>':"")+
       '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0"><input type="file" id="imefile" accept=".json,.csv,.txt,.xlsx"><button type="button" class="btn" data-imeup="1">Upload list</button>'+(data.config.ime&&data.config.ime.loaded?'<button type="button" class="btn outline" data-imeclear="1">Remove list</button>':"")+'</div>'+
       '<div class="sub" style="margin-top:6px">Promote a term (reviewer-added important medical event)</div><div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0"><input id="imept" placeholder="MedDRA preferred term"><input id="imenote" placeholder="Note (optional)"><button type="button" class="btn outline" data-imepromo="1">Promote</button></div>'+
@@ -5899,14 +6022,14 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
     if(!ev||!(ev.verbatim||{}).value){message("Enter the event wording first.",true);return;}
     box.innerHTML='<span class="sub">Looking…</span>';
     api("case-coding",{id:curCase.id,verbatim:ev.verbatim.value}).then(r=>{
-      codeSug[i]=[].concat((r.ime||[]).map(h=>({pt:h.term,pt_code:h.code,soc:h.soc,status:"Proposed (IME list)",label:h.term+" (IME list"+(h.soc?", "+h.soc:"")+")"})),(r.memory||[]).map(m=>({llt:m.llt,pt:m.pt,pt_code:m.pt_code,hlt:m.hlt,hlgt:m.hlgt,soc:m.soc,version:m.version,status:"Proposed (earlier reviewed case)",label:m.pt+" (from "+m.case+", match "+Math.round(m.score*100)+"%)"})));
+      codeSug[i]=[].concat((r.meddra||[]).map(meddraOption),(r.ime||[]).map(h=>({pt:h.term,pt_code:h.code,soc:h.soc,status:"Proposed (IME list)",label:h.term+" (IME list"+(h.soc?", "+h.soc:"")+")"})),(r.memory||[]).map(m=>({llt:m.llt,pt:m.pt,pt_code:m.pt_code,hlt:m.hlt,hlgt:m.hlgt,soc:m.soc,version:m.version,status:"Proposed (earlier reviewed case)",label:m.pt+" (from "+m.case+", match "+Math.round(m.score*100)+"%)"})));
       box.innerHTML=codeSug[i].length?'<div class="chips" style="margin-top:6px">'+codeSug[i].map((c,j)=>'<button type="button" class="badge" style="cursor:pointer" data-codeapply="'+i+"|"+j+'">'+esc(c.label)+'</button>').join("")+'</div>':'<span class="sub">No suggestion: this wording is not on the IME list and has not been coded in an earlier case. Enter the terms from your licensed MedDRA source.</span>';
     }).catch(e=>{box.innerHTML="";message(e.message,true);});
     return;
@@ -5914,7 +6037,7 @@ document.addEventListener("click",event=>{
   if(target.dataset.codeapply){
     collectCase();const [i,j]=target.dataset.codeapply.split("|").map(Number),c=(codeSug[i]||[])[j],ev=curCase.data.events[i];if(!c||!ev)return;
     const put=(k,v)=>{if(v)ev[k]={value:v,normalized_value:null,state:"proposed",evidence:(ev[k]||{}).evidence||[]};};
-    ["llt","pt","pt_code","hlt","hlgt","soc"].forEach(k=>put(k,c[k]));put("meddra_version",c.version);put("coding_status",c.status);
+    ["llt","llt_code","pt","pt_code","hlt","hlgt","soc"].forEach(k=>put(k,c[k]));put("meddra_version",c.version);put("coding_status",c.status);
     renderCase();return;
   }
   if(target.dataset.pickevent){
@@ -6092,6 +6215,7 @@ document.addEventListener("click",event=>{
   if(target.dataset.p5){p5action(target);return;}
   if(target.dataset.p7){p7action(target);return;}
   if(target.dataset.p8){event.preventDefault();p8action(target);return;}
+  if(target.dataset.p9){p9action(target);return;}
   if(target.dataset.p6){event.preventDefault();p6action(target);return;}
   if(target.dataset.syncat!==undefined){synCat=target.dataset.syncat;render();return;}
   if(target.dataset.synfolder!==undefined){synFolder=target.dataset.synfolder;render();return;}
@@ -6284,7 +6408,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  extractClinical, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  extractClinical, zipFiles, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);

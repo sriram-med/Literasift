@@ -238,7 +238,7 @@ async function handler(req, res) {
     headers.set(name, value);
   }
   if (signedIn) headers.set("oai-authenticated-user-email", email);
-  let body = req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req, path === "/api/fulltext-upload" || path === "/api/ime-upload" ? 40_000_000 : 2_000_000);
+  let body = req.method === "GET" || req.method === "HEAD" ? undefined : await readBody(req, path === "/api/fulltext-upload" || path === "/api/ime-upload" || path === "/api/meddra-upload" ? 80_000_000 : 2_000_000);
   // Signing requires the password again. The host checks it, removes it from the request, and tells the app it was verified.
   if (path === "/api/sign" && signedIn && body) {
     let parsed = {}; try { parsed = JSON.parse(body.toString() || "{}"); } catch {}
