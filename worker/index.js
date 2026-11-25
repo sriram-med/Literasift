@@ -21,7 +21,7 @@ async function write(env, mutate) {
 // 3 requests/second, or 10 with a free API key. All E-utilities calls share one pacing gate and identity.
 let ncbiNext = 0;
 async function ncbiThrottle(env) {
-  const gap = env.NCBI_API_KEY ? 110 : 340, at = Math.max(Date.now(), ncbiNext);
+  const gap = env.NCBI_GAP_MS !== undefined ? Number(env.NCBI_GAP_MS) : env.NCBI_API_KEY ? 110 : 340, at = Math.max(Date.now(), ncbiNext);
   ncbiNext = at + gap;
   if (at > Date.now()) await new Promise(resolve => setTimeout(resolve, at - Date.now()));
 }
@@ -223,6 +223,15 @@ async function fetchCitations(env, ids) {
   return { articles, missing, xml };
 }
 const sha256Hex = async data => [...new Uint8Array(await crypto.subtle.digest("SHA-256", typeof data === "string" ? new TextEncoder().encode(data) : data))].map(b => b.toString(16).padStart(2, "0")).join("");
+async function storeEfetch(env, xmlById) {
+  const evidence = {};
+  for (const [id, xml] of Object.entries(xmlById)) {
+    const key = "evidence/" + id + "/efetch.xml", hash = await sha256Hex(xml);
+    await env.BUCKET.put(key, xml, { httpMetadata:{ contentType:"application/xml" } });
+    evidence[id] = { key, sha256:hash, bytes:xml.length, source:"NCBI EFetch (PubMed)", license:"NLM data; abstracts remain the property of their publishers", retrievedAt:new Date().toISOString(), parser:"efetch-parser/1" };
+  }
+  return evidence;
+}
 async function processWindow(env, runId, index) {
   const { state } = await load(env), run = state.runs.find(r => r.id === runId), win = run?.windows?.[index];
   if (!win) return null;
@@ -243,12 +252,7 @@ async function processWindow(env, runId, index) {
     if (expected > ids.length) throw new Error("A single day has more than 9,999 records. Narrow the query.");
     const fetched = ids.length ? await fetchCitations(env, ids) : { articles:{}, missing:[], xml:{} };
     // Original EFetch XML, one object per PMID with its hash, kept apart from full texts and screenshots.
-    const evidence = {};
-    for (const [id, xml] of Object.entries(fetched.xml)) {
-      const key = "evidence/" + id + "/efetch.xml", hash = await sha256Hex(xml);
-      await env.BUCKET.put(key, xml, { httpMetadata:{ contentType:"application/xml" } });
-      evidence[id] = { key, sha256:hash, bytes:xml.length, source:"NCBI EFetch (PubMed)", license:"NLM data; abstracts remain the property of their publishers", retrievedAt:new Date().toISOString(), parser:"efetch-parser/1" };
-    }
+    const evidence = await storeEfetch(env, fetched.xml);
     const missing = uniq([...fetched.missing, ...ids.filter(id => fetched.articles[id] && !fetched.xml[id])]);
     const reconciled = ids.length === expected && missing.length === 0;
     await write(env, data => {
@@ -267,7 +271,7 @@ async function processWindow(env, runId, index) {
         allocate(data, item); data.assignments.push(item);
       }
       r.ids = uniq([...(r.ids || []), ...ids.filter(id => data.articles[id])]);
-      Object.assign(w, { expected, retrieved:ids.length, imported, missing, state:expected === 0 ? "zero_results" : reconciled ? "reconciled" : "partial", error:"", completedAt:new Date().toISOString() });
+      Object.assign(w, { expected, retrieved:ids.length, pmids:ids, imported, missing, state:expected === 0 ? "zero_results" : reconciled ? "reconciled" : "partial", error:"", completedAt:new Date().toISOString() });
       summarizeRun(r);
     });
     return { done:true };
@@ -319,6 +323,112 @@ function commitWatch(data, watch, by, note = "query edited") {
 async function esearchCount(env, query, from, to, dateField) {
   const { esearchresult: r } = await withRetry(env, () => pubmed(env, "esearch", { term:searchTerm(query, from, to, dateField), retmode:"json", retmax:"0" }), { tries:2 });
   return Number(r?.count ?? NaN);
+}
+// ---- Evidence records and parsing. Original EFetch XML, full text (PMC JATS or PDF) and the snapshot are separate objects; each is recorded with source, licence, retrieval time, content hash and parser version. ----
+const PARSER_VERSION = "jats-parser/1";
+function parseXmlTree(xml) {
+  const root = { tag:"#root", attrs:{}, children:[] }, stack = [root], re = /<!--[\s\S]*?-->|<!\[CDATA\[([\s\S]*?)\]\]>|<\?[\s\S]*?\?>|<!DOCTYPE[^>]*>|<(\/?)([A-Za-z_][\w:.-]*)([^>]*?)(\/?)>|([^<]+)/g;
+  for (const m of String(xml).matchAll(re)) {
+    const top = stack[stack.length - 1];
+    if (m[1] !== undefined) top.children.push({ text:m[1] });
+    else if (m[6] !== undefined) top.children.push({ text:decodeXml(m[6]) });
+    else if (m[3]) {
+      if (m[2]) { if (stack.length > 1) { const at = stack.map(n => n.tag).lastIndexOf(m[3]); if (at > 0) stack.length = at; } }
+      else {
+        const attrs = {}; for (const a of m[4].matchAll(/([\w:.-]+)\s*=\s*"([^"]*)"/g)) attrs[a[1]] = decodeXml(a[2]);
+        const node = { tag:m[3], attrs, children:[] }; top.children.push(node); if (!m[5]) stack.push(node);
+      }
+    }
+  }
+  return root;
+}
+const nodeText = n => !n ? "" : n.text !== undefined ? n.text : (n.tag === "xref" ? "" : n.children.map(nodeText).join(""));
+const clean = t => String(t).replace(/\s+/g, " ").replace(/\s+([.,;:)])/g, "$1").trim();
+const findAll = (n, tag, out = []) => { for (const c of n.children || []) if (c.tag) { if (c.tag === tag) out.push(c); findAll(c, tag, out); } return out; };
+const findFirst = (n, tag) => findAll(n, tag)[0];
+const kids = (n, tag) => (n?.children || []).filter(c => c.tag === tag);
+// Sections, tables, captions and author metadata from JATS full-text XML (PMC, Europe PMC, preprints).
+function parseJats(xml) {
+  const tree = parseXmlTree(xml), article = findFirst(tree, "article"); if (!article) return null;
+  const sections = [], section = (node, level, trail) => {
+    const title = clean(nodeText(kids(node, "title")[0])), paragraphs = kids(node, "p").map(p => clean(nodeText(p))).filter(Boolean);
+    const path = [...trail, title].filter(Boolean);
+    if (paragraphs.length || title) sections.push({ title, path:path.join(" > "), level, paragraphs });
+    for (const sub of kids(node, "sec")) section(sub, level + 1, path);
+  };
+  const abstractNode = findFirst(article, "abstract"); if (abstractNode) { const own = kids(abstractNode, "p").map(p => clean(nodeText(p))).filter(Boolean); if (own.length) sections.push({ title:"Abstract", path:"Abstract", level:0, paragraphs:own }); for (const sub of kids(abstractNode, "sec")) section(sub, 1, ["Abstract"]); }
+  const body = findFirst(article, "body"); if (body) { const loose = kids(body, "p").map(p => clean(nodeText(p))).filter(Boolean); if (loose.length) sections.push({ title:"", path:"Body", level:0, paragraphs:loose }); for (const sec of kids(body, "sec")) section(sec, 1, []); }
+  const tables = findAll(article, "table-wrap").map(w => ({ id:w.attrs.id || "", label:clean(nodeText(kids(w, "label")[0])), caption:clean(nodeText(kids(w, "caption")[0])),
+    rows:findAll(w, "tr").map(tr => (tr.children || []).filter(c => c.tag === "th" || c.tag === "td").map(c => clean(nodeText(c)))).filter(r => r.some(Boolean)) }));
+  const figures = findAll(article, "fig").map(f => ({ id:f.attrs.id || "", label:clean(nodeText(kids(f, "label")[0])), caption:clean(nodeText(kids(f, "caption")[0])) }));
+  const affs = Object.fromEntries(findAll(article, "aff").map(a => [a.attrs.id || "", clean(nodeText(a))]));
+  const authors = findAll(article, "contrib").filter(c => (c.attrs["contrib-type"] || "author") === "author").map(c => {
+    const name = findFirst(c, "name"), surname = clean(nodeText(findFirst(name || c, "surname"))), given = clean(nodeText(findFirst(name || c, "given-names")));
+    const refs = findAll(c, "xref").map(x => ({ type:x.attrs["ref-type"], rid:x.attrs.rid }));
+    return { name:[given, surname].filter(Boolean).join(" ") || clean(nodeText(findFirst(c, "collab"))), affiliations:refs.filter(r => r.type === "aff").map(r => affs[r.rid]).filter(Boolean), email:clean(nodeText(findFirst(c, "email"))), corresponding:c.attrs.corresp === "yes" || refs.some(r => r.type === "corresp") };
+  });
+  const corresp = findAll(article, "corresp").map(c => clean(nodeText(c))).filter(Boolean);
+  const emails = uniq([...corresp.join(" ").matchAll(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g)].map(m => m[0]));
+  return { parserVersion:PARSER_VERSION, title:clean(nodeText(findFirst(findFirst(article, "article-title") ? article : article, "article-title"))), sections, tables, figures, authors, correspondence:corresp, correspondenceEmails:emails,
+    counts:{ sections:sections.length, paragraphs:sections.reduce((n, s) => n + s.paragraphs.length, 0), tables:tables.length, captions:tables.filter(t => t.caption).length + figures.filter(f => f.caption).length } };
+}
+// Text of the parsed structure in reading order, with table rows kept as lines, for event detection.
+const jatsPlainText = parsed => parsed.sections.flatMap(s => [...(s.title ? [s.title] : []), ...s.paragraphs]).concat(parsed.tables.flatMap(t => [t.label + " " + t.caption, ...t.rows.map(r => r.join(" | "))]), parsed.figures.map(f => f.label + " " + f.caption)).filter(Boolean).join("\n");
+// A clearly labelled citation snapshot built from the retrieved EFetch XML. It is not a capture of the PubMed web page.
+function citationSnapshotSvg(article, efetch) {
+  const esc = x => String(x ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c])), lines = [], width = 900;
+  const add = (text, size, bold, color = "#18181b", gap = 6) => { for (const line of wrap(text, size, bold, width - 80)) lines.push({ text:line, size, bold, color, gap }); };
+  add("CITATION SNAPSHOT (generated by LiteraSift from the retrieved PubMed EFetch XML; not a capture of the PubMed web page)", 11, true, "#b45309", 12);
+  add("PubMed record · PMID " + article.id + (article.doi ? " · DOI " + article.doi : ""), 12, false, "#20558a", 8);
+  add(article.title || "", 20, true, "#18181b", 10);
+  add([article.journal, article.date].filter(Boolean).join(" · "), 12, false, "#52525b", 4);
+  add((article.authors || []).join(", "), 12, false, "#52525b", 14);
+  add("Abstract", 13, true, "#20558a", 4);
+  add(article.abstract || "No abstract in the retrieved record.", 12, false, "#18181b", 14);
+  if (article.pullQuery) add("Search query: " + article.pullQuery + " · " + (article.pullDateField || "Date") + " range " + (article.pullRange || "") + " · retrieved " + (article.pullAt || efetch?.retrievedAt || "").slice(0, 16).replace("T", " ") + " UTC", 10, false, "#52525b", 6);
+  if (efetch?.sha256) add("EFetch XML SHA-256: " + efetch.sha256, 9, false, "#71717a", 4);
+  let y = 30; const body = lines.map(l => { y += l.size * 1.35; const out = `<text x="40" y="${y.toFixed(1)}" font-family="Helvetica,Arial,sans-serif" font-size="${l.size}" font-weight="${l.bold ? 700 : 400}" fill="${l.color}">${esc(l.text)}</text>`; y += l.gap; return out; }).join("");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${Math.ceil(y + 30)}" viewBox="0 0 ${width} ${Math.ceil(y + 30)}"><rect width="100%" height="100%" fill="#ffffff"/><rect x="1" y="1" width="${width - 2}" height="${Math.ceil(y + 28)}" fill="none" stroke="#b45309" stroke-width="2"/>${body}</svg>`;
+}
+// Evidence status per category for one article: available, restricted, missing, failed or pending. Used by the manifest, readiness and targeted retries.
+function evidenceStatus(article) {
+  const ft = article.fullTextStatus || "";
+  const citation = article.evidence?.efetch ? "available" : article.citationXmlStatus ? "failed" : "pending";
+  const fulltext = article.fullTextKey ? (article.fullTextRestricted ? "restricted" : "available") : !ft ? "pending" : /Retry needed/i.test(ft) ? "failed" : /not covered|not applicable/i.test(ft) ? "restricted" : "missing";
+  const shot = article.evidence?.screenshot, snapshot = article.evidence?.snapshot;
+  const screenshot = article.screenshotKey || snapshot ? (article.screenshotKey && article.screenshotKind === "pubmed_page" ? "available" : "citation_snapshot") : article.screenshotStatus === "Blocked" ? "blocked" : article.screenshotStatus === "Retry needed" ? "failed" : shot?.status === "not_configured" ? "not_configured" : "pending";
+  return { citation, fulltext, screenshot };
+}
+const isFinalEvidence = st => st.citation === "available" && ["available", "restricted", "missing"].includes(st.fulltext) && ["available", "citation_snapshot", "blocked", "not_configured"].includes(st.screenshot);
+function batchReadiness(state, run) {
+  const matched = uniq([...(run.ids || []), ...(run.windows || []).flatMap(w => w.pmids || [])]), counts = { citation:{}, fulltext:{}, screenshot:{} };
+  for (const id of matched) { const st = state.articles[id] ? evidenceStatus(state.articles[id]) : { citation:"failed", fulltext:"pending", screenshot:"pending" }; for (const k of Object.keys(counts)) counts[k][st[k]] = (counts[k][st[k]] || 0) + 1; }
+  const pending = matched.filter(id => !state.articles[id] || !isFinalEvidence(evidenceStatus(state.articles[id])));
+  return { matched:matched.length, counts, pending:pending.length, retryable:pending, importCoverage:run.coverage || "legacy", gaps:(run.gaps || []).length, ready:!pending.length && ["reconciled", "zero_results", undefined].includes(run.coverage) };
+}
+// Records a stored full text as evidence: source, licence, retrieval time, content hash, extraction method and parser version; JATS XML is also parsed into sections, tables and captions.
+async function buildFullTextEvidence(env, articleId, status, hadText) {
+  if (!status.fullTextKey || status.fullTextStatus !== "Captured") return null;
+  const object = await env.BUCKET.get(status.fullTextKey);
+  if (!object) return null;
+  const bytes = await object.arrayBuffer(), isXml = /\.xml$/i.test(status.fullTextKey), isPdf = /\.pdf$/i.test(status.fullTextKey);
+  const record = { key:status.fullTextKey, source:status.fullTextOrigin || "", sourceUrl:status.fullTextSource || "", license:status.fullTextLicense || "", restricted:Boolean(status.fullTextRestricted), version:status.fullTextVersion || "", retrievedAt:new Date().toISOString(),
+    sha256:await sha256Hex(bytes), bytes:bytes.byteLength, format:isXml ? "xml" : isPdf ? "pdf" : "text", extraction:{} };
+  const patch = { fulltext:record }; let parsed = null, text = null;
+  if (isXml) {
+    parsed = parseJats(new TextDecoder().decode(bytes));
+    record.extraction = { method:parsed ? "jats-xml" : "none", parser:PARSER_VERSION, textLayerUsable:Boolean(parsed) };
+    if (parsed) text = jatsPlainText(parsed);
+  } else if (isPdf) {
+    const info = env.lastPdfTextInfo || {};
+    record.extraction = { method:hadText ? (info.method || "pdf-text-layer") : "none", textLayerUsable:hadText && info.textLayerUsable !== false, parser:info.parser || "pdfjs-dist" };
+  } else record.extraction = { method:"supplied-text", textLayerUsable:true, parser:"none" };
+  if (parsed) {
+    const key = "evidence/" + articleId + "/parsed.json", body = JSON.stringify(parsed);
+    await env.BUCKET.put(key, body, { httpMetadata:{ contentType:"application/json" } });
+    patch.parsed = { key, sha256:await sha256Hex(body), parserVersion:PARSER_VERSION, derivedFrom:record.sha256, ...parsed.counts };
+  }
+  return { patch, parsed, text };
 }
 const safetyFilter = '("adverse effects"[sh] OR "drug-related side effects and adverse reactions"[MeSH Terms] OR safety[tiab] OR toxicity[tiab] OR "adverse event*"[tiab] OR "adverse reaction*"[tiab] OR "adverse drug reaction*"[tiab] OR "side effect*"[tiab])';
 function buildQuery(names, safetyOnly) {
@@ -587,7 +697,7 @@ function keyPassages(text, molecules) {
 }
 // Optional GROBID service (Apache-2.0, self-hosted): turns a stored PDF into structured text.
 async function pdfToText(env, bytes) {
-  if (!env.GROBID_URL) return env.PDF_TEXT_FN ? String(await env.PDF_TEXT_FN(bytes)) : "";
+  if (!env.GROBID_URL) { const info = env.lastPdfTextInfo = { method:"none", textLayerUsable:false }; return env.PDF_TEXT_FN ? String(await env.PDF_TEXT_FN(bytes, info)) : ""; }
   const form = new FormData();
   form.append("input", new Blob([bytes], { type:"application/pdf" }), "article.pdf");
   const response = await fetch(String(env.GROBID_URL).replace(/\/+$/, "") + "/api/processFulltextDocument", { method:"POST", body:form, signal:AbortSignal.timeout(120000) });
@@ -960,7 +1070,7 @@ async function exportPdf(env, state, viewer, manager, body) {
     // A PDF always carries an up-to-date snapshot: one made before the current record-card layout is taken again first (needs the screenshot service on the server).
     let fresh = article;
     if (env.SCREENSHOT_FN && article.source !== "Social media" && (!article.screenshotKey || article.screenshotKind !== "record2")) {
-      try { const status = await captureScreenshot(env, article); await write(env, data => Object.assign(data.articles[id], status)); fresh = { ...article, ...status }; } catch { /* the earlier snapshot, if any, is used */ }
+      try { const shot = await captureScreenshot(env, article), status = shot.status; await write(env, data => { Object.assign(data.articles[id], status); data.articles[id].evidence = { ...(data.articles[id].evidence || {}), screenshot:shot.evidence }; }); fresh = { ...article, ...status }; } catch { /* the earlier snapshot, if any, is used */ }
     }
     let png = null;
     if (fresh.screenshotKey) { const object = await env.BUCKET.get(fresh.screenshotKey); if (object) png = new Uint8Array(await object.arrayBuffer()); }
@@ -2113,7 +2223,9 @@ async function captureScreenshot(env, article) {
     const shot = await env.SCREENSHOT_FN(article);
     const key = "evidence/" + article.id + "/pubmed.png";
     await env.BUCKET.put(key, shot.bytes, {httpMetadata:{contentType:"image/png"}});
-    return { screenshotKey:key, screenshotStatus:"Captured", screenshotKind:shot.kind, screenshotAt:new Date().toISOString() };
+    const at = new Date().toISOString();
+    // This local capture is a record card built from the retrieved data, so it is labelled as a citation snapshot.
+    return { status:{ screenshotKey:key, screenshotStatus:"Captured", screenshotKind:shot.kind, screenshotAt:at }, evidence:{ status:"captured", kind:"citation_snapshot_png", key, sha256:await sha256Hex(shot.bytes), at, label:"Record card generated by LiteraSift from retrieved data; not a capture of the PubMed web page" } };
   }
   const endpoint = new URL(env.SCREENSHOT_ENDPOINT);
   if (endpoint.protocol !== "https:") throw new Error("Screenshot endpoint must use HTTPS.");
@@ -2123,9 +2235,12 @@ async function captureScreenshot(env, article) {
   if (!response.ok || !response.body || !response.headers.get("content-type")?.includes("image/png")) {
     throw new Error("Screenshot service returned HTTP " + response.status);
   }
-  const key = "evidence/" + article.id + "/pubmed.png";
-  await env.BUCKET.put(key,response.body,{httpMetadata:{contentType:"image/png"}});
-  return { screenshotKey:key, screenshotStatus:"Captured", screenshotAt:new Date().toISOString() };
+  const key = "evidence/" + article.id + "/pubmed.png", image = await response.arrayBuffer();
+  // A real page capture is verified before it is kept: a PNG signature and a plausible size, otherwise the service returned an error or block page.
+  if (image.byteLength < 2000 || new Uint8Array(image.slice(0, 4)).join(",") !== "137,80,78,71") throw new Error("Screenshot service returned a blocked or invalid image");
+  await env.BUCKET.put(key, image, {httpMetadata:{contentType:"image/png"}});
+  const at = new Date().toISOString();
+  return { status:{ screenshotKey:key, screenshotStatus:"Captured", screenshotKind:"pubmed_page", screenshotAt:at }, evidence:{ status:"captured", kind:"pubmed_page", key, sha256:await sha256Hex(image), bytes:image.byteLength, at, verified:true } };
 }
 async function collectEvidence(baseEnv, ids) {
   const {state} = await load(baseEnv);
@@ -2193,8 +2308,12 @@ async function collectEvidence(baseEnv, ids) {
       catch (error) { status.retractionError = error.message; }
     }
     if (needsScreen(article)) {
-      try { Object.assign(status,await captureScreenshot(env,{...article,...status})); }
-      catch { status.screenshotStatus="Retry needed"; }
+      try { const shot = await captureScreenshot(env, { ...article, ...status }); Object.assign(status, shot.status || shot); if (shot.evidence) status.evidencePatch = { ...(status.evidencePatch || {}), screenshot:shot.evidence }; }
+      catch (error) {
+        const blocked = /HTTP (401|403|429)|blocked|captcha|denied|forbidden/i.test(String(error.message));
+        status.screenshotStatus = blocked ? "Blocked" : "Retry needed";
+        status.evidencePatch = { ...(status.evidencePatch || {}), screenshot:{ status:blocked ? "blocked" : "failed", reason:String(error.message).slice(0, 200), at:new Date().toISOString(), fallback:"citation snapshot generated from the retrieved EFetch XML" } };
+      }
     }
     if (needsPdfText(article) && !status._text) {
       status.pdfTextTried = new Date().toISOString();
@@ -2210,10 +2329,24 @@ async function collectEvidence(baseEnv, ids) {
         status.keyPassages = keyPassages(status._text, molecules);
       } catch { /* best effort */ }
     }
+    try {
+      const built = await buildFullTextEvidence(env, article.id, { ...article, ...status }, Boolean(status._text));
+      if (built) { status.evidencePatch = { ...(status.evidencePatch || {}), ...built.patch }; if (built.text) status._text = built.text; if (built.parsed) { status.jatsAuthors = built.parsed.authors; status.correspondence = built.parsed.correspondence; status.correspondenceEmails = built.parsed.correspondenceEmails; } }
+    } catch { /* evidence records are best effort; the file itself is already stored */ }
+    // A citation snapshot, clearly labelled, is made from the stored EFetch record for every article, whatever happens to the screenshot.
+    try {
+      const fresh = { ...article, ...status };
+      if (fresh.evidence?.efetch && !fresh.evidence?.snapshot) {
+        const svg = citationSnapshotSvg(fresh, fresh.evidence.efetch), key = "evidence/" + article.id + "/citation_snapshot.svg";
+        await env.BUCKET.put(key, svg, { httpMetadata:{ contentType:"image/svg+xml" } });
+        status.evidencePatch = { ...(status.evidencePatch || {}), snapshot:{ key, kind:"citation_snapshot", format:"svg", sha256:await sha256Hex(svg), derivedFrom:fresh.evidence.efetch.sha256, generatedAt:new Date().toISOString(), label:"Generated by LiteraSift from the retrieved EFetch XML; not a capture of the PubMed web page" } };
+      }
+    } catch { /* optional */ }
     const capturedText = status._text || "";
     delete status._text;
     Object.assign(status, applyDetection({ ...article, ...status }, moleculesOf(article.id), ime, promotions, capturedText));
-    await write(env, data => Object.assign(data.articles[article.id],status));
+    const evidencePatch = status.evidencePatch; delete status.evidencePatch;
+    await write(env, data => { const target = data.articles[article.id]; if (!target) return; Object.assign(target, status); if (evidencePatch) target.evidence = { ...(target.evidence || {}), ...evidencePatch }; });
   }
   if (state.assignments.some(a => !a.reviewer)) await write(env, data => data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data, a)));
   if (state.settings?.autoIcsr !== false) {
@@ -2523,8 +2656,10 @@ async function apiCore(request, env, path) {
       await env.BUCKET.put(textKey, text.slice(0, 2_000_000), { httpMetadata:{ contentType:"text/plain; charset=utf-8" } });
       Object.assign(status, { fullTextTextKey:textKey, keyPassages:keyPassages(text, molecules) });
     }
+    let evidencePatch = null;
+    try { const built = await buildFullTextEvidence(env, id, { ...article, ...status }, Boolean(text)); if (built) { evidencePatch = built.patch; if (built.text) text = built.text; } } catch { /* best effort */ }
     Object.assign(status, applyDetection({ ...article, ...status }, molecules, ime, state.settings?.imePromotions || [], text));
-    await write(env, data => Object.assign(data.articles[id], status));
+    await write(env, data => { Object.assign(data.articles[id], status); if (evidencePatch) data.articles[id].evidence = { ...(data.articles[id].evidence || {}), ...evidencePatch }; });
     await audit(env, { by:email, action:"upload.fulltext", target:"PMID " + id, detail:{ type:ext, bytes:bytes.length, text_read:Boolean(text) } });
     return json({ ok:true, textRead:Boolean(text), events:(status.events || []).length });
   }
@@ -2606,6 +2741,57 @@ async function apiCore(request, env, path) {
       await audit(env, { by:email, action:"library.deleted", entityType:"Library", entityId:doomed.length + " article" + (doomed.length === 1 ? "" : "s"), detail:{ reason, pmids:doomed.slice(0, 200).join(", "), titles:titles.join(" | "), files_removed:files.size, kept_because_of_cases:blocked.length } });
     }
     return json({ ok:true, deleted:doomed.length, kept:blocked });
+  }
+  if ((path === "/api/batch-readiness" || path === "/api/evidence-retry" || path === "/api/batch-zip") && viewer) {
+    if (!manager) return json({ error:"Manager access required." }, 403);
+    if (path === "/api/batch-readiness") return json({ batches:state.runs.filter(r => r.status !== "Failed" || r.windows).slice(0, 40).map(r => ({ id:r.id, portfolio:r.portfolio, molecule:r.molecule, from:r.from, to:r.to, dateField:r.dateFieldLabel || "", coverage:r.coverage || "legacy", query:r.query, ...batchReadiness(state, r), retryable:undefined })), exports:(state.exports || []).slice(-100).reverse() });
+    const run = state.runs.find(r => r.id === body.runId);
+    if (!run) return json({ error:"Batch not found." }, 404);
+    if (path === "/api/evidence-retry") {
+      // Targeted retry: only the PMIDs whose evidence is pending or failed, and only the part that is missing.
+      const before = batchReadiness(state, run), ids = before.retryable.slice(0, 300), cfg = withSettings(env, state);
+      const needCitation = ids.filter(id => !state.articles[id]?.evidence?.efetch);
+      if (needCitation.length) {
+        const fetched = await fetchCitations(cfg, needCitation), evidence = await storeEfetch(cfg, fetched.xml);
+        await write(env, data => {
+          for (const [id, article] of Object.entries(fetched.articles)) { data.articles[id] = { ...data.articles[id], ...article, citationXmlStatus:evidence[id] ? undefined : article.citationXmlStatus, evidence:{ ...(data.articles[id]?.evidence || {}), ...(evidence[id] ? { efetch:evidence[id] } : {}) } };
+            if (!data.assignments.some(a => a.pmid === id && a.portfolio === run.portfolio)) { const item = { id:crypto.randomUUID(), pmid:id, portfolio:run.portfolio, molecules:run.molecule ? [run.molecule] : [], reviewer:"", status:"Pending" }; allocate(data, item); data.assignments.push(item); } }
+          const r = data.runs.find(x => x.id === run.id); r.ids = uniq([...(r.ids || []), ...Object.keys(fetched.articles)]);
+          for (const w of r.windows || []) if (w.state === "partial" && (w.missing || []).every(id => data.articles[id]?.evidence?.efetch)) { w.state = "reconciled"; w.missing = []; w.resolvedBy = "targeted retry"; }
+          summarizeRun(r);
+        });
+      }
+      await write(env, data => { for (const id of ids) { const a = data.articles[id]; if (!a) continue; if (/Retry needed|Blocked/.test(a.fullTextStatus || a.screenshotStatus || "")) { if (a.fullTextStatus === "Retry needed") a.fullTextStatus = undefined; if (a.screenshotStatus) a.screenshotStatus = undefined; } a.evidenceAttempt = ""; } });
+      const collected = await collectEvidence(env, ids);
+      const after = batchReadiness((await load(env)).state, (await load(env)).state.runs.find(r => r.id === run.id));
+      await audit(env, { by:email, action:"evidence.retry", target:run.portfolio + (run.molecule ? " · " + run.molecule : ""), detail:{ run:run.id, retried:ids.length, still_pending:after.pending } });
+      return json({ retried:ids.length, collected, readiness:{ ...after, retryable:undefined } });
+    }
+    // Versioned batch ZIP: manifest of every matched PMID, the retrieved citation XML, permitted full text, parsed structure and the available snapshot, one folder per PMID.
+    const matched = uniq([...(run.ids || []), ...(run.windows || []).flatMap(w => w.pmids || [])]), rows = [], files = [], enc = new TextEncoder();
+    const head = ["PMID", "Title", "Journal", "Publication date", "DOI", "Citation XML status", "Citation XML SHA-256", "Full text status", "Full text source", "Full text licence", "Full text SHA-256", "Full text file", "Text extraction", "Parsed sections", "Parsed tables", "Parsed captions", "Snapshot status", "Snapshot kind", "Snapshot SHA-256", "Query version", "Search window"];
+    for (const id of matched) {
+      const a = state.articles[id], st = a ? evidenceStatus(a) : { citation:(run.windows || []).some(w => (w.missing || []).includes(id)) ? "failed" : "pending", fulltext:"pending", screenshot:"pending" }, ev = a?.evidence || {}, folder = "PMID_" + id + "/";
+      let ftFile = "";
+      const add = async (key, name) => { const object = key && await env.BUCKET.get(key); if (!object) return ""; files.push({ name:folder + name, data:new Uint8Array(await object.arrayBuffer()) }); return folder + name; };
+      if (ev.efetch) await add(ev.efetch.key, "efetch.xml");
+      if (a?.fullTextKey && !a.fullTextRestricted) { ftFile = await add(a.fullTextKey, "fulltext." + (/\.(\w+)$/.exec(a.fullTextKey)?.[1] || "bin")); if (ev.parsed) await add(ev.parsed.key, "fulltext_parsed.json"); } else if (a?.fullTextKey) ftFile = "withheld: restricted licence, kept in the workbench";
+      const shotFile = ev.snapshot && st.screenshot === "citation_snapshot" && !a.screenshotKey ? await add(ev.snapshot.key, "citation_snapshot.svg") : a?.screenshotKey ? await add(a.screenshotKey, a.screenshotKind === "pubmed_page" ? "pubmed_page.png" : "citation_snapshot.png") : "";
+      const window = (run.windows || []).find(w => (w.pmids || []).includes(id));
+      rows.push([id, a?.title || "", a?.journal || "", a?.date || "", a?.doi || "", st.citation, ev.efetch?.sha256 || "", st.fulltext, ev.fulltext?.source || a?.fullTextOrigin || "", ev.fulltext?.license || a?.fullTextLicense || "", ev.fulltext?.sha256 || "", ftFile, ev.fulltext?.extraction?.method || "", ev.parsed?.sections ?? "", ev.parsed?.tables ?? "", ev.parsed?.captions ?? "", st.screenshot, ev.screenshot?.kind || ev.snapshot?.kind || "", ev.screenshot?.sha256 || ev.snapshot?.sha256 || "", window ? "v" + window.queryVersion : "", window ? window.from + " to " + window.to : ""]);
+    }
+    const manifest = [head, ...rows].map(r => r.map(csvCell).join(",")).join("\r\n") + "\r\n", manifestSha = await sha256Hex(manifest);
+    const previous = (state.exports || []).filter(x => x.runId === run.id).sort((a, b) => b.version - a.version), latest = previous[0];
+    let record = latest && latest.manifestSha256 === manifestSha && body.force !== true ? latest : null;
+    if (!record) {
+      record = { id:crypto.randomUUID(), runId:run.id, version:(latest?.version || 0) + 1, createdAt:new Date().toISOString(), by:email, manifestSha256:manifestSha, pmids:matched.length, files:files.length, previousVersion:latest?.version || null, previousManifestSha256:latest?.manifestSha256 || null, readiness:{ ...batchReadiness(state, run), retryable:undefined }, coverage:run.coverage || "legacy" };
+      await env.BUCKET.put("exports/" + run.id + "/v" + record.version + "/manifest.csv", manifest, { httpMetadata:{ contentType:"text/csv" } });
+      await write(env, data => { (data.exports ||= []).push(record); data.exports = data.exports.slice(-500); });
+      await audit(env, { by:email, action:"export.batch", entityType:"Export", entityId:"batch " + run.id.slice(0, 8) + " v" + record.version, detail:{ pmids:record.pmids, files:record.files, manifest_sha256:manifestSha, previous_version:record.previousVersion } });
+    }
+    const info = { exportVersion:record.version, previousVersion:record.previousVersion, previousManifestSha256:record.previousManifestSha256, manifestSha256:manifestSha, createdAt:record.createdAt, by:record.by, batch:{ id:run.id, portfolio:run.portfolio, molecule:run.molecule, from:run.from, to:run.to, dateField:run.dateFieldLabel || "", coverage:run.coverage || "legacy", expected:run.expected ?? null, retrieved:run.retrieved ?? matched.length, queryVersions:run.queryVersions || [], executedQueries:run.executedQueries || [], windows:(run.windows || []).map(w => ({ from:w.from, to:w.to, state:w.state, expected:w.expected, retrieved:w.retrieved, missing:w.missing || [] })), gaps:run.gaps || [] }, readiness:record.readiness };
+    files.unshift({ name:"manifest.csv", data:enc.encode(manifest) }, { name:"export.json", data:enc.encode(JSON.stringify(info, null, 2)) }, { name:"README.txt", data:enc.encode("LiteraSift batch export v" + record.version + "\r\nEvery PMID matched by the search appears in manifest.csv with an explicit status (available, restricted, missing, failed or pending).\r\nFull texts under restricted licences are listed but not included. A citation snapshot is generated from the retrieved EFetch XML; it is not a capture of the PubMed web page.\r\n") });
+    return new Response(zipFiles(files), { headers:{ "Content-Type":"application/zip", "Cache-Control":"private, no-store", "X-Export-Version":String(record.version), "Content-Disposition":'attachment; filename="literasift-batch-' + run.id.slice(0, 8) + "-v" + record.version + '.zip"' } });
   }
   if ((path === "/api/memory-list" || path === "/api/memory-delete") && viewer) {
     if (!manager) return json({ error:"Manager access required." }, 403);

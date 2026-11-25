@@ -28,9 +28,14 @@ const env = { BUCKET: bucket, RUN_TOKEN: runToken, UNPAYWALL_EMAIL: e.UNPAYWALL_
   SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN, HOST_ACCOUNTS: true, AUDIT_ANCHOR_KEY: e.AUDIT_ANCHOR_KEY || createHmac("sha256", secret).update("literasift-audit-anchor").digest("hex"), LIBRARY_PATH: dataDir + "/library" };
 
 const pdfTextFn = await makePdfTextFn(), ocrFn = await makeOcrFn();
-if (pdfTextFn || ocrFn) env.PDF_TEXT_FN = async bytes => {
+// The reader says how it got the text (text layer or OCR) so the evidence record can show it: OCR is used only when the text layer is unusable.
+if (pdfTextFn || ocrFn) env.PDF_TEXT_FN = async (bytes, info = {}) => {
   const text = pdfTextFn ? await pdfTextFn(bytes).catch(() => "") : "";
-  return ocrFn && looksScanned(text) ? (await ocrFn(bytes).catch(() => "")) || text : text;
+  info.parser = pdfTextFn ? "pdfjs-dist" : "none";
+  if (!looksScanned(text)) { info.method = "pdf-text-layer"; info.textLayerUsable = true; return text; }
+  if (ocrFn) { const ocr = await ocrFn(bytes).catch(() => ""); if (ocr) { info.method = "ocr"; info.parser = "tesseract + pdftoppm"; info.textLayerUsable = false; return ocr; } }
+  info.method = text ? "pdf-text-layer" : "none"; info.textLayerUsable = false;
+  return text;
 };
 console.log(pdfTextFn ? "PDF text: on" : "PDF text: off (run deploy/enable-pdf-text.sh to read PDF full texts)", "|", ocrFn ? "OCR: on" : "OCR: off (run deploy/enable-ocr.sh to read scanned PDFs)");
 const screenshotFn = await makeScreenshotFn();

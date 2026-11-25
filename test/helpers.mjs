@@ -44,9 +44,35 @@ export async function makeEnv(state = {}, extra = {}) {
   const dir = await mkdtemp(join(tmpdir(), "ls-p1-")), BUCKET = new FileBucket(dir + "/objects");
   const base = { profiles: [{ email: MANAGER, name: "Boss", role: "manager", active: true }, { email: SCREENER, name: "Asha", role: "reviewer", active: true, capacity: 99 }], watches: [], settings: {}, runs: [], articles: {}, assignments: [], ...state };
   await BUCKET.put("bench.json", JSON.stringify(base));
-  const env = { BUCKET, RUN_TOKEN: "x".repeat(40), HOST_ACCOUNTS: true, RETRY_BASE_MS: 1, AUDIT_ANCHOR_KEY: "k".repeat(32), ...extra };
+  const env = { BUCKET, RUN_TOKEN: "x".repeat(40), HOST_ACCOUNTS: true, RETRY_BASE_MS: 1, NCBI_GAP_MS: 0, AUDIT_ANCHOR_KEY: "k".repeat(32), ...extra };
   const call = async (who, path, body = {}, headers = {}) => { const r = await worker.fetch(new Request("http://localhost" + path, { method: "POST", headers: { "oai-authenticated-user-email": who, "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) }), env); return { status: r.status, body: await r.json().catch(() => ({})), response: r }; };
+  const raw = (who, path, body = {}) => worker.fetch(new Request("http://localhost" + path, { method: "POST", headers: { "oai-authenticated-user-email": who, "Content-Type": "application/json" }, body: JSON.stringify(body) }), env);
   const get = async (who, path) => { const r = await worker.fetch(new Request("http://localhost" + path, { headers: { "oai-authenticated-user-email": who } }), env); return r; };
   const state2 = async () => JSON.parse(await (await BUCKET.get("bench.json")).text());
-  return { dir, env, BUCKET, call, get, state: state2 };
+  return { dir, env, BUCKET, call, raw, get, state: state2 };
 }
+
+import { inflateRawSync } from "node:zlib";
+// Minimal zip reader for tests (stored and deflated entries).
+export function readZip(buffer) {
+  const b = Buffer.from(buffer), out = new Map();
+  let end = -1; for (let i = b.length - 22; i >= 0; i--) if (b.readUInt32LE(i) === 0x06054b50) { end = i; break; }
+  const count = b.readUInt16LE(end + 10); let pos = b.readUInt32LE(end + 16);
+  for (let n = 0; n < count; n++) {
+    const method = b.readUInt16LE(pos + 10), size = b.readUInt32LE(pos + 20), nl = b.readUInt16LE(pos + 28), el = b.readUInt16LE(pos + 30), cl = b.readUInt16LE(pos + 32), local = b.readUInt32LE(pos + 42);
+    const name = b.subarray(pos + 46, pos + 46 + nl).toString("utf8"); pos += 46 + nl + el + cl;
+    const start = local + 30 + b.readUInt16LE(local + 26) + b.readUInt16LE(local + 28), data = b.subarray(start, start + size);
+    out.set(name, method === 0 ? Buffer.from(data) : inflateRawSync(data));
+  }
+  return out;
+}
+export const parseCsv = text => { const rows = []; let row = [], cell = "", q = false; for (let i = 0; i < text.length; i++) { const c = text[i]; if (q) { if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c; } else if (c === '"') q = true; else if (c === ",") { row.push(cell); cell = ""; } else if (c === "\n") { row.push(cell.replace(/\r$/, "")); rows.push(row); row = []; cell = ""; } else cell += c; } return rows; };
+export const JATS = `<?xml version="1.0"?><article><front><article-meta><title-group><article-title>Aciclovir neurotoxicity and status epilepticus</article-title></title-group>
+<contrib-group><contrib contrib-type="author"><name><surname>Rao</surname><given-names>Anil</given-names></name><xref ref-type="aff" rid="a1"/><xref ref-type="corresp" rid="c1"/><email>anil.rao@test-hospital.example</email></contrib>
+<contrib contrib-type="author"><name><surname>Iyer</surname><given-names>Sita</given-names></name><xref ref-type="aff" rid="a2"/></contrib></contrib-group>
+<aff id="a1">Department of Nephrology, Test Hospital, Pune, India</aff><aff id="a2">Department of Neurology, Test Hospital, Pune, India</aff><author-notes><corresp id="c1">Correspondence: Anil Rao, anil.rao@test-hospital.example</corresp></author-notes>
+<abstract><sec><title>Background</title><p>Aciclovir can cause neurotoxicity in renal impairment.</p></sec></abstract></article-meta></front>
+<body><sec><title>Case presentation</title><p>A 54-year-old man received aciclovir 10 mg/kg three times daily for herpes zoster encephalitis.<xref ref-type="table" rid="t1">Table 1</xref></p><sec><title>Course</title><p>Creatinine rose on day 3. He became confused on day 4 and developed status epilepticus on day 5.</p></sec></sec>
+<sec><title>Discussion</title><p>Renal impairment increases exposure.</p></sec>
+<table-wrap id="t1"><label>Table 1</label><caption><p>Laboratory course</p></caption><table><thead><tr><th>Day</th><th>Creatinine (mg/dL)</th></tr></thead><tbody><tr><td>1</td><td>1.0</td></tr><tr><td>3</td><td>2.4</td></tr></tbody></table></table-wrap>
+<fig id="f1"><label>Figure 1</label><caption><p>EEG showing generalised discharges</p></caption></fig></body></article>`;
