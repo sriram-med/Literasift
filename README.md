@@ -202,3 +202,7 @@ Search & Pull > **Batch by PMID list**: paste PMIDs (one per line, optionally fo
 ## Patient-reported posts and event confidence
 
 Search & Pull > **Patient-reported posts**: paste a post (several: separate with a line of three dashes), choose the platform and portfolio. Personal data is masked before storage; the post is screened for events and can become a Synchrony case marked as a consumer report (CIOMS source type "social media", no literature reference in E2B). Event detection now shows a confidence and its reasons for every event. Ideas from DrishtiAI; see `docs/OPEN_SOURCE.md`.
+
+## Deleting the coding memory
+
+Settings > **Coding memory** lists the MedDRA codings reviewers marked as Reviewed, which the event picker suggests for similar events. A manager can delete one entry or the whole memory, with a reason. Cases keep their codings; only the suggestions stop. Each deletion is written to the audit trail (`memory.removed`, `memory.cleared`) with who, when, how many and why.

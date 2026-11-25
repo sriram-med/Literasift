@@ -584,3 +584,34 @@ test("record cards and tile sheets show the source, the search query and when it
   const sheet = tilesHtml({ portfolio: "P", molecule: "m", query: "q1", from: "2026-10-01", to: "2026-11-20", source: "PubMed", time: "2026-11-25T04:49:12Z" }, [a]);
   assert.ok(sheet.includes("PubMed®") && sheet.includes("2026-11-25 04:49 UTC") && sheet.includes("q1"));
 });
+
+test("coding memory can be listed, entries deleted, or all cleared; cases are untouched and every deletion is audited", async () => {
+  const t = await setup(); await seedWithEvents(t);
+  const f = value => ({ value, state: "edited", evidence: [] });
+  const first = (await t.call(MANAGER, "/api/case-create", { pmid: "1" })).body.case;
+  first.data.events[0] = { ...first.data.events[0], verbatim: f("Liver failure"), pt: f("Hepatic failure"), soc: f("Hepatobiliary disorders"), coding_status: f("Reviewed") };
+  await t.call(MANAGER, "/api/case-save", { id: first.id, status: "Draft", data: first.data, notes: "" });
+  const second = (await t.call(MANAGER, "/api/case-create", { pmid: "1" })).body.case;
+  const suggest = async () => (await t.call(MANAGER, "/api/case-coding", { id: second.id, verbatim: "liver failure" })).body.memory;
+  assert.equal((await suggest())[0].pt, "Hepatic failure");
+  assert.equal((await t.call(REVIEWER, "/api/memory-list", {})).status, 403); assert.equal((await t.call(REVIEWER, "/api/memory-delete", { all: true })).status, 403);
+  const list = (await t.call(MANAGER, "/api/memory-list", {})).body; assert.equal(list.count, 1); assert.equal(list.entries[0].pt, "Hepatic failure");
+  assert.equal((await t.call(MANAGER, "/api/memory-delete", { key: "nope" })).status, 404);
+  assert.equal((await t.call(MANAGER, "/api/memory-delete", { key: list.entries[0].key, reason: "Wrong mapping" })).body.deleted, 1);
+  assert.deepEqual(await suggest(), []); assert.equal((await t.call(MANAGER, "/api/memory-list", {})).body.count, 0);
+  // the case itself still has its coding
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8")); assert.equal(bench.cases.find(c => c.id === first.id).data.events[0].pt.value, "Hepatic failure");
+  // saving the case again makes it count again; then clear everything
+  await t.call(MANAGER, "/api/case-save", { id: first.id, status: "Draft", data: first.data, notes: "again" });
+  assert.equal((await t.call(MANAGER, "/api/memory-list", {})).body.count, 0, "a removed entry stays removed");
+  const second2 = (await t.call(MANAGER, "/api/case-create", { pmid: "1" })).body.case;
+  second2.data.events[0] = { ...second2.data.events[0], verbatim: f("Rash"), pt: f("Rash"), coding_status: f("Reviewed") };
+  await t.call(MANAGER, "/api/case-save", { id: second2.id, status: "Draft", data: second2.data, notes: "" });
+  assert.equal((await t.call(MANAGER, "/api/memory-list", {})).body.count, 1);
+  assert.equal((await t.call(MANAGER, "/api/memory-delete", { all: true, reason: "Reset after audit" })).body.deleted, 1);
+  assert.equal((await t.call(MANAGER, "/api/memory-list", {})).body.count, 0);
+  const log = (await readFile(monthFile(t.dir), "utf8")).trim().split("\n").map(JSON.parse).filter(e => e.action.startsWith("memory."));
+  assert.deepEqual(log.map(e => e.action), ["memory.removed", "memory.cleared"]);
+  assert.equal(log[0].detail.reason, "Wrong mapping"); assert.equal(log[1].detail.reason, "Reset after audit"); assert.equal(log[1].detail.entries, 1); assert.equal(log[0].actor, "user:" + MANAGER);
+  assert.equal((await worker.verifyAuditChain(t.env)).ok, true);
+});

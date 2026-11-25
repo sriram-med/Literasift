@@ -1841,6 +1841,21 @@ function seriesSummary(cases) {
     events:tally(c => norm(c).events.map(e => v(e.pt) || v(e.verbatim)).filter(Boolean)), products:tally(c => v(firstSuspect(norm(c))?.name)), countries:tally(c => v(norm(c).patient.country)), sex:tally(c => v(norm(c).patient.sex) || "Unknown"), ages:tally(band),
     monthly, trend:{ ...trend, hikes:trend.hikes.map(h => h.month), basis:monthly.length < 4 ? "Too few months to judge a trend (needs at least 4)." : "Months above the upper limit are flagged." } };
 }
+// Coding memory: MedDRA codings a reviewer marked "Reviewed" in earlier cases, offered as hints in the event picker. It is derived from cases, so deleting it never changes a case:
+// a clear date and a list of removed entries decide what still counts. Every deletion is written to the audit trail.
+const memoryKey = (c, e) => c.id + "|" + imeNorm(v(e.verbatim)) + "|" + imeNorm(v(e.pt));
+function memoryEntries(state) {
+  const cleared = state.codingMemory?.clearedAt || "", removed = new Set(state.codingMemory?.removed || []), out = [];
+  for (const c of state.cases || []) {
+    if (cleared && String(c.updatedAt || "") <= cleared) continue;
+    for (const e of c.data?.events || []) {
+      if (e.coding_status?.value !== "Reviewed" || !hasVal(e.pt) || !hasVal(e.verbatim)) continue;
+      const key = memoryKey(c, e);
+      if (!removed.has(key)) out.push({ key, case:c.number, caseId:c.id, createdBy:c.createdBy, assignee:c.assignee, verbatim:v(e.verbatim), llt:v(e.llt), pt:v(e.pt), pt_code:v(e.pt_code), hlt:v(e.hlt), hlgt:v(e.hlgt), soc:v(e.soc), version:v(e.meddra_version), at:c.updatedAt });
+    }
+  }
+  return out;
+}
 const caseStatuses = ["Draft", "Ready for medical review", "Sent to PV Nexus", "Closed: not a valid ICSR"];
 // ---- Electronic signatures (21 CFR Part 11 pattern, design from argus-auditable-rag, MIT): signer, meaning, time, and a hash that binds the
 // signature to exactly what was signed. The server recomputes that hash, so a signature over different content is rejected. ----
@@ -2442,6 +2457,24 @@ async function apiCore(request, env, path) {
     if (format === "e2b") return new Response(e2bBatch(list, state.articles, { sender:state.settings?.senderId, receiver:state.settings?.receiverId }), { headers:{ "Content-Type":"application/xml", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-E2B-R3-' + stamp + '.xml"' } });
     return new Response(lineListing(list, state.articles), { headers:{ "Content-Type":"text/csv; charset=utf-8", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-line-listing-' + stamp + '.csv"' } });
   }
+  if ((path === "/api/memory-list" || path === "/api/memory-delete") && viewer) {
+    if (!manager) return json({ error:"Manager access required." }, 403);
+    const entries = memoryEntries(state);
+    if (path === "/api/memory-list") return json({ count:entries.length, clearedAt:state.codingMemory?.clearedAt || "", entries:entries.slice(0, 300).map(({ key, case:number, verbatim, pt, pt_code, soc, version, at }) => ({ key, case:number, verbatim, pt, pt_code, soc, version, at })) });
+    const reason = String(body.reason || "").trim().slice(0, 300);
+    if (body.all === true) {
+      if (!entries.length) return json({ ok:true, deleted:0 });
+      const at = new Date().toISOString();
+      await write(env, data => { data.codingMemory = { clearedAt:at, removed:[] }; });
+      await audit(env, { by:email, action:"memory.cleared", entityType:"Coding memory", entityId:"all", detail:{ entries:entries.length, reason, note:"Cases were not changed." } });
+      return json({ ok:true, deleted:entries.length });
+    }
+    const key = String(body.key || ""), entry = entries.find(x => x.key === key);
+    if (!entry) return json({ error:"That entry is no longer in the memory." }, 404);
+    await write(env, data => { const m = data.codingMemory ||= { clearedAt:"", removed:[] }; if (!m.removed.includes(key)) m.removed.push(key); m.removed = m.removed.slice(-5000); });
+    await audit(env, { by:email, action:"memory.removed", entityType:"Coding memory", entityId:entry.case, detail:{ verbatim:entry.verbatim, pt:entry.pt, reason } });
+    return json({ ok:true, deleted:1 });
+  }
   if ((path === "/api/case-assign" || path === "/api/cases-autoassign") && viewer) {
     if (!manager) return json({ error:"Manager access required." }, 403);
     const target = String(body.assignee || "").trim().toLowerCase(), at = new Date().toISOString();
@@ -2479,14 +2512,11 @@ async function apiCore(request, env, path) {
       const ime = await loadIme(env), tokens = t => new Set(imeNorm(t).split(" ").filter(Boolean)), want = tokens(verbatim);
       const hits = ime ? detectEvents({ title:"", abstract:verbatim }, [], ime, state.settings?.imePromotions || [], []).filter(e => e.ime).map(e => ({ term:e.term, code:e.ime.code || "", soc:e.ime.soc || "", provenance:e.ime.provenance })) : [];
       const memory = [];
-      for (const other of state.cases || []) {
-        if (!canSee(other) || other.id === current.id) continue;
-        for (const e of other.data.events || []) {
-          if (e.coding_status?.value !== "Reviewed" || !hasVal(e.pt)) continue;
-          const have = tokens(e.verbatim?.value || ""), common = [...want].filter(t => have.has(t)).length;
-          const score = imeNorm(e.verbatim?.value) === imeNorm(verbatim) ? 1 : want.size && have.size ? common / Math.max(want.size, have.size) : 0;
-          if (score >= 0.25) memory.push({ verbatim:e.verbatim.value, llt:e.llt?.value || "", pt:e.pt.value, pt_code:e.pt_code?.value || "", hlt:e.hlt?.value || "", hlgt:e.hlgt?.value || "", soc:e.soc?.value || "", version:e.meddra_version?.value || "", score:Number(score.toFixed(2)), case:other.number });
-        }
+      for (const entry of memoryEntries(state)) {
+        if (entry.caseId === current.id || !canSee({ createdBy:entry.createdBy, assignee:entry.assignee })) continue;
+        const have = tokens(entry.verbatim), common = [...want].filter(t => have.has(t)).length;
+        const score = imeNorm(entry.verbatim) === imeNorm(verbatim) ? 1 : want.size && have.size ? common / Math.max(want.size, have.size) : 0;
+        if (score >= 0.25) memory.push({ verbatim:entry.verbatim, llt:entry.llt, pt:entry.pt, pt_code:entry.pt_code, hlt:entry.hlt, hlgt:entry.hlgt, soc:entry.soc, version:entry.version, score:Number(score.toFixed(2)), case:entry.case });
       }
       return json({ ime:hits, memory:memory.sort((a, b) => b.score - a.score).slice(0, 5) });
     }
@@ -3020,6 +3050,14 @@ function renderCase(){
   $("casesign").dataset.id=curCase.id;$("casesign").textContent=(curCase.signatures||[]).some(x=>!x.superseded)?(curCase.signature_intact===false?"Signature: changed after signing":"Signed · view signature"):"Signature…";
 }
 let signCtx=null, codeSug={};
+async function loadMemory(){
+  const box=$("memorybox");if(!box)return;
+  try{
+    const r=await api("memory-list",{});
+    box.innerHTML='<div class="row"><span><b>'+r.count+'</b> remembered coding'+(r.count===1?"":"s")+(r.clearedAt?' · cleared '+esc(new Date(r.clearedAt).toLocaleString()):"")+'</span><button class="btn outline sm" data-memdel="all"'+(r.count?"":" disabled")+'>Delete all coding memory</button></div>'+
+      (r.entries.length?table(["Event as reported","Remembered PT","SOC","From case",""],r.entries.slice(0,100).map(e=>[esc(e.verbatim),esc(e.pt)+(e.pt_code?' <span class="sub">'+esc(e.pt_code)+'</span>':""),esc(e.soc),esc(e.case),'<button class="btn outline sm" data-memdel="'+esc(e.key)+'">Delete</button>']),""):'<div class="empty">Nothing remembered yet.</div>')+(r.count>100?'<p class="sub">Showing 100 of '+r.count+'.</p>':"");
+  }catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>';}
+}
 // For an article without a stored full text: a link through the user's library, and a way to supply the full text themselves.
 function closedAccessHtml(art){
   const link=art.doi?"https://doi.org/"+art.doi:art.url||"", prefix=data.config.proxyPrefix||"";
@@ -3322,7 +3360,7 @@ function render() {
   }
   if(tab==="Audit"){
     const months=[...Array(12)].map((_,i)=>{const d=new Date();d.setDate(1);d.setMonth(d.getMonth()-i);return d.toISOString().slice(0,7);});
-    html=panel("Audit trail",'<div class="filters" style="padding:0 0 14px;border:0"><select id="auditmonth" aria-label="Month">'+months.map(m=>'<option'+(m===auditMonth?" selected":"")+'>'+m+'</option>').join("")+'</select><input id="auditq" placeholder="Search user, target, detail…" value="'+esc(auditQ)+'"><select id="auditaction" aria-label="Action"><option value="">All actions</option>'+["login","logout","password","account","review","bulk-status","pull","import","scheduled","watch","molecule","profile","export","download","settings","access","sign","audit"].map(a=>'<option'+(auditAction===a?" selected":"")+'>'+a+'</option>').join("")+'</select></div><div id="auditbody"></div>',
+    html=panel("Audit trail",'<div class="filters" style="padding:0 0 14px;border:0"><select id="auditmonth" aria-label="Month">'+months.map(m=>'<option'+(m===auditMonth?" selected":"")+'>'+m+'</option>').join("")+'</select><input id="auditq" placeholder="Search user, target, detail…" value="'+esc(auditQ)+'"><select id="auditaction" aria-label="Action"><option value="">All actions</option>'+["login","logout","password","account","review","bulk-status","pull","import","scheduled","watch","molecule","profile","export","download","settings","access","sign","audit","memory"].map(a=>'<option'+(auditAction===a?" selected":"")+'>'+a+'</option>').join("")+'</select></div><div id="auditbody"></div>',
       "Every sign-in, review decision, assignment, pull, export, download, account change and setting is recorded with the user and time. Entries are chained by hash, so edits or deletions show up as a broken chain.");
   }
   if(tab==="Library"){
@@ -3388,6 +3426,7 @@ function render() {
     panel("PV Nexus (ICSR processing)",'<form class="grid" data-route="settings"><label>PV Nexus API address (optional)<input name="pvNexusUrl" value="'+esc((data.config.pvNexus||{}).url||"")+'" placeholder="https://your-pv-nexus-backend"'+((data.config.pvNexus||{}).urlFromEnv?" disabled":"")+'></label><label>API token (optional)<input type="password" name="pvNexusToken" autocomplete="off" placeholder="'+((data.config.pvNexus||{}).tokenSet?"Token is set; leave blank to keep it":"Sent as a Bearer token if your gateway needs one")+'"></label><div><button class="btn">Save</button>'+((data.config.pvNexus||{}).tokenSet?' <button type="button" class="btn outline" data-pvremove="1">Remove token</button>':"")+'</div></form>',
       "ICSR cases are assessed here with a port of PV Nexus's deterministic rules (validity, QC, causality suggestion, follow-up questions), checked to give identical results. If you enter the address of a PV Nexus backend, the same checks are run by it instead, and LiteraSift falls back to the local rules if it is unreachable.")+
     panel("Publisher and aggregator access",'<form class="grid" data-route="settings"><label>CORE API key (free, core.ac.uk)<input type="password" name="coreApiKey" autocomplete="off" placeholder="'+((data.config.retrievalKeys||{}).core?"Set; leave blank to keep":"Paste your CORE key")+'"></label><label>Wiley text-mining token<input type="password" name="wileyTdmToken" autocomplete="off" placeholder="'+((data.config.retrievalKeys||{}).wiley?"Set; leave blank to keep":"Wiley-TDM-Client-Token")+'"></label><label>Elsevier API key<input type="password" name="elsevierApiKey" autocomplete="off" placeholder="'+((data.config.retrievalKeys||{}).elsevier?"Set; leave blank to keep":"X-ELS-APIKey")+'"></label><label>Elsevier institution token (optional)<input type="password" name="elsevierInsttoken" autocomplete="off" placeholder="'+((data.config.retrievalKeys||{}).elsevierInst?"Set; leave blank to keep":"X-ELS-Insttoken")+'"></label><div><button class="btn">Save</button> '+Object.entries({coreApiKey:"core",wileyTdmToken:"wiley",elsevierApiKey:"elsevier",elsevierInsttoken:"elsevierInst"}).filter(([,k])=>(data.config.retrievalKeys||{})[k]).map(([f,k])=>'<button type="button" class="btn outline sm" data-keyremove="'+f+'">Remove '+esc(k)+'</button>').join(" ")+'</div></form>',"Extra places to look for full texts, each used only with a key you hold. CORE searches open repository copies. The Wiley and Elsevier text-mining services return only what your institution is licensed to read, and may refuse requests from this server if your licence is tied to your campus network. Those texts are stored as restricted. Leave all blank to skip.")+
+    panel("Coding memory",'<div id="memorybox"><div class="empty">Loading…</div></div>',"When a reviewer marks an event coding as Reviewed, LiteraSift remembers it and suggests it for similar events in other cases. Deleting an entry or the whole memory only stops those suggestions: the cases keep their codings. Every deletion is recorded in the audit trail.")+
     panel("Closed-access articles",'<form class="grid" data-route="settings"><label class="wide">Library proxy address (optional)<input name="proxyPrefix" value="'+esc(data.config.proxyPrefix||"")+'" placeholder="https://ezproxy.your-library.edu/login?url="></label><div><button class="btn">Save</button></div></form>',"For articles behind a paywall. With your library's proxy address, every closed article gets an Open with your institution link that signs in through your library. You can then download the PDF and upload it on the article, or paste the text; it flows into event detection and Synchrony like any other full text. LiteraSift does not bypass paywalls.")+
     panel("Synchrony (ICSR workbench)",'<form class="grid" data-route="settings"><label>Add full-text articles automatically<select name="autoIcsr"><option value="on"'+(data.config.autoIcsr?" selected":"")+'>On: draft a case for each article with stored full text and detected events</option><option value="off"'+(data.config.autoIcsr?"":" selected")+'>Off: add them with the button on the Synchrony tab</option></select></label><label>Assign new cases automatically<select name="autoAssignCases"><option value="on"'+(data.config.autoAssignCases?" selected":"")+'>On: molecule owner, else the reviewer with the fewest open cases</option><option value="off"'+(data.config.autoAssignCases?"":" selected")+'>Off: managers assign by hand</option></select></label><label>Sender organisation<input name="senderOrg" value="'+esc((data.config.sender||{}).org||"")+'" placeholder="Your company"></label><label>Sender contact name<input name="senderName" value="'+esc((data.config.sender||{}).name||"")+'"></label><label>Sender e-mail<input name="senderEmail" value="'+esc((data.config.sender||{}).email||"")+'"></label><label>Sender phone<input name="senderPhone" value="'+esc((data.config.sender||{}).phone||"")+'"></label><label>Sender country<input name="senderCountry" value="'+esc((data.config.sender||{}).country||"")+'"></label><label>E2B sender identifier<input name="senderId" value="'+esc((data.config.e2b||{}).sender||"")+'" placeholder="Your organisation ID (N.2.r.2)"></label><label>E2B receiver identifier<input name="receiverId" value="'+esc((data.config.e2b||{}).receiver||"")+'" placeholder="Regulator or partner ID (N.2.r.3)"></label><div><button class="btn">Save</button></div></form>',"E2B(R3) files carry these identifiers in the message header.")+
     panel("NCBI / PubMed access",'<form class="grid" data-route="settings"><label>Contact email for NCBI<input type="email" name="ncbiEmail" value="'+esc((data.config.ncbi||{}).email||"")+'" placeholder="you@example.com"'+((data.config.ncbi||{}).emailFromEnv?" disabled":"")+'></label><label>NCBI API key (optional)<input type="password" name="ncbiApiKey" autocomplete="off" placeholder="'+((data.config.ncbi||{}).keySet?"Key is set; leave blank to keep it":"Paste a free key to allow 10 requests a second")+'"'+((data.config.ncbi||{}).keyFromEnv?" disabled":"")+'></label><div><button class="btn">Save</button>'+(((data.config.ncbi||{}).keySet&&!(data.config.ncbi||{}).keyFromEnv)?' <button type="button" class="btn outline" data-ncbiremove="1">Remove key</button>':"")+'</div></form>',
@@ -3433,6 +3472,7 @@ function render() {
   animate();
   drawProgress();
   if(tab==="Watchlists"&&$("rkrows")){rkAddRow(1,20);rkAddRow(21,30);}
+  if(tab==="Settings"&&$("memorybox"))loadMemory();
   if(tab==="Synchrony"){
     document.querySelectorAll("[data-assignsel]").forEach(el=>{el.onchange=()=>api("case-assign",{ids:[el.dataset.assignsel],assignee:el.value}).then(()=>{message(el.value?"Case assigned.":"Case unassigned.");return refresh();}).catch(e=>message(e.message,true));});
   }
@@ -3490,7 +3530,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -3598,6 +3638,13 @@ document.addEventListener("click",event=>{
       finally{target.disabled=false;}
     })();
     return;
+  }
+  if(target.dataset.memdel){
+    const all=target.dataset.memdel==="all";
+    if(all&&!confirm("Delete all coding memory? Suggestions from earlier reviewed codings stop. Cases are not changed. This is recorded in the audit trail."))return;
+    const reason=prompt(all?"Reason for deleting the memory (recorded in the audit trail):":"Reason for deleting this entry (recorded in the audit trail):","");
+    if(reason===null)return;
+    api("memory-delete",all?{all:true,reason}:{key:target.dataset.memdel,reason}).then(r=>{message(r.deleted+" entr"+(r.deleted===1?"y":"ies")+" deleted. Recorded in the audit trail.");return loadMemory();}).catch(e=>message(e.message,true));return;
   }
   if(target.dataset.keyremove){api("settings",{[target.dataset.keyremove]:null}).then(()=>{message("Key removed.");return refresh();}).catch(e=>message(e.message,true));return;}
   if(target.dataset.ncbiremove){api("settings",{ncbiApiKey:null}).then(()=>{message("API key removed.");return refresh();}).catch(e=>message(e.message,true));return;}
