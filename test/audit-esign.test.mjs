@@ -540,3 +540,37 @@ test("batch by PMID list adds the articles to a portfolio, assigns them, reports
     assert.equal(bench.runs[0].query, "PMID list (3 requested)");
   } finally { globalThis.fetch = realFetch; }
 });
+
+test("personal data in patient-reported posts is masked", () => {
+  const raw = "My name is Priya Sharma, mail me at priya.s@example.com or call +91 98765 43210. Follow @priya_s, https://reddit.com/u/priya. Dr. Rao said DOB: 12/03/1980. Aadhaar 1234 5678 9012.";
+  const { text, types } = worker.maskPii(raw);
+  for (const leaked of ["Priya", "Sharma", "priya.s@example.com", "98765", "priya_s", "reddit.com", "Rao", "12/03/1980", "1234 5678"]) assert.ok(!text.includes(leaked), leaked + " leaked: " + text);
+  for (const type of ["name", "email", "phone", "handle", "link", "date of birth", "id number"]) assert.ok(types.includes(type), type);
+  assert.equal(worker.maskPii("I took aciclovir 400 mg and felt dizzy.").text, "I took aciclovir 400 mg and felt dizzy.");
+});
+
+test("events carry a confidence and the reasons for it", () => {
+  const e = worker.applyDetection({ id: "3", title: "T", abstract: "Seizures developed after aciclovir and he was hospitalised.", entities: { diseases: ["seizures", "headache"] }, pubTypes: [] }, ["aciclovir"], null, []).events;
+  const seizure = e.find(x => x.term === "seizures");
+  assert.ok(seizure.confidence >= 0.5 && seizure.confidence <= 1); assert.ok(seizure.why.includes("in the same sentence as the drug")); assert.ok(seizure.why.includes("causal or temporal wording")); assert.ok(seizure.why.includes("seriousness wording"));
+  const bare = worker.applyDetection({ id: "3", title: "T", abstract: "Headache is common. Aciclovir is an antiviral.", entities: { diseases: ["headache"] }, pubTypes: [] }, ["aciclovir"], null, []).events.find(x => x.term === "headache");
+  assert.ok(bare.confidence < seizure.confidence);
+});
+
+test("patient-reported posts: masked, screened, assigned, and a case from one is marked as a consumer report", async () => {
+  const t = await setup();
+  assert.equal((await t.call(REVIEWER, "/api/social-add", { text: "x".repeat(40), portfolio: "Antivirals" })).status, 403);
+  assert.equal((await t.call(MANAGER, "/api/social-add", { text: "too short", portfolio: "Antivirals" })).status, 400);
+  const post = "I am Raj Kumar, email raj@example.com. After starting aciclovir I developed seizures and was hospitalised. Doctor stopped the aciclovir.";
+  const r = await t.call(MANAGER, "/api/social-add", { text: post + "\n---\nSecond post about aciclovir and a rash that appeared after the second dose.", platform: "Reddit", portfolio: "Antivirals", molecule: "aciclovir" });
+  assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal(r.body.added, 2);
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8")), posts = Object.values(bench.articles).filter(a => a.source === "Social media");
+  assert.equal(posts.length, 2); assert.ok(posts.every(a => /^SM-/.test(a.id) && a.piiMasked));
+  const first = posts.find(a => /seizures/.test(a.abstract)); assert.ok(!first.abstract.includes("raj@example.com") && !first.abstract.includes("Raj Kumar"));
+  assert.ok(bench.assignments.some(a => a.pmid === first.id && a.reviewer));
+  const made = (await t.call(MANAGER, "/api/case-create", { pmid: first.id })).body;
+  assert.equal(made.case.data.source_type, "social"); assert.match(made.case.data.reporter.qualification.value, /Consumer/);
+  assert.ok(made.assessment.literature_checks.some(c => /cannot be followed up/.test(c.title)));
+  assert.match(worker.caseNarrativeText(worker.normalizeCase(made.case.data), ""), /patient or consumer in a Reddit post/);
+  assert.ok(!worker.e2bBatch([made.case], {}).includes('displayName="literatureReference"'));
+});

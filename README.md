@@ -198,3 +198,7 @@ Settings > **Publisher and aggregator access** takes a free **CORE** API key (op
 ## Batch by PMID list
 
 Search & Pull > **Batch by PMID list**: paste PMIDs (one per line, optionally followed by a name, or comma separated), choose a portfolio, and every article is read from PubMed, queued, assigned, and looked up for a full text. **Unfetched list (TSV)** on the pull gives the PMIDs still without a full text in the same format. Based on Pubmed-Batch-Download (MIT).
+
+## Patient-reported posts and event confidence
+
+Search & Pull > **Patient-reported posts**: paste a post (several: separate with a line of three dashes), choose the platform and portfolio. Personal data is masked before storage; the post is screened for events and can become a Synchrony case marked as a consumer report (CIOMS source type "social media", no literature reference in E2B). Event detection now shows a confidence and its reasons for every event. Ideas from DrishtiAI; see `docs/OPEN_SOURCE.md`.

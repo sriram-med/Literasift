@@ -111,6 +111,45 @@ async function importWatch(env, watch, from, to) {
     return run;
   });
 }
+// ---- Patient-reported posts (social media or forums), added by hand. Personal data is masked before anything is stored. The idea follows DrishtiAI (listening for patient-reported
+// events, masking identifiers, explainable scoring); this is a separate implementation, and posts are never collected automatically (platform terms and privacy law). ----
+function maskPii(text) {
+  const types = new Set(); let out = String(text || "");
+  const sub = (re, label, type) => { out = out.replace(re, () => { types.add(type); return label; }); };
+  sub(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[EMAIL]", "email");
+  sub(/(?<![\w@])@[A-Za-z0-9_]{2,30}\b/g, "[USER]", "handle");
+  sub(/\bhttps?:\/\/\S+/g, "[LINK]", "link");
+  sub(/\b\d{3}-\d{2}-\d{4}\b|\b\d{4}\s\d{4}\s\d{4}\b/g, "[ID NUMBER]", "id number");
+  sub(/(?:\+\d{1,3}[\s.-]?)?(?:\(\d{2,4}\)[\s.-]?)?\d{3,5}[\s.-]\d{3,5}(?:[\s.-]\d{2,5})?/g, "[PHONE]", "phone");
+  sub(/\b\d{10,12}\b/g, "[NUMBER]", "number");
+  sub(/\b(?:dob|d\.o\.b\.|date of birth|born on)\s*[:\-]?\s*[0-9A-Za-z ,\/.\-]{6,20}/gi, "[DATE OF BIRTH]", "date of birth");
+  sub(/\b(?:[Mm]y name is|[Ii] am called|[Nn]ame:|I am|I'm)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?/g, "[NAME]", "name");
+  sub(/\b(?:Dr|Mr|Mrs|Ms|Miss|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?/g, "[NAME]", "name");
+  return { text:out, types:[...types] };
+}
+async function addSocialPosts(env, posts, portfolio, molecule, platform, by) {
+  const ime = await loadIme(env), state0 = (await load(env)).state, promotions = state0.settings?.imePromotions || [], added = [];
+  const built = {};
+  for (const post of posts) {
+    const masked = maskPii(post.text), digest = await sha256(platform + "|" + post.text.slice(0, 500)), id = "SM-" + digest.slice(0, 10);
+    const article = { id, source:"Social media", platform, title:masked.text.replace(/\s+/g, " ").slice(0, 110) + (masked.text.length > 110 ? "..." : ""), abstract:masked.text.slice(0, 6000), abstractSource:"Patient-reported post", journal:platform,
+      date:post.postedAt || day(), url:/^https:\/\//.test(post.url || "") ? post.url : "", authors:[], piiMasked:true, piiTypes:masked.types, enrichedAt:new Date().toISOString(), enrichVersion:99, entitiesCheckedAt:new Date().toISOString(), linksCheckedAt:new Date().toISOString(),
+      oaCheckedAt:new Date().toISOString(), retractionCheckedAt:new Date().toISOString(), retractionStatus:"Not applicable", fullTextStatus:"Not applicable", fullTextTier, addedBy:by };
+    Object.assign(article, applyDetection(article, molecule ? [molecule] : [], ime, promotions, ""));
+    built[id] = article; added.push(id);
+  }
+  await write(env, state => {
+    for (const [id, article] of Object.entries(built)) state.articles[id] = { ...state.articles[id], ...article };
+    const run = { id:crypto.randomUUID(), source:"Social media", portfolio, molecule, from:day(), to:day(), count:added.length, ids:added, time:new Date().toISOString(), query:"Patient-reported posts (" + platform + ")", status:"Imported" };
+    state.runs.unshift(run);
+    for (const id of added) {
+      if (state.assignments.some(a => a.pmid === id && a.portfolio === portfolio)) continue;
+      const item = { id:crypto.randomUUID(), pmid:id, portfolio, molecules:molecule ? [molecule] : [], reviewer:"", status:"Pending" };
+      allocate(state, item); state.assignments.push(item);
+    }
+  });
+  return added;
+}
 // ---- Batch by PMID list (after Pubmed-Batch-Download, MIT, Copyright 2023 Bill Young Greenwald): a list of PMIDs, optionally with a name for each, goes through the whole
 // pipeline instead of being downloaded as loose files. One PMID per line (PMID, then an optional name), or a comma-separated list. ----
 function parsePmidList(text) {
@@ -1090,7 +1129,18 @@ function detectEvents(article, molecules, ime, promotions, exclude) {
     if (sentence && !isNegated(norm.split(" ").filter(Boolean), first, first + imeNorm(d).split(" ").length)) add(d, "PubTator condition", sentence);
   }
   const rank = e => (e.ime ? 0 : 4) + (e.withDrug ? 0 : 2) + (e.kinds.includes("MeSH adverse-effect indexing") ? 0 : 1);
-  return [...found.values()].sort((a, b) => rank(a) - rank(b)).slice(0, 12);
+  // Every event carries a confidence and the reasons for it, so a reviewer can see why it was picked (idea after DrishtiAI's explainable adverse-event scoring).
+  for (const e of found.values()) {
+    const why = []; let c = 0.15;
+    if (e.ime) { c += 0.3; why.push("on the EMA IME list"); }
+    if (e.withDrug) { c += 0.25; why.push("in the same sentence as the drug"); }
+    if (/\b(after|following|induced|associated with|due to|caused by|secondary to|attributed to|developed|experienced|occurred)\b/i.test(e.evidence || "")) { c += 0.15; why.push("causal or temporal wording"); }
+    if (Object.keys(e.serious).length) { c += 0.1; why.push("seriousness wording"); }
+    if (e.kinds.includes("MeSH adverse-effect indexing")) { c += 0.2; why.push("indexed as a drug adverse effect in MeSH"); }
+    if (e.kinds.includes("PubTator condition")) { c += 0.05; why.push("condition found by PubTator"); }
+    e.confidence = Math.min(1, Number(c.toFixed(2))); e.why = why;
+  }
+  return [...found.values()].sort((a, b) => rank(a) - rank(b) || b.confidence - a.confidence).slice(0, 12);
 }
 // Country and event detection are pure functions of stored data, so they are recomputed whenever the inputs or the IME list change.
 const detectKey = (a, ime) => [EVENT_VERSION, ime?.info.version || "none", ime?.info.count || 0, a.abstract ? 1 : 0, a.fullTextTextKey ? 1 : 0, (a.entities?.diseases || []).length, (a.aeMesh || []).length, a.affiliation ? 1 : 0].join("|");
@@ -1286,6 +1336,7 @@ function normalizeCase(input) {
     case_id:data.case_id ?? null, receipt_date:data.receipt_date || null,
     patient:group(data.patient, FIELDS.patient, { medical_history:(data.patient?.medical_history || []).slice(0, 50).map(fixField) }),
     reporter:group(data.reporter, FIELDS.reporter), sender:group(data.sender, FIELDS.sender),
+    source_type:data.source_type === "social" ? "social" : "literature", source_platform:String(data.source_platform || "").slice(0, 60),
     general_comments:String(data.general_comments || "").slice(0, 4000), sender_comments:String(data.sender_comments || "").slice(0, 4000),
     products:(data.products || []).slice(0, 30).map(p => ({ ...group(p, FIELDS.product), role:["suspect", "concomitant", "interacting"].includes(p?.role) ? p.role : "suspect", start_not_reported:p?.start_not_reported === true })),
     events:(data.events || []).slice(0, 30).map(e => ({ ...group(e, FIELDS.event), onset_not_reported:e?.onset_not_reported === true, seriousness:Object.fromEntries(SERIOUS_FLAGS.map(k => [k, Boolean(e?.seriousness?.[k])])) })),
@@ -1351,7 +1402,8 @@ const withRegulatory = (assessment, state, record) => ({ ...assessment, regulato
 // Literature-specific checks that sit beside PV Nexus's rules (they do not change its validity or QC score).
 function literatureChecks(c) {
   const out = [], add = (severity, title, detail, suggested_action) => out.push({ severity, title, detail, suggested_action }), suspect = firstSuspect(c);
-  if (!String(c.source_summary || "").trim()) add("critical", "Literature reference missing", "A case from published literature needs the article reference (E2B(R3) C.4.r.1).", "Keep the citation in the source summary.");
+  if (c.source_type === "social") add("major", "Reporter cannot be followed up", "Social media reports usually give no identifiable or contactable reporter, so the reporter criterion is met only formally.", "Record the platform and the post in the source summary, and decide with your SOP whether the case is reportable.");
+  else if (!String(c.source_summary || "").trim()) add("critical", "Literature reference missing", "A case from published literature needs the article reference (E2B(R3) C.4.r.1).", "Keep the citation in the source summary.");
   if (suspect && String(suspect.dechallenge.value || "").toLowerCase().includes("confounded")) add("major", "Dechallenge confounded by treatment", suspect.dechallenge.value, "Do not count the dechallenge as supportive on its own; document the treatment and weigh the evidence.");
   if (c.treatment_given.length && !c.confounders.some(x => /treatment/i.test(x.type))) add("minor", "Treatment given for the event is not listed as a confounder", c.treatment_given.join(", "), "Record whether the treatment could explain the improvement.");
   if (suspect && !hasVal(suspect.dechallenge) && !hasVal(suspect.rechallenge)) add("info", "No dechallenge or rechallenge information", "The article does not say what happened when the drug was stopped or re-introduced.", "Check the full text, or ask the author in follow-up.");
@@ -1420,18 +1472,20 @@ function caseFromArticle(article, assignment, settings = {}) {
   const history = (facts?.patient?.history || []).map(h => icsrField(h, "proposed", ev(facts.patient.evidence || h)));
   const events = picked.length ? picked.map(e => { const s = { ...e.serious, other_medically_important:Boolean(e.ime) }; s.serious = Object.values(s).some(Boolean);
     const quote = e.verbatim ? "[" + e.verbatim.section + "] " + e.verbatim.quote : e.evidence;
-    return { verbatim:icsrField(e.verbatim?.reported || e.term, "proposed", ev(e.verbatim?.reported || e.term, quote)), coded_term:e.ime ? icsrField(e.term, "proposed", ev(e.ime.provenance + (e.ime.code ? " (PT " + e.ime.code + ")" : ""), quote)) : icsrField(""),
+    const evc = [{ ...ev(e.term, quote)[0], confidence:e.confidence ?? 0.5, why:(e.why || []).join("; ") }];
+    return { verbatim:icsrField(e.verbatim?.reported || e.term, "proposed", evc), coded_term:e.ime ? icsrField(e.term, "proposed", ev(e.ime.provenance + (e.ime.code ? " (PT " + e.ime.code + ")" : ""), quote)) : icsrField(""),
       pt:e.ime ? icsrField(e.term, "proposed", ev(e.ime.provenance, quote)) : icsrField(""), pt_code:e.ime?.code ? icsrField(e.ime.code, "proposed") : icsrField(""), soc:e.ime?.soc ? icsrField(e.ime.soc, "proposed") : icsrField(""),
       coding_status:e.ime ? icsrField("Proposed (IME list)", "proposed") : icsrField(""), seriousness:s,
       // Each event keeps its own outcome and onset date when its own sentence gives them.
       ...(eventOutcome(quote) ? { outcome:icsrField(eventOutcome(quote), "proposed", ev(e.term, quote)) } : {}),
       ...(eventDate(quote) ? { onset_date:icsrField(eventDate(quote), "proposed", ev(e.term, quote)) } : {}) }; })
     : [{ verbatim:icsrField(condition, "proposed", condition ? ev(condition, article.abstract) : []) }];
-  const built = normalizeCase({ receipt_date:new Date().toISOString().slice(0, 10),
+  const social = article.source === "Social media";
+  const built = normalizeCase({ source_type:social ? "social" : "literature", source_platform:social ? article.platform || "" : "", receipt_date:new Date().toISOString().slice(0, 10),
     patient:{ identifier:patientIdentity(facts?.patient, ev), country:icsrField(article.patientCountry?.name || "", "proposed", article.patientCountry ? ev(article.patientCountry.evidence) : []),
       age:fe(facts?.patient?.age, { evidence:facts?.patient?.evidence }), age_unit:icsrField(facts?.patient?.age_unit || "years", "proposed"), age_group:icsrField(facts?.patient?.age ? "" : groupFromWord(facts?.patient?.age_group), "proposed", facts?.patient?.evidence ? ev(facts.patient.evidence) : []), sex:fe(facts?.patient?.sex, { evidence:facts?.patient?.evidence }),
       weight:fe(facts?.patient?.weight, { evidence:facts?.patient?.evidence }), medical_history:history },
-    reporter:{ identifier:icsrField(authors[0] ? authors[0] + " (first author)" : "", "proposed", ev(cite)), qualification:icsrField("Health professional (published literature)", "proposed", ev(cite)),
+    reporter:{ identifier:icsrField(social ? "Social media user (name withheld)" : authors[0] ? authors[0] + " (first author)" : "", "proposed", ev(cite)), qualification:icsrField(social ? "Consumer or other non-health professional" : "Health professional (published literature)", "proposed", ev(cite)),
       country:icsrField(article.affiliationCountry || "", "proposed", article.affiliation ? ev(article.affiliation) : []), organisation:icsrField(String(article.affiliation || "").slice(0, 300), "proposed", article.affiliation ? ev(article.affiliation) : []) },
     sender:{ type:icsrField(settings.senderType || "Pharmaceutical company", "proposed"), organisation:icsrField(settings.senderOrg || ""), name:icsrField(settings.senderName || ""), email:icsrField(settings.senderEmail || ""), phone:icsrField(settings.senderPhone || ""), country:icsrField(settings.senderCountry || "") },
     products:[{ role:"suspect", name:icsrField(molecule, "proposed", ev(cite)), start_date:fe(facts?.startDate?.value, facts?.startDate), action_taken:fe(facts?.actionTaken?.value, facts?.actionTaken), dechallenge:fe(facts?.dechallenge?.value, facts?.dechallenge), rechallenge:fe(facts?.rechallenge?.value, facts?.rechallenge) },
@@ -1439,9 +1493,9 @@ function caseFromArticle(article, assignment, settings = {}) {
     events:events.map((e, i) => i === 0 && facts?.latency && !hasVal(e.time_to_onset) ? { ...e, time_to_onset:icsrField(facts.latency.value, "proposed", ev(facts.latency.value, facts.latency.evidence)) } : e).map((e, i) => i === 0 && facts?.onsetDate && !hasVal(e.onset_date) ? { ...e, onset_date:icsrField(facts.onsetDate.value, "proposed", ev(facts.onsetDate.value, facts.onsetDate.evidence)) } : e).map((e, i) => i === 0 && picked.length <= 1 && facts?.outcome && !hasVal(e.outcome) ? { ...e, outcome:icsrField(facts.outcome, "proposed", facts.patient?.evidence ? ev(facts.patient.evidence) : []) } : e),
     treatment_given:(facts?.treatment || []).map(t => t.text), confounders:facts?.confounders || [],
     source_documents:[{ filename:article.fullTextKey ? "PMID_" + article.id + "." + (/\.(\w+)$/.exec(article.fullTextKey)?.[1] || "pdf") : "PMID " + article.id + " citation and abstract", media_type:article.fullTextKey ? "application/pdf" : "text/plain", source_type:article.fullTextKey ? "pdf" : "text" }],
-    source_summary:cite + (article.abstract ? "\n\nAbstract: " + article.abstract : ""),
+    source_summary:social ? "Social media post (" + (article.platform || "platform") + ", " + (article.date || "") + ")" + (article.url ? " " + article.url : "") + "\n\nPost (personal data masked): " + (article.abstract || "") : cite + (article.abstract ? "\n\nAbstract: " + article.abstract : ""),
     special_situations:[...new Set([...specialSituationHints.filter(([re]) => re.test(text)).map(([, label]) => label), ...(facts?.patient?.pregnancy ? ["Pregnancy exposure"] : [])])],
-    warnings:["Pre-filled from the published article by LiteraSift. Patient details are usually only partly reported in literature; every value needs human review.",
+    warnings:[...(social ? ["Patient-reported post: the report is unverified, the reporter cannot be identified or contacted, and personal data was masked before storage. Check whether it meets your minimum criteria."] : []), "Pre-filled from the published article by LiteraSift. Patient details are usually only partly reported in literature; every value needs human review.",
       ...(picked.some(e => e.ime) ? ["Events matching the EMA IME list are pre-ticked as other medically important (ICH E2A criterion 6). Confirm each one."] : []),
       ...(facts?.dechallenge?.confounded ? ["Dechallenge looks positive but treatment was given (" + facts.treatment.map(t => t.text).join(", ") + "), so it is confounded. Weigh it cautiously."] : []),
       "Patients are not named in published articles, so the patient is identified by age and sex. Therapy start and event onset dates are rarely given: if the article does not give them, tick \"not reported in the article\" once you have checked, and use the time to onset if it states one.",
@@ -1509,7 +1563,7 @@ const ageText = p => v(p.age) ? v(p.age) + " " + (v(p.age_unit) || "years") : ""
 function caseNarrativeText(c, citation) {
   const p = c.patient, suspect = firstSuspect(c), events = c.events.filter(e => hasVal(e.verbatim)), out = [];
   const who = [v(p.age) ? v(p.age) + "-" + (v(p.age_unit) || "years").replace(/s$/, "") + "-old" : "", v(p.sex).toLowerCase()].filter(Boolean).join(" ") || "patient of unspecified age and sex";
-  out.push("This case was reported in the published literature" + (citation ? " (" + citation + ")" : "") + ". It concerns a " + who + (v(p.country) ? " from " + v(p.country) : "") + (v(p.weight) ? ", weight " + v(p.weight) + " kg" : "") + ".");
+  out.push((c.source_type === "social" ? "This case was reported by a patient or consumer in a " + (c.source_platform || "social media") + " post (not verified)" : "This case was reported in the published literature") + (citation ? " (" + citation + ")" : "") + ". It concerns a " + who + (v(p.country) ? " from " + v(p.country) : "") + (v(p.weight) ? ", weight " + v(p.weight) + " kg" : "") + ".");
   if (c.patient.medical_history.length) out.push("Relevant medical history: " + c.patient.medical_history.map(h => v(h)).filter(Boolean).join("; ") + ".");
   if (suspect && hasVal(suspect.name)) out.push("The patient received " + v(suspect.name) + (v(suspect.dose) ? " " + v(suspect.dose) : "") + (v(suspect.route) ? " by the " + v(suspect.route) + " route" : "") + (v(suspect.frequency) ? ", " + v(suspect.frequency) : "") + (v(suspect.indication) ? " for " + v(suspect.indication) : "") + (v(suspect.start_date) ? ", started on " + v(suspect.start_date) : suspect.start_not_reported ? "; the start date was not reported in the article" : "") + ".");
   const others = c.products.filter(x => x.role !== "suspect" && hasVal(x.name)).map(x => v(x.name));
@@ -1582,7 +1636,7 @@ function e2bCase(rec, article, opts = {}) {
     `<controlActProcess classCode="CACT" moodCode="EVN"><code code="PORR_TE049016UV" codeSystem="2.16.840.1.113883.1.18"/><subject typeCode="SUBJ"><investigationEvent classCode="INVSTG" moodCode="EVN">` +
     `<id root="${OID.c11}" extension="${xmlEsc(rec.number)}"/><id root="${OID.c181}" extension="${xmlEsc(rec.number)}"/><code code="PAT_ADV_EVNT" codeSystem="2.16.840.1.113883.5.4"/><text>${xmlEsc(narrative)}</text><statusCode code="active"/>` +
     (received ? `<effectiveTime><low value="${received}"/></effectiveTime><availabilityTime value="${received}"/>` : "") +
-    (rec.data.source_summary ? `<reference typeCode="REFR"><document classCode="DOC" moodCode="EVN"><code code="2" codeSystem="2.16.840.1.113883.3.989.2.1.1.4" displayName="literatureReference"/><bibliographicDesignationText>${xmlEsc(String(rec.data.source_summary).split("\n")[0].slice(0, 500))}</bibliographicDesignationText></document></reference>` : "") +
+    (rec.data.source_summary && c.source_type !== "social" ? `<reference typeCode="REFR"><document classCode="DOC" moodCode="EVN"><code code="2" codeSystem="2.16.840.1.113883.3.989.2.1.1.4" displayName="literatureReference"/><bibliographicDesignationText>${xmlEsc(String(rec.data.source_summary).split("\n")[0].slice(0, 500))}</bibliographicDesignationText></document></reference>` : "") +
     `<component typeCode="COMP"><adverseEventAssessment classCode="INVSTG" moodCode="EVN"><subject1 typeCode="SBJ"><primaryRole classCode="INVSBJ"><id root="${OID.patient}" extension="${xmlEsc(rec.number)}-P"/>` +
     `<player1 classCode="PSN" determinerCode="INSTANCE">${v(p.identifier) ? `<name>${xmlEsc(v(p.identifier))}</name>` : ""}${sexCode ? `<administrativeGenderCode code="${sexCode}" codeSystem="1.0.5218"/>` : ""}</player1>` +
     age + ageGroup + weight + reactions + (drugs ? `<subjectOf2 typeCode="SBJ"><organizer classCode="CATEGORY" moodCode="EVN"><code code="4" codeSystem="${OID.obs}" displayName="drugInformation"/>${drugs}</organizer></subjectOf2>` : "") +
@@ -1662,7 +1716,7 @@ function ciomsPdf(rec, article) {
   warn("Causality, seriousness, dechallenge, rechallenge and expectedness reflect the latest saved case data" + (signature ? ", signed by " + signature.signer_name + " on " + signature.signed_at.slice(0, 10) + "." : "; a human-confirmed medical assessment has not yet been recorded for this case."));
   if (c.warnings.length && !signature) warn("Values marked as proposed were filled from the article and have not been confirmed by a reviewer yet.");
   band("0. ADMINISTRATIVE INFORMATION");
-  cells([{ label:"Sender case identifier", value:rec.number }, { label:"Report type", value:"initial" }, { label:"Source type", value:"literature" }]);
+  cells([{ label:"Sender case identifier", value:rec.number }, { label:"Report type", value:"initial" }, { label:"Source type", value:c.source_type === "social" ? "social media (patient-reported)" : "literature" }]);
   cells([{ label:"Day 0 / receipt date", value:c.receipt_date }, { label:"Validity status", value:assessment.validity.valid_icsr ? "valid" : "incomplete: " + assessment.validity.missing.join(", ") }, { label:"Country of incidence", value:v(p.country) }]);
   band("I. PATIENT INFORMATION");
   cells([{ label:"1 Patient identifier", value:v(p.identifier) }, { label:"2 Age at onset", value:ageText(p) }, { label:"2a Age group", value:v(p.age_group) }, { label:"3 Sex", value:v(p.sex).toLowerCase() }, { label:"Weight (kg)", value:v(p.weight) }, { label:"Country", value:v(p.country) }]);
@@ -1694,11 +1748,11 @@ function ciomsPdf(rec, article) {
   });
   band("VI. NARRATIVE SUMMARY"); box(caseNarrativeText(c, ""));
   band("VII. REPORTER AND SENDER INFORMATION");
-  table(["30. Qualification", "Type", "31. Country", "Organization", "Primary"], [2, 1.2, 1.2, 2.6, 0.9], [[v(c.reporter.qualification) || v(c.reporter.identifier), "literature", v(c.reporter.country), v(c.reporter.organisation), "Yes"]]);
+  table(["30. Qualification", "Type", "31. Country", "Organization", "Primary"], [2, 1.2, 1.2, 2.6, 0.9], [[v(c.reporter.qualification) || v(c.reporter.identifier), c.source_type === "social" ? "consumer" : "literature", v(c.reporter.country), v(c.reporter.organisation), "Yes"]]);
   cells([{ label:"Reporter (first author)", value:v(c.reporter.identifier) }, { label:"Reporter e-mail / phone", value:[v(c.reporter.email), v(c.reporter.phone)].filter(Boolean).join(" · ") }, { label:"Reporter address", value:[v(c.reporter.department), v(c.reporter.address)].filter(Boolean).join(", ") }]);
   cells([{ label:"Sender type", value:v(c.sender.type) }, { label:"Sender organisation", value:v(c.sender.organisation) }, { label:"Sender contact", value:[v(c.sender.name), v(c.sender.email), v(c.sender.phone)].filter(Boolean).join(" · ") }]);
   band("VIII. CASE NARRATIVE");
-  box("Literature report: " + String(rec.data.source_summary || "").split("\n")[0] + (article?.doi ? " DOI " + article.doi + "." : "") + (article?.id ? " PMID " + article.id + "." : ""));
+  box((c.source_type === "social" ? "Patient-reported post: " : "Literature report: ") + String(rec.data.source_summary || "").split("\n")[0] + (article?.doi ? " DOI " + article.doi + "." : "") + (article?.id ? " PMID " + article.id + "." : ""));
   if (c.general_comments) { caption("General comments (reporter)"); box(c.general_comments); }
   if (c.sender_comments) { caption("Sender's comments"); box(c.sender_comments); }
   band("IX. QUALITY CONTROL SUMMARY");
@@ -1943,7 +1997,7 @@ async function collectEvidence(baseEnv, ids) {
     (Boolean(env.UNPAYWALL_EMAIL) && ["No PMC record","No eligible PMC file"].includes(a.fullTextStatus)) ||
     (!a.fullTextKey && (a.fullTextTier || 0) < fullTextTier) || (Boolean(a.doi) && /^No DOI/.test(a.fullTextStatus || ""));
   // Local captures made before screenshotKind existed may be saved error pages, so they are taken again.
-  const needsScreen = a => enabled && (!a.screenshotKey || (Boolean(env.SCREENSHOT_FN) && !a.screenshotKind));
+  const needsScreen = a => enabled && a.source !== "Social media" && (!a.screenshotKey || (Boolean(env.SCREENSHOT_FN) && !a.screenshotKind));
   // PDFs stored before a text reader was available are read once (pdf.js on the host, or GROBID).
   const needsPdfText = a => Boolean(env.PDF_TEXT_FN || env.GROBID_URL) && Boolean(a.fullTextKey) && /\.pdf$/i.test(a.fullTextKey) && !a.fullTextTextKey && !a.pdfTextTried;
   const needsEnrich = a => !a.enrichedAt || (a.enrichVersion || 0) < 2;
@@ -2731,6 +2785,14 @@ async function apiCore(request, env, path) {
     const run = await execute(env, watch, body.from, body.to);
     await collectEvidence(env, run.ids);
     return json(run);
+  } else if (path === "/api/social-add") {
+    const posts = String(body.text || "").split(/\r?\n\s*-{3,}\s*\r?\n/).map(t => t.trim()).filter(t => t.length >= 20).slice(0, 50).map(text => ({ text:text.slice(0, 6000), url:String(body.url || "").trim(), postedAt:/^\d{4}-\d{2}-\d{2}$/.test(body.postedAt || "") ? body.postedAt : "" }));
+    const portfolio = String(body.portfolio || "").trim().slice(0, 80), molecule = String(body.molecule || "").trim().slice(0, 100), platform = ["Reddit", "X (Twitter)", "Facebook", "Patient forum", "Other"].includes(body.platform) ? body.platform : "Other";
+    if (!posts.length) return json({ error:"Paste at least one post (20 or more characters). Separate several posts with a line of three dashes." }, 400);
+    if (!portfolio) return json({ error:"Choose or type a portfolio." }, 400);
+    const ids = await addSocialPosts(env, posts, portfolio, molecule, platform, email);
+    await audit(env, { by:email, action:"import.social", target:portfolio + (molecule ? " · " + molecule : ""), detail:{ posts:ids.length, platform } });
+    return json({ added:ids.length });
   } else if (path === "/api/pmid-batch") {
     const list = parsePmidList(body.text), portfolio = String(body.portfolio || "").trim().slice(0, 80), molecule = String(body.molecule || "").trim().slice(0, 100);
     if (!list.length) return json({ error:"Paste at least one PMID (digits), one per line, or comma separated." }, 400);
@@ -3226,6 +3288,7 @@ function render() {
     const today=new Date().toISOString().slice(0,10), start=new Date(Date.now()-30*864e5).toISOString().slice(0,10);
     html=panel("Pull articles from PubMed",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div class="wide" style="display:flex;gap:16px;flex-wrap:wrap;grid-column:1/-1"><span class="sub">Narrow with PubMed filters:</span><label class="check"><input type="checkbox" name="humans">&nbsp;Humans only</label><label class="check"><input type="checkbox" name="caseReports">&nbsp;Case reports only</label><label class="check"><input type="checkbox" name="english">&nbsp;English only</label><label class="check"><input type="checkbox" name="noReviews">&nbsp;Exclude reviews</label></div><div><button class="btn">Pull articles</button> <button type="button" class="btn outline" data-suggest="1">Suggest synonyms &amp; brands</button></div></form><div id="suggest"></div>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+'<div id="progress"></div>'+
       panel("Batch by PMID list",'<form class="grid" data-route="pmid-batch"><label class="wide">PMIDs (one per line, optionally followed by a name; or comma separated)<textarea name="text" rows="5" required placeholder="123456  Smith_2020&#10;789012  Jones_2021&#10;345678,901234"></textarea></label><label>Portfolio<input name="portfolio" required list="pfopts" placeholder="Type or choose"><datalist id="pfopts">'+[...new Set((data.watches||[]).map(w=>w.portfolio))].map(p=>'<option value="'+esc(p)+'">').join("")+'</datalist></label><label>Molecule (optional)<input name="molecule"></label><div><button class="btn">Add and fetch full texts</button></div></form>',"For lists of articles you already have: each PMID is read from PubMed, enters the screening queue and Synchrony like any other article, and its full text is looked up in every open source. Afterwards, Recent pulls offers a list of the PMIDs that could not be fetched, in the same format, to try again once you have the files.")+
+      panel("Patient-reported posts",'<form class="grid" data-route="social-add"><label class="wide">Post text (several posts: separate with a line of three dashes)<textarea name="text" rows="5" required placeholder="Paste a patient or forum post that mentions a medicine and a problem"></textarea></label><label>Platform<select name="platform"><option>Reddit</option><option>X (Twitter)</option><option>Facebook</option><option>Patient forum</option><option>Other</option></select></label><label>Link to the post (optional)<input name="url" placeholder="https://"></label><label>Posted on (optional)<input name="postedAt" type="date"></label><label>Portfolio<input name="portfolio" required list="pfopts" placeholder="Type or choose"></label><label>Molecule (optional)<input name="molecule"></label><div><button class="btn">Add posts</button></div></form>',"Names, e-mail addresses, phone numbers, handles, links and ID numbers are masked before anything is stored. Posts are added by hand, never collected automatically: platform terms and privacy law restrict that. Each post is screened for events like an article, with a confidence and the reasons for it, and can become a Synchrony case marked as a patient report. Social reports are unverified and the reporter cannot be contacted.")+
       panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>'+(String(r.query||"").startsWith("PMID list")?' <button class="btn outline sm" data-unfetched="'+esc(r.id)+'">Unfetched list (TSV)</button>':"")+(data.config.accounts?' <a class="btn outline sm" href="/host/run-tiles?run='+encodeURIComponent(r.id)+'" target="_blank" rel="noopener">Tile screenshot</a>':""):""]),"No pulls yet."),"",true);
   }
   if(tab==="Synchrony"){
@@ -3696,7 +3759,7 @@ document.addEventListener("click",event=>{
       ((art.meshTerms||[]).length?'<div class="chips">'+art.meshTerms.slice(0,12).map(t=>badge(t)).join("")+'</div>':"")+
       ((art.authors||[]).length?'<div class="sub" style="margin-top:8px">'+esc(art.authors.join(", "))+'</div>':"")+
       factsHtml(art.caseFacts,active.molecules)+
-      (((art.events||[]).length)?'<div class="sub" style="margin:10px 0 4px">Detected events'+(data.config.ime&&data.config.ime.loaded?" (IME list: MedDRA "+esc(data.config.ime.version)+")":" (load the IME list in Settings to flag important medical events)")+'</div>'+art.events.map(e=>'<div class="row" style="align-items:flex-start"><span>'+(e.ime?badge("IME","red")+" ":"")+'<b>'+esc(e.term)+'</b>'+(e.withDrug?" "+badge("with "+(active.molecules[0]||"drug"),"blue"):"")+'<div class="sub">'+esc((e.kinds||[]).join(" · "))+(e.evidence?" · “"+esc(e.evidence)+"”":"")+'</div></span></div>').join(""):"")+
+      (((art.events||[]).length)?'<div class="sub" style="margin:10px 0 4px">Detected events'+(data.config.ime&&data.config.ime.loaded?" (IME list: MedDRA "+esc(data.config.ime.version)+")":" (load the IME list in Settings to flag important medical events)")+'</div>'+art.events.map(e=>'<div class="row" style="align-items:flex-start"><span>'+(e.ime?badge("IME","red")+" ":"")+'<b>'+esc(e.term)+'</b>'+(e.confidence!==undefined?" "+tbadge(Math.round(e.confidence*100)+"%",e.confidence>=0.7?"green":e.confidence>=0.45?"amber":"","Confidence: "+(e.why||[]).join("; ")):"")+(e.withDrug?" "+badge("with "+(active.molecules[0]||"drug"),"blue"):"")+'<div class="sub">'+esc((e.kinds||[]).join(" · "))+(e.evidence?" · “"+esc(e.evidence)+"”":"")+'</div></span></div>').join(""):"")+
       (artCountry(art)?'<div class="sub" style="margin:10px 0 4px">Country</div><div class="chips"><span class="badge">'+esc(artCountry(art))+' · '+esc(artCountryBasis(art))+'</span>'+(art.patientCountry?'<span class="badge">Patient: '+esc(art.patientCountry.name)+'</span>':'')+(art.affiliationCountry?'<span class="badge">Author affiliation: '+esc(art.affiliationCountry)+'</span>':'')+(art.journalCountry?'<span class="badge">Journal: '+esc(art.journalCountry)+'</span>':'')+maChip(active.molecules,artCountry(art))+'</div>':'')+
       ((art.linkOut||[]).length?'<div class="sub" style="margin:10px 0 4px">PubMed LinkOut'+(art.pubmedCitedBy!==undefined?" · cited by "+art.pubmedCitedBy+" in PubMed":"")+'</div><div class="chips">'+art.linkOut.map(l=>'<a class="badge '+(l.free?"green":"blue")+'" target="_blank" rel="noopener" href="'+esc(l.url)+'">'+esc((l.free?"Free: ":"")+l.provider)+'</a>').join("")+'</div>':"")+
       '<div style="margin-top:10px"><button type="button" class="btn outline sm" data-newcase="'+esc(active.pmid)+'">Send to Synchrony</button> '+(data.cases||[]).filter(c=>c.pmid===active.pmid).map(c=>'<a href="#" data-opencase="'+esc(c.id)+'">'+esc(c.number)+'</a>').join(" · ")+'</div>'+
@@ -3733,6 +3796,7 @@ document.addEventListener("submit",async event=>{
   button.disabled=true;message(route==="import"||route==="pull"||route==="pmid-batch"?"Retrieving PubMed citations…":"Saving…");
   try {const result=await api(route,body);if(route==="review")$("dialog").close();await refresh();
     if(route==="pull"){pullRun=result.id;drawProgress();extractRun(result.id);}
+    if(route==="social-add"){form.reset();message(result.added+" post"+(result.added===1?"":"s")+" added; personal data masked.");return;}
     if(route==="pmid-batch"){pullRun=result.run.id;drawProgress();extractRun(result.run.id);form.reset();message(result.run.count+" of "+result.requested+" article"+(result.requested===1?"":"s")+" added; looking for full texts."+(result.missing.length?" Not found in PubMed: "+result.missing.slice(0,10).join(", ")+(result.missing.length>10?"…":"")+".":""),result.missing.length>0);return;}
     if(route==="/host/invite"&&result.link)showLink("Invite link for "+body.email,(result.mailError?result.mailError+" ":"Email isn't configured. ")+"Send this link to them yourself. It works once and expires in 7 days.",result.link);
     if(route==="/host/change-password")form.reset();
@@ -3766,7 +3830,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  libraryLayout, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);

@@ -106,3 +106,11 @@ Not integrated: paperscraper's search over local dumps (bulk downloads), and its
 The batch-by-PMID idea (a file or list of PMIDs with an optional name for each, a list of what could not be fetched in the same format, retries) is integrated as **Search & Pull > Batch by PMID list**.
 What it adds over the original script: the articles enter the screening queue, assignment, event detection and Synchrony; full texts are looked up in every open and keyed source LiteraSift has (PMC, Europe PMC, Unpaywall, Semantic Scholar, CORE, preprints, optional Wiley/Elsevier text-mining with your keys) with pacing, retries and progress; duplicates are skipped; PMIDs PubMed does not know are reported; the **Unfetched list (TSV)** can be fed back in later.
 Not integrated: the original's per-publisher page scraping (it reads each publisher's HTML to find a PDF link, which depends on the caller's campus IP address and is against many publishers' terms). Its author notes that the project is no longer maintained.
+
+## DrishtiAI (524himanshu/drishti-ai, commit `d5f9492`): ideas only, no code copied
+
+The repository has no licence file, so all rights are reserved by its author and none of its code is used. LiteraSift reimplements three ideas from its README and design:
+- **Explainable event scoring:** each detected event now carries a confidence and the reasons for it (on the IME list, same sentence as the drug, causal wording, seriousness wording, MeSH adverse-effect indexing). The reasons show on hover in the review dialog and travel with the case evidence.
+- **Personal data masking:** names, e-mail addresses, phone numbers, handles, links, ID numbers and dates of birth are masked in patient-reported posts before storage (regular expressions, no model).
+- **Patient-reported source:** Search & Pull > Patient-reported posts adds posts by hand; they are screened like articles and can become Synchrony cases marked as consumer reports (unverified, reporter not contactable).
+Not built: automatic collection from X, Reddit and forums, and agent-based discovery of new communities. Platform terms and privacy law restrict that, and the data would be personal health information about identifiable people.
