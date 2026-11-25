@@ -48,14 +48,18 @@ async function pubmed(env, operation, params) {
 function allocate(state, item) {
   // A molecule owner (set by a manager) receives every article for that molecule, regardless of capacity.
   const owned = state.watches.find(w => w.owner && w.portfolio === item.portfolio && (!w.molecule || (item.molecules || []).includes(w.molecule)));
-  if (owned && state.profiles.some(p => p.email === owned.owner && p.active)) { item.reviewer = owned.owner; return; }
+  if (owned && state.profiles.some(p => p.email === owned.owner && p.active)) { item.reviewer = owned.owner; item.dueAt ||= addDays(day(), Number(state.settings?.screeningSlaDays ?? 7)); return; }
   const matches = p => p.active && (!p.portfolio || p.portfolio.toLowerCase() === item.portfolio.toLowerCase());
   let candidates = state.profiles.filter(p => p.role === "reviewer" && matches(p));
   // With no reviewers yet, managers screen their own queue so nothing sits unassigned.
   if (!state.profiles.some(p => p.role === "reviewer" && p.active)) candidates = state.profiles.filter(p => p.role === "manager" && p.active).map(p => ({ ...p, capacity:Infinity }));
-  const open = p => state.assignments.filter(a => a.reviewer === p.email && a.status !== "Complete").length;
-  const reviewer = candidates.map(p => ({ ...p, open: open(p) }))
-    .filter(p => p.open < p.capacity).sort((a, b) => a.open - b.open || a.email.localeCompare(b.email))[0];
+  // Availability (away dates), workload against capacity, and overdue work decide who gets the next item; every item gets a due date.
+  const today = day(), away = p => p.awayFrom && p.awayFrom <= today && (!p.awayUntil || p.awayUntil >= today);
+  const isOpen = a => !["Complete", "Full text needed"].includes(a.status);
+  const open = p => state.assignments.filter(a => a.reviewer === p.email && isOpen(a)).length, overdue = p => state.assignments.filter(a => a.reviewer === p.email && isOpen(a) && a.dueAt && a.dueAt < today).length;
+  const reviewer = candidates.filter(p => !away(p)).map(p => ({ ...p, open:open(p), late:overdue(p) }))
+    .filter(p => p.open < p.capacity).sort((a, b) => a.late - b.late || a.open / a.capacity - b.open / b.capacity || a.email.localeCompare(b.email))[0];
+  item.dueAt ||= addDays(today, Number(state.settings?.screeningSlaDays ?? 7));
   if (reviewer) item.reviewer = reviewer.email;
 }
 const addDays = (value, days) => new Date(Date.parse(value) + days * 86400000).toISOString().slice(0, 10);
@@ -158,6 +162,24 @@ async function importPmidList(env, list, portfolio, molecule) {
   });
   return { run, missing };
 }
+// ---- Roles and access. Roles are scoped to a portfolio: manager, screener, medical reviewer and QC. A profile with the old "reviewer" role is a screener (for its portfolio, or all).
+// The same checks apply to the interface, the API, evidence downloads and exports. ----
+const ROLES = ["manager", "screener", "medical_reviewer", "qc"];
+function rolesIn(state, email, portfolio) {
+  const out = new Set(), p = (state.profiles || []).find(x => x.email === email && x.active);
+  if (!p) return out;
+  if (p.role === "manager") out.add("manager");
+  if (p.role === "reviewer" && (!p.portfolio || p.portfolio.toLowerCase() === String(portfolio || "").toLowerCase())) out.add("screener");
+  for (const m of state.memberships || []) if (m.email === email && (m.portfolio === "*" || m.portfolio.toLowerCase() === String(portfolio || "").toLowerCase())) out.add(m.role);
+  return out;
+}
+function mayAccess(state, viewer, a) {
+  if (!viewer || !a) return false;
+  if (viewer.role === "manager") return true;
+  const r = rolesIn(state, viewer.email, a.portfolio);
+  return r.has("manager") || a.reviewer === viewer.email || a.qc?.reviewer === viewer.email || a.medicalReviewer === viewer.email || (r.has("qc") && Boolean(a.qc)) || (r.has("medical_reviewer") && a.disposition?.value === "potential_icsr");
+}
+const isPortfolioManager = (state, viewer, portfolio) => viewer?.role === "manager" || rolesIn(state, viewer?.email, portfolio).has("manager");
 // ---- Imports as restartable jobs. A search range is cut into bounded date windows; each window is searched, reconciled (count reported by PubMed against unique PMIDs retrieved)
 // and checkpointed before the next one starts, so a failure resumes where it stopped and a replay changes nothing that was already decided. ----
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -429,6 +451,245 @@ async function buildFullTextEvidence(env, articleId, status, hadText) {
     patch.parsed = { key, sha256:await sha256Hex(body), parserVersion:PARSER_VERSION, derivedFrom:record.sha256, ...parsed.counts };
   }
   return { patch, parsed, text };
+}
+// ---- Clinical extraction: patients, reporter attribution, and patient-specific product-event views. Every item links back to the exact sentence or table cell it came from,
+// with the reasons it was chosen; the original verbatim is kept apart from the normalised term and the suggested MedDRA coding. Rules, not a model: nothing is invented. ----
+const EXTRACTION_VERSION = "clinical-extraction/1";
+const DRUG_LEXICON = ["aciclovir", "acyclovir", "valaciclovir", "valacyclovir", "ganciclovir", "oseltamivir", "levetiracetam", "lorazepam", "diazepam", "midazolam", "phenytoin", "phenobarbital", "phenobarbitone", "valproate", "carbamazepine", "lacosamide", "propofol", "furosemide", "frusemide",
+  "metformin", "insulin", "amlodipine", "atenolol", "metoprolol", "bisoprolol", "lisinopril", "ramipril", "enalapril", "losartan", "telmisartan", "atorvastatin", "rosuvastatin", "simvastatin", "aspirin", "clopidogrel", "warfarin", "heparin", "enoxaparin", "paracetamol", "acetaminophen", "ibuprofen", "diclofenac", "naproxen",
+  "amoxicillin", "ceftriaxone", "cefepime", "meropenem", "vancomycin", "gentamicin", "ciprofloxacin", "levofloxacin", "azithromycin", "doxycycline", "metronidazole", "fluconazole", "amphotericin", "tacrolimus", "cyclosporine", "methotrexate", "prednisolone", "prednisone", "dexamethasone", "hydrocortisone",
+  "omeprazole", "pantoprazole", "ondansetron", "tramadol", "morphine", "fentanyl", "ketamine", "haloperidol", "olanzapine", "risperidone", "sertraline", "fluoxetine", "lithium", "digoxin", "amiodarone", "spironolactone", "hydrochlorothiazide", "allopurinol", "colchicine", "sildenafil", "ropivacaine", "bupivacaine", "lidocaine"];
+const PROCEDURE_LEXICON = ["haemodialysis", "hemodialysis", "dialysis", "haemofiltration", "hemofiltration", "intubation", "mechanical ventilation", "ventilation", "plasma exchange", "plasmapheresis", "intensive care", "icu", "eeg", "mri", "ct scan", "lumbar puncture"];
+const DRUG_SUFFIX = /\b[a-z]{4,}(?:mab|nib|pril|sartan|olol|statin|azole|cillin|mycin|vir|vudine|navir|parin|platin|tinib|zumab|ximab|caine|pam|lam|oxetine|triptan|gliptin|gliflozin|prazole|dipine|semide|thiazide|barbital|setron|profen|coxib|tidine)\b/i;
+// [term, default category, parent term when it is usually a manifestation, suggested PT (unverified unless the IME list confirms it)]
+const EVENT_LEXICON = [
+  ["status epilepticus", "ae", "", "Status epilepticus"], ["seizure", "manifestation", "status epilepticus", "Seizure"], ["seizures", "manifestation", "status epilepticus", "Seizure"], ["convulsion", "manifestation", "status epilepticus", "Convulsion"], ["convulsions", "manifestation", "status epilepticus", "Convulsion"], ["confused", "manifestation", "neurotoxicity", "Confusional state"], ["myoclonic jerks", "manifestation", "neurotoxicity", "Myoclonus"], ["encephalopathy", "ae", "", "Encephalopathy"], ["neurotoxicity", "ae", "", "Neurotoxicity"], ["nephrotoxicity", "ae", "", "Nephropathy toxic"],
+  ["renal toxicity", "ae", "", "Nephropathy toxic"], ["acute kidney injury", "ae", "", "Acute kidney injury"], ["renal failure", "ae", "", "Renal failure"], ["renal impairment", "ae", "", "Renal impairment"], ["renal insufficiency", "ae", "", "Renal impairment"], ["acute renal failure", "ae", "", "Acute kidney injury"],
+  ["hepatotoxicity", "ae", "", "Hepatotoxicity"], ["liver injury", "ae", "", "Liver injury"], ["hepatic failure", "ae", "", "Hepatic failure"], ["anaphylaxis", "ae", "", "Anaphylactic reaction"], ["rash", "ae", "", "Rash"], ["stevens-johnson syndrome", "ae", "", "Stevens-Johnson syndrome"], ["thrombocytopenia", "ae", "", "Thrombocytopenia"],
+  ["agranulocytosis", "ae", "", "Agranulocytosis"], ["pancreatitis", "ae", "", "Pancreatitis"], ["rhabdomyolysis", "ae", "", "Rhabdomyolysis"], ["hypotension", "ae", "", "Hypotension"], ["respiratory failure", "ae", "", "Respiratory failure"], ["coma", "ae", "", "Coma"], ["death", "ae", "", "Death"], ["cardiac arrest", "ae", "", "Cardiac arrest"],
+  ["confusion", "manifestation", "neurotoxicity", "Confusional state"], ["hallucinations", "manifestation", "neurotoxicity", "Hallucination"], ["hallucination", "manifestation", "neurotoxicity", "Hallucination"], ["myoclonus", "manifestation", "neurotoxicity", "Myoclonus"], ["tremor", "manifestation", "neurotoxicity", "Tremor"],
+  ["agitation", "manifestation", "neurotoxicity", "Agitation"], ["lethargy", "manifestation", "neurotoxicity", "Lethargy"], ["dysarthria", "manifestation", "neurotoxicity", "Dysarthria"], ["somnolence", "manifestation", "neurotoxicity", "Somnolence"], ["delirium", "manifestation", "neurotoxicity", "Delirium"],
+  ["oliguria", "manifestation", "renal toxicity", "Oliguria"], ["anuria", "manifestation", "renal toxicity", "Anuria"], ["nausea", "manifestation", "", "Nausea"], ["vomiting", "manifestation", "", "Vomiting"], ["headache", "manifestation", "", "Headache"], ["fever", "manifestation", "", "Pyrexia"], ["pruritus", "manifestation", "rash", "Pruritus"],
+  ["creatinine", "lab", "", ""], ["serum creatinine", "lab", "", ""], ["egfr", "lab", "", ""], ["urea", "lab", "", ""], ["alt", "lab", "", ""], ["ast", "lab", "", ""], ["bilirubin", "lab", "", ""], ["potassium", "lab", "", ""], ["sodium", "lab", "", ""], ["white cell count", "lab", "", ""], ["platelet count", "lab", "", ""],
+  ["herpes zoster encephalitis", "indication", "", ""], ["herpes zoster", "indication", "", ""], ["herpes simplex encephalitis", "indication", "", ""], ["encephalitis", "indication", "", ""], ["meningitis", "indication", "", ""], ["sepsis", "alternative", "", ""], ["chronic kidney disease", "history", "", ""], ["hypertension", "history", "", ""], ["diabetes", "history", "", ""], ["type 2 diabetes", "history", "", ""]];
+const EVENT_RE = EVENT_LEXICON.slice().sort((a, b) => b[0].length - a[0].length).map(([term, category, parent, pt]) => ({ term, category, parent, pt, re: new RegExp("\\b" + term.replace(/[-]/g, "[- ]").replace(/ /g, "\\s+") + "\\b", "gi") }));
+const HYPOTHETICAL_RE = /\b(may|might|could|can|potentially|potential|risk of|at risk|if|whether|should|would|has been reported|have been reported|been described|reported to|known to|is associated with|are associated with|can cause|may cause|is a recognised|is a recognized|literature|previous reports?|case reports? (?:have|has)|in patients with|in those with|especially in)\b/i;
+const HISTORY_RE = /\b(history of|known (?:case of|to have)?|chronic|pre-?existing|previous(?:ly)?|prior|diagnosed (?:with|in)|since \d{4}|background of|suffer(?:ed|s|ing) from|comorbid\w*|long-?standing|medical history)\b/i;
+const INDICATION_RE = /\b(for|to treat|treatment of|treating|against|prophylaxis (?:of|for)|indicated for|prescribed for|diagnosed with)\b/i;
+const ALTERNATIVE_RE = /\b(attributed to|due to|secondary to|caused by|differential|alternative (?:cause|explanation|diagnosis)|other causes?|likely cause|rather than|ruled out|excluded)\b/i;
+const TIME_RE = /\b(?:on |at |by |from )?(?:hospital )?day\s*(\d{1,3})\b|\b(\d{1,3})\s*(hours?|days?|weeks?|months?)\s+(?:after|following|later|into)\b|\bwithin\s+(\d{1,3})\s*(hours?|days?|weeks?)\b|\b(\d{1,3})\s*(hours?|days?|weeks?)\s+(?:of|after)\s+(?:starting|initiation|admission|treatment)/gi;
+const AGGREGATE_RE = /\b(?:n\s*=\s*\d+|a total of \d+ patients|\d+ patients|\d+ cases|\d+ participants|cohort|case series|series of \d+|retrospective (?:study|review)|randomi[sz]ed|trial|meta-analysis|systematic review|pooled)\b/i;
+const PATIENT_INTRO = [
+  { re: /\b(?:a|an|the|one|our)?\s*(\d{1,3})[- ]?(year|month|week|day)s?[- ]?old\s+(?:\w+\s+){0,2}?(man|woman|male|female|boy|girl|infant|child|gentleman|lady|patient)\b/i, kind: "descriptor" },
+  { re: /\b(?:patient|case|subject)\s+(\d{1,2}|[A-D]|one|two|three|four)\b/i, kind: "label" },
+  { re: /\b(?:the\s+|a\s+)?(first|second|third|fourth|another|other)\s+(?:patient|case)\b/i, kind: "ordinal" }];
+const ORDINAL = { first: 1, second: 2, third: 3, fourth: 4, one: 1, two: 2, three: 3, four: 4, A: 1, B: 2, C: 3, D: 4 };
+const sexOf = w => /^(woman|female|girl|lady)$/i.test(w) ? "Female" : /^(man|male|boy|gentleman)$/i.test(w) ? "Male" : "";
+// Units of evidence: every sentence of the title, abstract and full text (with its section), and every table row as a cell-level unit.
+function buildUnits(article, parsed, plainText) {
+  const units = []; let n = 0;
+  const add = (section, text, extra = {}) => { const t = String(text || "").trim(); if (t.length > 2) units.push({ id:"u" + (++n), section, text:t, ...extra }); };
+  for (const sentence of paperSentences(article.title || "")) add("Title", sentence);
+  for (const sentence of paperSentences(article.abstract || "")) add("Abstract", sentence);
+  if (parsed) {
+    for (const section of parsed.sections || []) { if (/^abstract/i.test(section.path || "")) continue; for (const paragraph of section.paragraphs) for (const sentence of paperSentences(paragraph)) add(section.path || section.title || "Body", sentence); }
+    for (const table of parsed.tables || []) { const header = table.rows[0] || []; table.rows.slice(1).forEach((row, i) => add((table.label || "Table") + (table.caption ? ": " + table.caption : ""), row.map((cell, j) => (header[j] ? header[j] + " = " : "") + cell).join("; "), { cell:{ table:table.label || table.id || "Table", row:i + 2, header, values:row } })); if (table.caption) add(table.label || "Table", table.caption); }
+    for (const fig of parsed.figures || []) if (fig.caption) add(fig.label || "Figure", fig.caption);
+  } else if (plainText) {
+    const parts = fullTextSections(plainText); const src = parts.length ? parts : [{ name:"Full text", text:plainText }];
+    for (const part of src) for (const sentence of paperSentences(part.text)) add(part.name, sentence);
+  }
+  return units;
+}
+const BACKGROUND_SECTION = /introduction|background|discussion|conclusion|literature|review of|mechanism/i;
+const wordsOf = text => imeNorm(text).split(" ").filter(Boolean);
+function negatedAt(sentence, matched) {
+  const norm = imeNorm(sentence), phrase = imeNorm(matched), index = norm.indexOf(phrase); if (index < 0) return false;
+  const start = norm.slice(0, index).split(" ").filter(Boolean).length;
+  return isNegated(norm.split(" ").filter(Boolean), start, start + Math.max(1, phrase.split(" ").length));
+}
+// Splits the units into patients. A patient starts where a descriptor ("54-year-old man"), a label ("Patient 2") or an ordinal ("the second patient") introduces one;
+// following sentences belong to that patient until another is introduced. Sentences that could belong to several patients are flagged instead of guessed.
+function segmentPatients(units, article) {
+  const patients = [], ambiguous = [], byKey = new Map();
+  const make = (info) => { const p = { id:"P" + (patients.length + 1), label:info.label, descriptor:{ age:info.age || "", ageUnit:info.ageUnit || "", sex:info.sex || "", label:info.labelText || "", labelText:info.labelText || "" }, introducedBy:info.unit, unitIds:[], evidence:[] }; patients.push(p); return p; };
+  let current = null, seenAggregate = false, aggregateMentions = [];
+  const caseLike = (article.pubTypes || []).some(t => /case report/i.test(t)) || units.some(u => /case (report|presentation|description)/i.test(u.section));
+  for (const unit of units) {
+    const background = BACKGROUND_SECTION.test(unit.section) && !/case/i.test(unit.section);
+    let introduced = null;
+    const dm = PATIENT_INTRO[0].re.exec(unit.text), lm = PATIENT_INTRO[1].re.exec(unit.text), om = PATIENT_INTRO[2].re.exec(unit.text);
+    const dInfo = dm && { age:dm[1], ageUnit:(dm[2] || "year").toLowerCase() + "s", sex:sexOf(dm[3]), word:dm[3] };
+    const labelNum = lm ? (ORDINAL[lm[1]] || lm[1]) : om ? (/^(another|other)$/i.test(om[1]) ? patients.length + 1 : ORDINAL[om[1].toLowerCase()]) : null;
+    if (labelNum) {
+      const key = "label" + labelNum;
+      introduced = byKey.get(key) || make({ label:"Patient " + labelNum, labelText:"Patient " + labelNum, unit:unit.id });
+      byKey.set(key, introduced);
+      if (dInfo && !introduced.descriptor.age) { Object.assign(introduced.descriptor, { age:dInfo.age, ageUnit:dInfo.ageUnit, sex:dInfo.sex }); byKey.set(dInfo.age + dInfo.ageUnit + dInfo.sex, introduced); }
+    } else if (dInfo) {
+      const key = dInfo.age + dInfo.ageUnit + dInfo.sex;
+      if (!byKey.has(key) && current && !current.descriptor.age && !current.descriptor.sex && current.unitIds.length <= 2) { Object.assign(current.descriptor, { age:dInfo.age, ageUnit:dInfo.ageUnit, sex:dInfo.sex }); byKey.set(key, current); introduced = current; }
+      else { introduced = byKey.get(key) || make({ age:dInfo.age, ageUnit:dInfo.ageUnit, sex:dInfo.sex, label:dInfo.age + "-" + dInfo.ageUnit.replace(/s$/, "") + "-old " + (dInfo.sex ? dInfo.sex.toLowerCase() : dInfo.word), unit:unit.id }); byKey.set(key, introduced); }
+    }
+    // A table row that names or describes a patient (columns such as Patient, Age, Sex) is that patient's own cell-level record.
+    if (unit.cell) {
+      const header = unit.cell.header.map(h => h.toLowerCase()), cell = name => unit.cell.values[header.findIndex(h => h.includes(name))];
+      const label = cell("patient") || cell("case"), age = cell("age"), sex = cell("sex") || cell("gender");
+      if (label || age) {
+        const ageNum = /(\d{1,3})/.exec(age || "")?.[1] || "", sx = sexOf(String(sex || "").replace(/^m$/i, "male").replace(/^f$/i, "female")), key = label ? "label" + (/\d+/.exec(label)?.[0] || label) : ageNum + "years" + sx;
+        introduced = byKey.get(key) || (ageNum && byKey.get(ageNum + "years" + sx)) || make({ age:ageNum, ageUnit:"years", sex:sx, label:label ? String(label) : (ageNum ? ageNum + "-year-old " + (sx ? sx.toLowerCase() : "patient") : "Patient"), labelText:label ? String(label) : "", unit:unit.id });
+        byKey.set(key, introduced); if (ageNum) byKey.set(ageNum + "years" + sx, introduced);
+        if (!introduced.descriptor.age && ageNum) Object.assign(introduced.descriptor, { age:ageNum, ageUnit:"years", sex:sx || introduced.descriptor.sex });
+      }
+    }
+    if (introduced) { current = introduced; if (!introduced.evidence.some(e => e.unitId === unit.id)) introduced.evidence.push({ unitId:unit.id, section:unit.section, text:unit.text, why:"introduces the patient" }); }
+    const plural = /\b(both|all|the (?:two|three|four) patients|the patients|patients (?:1|2|3)|they|their|each patient|in both)\b/i.test(unit.text) && patients.length > 1;
+    if (AGGREGATE_RE.test(unit.text) && !introduced) { seenAggregate = true; aggregateMentions.push({ unitId:unit.id, section:unit.section, text:unit.text }); }
+    if (background && !introduced) continue;
+    if (!current) { if (caseLike && /\b(patient|he|she|his|her)\b/i.test(unit.text)) { current = make({ label:"Patient", labelText:"", unit:unit.id }); byKey.set("anon", current); } else continue; }
+    if (plural) { ambiguous.push({ unitId:unit.id, text:unit.text, reason:"This sentence refers to several patients; it is not attributed to any one of them." }); continue; }
+    if (!introduced && patients.length > 1 && /\b(the patient|patient)\b/i.test(unit.text) && !/\b(he|she|his|her)\b/i.test(unit.text) === false) { /* pronoun continuation is attributed to the patient most recently introduced */ }
+    current.unitIds.push(unit.id);
+  }
+  // Single-patient papers: sentences before the introduction (title, abstract) that describe the case belong to the only patient.
+  if (patients.length === 1) { const only = patients[0]; for (const unit of units) if (!only.unitIds.includes(unit.id) && ["Title", "Abstract"].includes(unit.section) && !BACKGROUND_SECTION.test(unit.section)) only.unitIds.push(unit.id); only.unitIds.sort((a, b) => Number(a.slice(1)) - Number(b.slice(1))); }
+  const individual = patients.filter(p => p.descriptor.age || p.descriptor.labelText || p.descriptor.sex);
+  const aggregateOnly = (seenAggregate || !patients.length) && !individual.length;
+  return { patients, ambiguous, aggregateOnly, aggregateMentions:aggregateMentions.slice(0, 10) };
+}
+const timeOf = text => { const out = []; for (const m of String(text).matchAll(TIME_RE)) out.push(m[1] ? { day:Number(m[1]), text:m[0].trim() } : m[2] ? { offset:Number(m[2]), unit:m[3].replace(/s$/, ""), text:m[0].trim() } : { within:Number(m[4] || m[5]), unit:(m[6] || m[5] && "day").toString().replace(/s$/, ""), text:m[0].trim() }); return out; };
+// The time marker that belongs to a mention: the nearest one after the term inside the same clause, else the nearest before it.
+function timeNear(text, start, end) {
+  const marks = []; for (const m of String(text).matchAll(TIME_RE)) marks.push({ at:m.index, end:m.index + m[0].length, t:m[1] ? { day:Number(m[1]), text:m[0].trim() } : m[2] ? { offset:Number(m[2]), unit:m[3].replace(/s$/, ""), text:m[0].trim() } : { within:Number(m[4] || m[5]), unit:(m[6] || "day").replace(/s$/, ""), text:m[0].trim() } });
+  const clause = (a, b) => !/[;]|\b(?:and|but|while|then|whereas)\b/i.test(text.slice(Math.min(a, b), Math.max(a, b)).replace(/^\W+/, "")) ;
+  const after = marks.filter(x => x.at >= end && clause(end, x.at)).sort((a, b) => a.at - b.at)[0], before = marks.filter(x => x.end <= start && !/[;.]/.test(text.slice(x.end, start))).sort((a, b) => b.end - a.end)[0];
+  return (after || before)?.t || null;
+}
+const findDates = text => [...String(text).matchAll(DATE_RE)].map(m => isoFromParts(m)).filter(Boolean);
+// Drugs and events for one patient, from that patient's own sentences only. Timelines and exposures therefore never mix between patients.
+function extractForPatient(patient, units, ctx) {
+  const mine = patient.unitIds.map(id => units.find(u => u.id === id)).filter(Boolean), suspectNames = new Set((ctx.molecules || []).map(m => m.toLowerCase()));
+  const knownDrugs = uniq([...DRUG_LEXICON, ...(ctx.dictionaryNames || []).map(x => x.toLowerCase()), ...suspectNames]);
+  const drugs = new Map(), events = new Map(), timeline = [], procedures = new Map();
+  const addDrug = (name, unit, role, why, extra = {}) => {
+    const key = name.toLowerCase(), entry = drugs.get(key) || { name, normalized:key, role:"", roleReasons:[], mentions:[], dose:"", route:"", frequency:"", start:null, stop:null };
+    const rank = { suspect:5, interacting:4, treatment:3, prior:2, concomitant:1, "":0 };
+    if (rank[role] > rank[entry.role]) entry.role = role;
+    entry.roleReasons.push({ role, why, unitId:unit.id }); if (!entry.mentions.some(m => m.unitId === unit.id)) entry.mentions.push({ unitId:unit.id, section:unit.section, sentence:unit.text });
+    Object.assign(entry, Object.fromEntries(Object.entries(extra).filter(([, v]) => v && !entry[Object.keys(extra).find(k => extra[k] === v)])));
+    drugs.set(key, entry); return entry;
+  };
+  const doseNear = (text, name) => { const i = text.toLowerCase().indexOf(name.toLowerCase()); const seg = text.slice(i, i + 140); return { dose:/(\d+(?:\.\d+)?\s?(?:mg\/kg|mg|g|mcg|µg|ml|mL|units?|IU)(?:\/(?:kg|day|dose))?)/i.exec(seg)?.[1] || "", route:/\b(oral(?:ly)?|intravenous(?:ly)?|iv|intramuscular|subcutaneous|topical|intrathecal|inhaled)\b/i.exec(seg)?.[1] || "", frequency:/\b(once|twice|three times|four times|\d+ times)\s+(?:daily|a day|per day)|\b(?:q\d+h|bid|tid|qid|od)\b|every \d+ hours/i.exec(seg)?.[0] || "" }; };
+  mine.forEach((unit, index) => {
+    const text = unit.text, lower = text.toLowerCase(), background = BACKGROUND_SECTION.test(unit.section) && !/case/i.test(unit.section);
+    // ---- drugs ----
+    const found = [];
+    for (const name of knownDrugs) { const m = new RegExp("\\b" + name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i").exec(text); if (m) found.push({ name:m[0], at:m.index }); }
+    for (const m of text.matchAll(/\b(?:received|given|started on|started|commenced on|commenced|treated with|managed with|administered|prescribed|taking|on|using|switched to)\s+(?:intravenous\s+|oral\s+)?([A-Za-z][A-Za-z-]{4,})/gi)) if (DRUG_SUFFIX.test(m[1]) && !found.some(f => f.name.toLowerCase() === m[1].toLowerCase())) found.push({ name:m[1], at:m.index + m[0].length - m[1].length });
+    const eventAfter = /\b(?:developed|presented with|experienced|complained of|noted|had|became|progressed to|complicated by|resulted in|led to|suffered)\b/i.test(text);
+    for (const f of found) {
+      const isSuspect = suspectNames.has(f.name.toLowerCase()) && !background;
+      let role = "concomitant", why = "mentioned with this patient";
+      if (isSuspect) { role = "suspect"; why = "the product this assignment is about"; }
+      else if (/\b(previous(?:ly)?|prior|formerly|had been (?:on|taking|treated)|history of use|discontinued .* (?:months?|years?) (?:ago|earlier|before))\b/i.test(text)) { role = "prior"; why = "described as earlier treatment"; }
+      else if (/\binteract\w*|co-?administ\w*|concomitant use|combined with|in combination with|coadministration/i.test(text) && found.length > 1) { role = "interacting"; why = "sentence describes an interaction or co-administration"; }
+      else if (/\b(treated with|managed with|was given|were given|administered|started on|commenced on|loaded with|controlled with|received)\b/i.test(text) && index > 0 && events.size && !isSuspect) { role = "treatment"; why = "given after an event, to treat it"; }
+      else if (/\b(also (?:taking|receiving|on|prescribed)|medications? (?:included|were)|concurrent|concomitant|regular(?:ly)? (?:taking|on)|on long-?term)\b/i.test(text)) { role = "concomitant"; why = "listed as another medicine the patient took"; }
+      addDrug(f.name, unit, role, why, doseNear(text, f.name));
+      for (const d of findDates(text.slice(f.at, f.at + 160))) { const e = drugs.get(f.name.toLowerCase()); if (!e.start && /\b(start|began|commenc|initiat|admitted|received|prescribed)\w*/i.test(text)) e.start = { date:d, unitId:unit.id }; }
+      if (/\b(stopped|discontinued|withdrawn|ceased|held|interrupted|suspended)\b/i.test(text) && !/\b(not|never)\s+(?:been\s+)?(?:stopped|discontinued|withdrawn)\b/i.test(text)) { const e = drugs.get(f.name.toLowerCase()), tail = /\b(?:stopped|discontinued|withdrawn|ceased|held|interrupted|suspended)\b\s*(?:on |at |after |from )?(?:hospital )?(?:day\s*(\d{1,3})\b)?/i.exec(text), date = /\b(?:stopped|discontinued|withdrawn|ceased|held)\b[^.]{0,20}/i.test(text) ? findDates(text.slice(tail ? tail.index : 0))[0] : null; if (!e.stop) e.stop = { ...(tail?.[1] ? { day:Number(tail[1]) } : {}), ...(date ? { date } : {}), unitId:unit.id, action:/interrupt|held|suspend/i.test(text) ? "interrupted" : "withdrawn" }; }
+      for (const t of timeOf(text.slice(f.at, f.at + 120))) { const e = drugs.get(f.name.toLowerCase()); if (t.day && /\b(start|began|commenc|initiat|received|prescrib|admitted)\w*/i.test(text) && !e.start) e.start = { day:t.day, unitId:unit.id }; }
+    }
+    for (const proc of PROCEDURE_LEXICON) { const m = new RegExp("\\b" + proc + "\\b", "i").exec(text); if (m) { const e = procedures.get(proc) || { name:m[0], mentions:[] }; e.mentions.push({ unitId:unit.id, sentence:text }); procedures.set(proc, e); } }
+    // ---- events ----
+    const taken = [];
+    for (const lex of EVENT_RE) {
+      lex.re.lastIndex = 0; let m;
+      while ((m = lex.re.exec(text))) {
+        const start = m.index, end = start + m[0].length;
+        if (taken.some(([a, b]) => start < b && a < end)) continue;
+        taken.push([start, end]);
+        const before = text.slice(Math.max(0, start - 70), start), after = text.slice(end, end + 50), around = before + " " + after;
+        const negated = negatedAt(text, m[0]);
+        const hypothetical = background || (HYPOTHETICAL_RE.test(before.slice(-45)) && !/\b(he|she|the patient|our patient)\b/i.test(text)) || /\b(known|recognised|recognized) (?:complication|side effect|adverse)/i.test(text);
+        let category = lex.category;
+        const reasons = [];
+        if (category === "ae" || category === "manifestation") {
+          if (HISTORY_RE.test(before.slice(-40))) { category = "history"; reasons.push("introduced as past history"); }
+          else if (/\b(for|to treat|treatment of|treating|prophylaxis)\s+(?:\w+\s+){0,3}$/i.test(before) && found.some(f => suspectNames.has(f.name.toLowerCase()))) { category = "indication"; reasons.push("the reason the drug was given"); }
+          else if (ALTERNATIVE_RE.test(before.slice(-50)) && !/\b(aciclovir|acyclovir)\b/i.test(before.slice(-50))) { category = "alternative"; reasons.push("named as a possible other cause"); }
+        } else if (category === "history" && !HISTORY_RE.test(before.slice(-40)) && eventAfter) { category = "ae"; reasons.push("new in this episode"); }
+        else if (category === "indication" && !INDICATION_RE.test(before.slice(-50)) && !/\b(diagnosed|presented with|admitted with)\b/i.test(before.slice(-40))) { category = lex.parent ? "manifestation" : "ae"; }
+        else if (category === "alternative" && !ALTERNATIVE_RE.test(before.slice(-50) + after)) { category = "alternative"; }
+        const key = lex.term.replace(/s$/, "") + "|" + category, entry = events.get(key) || { id:null, term:lex.term, normalized:lex.term.replace(/^seizures$/, "seizure"), category, parent:lex.parent, verbatim:m[0], mentions:[], reasons:[], negated:false, hypothetical:false, suggested:{ pt:lex.pt || "", code:"", soc:"", llt:null, source:lex.pt ? "LiteraSift lexicon (unverified)" : "" } };
+        entry.mentions.push({ unitId:unit.id, section:unit.section, sentence:text, start, end, verbatim:m[0], cell:unit.cell ? { table:unit.cell.table, row:unit.cell.row } : null, negated, hypothetical });
+        entry.negated = entry.negated || negated; entry.hypothetical = entry.hypothetical || hypothetical;
+        for (const r of reasons) if (!entry.reasons.includes(r)) entry.reasons.push(r);
+        events.set(key, entry);
+        if (["ae", "manifestation", "lab"].includes(category) && !negated && !hypothetical) {
+          const near = timeNear(text, start, end);
+          if (near && !timeline.some(x => x.text === lex.term && x.unitId === unit.id)) timeline.push({ kind:category === "lab" ? "lab" : "event", text:lex.term, when:near, unitId:unit.id, sentence:text });
+          if (!near && findDates(text).length) timeline.push({ kind:category === "lab" ? "lab" : "event", text:lex.term, when:{ date:findDates(text)[0], text:findDates(text)[0] }, unitId:unit.id, sentence:text });
+          const outcome = /\b(resolved|recovered|improved|subsided|normali[sz]ed|died|death|fatal|persist\w*|ongoing)\b/i.exec(after + " " + before.slice(-25))?.[0]; if (outcome && !entry.outcome) entry.outcome = { text:eventOutcome(text) || outcome, unitId:unit.id, sentence:text };
+        }
+      }
+    }
+  });
+  // Name each event, decide what it is, and say why. Manifestations of a named parent event stay manifestations until a reviewer promotes them.
+  const list = [...events.values()]; let n = 0;
+  for (const e of list) {
+    e.id = patient.id + ":e" + (++n);
+    const suspectHere = [...drugs.values()].some(d => d.role === "suspect" && d.mentions.some(m => e.mentions.some(x => x.unitId === m.unitId)));
+    if (e.category === "manifestation") { const parent = list.find(p => p !== e && p.category === "ae" && (p.term === e.parent || p.normalized === e.parent || (e.parent === "neurotoxicity" && /encephalopathy|neurotox|status epilepticus/.test(p.term)) || (e.parent === "renal toxicity" && /renal|kidney|nephro/.test(p.term)))); if (parent) { e.parentId = parent.id; e.reasons.push("a manifestation of " + parent.term + ", named in this patient's record"); } else { e.category = "ae"; e.reasons.push("named on its own, with no broader diagnosis for this patient"); } }
+    if (e.category === "ae") { e.reasons.push(e.negated ? "the text says it did not happen" : e.hypothetical ? "only described as a possibility or as background" : "stated as happening to this patient"); if (suspectHere) e.reasons.push("same passage as the suspect drug"); }
+    if (e.category === "lab") e.reasons.push("a laboratory finding; it supports an event but is not itself one");
+    e.status = e.negated ? "negated" : e.hypothetical ? "hypothetical" : e.category === "ae" ? "candidate" : e.category;
+    const first = timeline.find(t => t.text === e.term && (t.when.day !== undefined || t.when.date) && t.kind !== "lab"), suspectStart = [...drugs.values()].find(d => d.role === "suspect")?.start;
+    if (first) { e.onset = first.when.date ? { date:first.when.date, unitId:first.unitId } : { day:first.when.day, unitId:first.unitId }; if (e.onset.day !== undefined && suspectStart?.day !== undefined) e.timeToOnset = { days:e.onset.day - suspectStart.day, text:(e.onset.day - suspectStart.day) + " day" + (Math.abs(e.onset.day - suspectStart.day) === 1 ? "" : "s") + " after the suspect drug was started (day " + e.onset.day + " vs day " + suspectStart.day + ")" }; }
+    e.confidence = Math.max(0.1, Math.min(0.95, 0.4 + (suspectHere ? 0.2 : 0) + (e.category === "ae" ? 0.2 : 0) - (e.hypothetical ? 0.3 : 0) - (e.negated ? 0.4 : 0) + (e.mentions.length > 1 ? 0.1 : 0)));
+    const ime = ctx.ime?.byName.get(imeNorm(e.suggested.pt || e.term)) || ctx.ime?.byName.get(imeNorm(e.term));
+    if (ime) { e.suggested = { pt:ime.name, code:ime.code || "", soc:ime.soc || "", llt:null, source:"EMA IME list, MedDRA " + (ctx.ime.info.version || "?") }; e.ime = true; e.reasons.push("on the EMA IME list (important medical event)"); }
+  }
+  // Roles for drugs that were never classified more precisely: the product being assessed is the suspect; everything else the patient took is concomitant.
+  for (const d of drugs.values()) if (!d.role) d.role = "concomitant";
+  const startDay = [...drugs.values()].find(d => d.role === "suspect")?.start;
+  const days = list.filter(e => e.category === "ae" && !e.negated && !e.hypothetical).map(e => ({ id:e.id, term:e.term, day:timeline.find(t => t.text === e.term && t.when.day)?.when.day ?? null, date:timeline.find(t => t.text === e.term && t.when.date)?.when.date ?? null }));
+  const ordered = timeline.filter(t => !t.when.within).sort((a, b) => (a.when.day ?? 999) - (b.when.day ?? 999));
+  return { id:patient.id, label:patient.label, descriptor:patient.descriptor, units:patient.unitIds, evidence:patient.evidence, drugs:[...drugs.values()], procedures:[...procedures.values()], events:list, timeline:ordered, eventOnsets:days, exposureStart:startDay || null };
+}
+// Reporter attribution for literature: authors, correspondence contacts, quoted clinicians and patients are different kinds of people and are kept apart.
+function attributeReporters(article, parsed, units) {
+  const authors = (parsed?.authors?.length ? parsed.authors : (article.authorDetails || (article.authors || []).map(name => ({ name, affiliations:[], email:"", corresponding:false })))).map((a, i) => ({ role:i === 0 ? "first author" : "author", name:a.name, affiliations:a.affiliations || [], email:a.email || "", corresponding:Boolean(a.corresponding) }));
+  const corresponding = authors.filter(a => a.corresponding || a.email), contacts = parsed?.correspondenceEmails || [];
+  const quoted = []; for (const u of units) for (const m of u.text.matchAll(/\b(?:Dr\.?|Prof(?:essor)?\.?)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)|\b(?:the )?(treating|attending|consulting|referring)\s+(nephrologist|neurologist|physician|clinician|doctor|surgeon|pharmacist|nurse)\b/g)) quoted.push({ role:"quoted clinician (not a reporter)", name:m[1] || (m[2] + " " + m[3]), unitId:u.id, sentence:u.text });
+  const patientVoice = units.filter(u => /\b(?:the patient|he|she)\s+(?:reported|stated|said|told|described|complained)\b/i.test(u.text)).slice(0, 3).map(u => ({ role:"patient (source of a statement, not a reporter)", unitId:u.id, sentence:u.text }));
+  const flags = [];
+  if (!authors.length) flags.push("No author metadata was retrieved, so no reporter can be identified from the publication.");
+  else if (!corresponding.length && !contacts.length) flags.push("No corresponding author or contact address was found; the first author is used as the reporter and needs confirmation.");
+  if (authors.length && !authors.some(a => a.affiliations.length || article.affiliation)) flags.push("No affiliation is available for any author, so the reporter's country and organisation are unknown.");
+  if (authors.length > 1 && corresponding.length > 1) flags.push("More than one author is marked as corresponding; choose the reporter.");
+  const candidates = authors.filter(a => a.corresponding).concat(authors.filter(a => !a.corresponding)).slice(0, 5);
+  return { authors, correspondence:parsed?.correspondence || [], correspondenceEmails:contacts, candidates, quoted:quoted.slice(0, 8), patientVoice, flags, status:!authors.length ? "missing" : flags.length ? "uncertain" : "supported" };
+}
+async function extractClinical(env, article, state) {
+  let parsed = null, plain = "";
+  if (article.evidence?.parsed?.key) { const o = await env.BUCKET.get(article.evidence.parsed.key); if (o) parsed = JSON.parse(await o.text()); }
+  if (!parsed && article.fullTextTextKey) { const o = await env.BUCKET.get(article.fullTextTextKey); if (o) plain = await o.text(); }
+  const units = buildUnits(article, parsed, plain), seg = segmentPatients(units, article);
+  const assignments = state.assignments.filter(a => a.pmid === article.id), molecules = uniq(assignments.flatMap(a => a.molecules || []));
+  const dictionaryNames = uniq(assignments.flatMap(a => { const d = state.dictionaries?.[a.portfolio]; return d ? d.products.flatMap(dictNames) : []; }));
+  const ime = await loadIme(env);
+  const ctx = { molecules, dictionaryNames, ime }, patients = seg.patients.map(p => extractForPatient(p, units, ctx));
+  const reporters = attributeReporters(article, parsed, units);
+  return { version:EXTRACTION_VERSION, createdAt:new Date().toISOString(), pmid:article.id, units:units.length, patients, ambiguous:seg.ambiguous, aggregateOnly:seg.aggregateOnly, aggregateMentions:seg.aggregateMentions, reporters, source:{ parsedJats:Boolean(parsed), plainText:Boolean(plain), fullTextSha256:article.evidence?.fulltext?.sha256 || null },
+    unitIndex:Object.fromEntries(units.map(u => [u.id, { section:u.section, text:u.text, cell:u.cell ? { table:u.cell.table, row:u.cell.row } : null }])) };
+}
+// Central monitoring counts for the dashboard, scoped to what the viewer may see.
+function monitoringCounts(state, viewer) {
+  const today = day(), scope = state.assignments.filter(a => mayAccess(state, viewer, a)), open = a => !["Complete", "Full text needed"].includes(a.status);
+  const runs = viewer?.role === "manager" ? state.runs : state.runs.filter(r => scope.some(a => a.portfolio === r.portfolio));
+  return { importGaps:runs.filter(r => (r.gaps || []).length).length, pendingEvidence:uniq(scope.map(a => a.pmid)).filter(id => state.articles[id] && !isFinalEvidence(evidenceStatus(state.articles[id]))).length,
+    unassigned:scope.filter(a => !a.reviewer).length, overdue:scope.filter(a => open(a) && a.dueAt && a.dueAt < today).length, qcReturned:scope.filter(a => a.qc?.status === "returned").length, qcPending:scope.filter(a => a.qc?.status === "pending").length };
 }
 const safetyFilter = '("adverse effects"[sh] OR "drug-related side effects and adverse reactions"[MeSH Terms] OR safety[tiab] OR toxicity[tiab] OR "adverse event*"[tiab] OR "adverse reaction*"[tiab] OR "adverse drug reaction*"[tiab] OR "side effect*"[tiab])';
 function buildQuery(names, safetyOnly) {
@@ -1065,7 +1326,7 @@ async function exportPdf(env, state, viewer, manager, body) {
   if (body.layout === true || body.layout === "country") for (const e of libraryLayout(state, body.layout === "country" ? "country" : "range")) if (!numbering.has(e.pmid)) numbering.set(e.pmid, e);
   for (const id of wanted) {
     const article = state.articles[id];
-    const item = state.assignments.find(a => a.pmid === id && (manager || a.reviewer === viewer.email));
+    const item = state.assignments.find(a => a.pmid === id && mayAccess(state, viewer, a));
     if (!article || !item) continue;
     // A PDF always carries an up-to-date snapshot: one made before the current record-card layout is taken again first (needs the screenshot service on the server).
     let fresh = article;
@@ -1285,7 +1546,8 @@ function isNegated(words, start, end) {
 const EVENT_VERSION = 5;
 // Candidate adverse events in the title and abstract, each with the sentence that supports it. IME terms come first.
 // ---- Verbatim phraser: finds the exact words the article used for an event, the sentence around them and the section they sit in ----
-const paperSentences = text => String(text || "").replace(/[ \t]+/g, " ").split(/(?<=[.!?])\s+(?=[A-Z(\[])|\n+/).map(s => s.trim()).filter(s => s.length > 3);
+// Abbreviations such as "Dr." or "et al." do not end a sentence.
+const paperSentences = text => String(text || "").replace(/[ \t]+/g, " ").replace(/\b(Dr|Prof|Mr|Mrs|Ms|St|vs|al|e\.g|i\.e|approx|Fig|No)\.(?=\s)/g, "$1\u0001").split(/(?<=[.!?])\s+(?=[A-Z(\[])|\n+/).map(s => s.replaceAll("\u0001", ".").trim()).filter(s => s.length > 3);
 const HEADING_RE = /^(abstract|introduction|background|case (report|presentation|description|summary|history)|patient (information|presentation)|clinical (course|presentation)|history of present illness|methods?|results?|discussion|conclusions?|outcome( and follow[- ]up)?|follow[- ]up|investigations?|diagnosis|treatment|timeline|references)\s*:?$/i;
 const NARRATIVE_RE = /case|patient|clinical|history|course|presentation|outcome|follow|timeline|investigation|diagnos|treatment|results?$/i, SKIP_RE = /^(references|introduction|background|discussion|methods?|abstract|conclusions?)$/i;
 const PATIENT_RE = /\b(patient|he|she|his|her|man|woman|boy|girl|infant|neonate|year[- ]old|month[- ]old|admitted|presented)\b/i;
@@ -2198,7 +2460,7 @@ async function exportFullTexts(env, state, viewer, manager, body) {
   if (body.layout === true || body.layout === "country") for (const e of libraryLayout(state, body.layout === "country" ? "country" : "range")) (folders.get(e.pmid) || folders.set(e.pmid, []).get(e.pmid)).push({ prefix:e.folder + "/", tag:libTag(e) + "_" });
   for (const id of ids) {
     const article = state.articles[id];
-    if (!article || !state.assignments.some(a => a.pmid === id && (manager || a.reviewer === viewer.email))) continue;
+    if (!article || !state.assignments.some(a => a.pmid === id && mayAccess(state, viewer, a))) continue;
     for (const { prefix, tag } of folders.size ? (folders.get(id) || [{ prefix:"Unfiled/", tag:"" }]) : [{ prefix:"", tag:"" }]) {
       const names = [];
       for (const [key, name] of [[article.fullTextKey, tag + "PMID_" + id + "." + (/\.(\w+)$/.exec(article.fullTextKey || "")?.[1] || "bin")], [article.fullTextTextKey, tag + "PMID_" + id + "_text.txt"]]) {
@@ -2580,10 +2842,11 @@ async function apiCore(request, env, path) {
   const manager = viewer?.role === "manager";
   if (!viewer && !service) return json({ error:"Your account needs a Literature Bench profile." }, 403);
   if (request.method === "GET" && path === "/api/state") {
-    const assignments = state.assignments.filter(a => manager || a.reviewer === email).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
+    const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
       cases:await Promise.all((state.cases || []).filter(c => manager || c.createdBy === email || c.assignee === email).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
-      dictionaries:manager ? (state.dictionaries || {}) : {},
+      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [],
+      monitoring:monitoringCounts(state, viewer),
       series:seriesSummary((state.cases || []).filter(c => manager || c.createdBy === email || c.assignee === email)), config:{ retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
@@ -2594,7 +2857,7 @@ async function apiCore(request, env, path) {
     const id = path.split("/").pop();
     const article = state.articles[id];
     const key = path.startsWith("/api/screenshot/") ? article?.screenshotKey : article?.fullTextKey;
-    if ((!manager && !state.assignments.some(a=>a.pmid===id && a.reviewer===email)) || !key) return json({error:"File unavailable."},404);
+    if (!state.assignments.some(a => a.pmid===id && mayAccess(state, viewer, a)) || !key) return json({error:"File unavailable."},404);
     const object = await env.BUCKET.get(key);
     if (!object) return json({error:"File unavailable."},404);
     await audit(env, { by:email, action:path.startsWith("/api/screenshot/") ? "download.snapshot" : "download.fulltext", target:"PMID " + id, detail:article?.fullTextOrigin || "" });
@@ -2622,7 +2885,7 @@ async function apiCore(request, env, path) {
   if (path === "/api/review" && viewer) {
     if (!["Pending","In review","Complete","Full text needed"].includes(body.status)) return json({error:"Invalid status."},400);
     const reviewed = await write(env, data => {
-      const item = data.assignments.find(a => a.id === body.id && (manager || a.reviewer === email));
+      const item = data.assignments.find(a => a.id === body.id && mayAccess(state, viewer, a));
       if (!item) throw new Error("Assignment unavailable.");
       if (activeSignature(item)) throw new Error("This decision is signed. A manager must supersede the signature before it can change.");
       const before = item.status;
@@ -2636,7 +2899,7 @@ async function apiCore(request, env, path) {
   }
   if (path === "/api/fulltext-upload" && viewer) {
     // For articles behind a paywall: the user supplies the full text from their own licensed access (library, publisher site, author), as a PDF, an XML file, or pasted text.
-    const id = String(body.pmid || ""), item = state.assignments.find(a => a.pmid === id && (manager || a.reviewer === email)), article = item && state.articles[id];
+    const id = String(body.pmid || ""), item = state.assignments.find(a => a.pmid === id && mayAccess(state, viewer, a)), article = item && state.articles[id];
     if (!article) return json({ error:"Article not found in your queue." }, 404);
     let bytes = null, text = "", ext = "txt", type = "text/plain; charset=utf-8";
     if (body.base64) {
@@ -2664,14 +2927,101 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"upload.fulltext", target:"PMID " + id, detail:{ type:ext, bytes:bytes.length, text_read:Boolean(text) } });
     return json({ ok:true, textRead:Boolean(text), events:(status.events || []).length });
   }
+  if (["/api/disposition", "/api/qc-decision", "/api/reassign", "/api/membership-save", "/api/extract", "/api/extraction-decide", "/api/allocate-bulk"].includes(path) && viewer) {
+    const today = day(), at = new Date().toISOString();
+    const EXCLUSION_REASONS = ["No individual patient (aggregate or study data only)", "No adverse event", "No suspect product", "Not a drug safety report (review, background, or editorial)", "Duplicate of another record", "Outside the portfolio scope", "Other (explain in the note)"];
+    if (path === "/api/membership-save") {
+      if (!manager) return json({ error:"Manager access required." }, 403);
+      const target = String(body.email || "").trim().toLowerCase(), portfolio = String(body.portfolio || "*").trim() || "*", role = String(body.role || "");
+      if (!state.profiles.some(p => p.email === target) || !ROLES.includes(role)) return json({ error:"Choose a team member and a role (" + ROLES.join(", ") + ")." }, 400);
+      if (portfolio !== "*" && !state.watches.some(w => w.portfolio === portfolio) && !state.assignments.some(a => a.portfolio === portfolio)) return json({ error:"Unknown portfolio." }, 400);
+      await write(env, data => { data.memberships = (data.memberships || []).filter(m => !(m.email === target && m.portfolio === portfolio && m.role === role)); if (body.remove !== true) data.memberships.push({ email:target, portfolio, role, by:email, at }); });
+      await audit(env, { by:email, action:body.remove === true ? "access.membership_removed" : "access.membership_added", target:target, detail:{ portfolio, role } });
+      return json({ ok:true });
+    }
+    if (path === "/api/reassign" || path === "/api/allocate-bulk") {
+      const ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), reason = String(body.reason || "").trim();
+      const wanted = path === "/api/allocate-bulk" ? state.assignments.filter(a => !a.reviewer && (!body.portfolio || a.portfolio === body.portfolio)) : state.assignments.filter(a => ids.has(a.id));
+      if (!wanted.length) return json({ error:"Nothing to allocate." }, 400);
+      if (wanted.some(a => !isPortfolioManager(state, viewer, a.portfolio))) return json({ error:"Manager access required for this portfolio." }, 403);
+      if (path === "/api/reassign") {
+        const to = String(body.to || "").trim().toLowerCase();
+        if (reason.length < 5) return json({ error:"Give a reason of at least 5 characters for the reassignment." }, 400);
+        if (!state.profiles.some(p => p.email === to && p.active)) return json({ error:"Choose an active team member." }, 400);
+        const moved = [];
+        await write(env, data => { for (const a of wanted) { const item = data.assignments.find(x => x.id === a.id); if (item.reviewer === to) continue; (item.history ||= []).push({ status:item.status, note:"Reassigned from " + (item.reviewer || "nobody") + " to " + to + ": " + reason.slice(0, 200), by:email, at }); item.reviewer = to; moved.push(item.pmid); } });
+        await audit(env, { by:email, action:"review.reassigned", entityType:"Assignment", entityId:moved.length + " assignment" + (moved.length === 1 ? "" : "s"), detail:{ to, reason:reason.slice(0, 300), pmids:moved.slice(0, 100).join(", ") } });
+        return json({ ok:true, moved:moved.length });
+      }
+      const moved = [];
+      await write(env, data => { for (const a of wanted) { const item = data.assignments.find(x => x.id === a.id); allocate(data, item); if (item.reviewer) { moved.push(item.pmid); (item.history ||= []).push({ status:item.status, note:"Allocated to " + item.reviewer + " (automatic)", by:email, at }); } } });
+      await audit(env, { by:email, action:"review.allocated", entityType:"Assignment", entityId:moved.length + " assignments", detail:{ portfolio:body.portfolio || "all" } });
+      return json({ ok:true, allocated:moved.length, unallocated:wanted.length - moved.length });
+    }
+    const item = state.assignments.find(a => a.id === body.id);
+    if (!item || !mayAccess(state, viewer, item)) return json({ error:"Assignment not found." }, 404);
+    const pm = isPortfolioManager(state, viewer, item.portfolio), isScreener = item.reviewer === email;
+    if (path === "/api/extract") {
+      const article = state.articles[item.pmid]; if (!article) return json({ error:"Article not found." }, 404);
+      let extraction = article.extraction;
+      if (!extraction || body.refresh === true || extraction.version !== EXTRACTION_VERSION || extraction.source?.fullTextSha256 !== (article.evidence?.fulltext?.sha256 || null)) {
+        extraction = await extractClinical(withSettings(env, state), article, state);
+        await write(env, data => { if (data.articles[item.pmid]) data.articles[item.pmid].extraction = extraction; });
+      }
+      return json({ extraction, decisions:item.extractionDecisions || {}, patientDecisions:item.patientDecisions || {} });
+    }
+    if (path === "/api/extraction-decide") {
+      if (!isScreener && !pm && !rolesIn(state, email, item.portfolio).has("medical_reviewer")) return json({ error:"Only the assigned reviewer, a medical reviewer or a manager can decide this." }, 403);
+      const action = String(body.action || ""), reason = String(body.reason || "").trim().slice(0, 300), key = String(body.eventId || body.patientId || "");
+      if (!["promote", "exclude", "reset"].includes(action) || !key) return json({ error:"Choose promote, exclude or reset for an event or patient." }, 400);
+      if (action === "exclude" && reason.length < 3) return json({ error:"Give a reason for excluding it." }, 400);
+      const extraction = state.articles[item.pmid]?.extraction, known = new Set([...(extraction?.patients || []).flatMap(p => [p.id, ...p.events.map(e => e.id)])]);
+      if (!known.has(key)) return json({ error:"That event or patient is not in the extraction. Refresh it first." }, 404);
+      await write(env, data => { const a = data.assignments.find(x => x.id === item.id), bucket = body.patientId ? (a.patientDecisions ||= {}) : (a.extractionDecisions ||= {}); if (action === "reset") delete bucket[key]; else bucket[key] = { action, reason, by:email, at }; });
+      await audit(env, { by:email, action:"extraction.decision", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ item:key, action, reason, portfolio:item.portfolio } });
+      return json({ ok:true });
+    }
+    if (path === "/api/disposition") {
+      if (!isScreener && !pm) return json({ error:"Only the assigned screener or a manager can record a disposition." }, 403);
+      if (item.qc?.status === "pending" && !pm) return json({ error:"This disposition is waiting for QC; it cannot change until QC decides." }, 409);
+      const value = String(body.value || ""), reason = String(body.reason || "").trim(), note = String(body.note || "").trim().slice(0, 1000);
+      if (!["potential_icsr", "full_text_needed", "aggregate_safety", "excluded"].includes(value)) return json({ error:"Choose potential ICSR, full text needed, aggregate safety relevance, or exclude." }, 400);
+      if (value === "excluded" && (!EXCLUSION_REASONS.includes(reason) || (reason.startsWith("Other") && note.length < 3))) return json({ error:"Choose a reason for the exclusion" + (reason.startsWith("Other") ? " and explain it in the note." : "."), reasons:EXCLUSION_REASONS }, 400);
+      const rate = Number(state.settings?.qcRate ?? 10), hash = [...(item.pmid + "|" + item.portfolio)].reduce((n, c) => (n * 31 + c.charCodeAt(0)) >>> 0, 7) % 100;
+      const needsQc = value === "potential_icsr" ? state.settings?.qcPotentialIcsr !== false : value === "full_text_needed" ? false : hash < rate;
+      const qcPool = state.profiles.filter(p => p.active && p.email !== item.reviewer && rolesIn(state, p.email, item.portfolio).has("qc"));
+      const load = p => state.assignments.filter(x => x.qc?.reviewer === p.email && x.qc.status === "pending").length;
+      const qcReviewer = needsQc ? qcPool.map(p => ({ p, n:load(p) })).sort((a, b) => a.n - b.n || a.p.email.localeCompare(b.p.email))[0]?.p.email || "" : "";
+      await write(env, data => { const a = data.assignments.find(x => x.id === item.id);
+        (a.history ||= []).push({ status:a.status, note:"Disposition: " + value + (reason ? " (" + reason + ")" : "") + (note ? " - " + note : ""), by:email, at });
+        a.disposition = { value, reason, note, by:email, at };
+        a.status = value === "full_text_needed" ? "Full text needed" : needsQc ? "Awaiting QC" : "Complete";
+        a.qc = needsQc ? { status:"pending", reviewer:qcReviewer, requestedAt:at, rounds:(a.qc?.rounds || 0) + (a.qc?.status === "returned" ? 1 : 0), reason:value === "potential_icsr" ? "all potential ICSRs are checked" : "sampled" } : undefined; });
+      await audit(env, { by:email, action:"review.disposition", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ portfolio:item.portfolio, value, reason, qc:needsQc ? (qcReviewer || "no QC reviewer available") : "not required" } });
+      return json({ ok:true, qc:needsQc ? { reviewer:qcReviewer } : null });
+    }
+    if (path === "/api/qc-decision") {
+      const roles = rolesIn(state, email, item.portfolio);
+      if (!item.qc || item.qc.status !== "pending") return json({ error:"This item is not waiting for QC." }, 409);
+      if (item.reviewer === email) return json({ error:"QC must be done by someone other than the screener." }, 409);
+      if (!(roles.has("qc") || item.qc.reviewer === email || pm)) return json({ error:"Only a QC reviewer can decide this." }, 403);
+      if (item.qc.reviewer && item.qc.reviewer !== email && !pm) return json({ error:"This QC item is assigned to someone else." }, 403);
+      const decision = body.decision === "return" ? "return" : body.decision === "approve" ? "approve" : "", note = String(body.note || "").trim().slice(0, 1000);
+      if (!decision || (decision === "return" && note.length < 5)) return json({ error:"Approve, or return with a note of at least 5 characters." }, 400);
+      await write(env, data => { const a = data.assignments.find(x => x.id === item.id); (a.history ||= []).push({ status:a.status, note:"QC " + (decision === "approve" ? "approved" : "returned") + (note ? ": " + note : ""), by:email, at });
+        a.qc = { ...a.qc, status:decision === "approve" ? "approved" : "returned", decidedBy:email, decidedAt:at, note, reviewer:a.qc.reviewer || email }; a.status = decision === "approve" ? "Complete" : "QC returned"; });
+      await audit(env, { by:email, action:"review.qc", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ portfolio:item.portfolio, decision, note, screener:item.reviewer } });
+      return json({ ok:true });
+    }
+  }
   if (path === "/api/icsr-intake" && viewer) {
-    const result = await write(env, data => icsrIntake(data, email, a => manager || a.reviewer === email, 1000, manager ? "" : email));
+    const result = await write(env, data => icsrIntake(data, email, a => mayAccess(data, viewer, a), 1000, manager ? "" : email));
     if (result.created.length) await audit(env, { by:email, action:"case.intake", target:result.created.length + " cases", detail:{ cases:result.created.slice(0, 50).join(", "), source:"articles with stored full text" } });
     return json(result);
   }
   if ((path === "/api/sign-preview" || path === "/api/sign" || path === "/api/supersede") && viewer) {
     const kind = body.kind === "screening" ? "screening" : "case";
-    const record = kind === "case" ? (state.cases || []).find(c => c.id === body.id && (manager || c.createdBy === email || c.assignee === email)) : state.assignments.find(a => a.id === body.id && (manager || a.reviewer === email));
+    const record = kind === "case" ? (state.cases || []).find(c => c.id === body.id && (manager || c.createdBy === email || c.assignee === email)) : state.assignments.find(a => a.id === body.id && mayAccess(state, viewer, a));
     if (!record) return json({ error:"Record not found." }, 404);
     const article = state.articles[record.pmid] || {};
     if (path === "/api/supersede") {
@@ -2834,7 +3184,7 @@ async function apiCore(request, env, path) {
   if (path.startsWith("/api/case-") && viewer) {
     const cfg = withSettings(env, state), canSee = c => manager || c.createdBy === email || c.assignee === email, find = id => (state.cases || []).find(c => c.id === id && canSee(c));
     if (path === "/api/case-create") {
-      const item = state.assignments.find(a => a.pmid === String(body.pmid) && (manager || a.reviewer === email)), article = item && state.articles[item.pmid];
+      const item = state.assignments.find(a => a.pmid === String(body.pmid) && mayAccess(state, viewer, a)), article = item && state.articles[item.pmid];
       if (!article) return json({ error:"Article not found in your queue." }, 404);
       const record = await write(env, data => makeCase(data, article, item, email, "manual", manager ? "" : email));
       await audit(env, { by:email, action:"case.create", target:record.number, detail:"from PMID " + record.pmid });
@@ -2910,7 +3260,7 @@ async function apiCore(request, env, path) {
   }
   if (path === "/api/export-citations" && viewer) {
     const ids = [...new Set(Array.isArray(body.pmids) ? body.pmids.map(String) : [])].slice(0, 500);
-    const articles = ids.map(id => state.articles[id]).filter(a => a && state.assignments.some(x => x.pmid === a.id && (manager || x.reviewer === email)));
+    const articles = ids.map(id => state.articles[id]).filter(a => a && state.assignments.some(x => x.pmid === a.id && mayAccess(state, viewer, x)));
     if (!articles.length) return json({ error:"No exportable articles in the selection." }, 400);
     const format = body.format === "bibtex" ? "bibtex" : "ris";
     return new Response(citationFile(articles, format, id => state.assignments.find(x => x.pmid === id)), { headers:{ "Content-Type":"text/plain; charset=utf-8", "Cache-Control":"private, no-store", "X-Content-Type-Options":"nosniff",
@@ -3092,7 +3442,8 @@ async function apiCore(request, env, path) {
   if (path === "/api/evidence") return json(await collectEvidence(env, Array.isArray(body.ids) ? body.ids.map(String).slice(0, 5000) : undefined));
   if (path === "/api/profile") {
     const profile = { email:String(body.email || "").trim().toLowerCase(), name:String(body.name || "").trim(),
-      role:"reviewer", portfolio:String(body.portfolio || "").trim(), capacity:Number(body.capacity), active:body.active !== false };
+      role:"reviewer", portfolio:String(body.portfolio || "").trim(), capacity:Number(body.capacity), active:body.active !== false,
+      ...(/^\d{4}-\d{2}-\d{2}$/.test(body.awayFrom || "") ? { awayFrom:body.awayFrom } : {}), ...(/^\d{4}-\d{2}-\d{2}$/.test(body.awayUntil || "") ? { awayUntil:body.awayUntil } : {}) };
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(profile.email) || !profile.name || !Number.isInteger(profile.capacity) ||
         profile.capacity < 1 || profile.capacity > 500) return json({ error:"Enter a valid profile and capacity." },400);
     await write(env, data => {
@@ -4296,7 +4647,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  extractClinical, buildUnits, segmentPatients, rolesIn, mayAccess, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);
