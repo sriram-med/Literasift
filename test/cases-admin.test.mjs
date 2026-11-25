@@ -71,3 +71,19 @@ test("only a manager deletes cases, with a reason and the case number typed; app
   assert.ok((await auditActions(t)).filter(a => a === "case.deleted").length === 2);
   assert.equal((await t.call(MANAGER, "/api/library-delete", { pmids: ["2"], reason: "Remove the pulled citation" })).body.deleted, 1, "after the case is gone the pulled citation can be deleted");
 });
+
+test("per-case dropdowns: seriousness and listedness are set directly, override data and tags, can be cleared, and are audited; archive takes a category", async () => {
+  const t = await setup(), cl = (who, body) => t.call(who, "/api/case-classify", body);
+  assert.equal((await cl(SCREENER, { ids: ["c3"], serious: "nonserious" })).status, 403);
+  assert.equal((await cl(SCREENER, { ids: ["c2"], serious: "maybe" })).status, 400);
+  assert.equal((await cl(SCREENER, { ids: ["c2"], serious: "serious", listedness: "unlisted" })).body.changed, 1);
+  const f = async x => (await t.call(MANAGER, "/api/search", { q: "", filters: x })).body.cases.map(c => c.number).sort();
+  assert.deepEqual(await f({ serious: "serious", listed: "unlisted" }), ["LS-1", "LS-2"]);
+  assert.equal((await cl(SCREENER, { ids: ["c1"], serious: "nonserious" })).body.changed, 1); assert.deepEqual(await f({ serious: "nonserious" }), ["LS-1"], "the dropdown overrides the event data");
+  await cl(SCREENER, { ids: ["c1"], serious: "" }); assert.equal((await t.state()).cases[0].manual, undefined); assert.deepEqual(await f({ serious: "nonserious" }), []);
+  assert.equal((await cl(SCREENER, { ids: ["c1"], serious: "" })).body.changed, 0, "no change, no entry");
+  assert.ok((await auditActions(t)).includes("case.classified"));
+  assert.equal((await t.call(MEDICAL, "/api/case-archive", { ids: ["c1"], category: "Duplicate", note: "Same patient as LS-9" })).body.changed, 1);
+  assert.deepEqual([(await t.state()).cases[0].archived.category, (await t.state()).cases[0].archived.reason], ["Duplicate", "Duplicate: Same patient as LS-9"]);
+  assert.equal((await t.call(MEDICAL, "/api/case-archive", { ids: ["c2"], category: "Nonsense" })).status, 400);
+});

@@ -2278,8 +2278,10 @@ function caseClass(c) {
   const values = events.map(e => v(e.listedness) || v(e.expectedness)).filter(Boolean).map(x => x.toLowerCase());
   let listedness = !values.length ? "unknown" : values.includes("unlisted") ? "unlisted" : values.every(x => x === "listed") ? "listed" : "unknown";
   if (listedness === "unknown") listedness = tags.includes("unlisted") ? "unlisted" : tags.includes("listed") ? "listed" : "unknown";
-  return { serious, criteria:[...criteria], listedness };
+  const m = c.manual || {};
+  return { serious:m.serious ? m.serious === "serious" : serious, criteria:[...criteria], listedness:m.listedness || listedness, manual:Boolean(m.serious || m.listedness) };
 }
+const ARCHIVE_REASONS = ["Case complete", "Follow-up closed", "Duplicate", "Not a valid ICSR", "Pulled in error", "Retention / end of review", "Other"];
 function parseSearch(q) {
   const terms = [], re = /(-?)(?:(\w+):)?(?:"([^"]+)"|(\S+))/g; let m;
   while ((m = re.exec(String(q || "").slice(0, 300)))) { const field = m[2] && ["pmid", "case", "drug", "event", "tag", "status", "portfolio", "author", "journal", "doi", "patient", "assignee", "title", "text"].includes(m[2].toLowerCase()) ? m[2].toLowerCase() : "", text = (m[3] || m[4] || "").toLowerCase(); const word = field || !m[2] ? text : (m[2] + ":" + text).toLowerCase(); if (word) terms.push({ neg:m[1] === "-", field, text:word }); }
@@ -3157,7 +3159,7 @@ async function apiCore(request, env, path) {
     const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
       cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
-      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
+      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
       monitoring:monitoringCounts(state, viewer),
       series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
@@ -3239,7 +3241,7 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"upload.fulltext", target:"PMID " + id, detail:{ type:ext, bytes:bytes.length, text_read:Boolean(text) } });
     return json({ ok:true, textRead:Boolean(text), events:(status.events || []).length });
   }
-  if (["/api/search", "/api/case-tag", "/api/folder-save", "/api/folder-delete", "/api/case-folder", "/api/case-archive", "/api/case-restore", "/api/cases-delete"].includes(path) && viewer) {
+  if (["/api/search", "/api/case-tag", "/api/folder-save", "/api/folder-delete", "/api/case-folder", "/api/case-archive", "/api/case-restore", "/api/cases-delete", "/api/case-classify"].includes(path) && viewer) {
     const at = new Date().toISOString(), ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), medical = c => isPortfolioManager(state, viewer, c.portfolio) || rolesIn(state, email, c.portfolio).has("medical_reviewer");
     const editable = c => caseVisible(state, viewer, c) && (medical(c) || c.assignee === email || c.createdBy === email), chosen = pred => (state.cases || []).filter(c => ids.has(c.id) && pred(c));
     if (path === "/api/search") {
@@ -3271,6 +3273,19 @@ async function apiCore(request, env, path) {
       let moved = 0; await write(env, data => { data.caseFolders = data.caseFolders.filter(f => f.id !== folder.id); for (const c of data.cases || []) if (c.folderId === folder.id) { delete c.folderId; moved++; } });
       await audit(env, { by:email, action:"folder.deleted", target:folder.name, detail:{ cases_unfiled:moved } }); return json({ ok:true, unfiled:moved });
     }
+    if (path === "/api/case-classify") {
+      const ser = body.serious === undefined ? undefined : String(body.serious || ""), lis = body.listedness === undefined ? undefined : String(body.listedness || "");
+      if ((ser !== undefined && !["", "serious", "nonserious"].includes(ser)) || (lis !== undefined && !["", "listed", "unlisted", "unknown"].includes(lis)) || (ser === undefined && lis === undefined)) return json({ error:"Choose a seriousness and/or a listedness value." }, 400);
+      const targets = chosen(editable); if (!targets.length) return json({ error:"Choose cases you are allowed to classify." }, 403);
+      const label = x => x || "from case data", changes = [];
+      await write(env, data => { for (const t of targets) { const c = data.cases.find(x => x.id === t.id), old = { ...(c.manual || {}) }, next = { ...old };
+        if (ser !== undefined) next.serious = ser || undefined; if (lis !== undefined) next.listedness = lis || undefined;
+        if (next.serious === old.serious && next.listedness === old.listedness) continue;
+        if (next.serious || next.listedness) c.manual = { ...next, by:email, at }; else delete c.manual;
+        (c.history ||= []).push({ at, by:email, action:"classified: seriousness " + label(next.serious) + ", listedness " + label(next.listedness) }); changes.push(c.number + " (seriousness " + label(old.serious) + " to " + label(next.serious) + ", listedness " + label(old.listedness) + " to " + label(next.listedness) + ")"); } });
+      if (changes.length) await audit(env, { by:email, action:"case.classified", target:changes.length + " case" + (changes.length === 1 ? "" : "s"), detail:{ changes:changes.slice(0, 50).join("; ") } });
+      return json({ ok:true, changed:changes.length });
+    }
     if (path === "/api/case-folder") {
       const folderId = String(body.folderId || ""); if (folderId && !(state.caseFolders || []).some(f => f.id === folderId)) return json({ error:"Folder not found." }, 404);
       const targets = chosen(editable); if (!targets.length) return json({ error:"Choose cases you are allowed to move." }, 403);
@@ -3280,10 +3295,13 @@ async function apiCore(request, env, path) {
     }
     const reason = String(body.reason || "").trim();
     if (path === "/api/case-archive" || path === "/api/case-restore") {
-      const archive = path === "/api/case-archive"; if (archive && reason.length < 5) return json({ error:"Give a reason of at least 5 characters." }, 400);
+      const archive = path === "/api/case-archive", category = String(body.category || ""), note = String(body.note || reason).trim();
+      if (archive && category && !ARCHIVE_REASONS.includes(category)) return json({ error:"Choose an archive category from the list." }, 400);
+      const why = archive ? (category ? category + (note && note !== category ? ": " + note : "") : reason) : "";
+      if (archive && (category ? false : reason.length < 5)) return json({ error:"Choose a category or give a reason of at least 5 characters." }, 400);
       const targets = chosen(c => medical(c) && Boolean(c.archived) !== archive); if (!targets.length) return json({ error:archive ? "Choose open cases you may archive (manager or medical reviewer)." : "Choose archived cases you may restore." }, 403);
-      await write(env, data => { for (const t of targets) { const c = data.cases.find(x => x.id === t.id); if (archive) c.archived = { at, by:email, reason:reason.slice(0, 300), status:c.status }; else delete c.archived; c.updatedAt = at; (c.history ||= []).push({ at, by:email, action:archive ? "archived: " + reason.slice(0, 200) : "restored from archive" }); } });
-      await audit(env, { by:email, action:archive ? "case.archived" : "case.restored", target:targets.length + " case" + (targets.length === 1 ? "" : "s"), detail:{ cases:targets.map(c => c.number).slice(0, 50).join(", "), reason:reason.slice(0, 300) } });
+      await write(env, data => { for (const t of targets) { const c = data.cases.find(x => x.id === t.id); if (archive) c.archived = { at, by:email, reason:why.slice(0, 300), category:category || "Other", status:c.status }; else delete c.archived; c.updatedAt = at; (c.history ||= []).push({ at, by:email, action:archive ? "archived: " + why.slice(0, 200) : "restored from archive" }); } });
+      await audit(env, { by:email, action:archive ? "case.archived" : "case.restored", target:targets.length + " case" + (targets.length === 1 ? "" : "s"), detail:{ cases:targets.map(c => c.number).slice(0, 50).join(", "), category:category || "", reason:why.slice(0, 300) } });
       return json({ ok:true, changed:targets.length });
     }
     // Permanent deletion of pulled cases: manager only, with a reason and the case number typed in. A tombstone and the audit entry keep a record that the case existed.
@@ -4584,23 +4602,79 @@ function caseCls(c){
   const vals=ev.map(e=>((e.listedness&&e.listedness.value)||(e.expectedness&&e.expectedness.value)||"").toLowerCase()).filter(Boolean);
   let l=!vals.length?"unknown":vals.includes("unlisted")?"unlisted":vals.every(x=>x==="listed")?"listed":"unknown";
   if(l==="unknown")l=tags.includes("unlisted")?"unlisted":tags.includes("listed")?"listed":"unknown";
-  return{serious:crit.size>0||tags.includes("serious"),crit:[...crit],listed:l};
+  const m=c.manual||{};return{serious:m.serious?m.serious==="serious":(crit.size>0||tags.includes("serious")),crit:[...crit],listed:m.listedness||l,manual:Boolean(m.serious||m.listedness)};
 }
 const canMedical=()=>data.viewer.role==="manager"||(data.viewerRoles||[]).includes("medical_reviewer");
 const tagChips=c=>(c.tags||[]).map(t=>'<span class="badge" title="added by '+esc(t.by)+'">'+esc(t.tag)+'</span>').join(" ");
 function bulkBar(cls,opts){
   opts=opts||{};const mgr=data.viewer.role==="manager",fl=data.caseFolders||[];
   return '<div class="card" style="padding:10px;margin-bottom:10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center"><button type="button" class="btn outline sm" data-p5="selall|'+cls+'">Select all shown</button>'+
+    '<select id="bk_ser" aria-label="Set seriousness"><option value="__">Set seriousness…</option><option value="serious">Serious</option><option value="nonserious">Non-serious</option><option value="">From case data</option></select><select id="bk_lis" aria-label="Set listedness"><option value="__">Set listedness…</option><option value="listed">Listed</option><option value="unlisted">Unlisted</option><option value="unknown">Unknown</option><option value="">From case data</option></select><button type="button" class="btn outline sm" data-p5="classify|'+cls+'">Apply</button>'+
     '<select id="bk_tag" aria-label="Tag">'+(data.standardTags||[]).map(t=>'<option>'+esc(t)+'</option>').join("")+'</select><input id="bk_custom" placeholder="or your own tag" style="width:130px"><button type="button" class="btn outline sm" data-p5="tag|'+cls+'">Add tag</button><button type="button" class="btn outline sm" data-p5="untag|'+cls+'">Remove tag</button>'+
     '<select id="bk_folder" aria-label="Folder"><option value="">No folder</option>'+fl.map(f=>'<option value="'+esc(f.id)+'">'+esc(f.name)+'</option>').join("")+'</select><button type="button" class="btn outline sm" data-p5="folder|'+cls+'">Move to folder</button>'+
     (canMedical()&&!opts.archive?'<button type="button" class="btn outline sm" data-p5="archive|'+cls+'">Archive</button>':"")+(opts.archive&&canMedical()?'<button type="button" class="btn outline sm" data-p5="restore|'+cls+'">Restore</button>':"")+
     (mgr?'<button type="button" class="btn outline sm" style="color:var(--red)" data-p5="delcase|'+cls+'">Delete…</button>':"")+'</div>';
 }
-function caseRowCells(c){
-  const cl=caseCls(c),f=(data.caseFolders||[]).find(x=>x.id===c.folderId),art=data.articles[c.pmid]||{};
-  return ['<input type="checkbox" class="'+(tab==="Search"?"srch_c":tab==="Archive"?"arc_c":"syn_c")+'" value="'+esc(c.id)+'" aria-label="Select case">','<a href="#" data-opencase="'+esc(c.id)+'"><b>'+esc(c.number)+'</b></a>',esc((art.title||"PMID "+c.pmid).slice(0,70))+'<div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.portfolio||"")+(f?" · folder: "+esc(f.name):"")+'</div>',
-    (cl.serious?badge("Serious","red"):badge("Non-serious",""))+" "+(cl.listed==="listed"?badge("Listed","green"):cl.listed==="unlisted"?badge("Unlisted","amber"):badge("Listedness unknown",""))+(cl.crit.length?'<div class="sub">'+esc(cl.crit.map(x=>x.replace(/_/g," ")).join(", "))+'</div>':""),tagChips(c),badge(c.status,""),esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||"")];
+const canEditCase=c=>{const me=data.viewer.email;return canMedical()||c.assignee===me||c.createdBy===me;};
+function rowSelects(c){
+  const cl=caseCls(c),m=c.manual||{},ed=canEditCase(c),opt=(v,l,cur)=>'<option value="'+v+'"'+(v===cur?" selected":"")+'>'+l+'</option>';
+  const ser=ed?'<select data-rowsel="ser|'+esc(c.id)+'" aria-label="Seriousness">'+opt("","From case data"+(m.serious?"":" ("+(cl.serious?"serious":"non-serious")+")"),m.serious||"")+opt("serious","Serious",m.serious)+opt("nonserious","Non-serious",m.serious)+'</select>':(cl.serious?badge("Serious","red"):badge("Non-serious",""));
+  const lis=ed?'<select data-rowsel="lis|'+esc(c.id)+'" aria-label="Listedness">'+opt("","From case data"+(m.listedness?"":" ("+cl.listed+")"),m.listedness||"")+opt("listed","Listed",m.listedness)+opt("unlisted","Unlisted",m.listedness)+opt("unknown","Unknown",m.listedness)+'</select>':(cl.listed==="listed"?badge("Listed","green"):cl.listed==="unlisted"?badge("Unlisted","amber"):badge("Unknown",""));
+  const fl=data.caseFolders||[],fold=ed?'<select data-rowsel="fold|'+esc(c.id)+'" aria-label="Folder"><option value="">No folder</option>'+fl.map(f=>'<option value="'+esc(f.id)+'"'+(f.id===c.folderId?" selected":"")+'>'+esc(f.name)+'</option>').join("")+'</select>':esc((fl.find(f=>f.id===c.folderId)||{}).name||"");
+  const acts=[c.archived?["restore","Restore from archive"]:["archive","Archive…"],["open","Open case"]].concat(data.viewer.role==="manager"?[["delete","Delete…"]]:[]);
+  const act=(ed&&canMedical())||data.viewer.role==="manager"?'<select data-rowsel="act|'+esc(c.id)+'" aria-label="Actions"><option value="">Actions…</option>'+acts.filter(a=>canMedical()||a[0]==="open").map(a=>'<option value="'+a[0]+'">'+a[1]+'</option>').join("")+'</select>':'<button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>';
+  return{ser,lis,fold,act,crit:cl.crit.length?'<div class="sub">'+esc(cl.crit.map(x=>x.replace(/_/g," ")).join(", "))+'</div>':""};
 }
+function caseRowCells(c){
+  const x=rowSelects(c),art=data.articles[c.pmid]||{};
+  return ['<input type="checkbox" class="'+(tab==="Search"?"srch_c":tab==="Archive"?"arc_c":"syn_c")+'" value="'+esc(c.id)+'" aria-label="Select case">','<a href="#" data-opencase="'+esc(c.id)+'"><b>'+esc(c.number)+'</b></a>',esc((art.title||"PMID "+c.pmid).slice(0,70))+'<div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.portfolio||"")+'</div>',x.ser+x.crit,x.lis,x.fold,tagChips(c),badge(c.status,""),esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||""),x.act];
+}
+const CASEHEAD=["","Case","Article","Seriousness","Listedness","Folder","Tags","Status","Owner","Actions"];
+const GROUPS={none:"No grouping",status:"Status",seriousness:"Seriousness",listedness:"Listedness",folder:"Folder",portfolio:"Portfolio",owner:"Owner",category:"Archive category"};
+function groupKey(c,by){
+  const cl=caseCls(c);
+  if(by==="status")return c.status;if(by==="seriousness")return cl.serious?"Serious":"Non-serious";if(by==="listedness")return cl.listed==="listed"?"Listed":cl.listed==="unlisted"?"Unlisted":"Listedness unknown";
+  if(by==="folder")return((data.caseFolders||[]).find(f=>f.id===c.folderId)||{}).name||"Not in a folder";if(by==="portfolio")return c.portfolio||"No portfolio";
+  if(by==="owner")return((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||"Unassigned";if(by==="category")return(c.archived&&c.archived.category)||"Other";return"";
+}
+function groupedTables(list,by,head,rowOf,empty){
+  if(by==="none"||!by)return panel("Cases ("+list.length+")",table(head,list.map(rowOf),empty),"",true);
+  const g={};list.forEach(c=>{(g[groupKey(c,by)]||(g[groupKey(c,by)]=[])).push(c);});
+  const keys=Object.keys(g).sort();if(!keys.length)return panel("Cases (0)",table(head,[],empty),"",true);
+  return keys.map(k=>panel(esc(k)+" ("+g[k].length+")",table(head,g[k].map(rowOf),empty),"",true)).join("");
+}
+const groupSelect=(cur,keys,id)=>'<label style="display:inline-flex;gap:6px;align-items:center">Group by <select id="'+id+'">'+keys.map(k=>'<option value="'+k+'"'+(k===cur?" selected":"")+'>'+GROUPS[k]+'</option>').join("")+'</select></label>';
+function archivePicker(count){
+  return new Promise(resolve=>{
+    const old=$("archdlg");if(old)old.remove();
+    document.body.insertAdjacentHTML("beforeend",'<dialog id="archdlg" style="width:min(460px,94vw)"><h3 style="margin:0 0 8px">Archive '+count+' case'+(count===1?"":"s")+'</h3><label>Category<select id="arch_cat">'+(data.archiveReasons||[]).map(r=>'<option>'+esc(r)+'</option>').join("")+'</select></label><label style="margin-top:8px">Note (optional)<textarea id="arch_note" rows="2"></textarea></label><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button type="button" class="btn outline" id="arch_no">Cancel</button><button type="button" class="btn" id="arch_yes">Archive</button></div></dialog>');
+    const d=$("archdlg");d.showModal();
+    $("arch_no").onclick=()=>{d.close();d.remove();resolve(null);};
+    $("arch_yes").onclick=()=>{const r={category:$("arch_cat").value,note:$("arch_note").value};d.close();d.remove();resolve(r);};
+  });
+}
+async function afterCaseChange(m){await refresh();if(tab==="Search"&&srch.res)await runSearchUi(true);else render();message(m);}
+async function deleteCases(list){
+  const cs=list.map(i=>(data.cases||[]).find(c=>c.id===i)).filter(Boolean);if(!cs.length)return;
+  const why=prompt("Why are you permanently deleting "+cs.length+" case"+(cs.length===1?"":"s")+"? (recorded in the audit trail)","");if(!why)return;
+  const typed=prompt(cs.length===1?"Type the case number "+cs[0].number+" to confirm:":"Type DELETE "+cs.length+" to confirm:","");if(!typed)return;
+  const r=await api("cases-delete",{ids:list,reason:why,confirm:typed});
+  if(confirm(r.deleted+" deleted. Also delete the pulled citation"+(r.pmids.length===1?"":"s")+" (PMID "+r.pmids.join(", ")+") from the library?")){try{await api("library-delete",{pmids:r.pmids,reason:why});}catch(e){message(e.message,true);}}
+  await afterCaseChange("Deleted.");
+}
+async function rowSelect(el){
+  const [kind,id]=el.dataset.rowsel.split("|"),v=el.value;
+  try{
+    if(kind==="ser"){await api("case-classify",{ids:[id],serious:v});await afterCaseChange("Seriousness updated.");return;}
+    if(kind==="lis"){await api("case-classify",{ids:[id],listedness:v});await afterCaseChange("Listedness updated.");return;}
+    if(kind==="fold"){await api("case-folder",{ids:[id],folderId:v});await afterCaseChange("Folder updated.");return;}
+    if(kind==="act"){el.value="";if(v==="open"){const c=(data.cases||[]).find(x=>x.id===id);if(c){const a=await api("case-assess",{id}).catch(()=>({assessment:null}));openCaseData(c,a.assessment);}return;}
+      if(v==="archive"){const r=await archivePicker(1);if(!r)return;await api("case-archive",{ids:[id],category:r.category,note:r.note});await afterCaseChange("Archived.");return;}
+      if(v==="restore"){await api("case-restore",{ids:[id]});await afterCaseChange("Restored.");return;}
+      if(v==="delete"){await deleteCases([id]);return;}}
+  }catch(e){message(e.message,true);}
+}
+document.addEventListener("change",e=>{const t=e.target;if(!t.dataset)return;if(t.dataset.rowsel)rowSelect(t);if(t.id==="syn_group"){synGroup=t.value;render();}if(t.id==="arc_group"){arcGroup=t.value;render();}if(t.id==="srch_group"){srchGroup=t.value;if(srch.res)$("sres").innerHTML=searchResults();}if(t.id==="arc_filter"){arcFilter=t.value;render();}});
 let srch={q:"",scope:"all",f:{},res:null};
 function searchHtml(){
   const pf=[...new Set((data.assignments||[]).map(a=>a.portfolio))].sort(),f=srch.f,sel=(id,label,opts)=>'<label>'+label+'<select id="'+id+'">'+opts.map(o=>'<option value="'+esc(o[0])+'"'+(String(f[id.slice(3)]||"")===o[0]?" selected":"")+'>'+esc(o[1])+'</option>').join("")+'</select></label>';
@@ -4615,14 +4689,20 @@ function searchHtml(){
 }
 function searchResults(){
   const r=srch.res,mgr=data.viewer.role==="manager";let h="";
-  h+=panel("Cases ("+r.counts.cases+")",(r.cases.length?bulkBar("srch_c",{archive:srch.f.archived==="yes"})+table(["","Case","Article","Classification","Tags","Status","Owner"],r.cases.map(x=>{const c=(data.cases||[]).find(y=>y.id===x.id);return c?caseRowCells(c):[];}).filter(x=>x.length),"No cases."):'<div class="empty">No cases match.</div>'),"",true);
+  h+=panel("Cases ("+r.counts.cases+")",(r.cases.length?'<div style="margin-bottom:8px">'+groupSelect(srchGroup,["none","status","seriousness","listedness","folder","portfolio","owner"],"srch_group")+'</div>'+bulkBar("srch_c",{archive:srch.f.archived==="yes"}):'<div class="empty">No cases match.</div>'),"",false);
+  if(r.cases.length)h+=groupedTables(r.cases.map(x=>(data.cases||[]).find(y=>y.id===x.id)).filter(Boolean),srchGroup,CASEHEAD,caseRowCells,"No cases.");
   if(r.articles.length||srch.scope!=="cases")h+=panel("Citations ("+r.counts.articles+")",(mgr&&r.articles.length?'<div style="margin-bottom:8px"><button type="button" class="btn outline sm" data-p5="selall|srch_a">Select all shown</button> <button type="button" class="btn outline sm" style="color:var(--red)" data-p5="delpulled">Delete selected pulled citations…</button> <span class="sub">Citations that still have a case are kept; delete or archive the case first.</span></div>':"")+
     table(mgr?["","Citation","Journal","Assignments"]:["Citation","Journal","Assignments"],r.articles.map(a=>{const cells=['<a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(a.pmid)+'/" target="_blank" rel="noopener"><b>'+esc(a.title||"PMID "+a.pmid)+'</b></a><div class="sub">PMID '+esc(a.pmid)+' · '+esc((a.authors||[]).join(", "))+(a.hasCase?' · '+badge("has a case",""):"")+'</div>',esc(a.journal)+'<div class="sub">'+esc(a.date)+'</div>',a.assignments.map(x=>esc(x.portfolio)+" · "+esc(x.status)+(x.disposition?" · "+esc(x.disposition.replace(/_/g," ")):"")).join("<br>")];return mgr?['<input type="checkbox" class="srch_a" value="'+esc(a.pmid)+'" aria-label="Select citation">'].concat(cells):cells;}),"No citations match."),"",true);
   return h;
 }
+let synGroup="none",arcGroup="category",arcFilter="",srchGroup="none";
 function archiveHtml(){
-  const arc=(data.cases||[]).filter(c=>c.archived).sort((a,b)=>(b.archived.at||"").localeCompare(a.archived.at||""));
-  return panel("Archived cases",'<div class="sub" style="margin-bottom:8px">Archived cases are out of working lists and case series counts and cannot be edited. They stay searchable (Search, Archive: archived only) and can be restored by a manager or medical reviewer. A manager may delete a case permanently from here; approved or exported cases must be archived first.</div>'+(arc.length?bulkBar("arc_c",{archive:true})+table(["","Case","Article","Classification","Tags","Status","Owner","Archived"],arc.map(c=>caseRowCells(c).concat([esc(c.archived.by||"")+'<div class="sub">'+esc(String(c.archived.at||"").slice(0,10))+" · "+esc(c.archived.reason||"")+'</div>'])),"No archived cases."):'<div class="empty">Nothing archived yet.</div>'),"",true)+
+  let arc=(data.cases||[]).filter(c=>c.archived).sort((a,b)=>(b.archived.at||"").localeCompare(a.archived.at||""));
+  const cats=data.archiveReasons||[];if(arcFilter)arc=arc.filter(c=>(c.archived.category||"Other")===arcFilter);
+  const head=CASEHEAD.concat(["Archived"]),rowOf=c=>caseRowCells(c).concat([esc(c.archived.by||"")+'<div class="sub">'+esc(String(c.archived.at||"").slice(0,10))+" · "+esc(c.archived.reason||"")+'</div>']);
+  const tools='<div class="card" style="padding:10px;margin-bottom:10px;display:flex;gap:12px;flex-wrap:wrap;align-items:center">'+groupSelect(arcGroup,["category","portfolio","folder","seriousness","listedness","owner","none"],"arc_group")+'<label style="display:inline-flex;gap:6px;align-items:center">Category <select id="arc_filter"><option value="">All categories</option>'+cats.map(c=>'<option'+(c===arcFilter?" selected":"")+'>'+esc(c)+'</option>').join("")+'</select></label></div>';
+  return panel("Archived cases",'<div class="sub" style="margin-bottom:8px">Archived cases are out of working lists and case series counts and cannot be edited. They stay searchable and can be restored by a manager or medical reviewer. A manager may delete a case permanently; approved or exported cases must be archived first.</div>'+tools+(arc.length?bulkBar("arc_c",{archive:true}):""))+
+    (arc.length?groupedTables(arc,arcGroup,head,rowOf,"No archived cases."):'<div class="empty">Nothing archived'+(arcFilter?" in this category":" yet")+'.</div>')+
     (data.viewer.role==="manager"?panel("Deleted cases (record kept)",table(["Case","PMID","Deleted","By","Reason"],(data.deletedCases||[]).slice().reverse().map(d=>[esc(d.number),esc(d.pmid),esc(String(d.deletedAt).slice(0,10)),esc(d.deletedBy),esc(d.reason)]),"No cases have been deleted."),"Deleting a case leaves this record and an audit trail entry.",true):"");
 }
 async function p5action(target){
@@ -4632,14 +4712,10 @@ async function p5action(target){
     if(act==="selall"){document.querySelectorAll("."+a1).forEach(x=>{x.checked=true;});return;}
     if(act==="tag"||act==="untag"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const tag=($("bk_custom").value||"").trim()||$("bk_tag").value;const r=await api("case-tag",{ids:list,tag,remove:act==="untag"});await again(r.changed+" case"+(r.changed===1?"":"s")+(act==="tag"?" tagged ":" untagged ")+tag+".");return;}
     if(act==="folder"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const r=await api("case-folder",{ids:list,folderId:$("bk_folder").value});await again(r.moved+" moved.");return;}
-    if(act==="archive"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const why=prompt("Why are these cases being archived? (recorded)","");if(!why)return;const r=await api("case-archive",{ids:list,reason:why});await again(r.changed+" archived.");return;}
+    if(act==="classify"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const body={ids:list},sv=$("bk_ser").value,lv=$("bk_lis").value;if(sv!=="__")body.serious=sv;if(lv!=="__")body.listedness=lv;if(body.serious===undefined&&body.listedness===undefined)return message("Choose a seriousness or listedness value.",true);const r=await api("case-classify",body);await again(r.changed+" updated.");return;}
+    if(act==="archive"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const pick=await archivePicker(list.length);if(!pick)return;const r=await api("case-archive",{ids:list,category:pick.category,note:pick.note});await again(r.changed+" archived.");return;}
     if(act==="restore"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const r=await api("case-restore",{ids:list});await again(r.changed+" restored.");return;}
-    if(act==="delcase"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const cs=list.map(i=>(data.cases||[]).find(c=>c.id===i)).filter(Boolean);
-      const why=prompt("Why are you permanently deleting "+cs.length+" case"+(cs.length===1?"":"s")+"? (recorded in the audit trail)","");if(!why)return;
-      const typed=prompt(cs.length===1?"Type the case number "+cs[0].number+" to confirm:":"Type DELETE "+cs.length+" to confirm:","");if(!typed)return;
-      const r=await api("cases-delete",{ids:list,reason:why,confirm:typed});
-      if(confirm(r.deleted+" deleted. Also delete the pulled citation"+(r.pmids.length===1?"":"s")+" (PMID "+r.pmids.join(", ")+") from the library?")){try{await api("library-delete",{pmids:r.pmids,reason:why});}catch(e){message(e.message,true);}}
-      await again("Deleted.");return;}
+    if(act==="delcase"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);await deleteCases(list);return;}
     if(act==="delpulled"){const list=ids("srch_a");if(!list.length)return message("Tick the citations first.",true);if(!confirm("Delete "+list.length+" pulled citation"+(list.length===1?"":"s")+" with their stored files? Citations with a case are kept. This cannot be undone."))return;const why=prompt("Reason (recorded in the audit trail):","");if(!why)return;const r=await api("library-delete",{pmids:list,reason:why});await again(r.deleted+" deleted"+((r.kept||[]).length?", "+r.kept.length+" kept because they have a case":"")+".");return;}
     if(act==="newfolder"){const name=prompt("Folder name:","");if(!name)return;await api("folder-save",{name});await again("Folder created.");return;}
     if(act==="delfolder"){if(!confirm("Delete this folder? Its cases are kept and become unfiled."))return;const r=await api("folder-delete",{id:a1});if(synFolder===a1)synFolder="";await again("Folder deleted; "+r.unfiled+" case"+(r.unfiled===1?"":"s")+" unfiled.");return;}
@@ -4967,16 +5043,16 @@ function render() {
     const intake='<div class="row"><span>'+ready+' article'+(ready===1?"":"s")+' with stored full text and detected events '+(ready===1?"is":"are")+' not in Synchrony yet.'+(data.config.autoIcsr?' New ones are added automatically.':' Automatic adding is off (Settings).')+'</span><button class="btn" data-icsrintake="1"'+(ready?"":" disabled")+'>Add to Synchrony</button></div>'+
       '<div class="row"><span>'+openCases.filter(c=>!c.assignee).length+' open case'+(openCases.filter(c=>!c.assignee).length===1?"":"s")+' without an assignee.'+(data.config.autoAssignCases?' New cases are assigned automatically to the reviewer with the fewest open cases.':' Automatic assignment is off (Settings).')+'</span>'+(manager?'<button class="btn outline" data-autoassign="1">Assign unassigned now</button>':"")+'</div>'+
       '<div class="row"><span>Export the cases shown in this list.</span><span style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn outline sm" data-synexport="csv">Line listing (CSV)</button><button class="btn outline sm" data-synexport="e2b">E2B(R3) batch (XML)</button></span></div>';
-    const rows=shown.map(c=>{
+    const rowOf=c=>{
       const a=c.assessment||{},d=c.data,sp=(d.products.find(p=>p.role==="suspect")||{name:{}}).name.value||"—",ev=((d.events[0]||{}).verbatim||{}).value||"—",art=data.articles[c.pmid]||{},dl=left(c);
       const who=manager?'<select data-assignsel="'+esc(c.id)+'" aria-label="Assignee"><option value="">Unassigned</option>'+people.map(p=>'<option value="'+esc(p.email)+'"'+(p.email===c.assignee?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select>':esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||"Unassigned");
       const due=c.dueAt?badge((dl<0?Math.abs(dl)+" d overdue":dl===0?"due today":dl+" d left")+" · "+c.dueAt,closed(c)?"":dl<0?"red":dl<=3?"amber":"green"):'<span class="sub">no date</span>';
-      return ['<input type="checkbox" class="syn_c" value="'+esc(c.id)+'" aria-label="Select case">','<b>'+esc(c.number)+'</b>'+(signed(c)?' <span class="badge green" title="Signed">signed</span>':"")+(caseCls(c).serious?' <span class="badge red">serious</span>':' <span class="badge">non-serious</span>')+(caseCls(c).listed==="unlisted"?' <span class="badge amber">unlisted</span>':caseCls(c).listed==="listed"?' <span class="badge green">listed</span>':"")+(tagChips(c)?'<div style="margin-top:3px">'+tagChips(c)+'</div>':""),'<a href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,80))+'</a><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.molecule||"")+'</div>',esc(sp)+" · "+esc(ev),who,due,badge(c.status,stColor[c.status]||""),(a.valid?badge("Valid","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"))+'<div class="sub">QC '+(a.score??"")+' / 100</div>','<button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>'];});
+      const x=rowSelects(c);return ['<input type="checkbox" class="syn_c" value="'+esc(c.id)+'" aria-label="Select case">','<b>'+esc(c.number)+'</b>'+(signed(c)?' <span class="badge green" title="Signed">signed</span>':"")+(tagChips(c)?'<div style="margin-top:3px">'+tagChips(c)+'</div>':""),'<a href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,80))+'</a><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.molecule||"")+'</div>',esc(sp)+" · "+esc(ev),x.ser+x.crit,x.lis,x.fold,who,due,badge(c.status,stColor[c.status]||""),(a.valid?badge("Valid","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"))+'<div class="sub">QC '+(a.score??"")+' / 100</div>',x.act+' <button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>'];};
     const S=data.series||{total:0,events:[],products:[],countries:[],sex:[],ages:[],monthly:[],serious:[],fatal:[],trend:{hikes:[]}};
     const bars=(list)=>list.length?list.map(x=>'<div class="row" title="'+esc(x.cases.join(", "))+'"><span>'+esc(x.key)+'</span><span class="sub">'+x.count+' case'+(x.count===1?"":"s")+' · '+esc(x.cases.slice(0,4).join(", "))+(x.cases.length>4?"…":"")+'</span></div>').join(""):'<div class="empty">No data yet.</div>';
     const months=S.monthly.map(m=>'<span class="badge'+((S.trend.hikes||[]).includes(m.month)?" red":"")+'" title="'+esc(m.cases.join(", "))+'">'+esc(m.month)+': '+m.count+'</span>').join(" ");
     const fl=data.caseFolders||[],folderBar=panel("Folders",'<div class="chips"><button type="button" class="btn sm '+(synFolder?"outline":"")+'" data-synfolder="">All cases</button><button type="button" class="btn sm '+(synFolder==="__none"?"":"outline")+'" data-synfolder="__none">Not in a folder</button>'+fl.map(f=>'<span style="display:inline-flex;gap:2px"><button type="button" class="btn sm '+(synFolder===f.id?"":"outline")+'" data-synfolder="'+esc(f.id)+'">'+esc(f.name)+' ('+openCases.filter(c=>c.folderId===f.id).length+')</button>'+(manager?'<button type="button" class="btn outline sm" data-p5="delfolder|'+esc(f.id)+'" title="Delete folder" aria-label="Delete folder">x</button>':"")+'</span>').join("")+(canMedical()?'<button type="button" class="btn outline sm" data-p5="newfolder">+ New folder</button>':"")+'</div>');
-    html=tiles+folderBar+bulkBar("syn_c")+panel("Case tracker",table(["","Case","Article","Product · event","Assignee","Reporting due","Status","Validity",""],rows,"No cases in this view."),"",true)+
+    html=tiles+folderBar+bulkBar("syn_c")+panel("Case tracker",'<div style="padding:4px 0">'+groupSelect(synGroup,["none","status","seriousness","listedness","folder","portfolio","owner"],"syn_group")+' <span class="sub">Seriousness, listedness and folder are dropdowns on each case. "From case data" uses the event fields.</span></div>',"")+groupedTables(shown,synGroup,["","Case","Article","Product · event","Seriousness","Listedness","Folder","Assignee","Reporting due","Status","Validity",""],rowOf,"No cases in this view.")+
       panel("Intake and assignment",intake)+
       panel("Case series summary",'<div class="row"><span><b>'+S.total+'</b> case'+(S.total===1?'':'s')+' · <b>'+S.serious.length+'</b> serious · <b>'+S.fatal.length+'</b> fatal</span><span class="sub">Counted from the case fields. Hover a line to see which cases it counts.</span></div>'+
         '<div style="display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))"><div><h3 style="margin:8px 0">Events</h3>'+bars(S.events)+'</div><div><h3 style="margin:8px 0">Suspect products</h3>'+bars(S.products)+'</div><div><h3 style="margin:8px 0">Countries</h3>'+bars(S.countries)+'</div><div><h3 style="margin:8px 0">Age and sex</h3>'+bars(S.ages)+bars(S.sex)+'</div></div>'+
