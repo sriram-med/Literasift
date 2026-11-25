@@ -520,7 +520,7 @@ async function captureFromPreprint(env, article, reason) {
 }
 const storeFile = async (env, article, name, bytes, type) => { const key = "evidence/" + article.id + "/" + name; await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:type } }); return key; };
 // ---- Retrieval through official programme interfaces. Wiley and Elsevier text-mining APIs use the user's own token and only return what their institution is entitled to
-// (design after paperscraper, MIT, Copyright (c) 2020 Jannis Born et al.). CORE aggregates open repository copies. bioRxiv/medRxiv publish their own full-text XML. ----
+// (design after paperscraper, MIT, Copyright (c) 2020 PhosphorylatedRabbits). CORE aggregates open repository copies. bioRxiv/medRxiv publish their own full-text XML. ----
 const wileyDoi = doi => /^10\.(1002|1111)\//.test(doi || ""), elsevierDoi = doi => /^10\.(1016|1053)\//.test(doi || "");
 async function captureFromWiley(env, article, reason) {
   if (!env.WILEY_TDM_TOKEN || !validDoi(article.doi) || !wileyDoi(article.doi)) return { fullTextStatus:reason };
