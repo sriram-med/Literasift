@@ -179,6 +179,12 @@ function mayAccess(state, viewer, a) {
   const r = rolesIn(state, viewer.email, a.portfolio);
   return r.has("manager") || a.reviewer === viewer.email || a.qc?.reviewer === viewer.email || a.medicalReviewer === viewer.email || (r.has("qc") && Boolean(a.qc)) || (r.has("medical_reviewer") && a.disposition?.value === "potential_icsr");
 }
+function caseVisible(state, viewer, c) {
+  if (!viewer || !c) return false;
+  if (viewer.role === "manager" || c.createdBy === viewer.email || c.assignee === viewer.email) return true;
+  const r = rolesIn(state, viewer.email, c.portfolio);
+  return r.has("manager") || r.has("medical_reviewer");
+}
 const isPortfolioManager = (state, viewer, portfolio) => viewer?.role === "manager" || rolesIn(state, viewer?.email, portfolio).has("manager");
 // ---- Imports as restartable jobs. A search range is cut into bounded date windows; each window is searched, reconciled (count reported by PubMed against unique PMIDs retrieved)
 // and checkpointed before the next one starts, so a failure resumes where it stopped and a replay changes nothing that was already decided. ----
@@ -691,6 +697,242 @@ function monitoringCounts(state, viewer) {
   return { importGaps:runs.filter(r => (r.gaps || []).length).length, pendingEvidence:uniq(scope.map(a => a.pmid)).filter(id => state.articles[id] && !isFinalEvidence(evidenceStatus(state.articles[id]))).length,
     pendingEvidenceIds:uniq(scope.map(a => a.pmid)).filter(id => state.articles[id] && !isFinalEvidence(evidenceStatus(state.articles[id]))).slice(0, 500), unassigned:scope.filter(a => !a.reviewer).length, overdue:scope.filter(a => open(a) && a.dueAt && a.dueAt < today).length, qcReturned:scope.filter(a => a.qc?.status === "returned").length, qcPending:scope.filter(a => a.qc?.status === "pending").length };
 }
+// ---- ICH E2D(R1) minimum criteria and one draft per supported patient. The four criteria are assessed for each patient on its own evidence, as supported, uncertain or missing.
+// Screening disposition, the minimum-criteria assessment and regulatory reportability are three separate decisions. ----
+const sentenceRef = (ex, unitId) => { const u = ex.unitIndex[unitId] || {}; return { unitId, section:u.section || "", sentence:u.text || "", cell:u.cell || null }; };
+function assessMinimumCriteria(ex, patient, decisions = {}) {
+  const evOf = ids => uniq(ids).filter(Boolean).slice(0, 4).map(id => sentenceRef(ex, id));
+  const d = patient.descriptor, individual = Boolean(d.age || d.sex || d.labelText);
+  const criteria = {};
+  // identifiable patient
+  if (ex.aggregateOnly) criteria.patient = { status:"missing", basis:"The article reports aggregate data only; no individual patient is described.", evidence:evOf(ex.aggregateMentions.map(m => m.unitId)) };
+  else if (individual) criteria.patient = { status:"supported", basis:"Described individually: " + [d.age && d.age + " " + (d.ageUnit || "years"), d.sex, d.labelText].filter(Boolean).join(", ") + ".", evidence:evOf(patient.evidence.map(e => e.unitId)) };
+  else criteria.patient = { status:"uncertain", basis:"A single patient is described but without age, sex or a label, so it is not clear that one specific person is meant.", evidence:evOf(patient.evidence.map(e => e.unitId)) };
+  if (ex.ambiguous.length && criteria.patient.status === "supported" && ex.patients.length > 1) criteria.patient.note = ex.ambiguous.length + " sentence" + (ex.ambiguous.length === 1 ? "" : "s") + " refer to several patients and were not attributed to this one.";
+  // identifiable reporter
+  const rep = ex.reporters, top = rep.candidates[0];
+  criteria.reporter = rep.status === "missing" ? { status:"missing", basis:"No author metadata was retrieved.", evidence:[], flags:rep.flags }
+    : top && (top.affiliations.length || top.email || rep.correspondenceEmails.length) && rep.status === "supported" ? { status:"supported", basis:(top.corresponding ? "Corresponding author " : "First author ") + top.name + (top.affiliations[0] ? ", " + top.affiliations[0] : "") + (top.email || rep.correspondenceEmails[0] ? " (" + (top.email || rep.correspondenceEmails[0]) + ")" : "") + ".", evidence:[], authors:rep.candidates.slice(0, 3), flags:[] }
+    : { status:"uncertain", basis:"Authors are known, but the reporter cannot be fully identified or contacted.", evidence:[], authors:rep.candidates.slice(0, 3), flags:rep.flags };
+  // suspect product
+  const suspect = patient.drugs.find(x => x.role === "suspect"), hasEvent = patient.events.some(e => e.category === "ae" && !e.negated && !e.hypothetical);
+  criteria.product = suspect ? { status:"supported", basis:"The patient received " + suspect.name + (suspect.dose ? " " + suspect.dose : "") + ".", evidence:evOf(suspect.mentions.map(m => m.unitId)) }
+    : { status:patient.drugs.length ? "uncertain" : "missing", basis:patient.drugs.length ? "Other medicines are mentioned, but none is the product being assessed." : "No drug exposure is described for this patient.", evidence:evOf(patient.drugs.flatMap(x => x.mentions.map(m => m.unitId))) };
+  // adverse event, after the reviewer's decisions
+  const counted = patient.events.filter(e => !e.negated && !e.hypothetical && ((e.category === "ae" && decisions[e.id]?.action !== "exclude") || (e.category === "manifestation" && decisions[e.id]?.action === "promote")));
+  const linked = counted.filter(e => patient.drugs.some(x => x.role === "suspect" && x.mentions.some(m => e.mentions.some(y => y.unitId === m.unitId))) || e.onset || e.timeToOnset);
+  criteria.event = linked.length ? { status:"supported", basis:linked.map(e => e.verbatim).join(", ") + (linked[0].timeToOnset ? " (" + linked[0].timeToOnset.text + ")" : "") + ".", evidence:evOf(linked.flatMap(e => e.mentions.map(m => m.unitId))) }
+    : counted.length ? { status:"uncertain", basis:"An event is named, but nothing ties it to the suspect product in time or in the text.", evidence:evOf(counted.flatMap(e => e.mentions.map(m => m.unitId))) }
+    : { status:"missing", basis:patient.events.some(e => e.category === "manifestation") ? "Only manifestations were found; promote the ones to capture, or confirm the event." : hasEvent ? "Candidate events were excluded." : "No adverse event is described for this patient.", evidence:[] };
+  const gaps = [];
+  if (criteria.patient.status !== "supported") gaps.push({ item:"Identify the patient (age, sex, initials or case label)", reason:criteria.patient.basis, priority:"high" });
+  if (criteria.reporter.status !== "supported") gaps.push({ item:"Identify and contact the reporter (corresponding author's name, affiliation and e-mail)", reason:criteria.reporter.basis, priority:"high" });
+  if (criteria.product.status !== "supported") gaps.push({ item:"Confirm the suspect product given to this patient", reason:criteria.product.basis, priority:"high" });
+  if (criteria.event.status !== "supported") gaps.push({ item:"Confirm the adverse event and its link to the product", reason:criteria.event.basis, priority:"high" });
+  if (suspect && !suspect.dose) gaps.push({ item:"Dose, route and frequency of " + suspect.name, reason:"Not stated for this patient.", priority:"medium" });
+  if (suspect && !suspect.start) gaps.push({ item:"Start date of " + suspect.name, reason:"No start date or day was found.", priority:"medium" });
+  if (counted.length && !counted.some(e => e.onset)) gaps.push({ item:"Onset date of the event", reason:"No onset date or day was found.", priority:"medium" });
+  if (counted.length && !counted.some(e => e.outcome)) gaps.push({ item:"Outcome of the event", reason:"The text does not say how it ended.", priority:"medium" });
+  if (suspect && !suspect.stop) gaps.push({ item:"Whether " + suspect.name + " was stopped (dechallenge)", reason:"The text does not say what was done with the drug.", priority:"medium" });
+  const states = Object.values(criteria).map(c => c.status), overall = states.every(x => x === "supported") ? "supported" : states.includes("missing") ? "not_met" : "uncertain";
+  return { criteria, overall, gaps, assessedAt:new Date().toISOString(), basis:"ICH E2D(R1) minimum criteria: identifiable patient, identifiable reporter, suspect product, adverse event" };
+}
+const eventSeriousness = (e, drugs) => {
+  const text = e.mentions.map(m => m.sentence).join(" "), flags = {}, basis = [];
+  const test = (key, re, label) => { const m = re.exec(text); if (m) { flags[key] = true; basis.push(label + ": \"" + m[0] + "\""); } };
+  test("death", /\b(died|death|fatal)\b/i, "death"); test("life_threatening", /\blife[- ]threatening|intensive care|\bicu\b|cardiac arrest|intubat\w+|mechanical ventilation/i, "life-threatening"); test("hospitalization", /\b(hospitali[sz]\w*|admitted|admission|prolonged (?:stay|hospital))\b/i, "hospitalisation");
+  test("disability", /\b(permanent|persistent|disabil\w+|sequel\w+|incapacit\w+)\b/i, "disability"); test("congenital_anomaly", /\b(congenital|birth defect|malformation)\b/i, "congenital anomaly");
+  if (e.ime) { flags.other_medically_important = true; basis.push("other medically important: on the EMA IME list"); }
+  if (/status epilepticus|haemodialysis|hemodialysis|dialysis/i.test(text + " " + e.term)) { flags.other_medically_important = true; basis.push("other medically important: " + (/dialysis/i.test(text) ? "intervention such as dialysis was needed" : "status epilepticus")); }
+  flags.serious = Object.values(flags).some(Boolean);
+  return { flags, basis };
+};
+// What a medical reviewer must still decide on one event (the draft never decides these for them).
+function medicalJudgment(e, suspect, seriousness) {
+  const out = [];
+  if (!seriousness.flags.serious) out.push("Seriousness is not stated; confirm whether any seriousness criterion applies.");
+  if (e.ime && !seriousness.basis.some(b => /hospital|death|life/.test(b))) out.push("Important medical event term without a stated seriousness criterion.");
+  if (!e.outcome) out.push("Outcome is not stated.");
+  if (!e.onset) out.push("Onset is not dated.");
+  if (!suspect?.stop) out.push("It is not stated whether the suspect product was stopped.");
+  return out;
+}
+function dechallengeFor(drug, events, ex, patient) {
+  const text = patient.units.map(id => ex.unitIndex[id]?.text || "").join(" ");
+  const recur = /\b(recurr\w+|re-?appear\w+|returned|again)\b/i.test(text);
+  const dech = !drug ? { value:"", basis:"unreported" } : drug.stop
+    ? (events.concat((patient.events || []).filter(e => e.category === "manifestation" || e.category === "ae")).some(e => e.outcome && /resolved|recovered|improved|subsided|normali/i.test(e.outcome.text)) ? { value:"Positive: the event improved or resolved after the product was stopped", basis:"reported" } : { value:"Product stopped; the effect on the event is not stated", basis:"unknown" })
+    : /\b(continued|continuing|remained on|maintained)\b/i.test(text) ? { value:"", basis:"not_applicable" } : { value:"", basis:"unreported" };
+  const rechText = /\b(re-?challenge|re-?introduc\w+|restart\w+|resum\w+|re-?exposure)\b/i.test(text) ? (/\b(not|no)\s+(?:re-?challenge|re-?introduc|restart)\w*|without\s+re-?challenge/i.test(text) ? "not_done" : "reported") : "";
+  const rech = rechText === "reported" ? { value:recur ? "Positive: the event recurred when the product was given again" : "Product given again; the effect is not stated", basis:recur ? "reported" : "unknown" } : rechText === "not_done" ? { value:"Not done", basis:"not_applicable" } : { value:"", basis:drug?.stop ? "unreported" : "not_applicable" };
+  return { dech, rech };
+}
+function caseFromPatient(article, patient, ex, assignment, settings, ctx) {
+  const criteria = ctx.criteria, decisions = ctx.decisions || {}, cite = (article.authors || []).slice(0, 3).join(", ") + ((article.authors || []).length > 3 ? " et al" : "") + ". " + article.title + " " + (article.journal || "") + ". " + (article.date || "") + ". PMID " + article.id + (article.doi ? ". DOI " + article.doi : "") + ".";
+  const evid = (unitIds, confidence = 0.6) => uniq(unitIds).slice(0, 3).map(id => { const u = ex.unitIndex[id] || {}; return { source_file:"PMID " + article.id, unit:id, section:u.section || "", cell:u.cell || null, excerpt:String(u.text || "").slice(0, 300), confidence }; });
+  const f = (value, unitIds, state = "proposed") => icsrField(value || "", state, value ? evid(unitIds || []) : []);
+  const d = patient.descriptor, suspects = patient.drugs.filter(x => x.role === "suspect"), suspect = suspects[0];
+  const counted = patient.events.filter(e => !e.negated && !e.hypothetical && ((e.category === "ae" && decisions[e.id]?.action !== "exclude") || (e.category === "manifestation" && decisions[e.id]?.action === "promote")));
+  const children = e => patient.events.filter(m => m.parentId === e.id && decisions[m.id]?.action !== "promote" && decisions[m.id]?.action !== "exclude");
+  const history = patient.events.filter(e => e.category === "history").map(e => f(e.verbatim, e.mentions.map(m => m.unitId)));
+  const { dech, rech } = dechallengeFor(suspect, counted, ex, patient);
+  const events = counted.map(e => { const ser = eventSeriousness(e, patient.drugs), judgment = medicalJudgment(e, suspect, ser), ids = e.mentions.map(m => m.unitId);
+    const onsetDate = e.onset?.date || "", detail = children(e);
+    return { verbatim:f(e.verbatim, ids), pt:f(e.suggested.pt, ids), pt_code:f(e.suggested.code, ids), soc:f(e.suggested.soc, ids), meddra_version:f(e.suggested.code ? (ctx.ime?.info.version || "") : "", ids), coding_status:f(e.suggested.pt ? (e.suggested.code ? "Proposed (IME list)" : "Proposed (unverified lexicon)") : "", ids),
+      onset_date:f(onsetDate, ids), onset_day:e.onset?.day ?? null, onset_not_reported:false, time_to_onset:f(e.timeToOnset?.text || (e.onset?.day !== undefined ? "day " + e.onset.day + " of the report" : ""), ids), outcome:f(e.outcome ? e.outcome.text : "", e.outcome ? [e.outcome.unitId] : []),
+      seriousness_basis:f(ser.basis.join("; "), ids), needs_medical_judgment:judgment, ime_flag:Boolean(e.ime), manifestations:detail.map(m => ({ verbatim:m.verbatim, evidence:evid(m.mentions.map(x => x.unitId)) })), extraction_ref:e.id, seriousness:ser.flags };
+  });
+  const products = [
+    ...suspects.map(x => ({ role:"suspect", name:f(x.name, x.mentions.map(m => m.unitId)), dose:f(x.dose, x.mentions.map(m => m.unitId)), route:f(x.route, x.mentions.map(m => m.unitId)), frequency:f(x.frequency, x.mentions.map(m => m.unitId)),
+      start_date:f(x.start?.date || "", x.start ? [x.start.unitId] : []), start_day:x.start?.day ?? null, stop_date:f(x.stop?.date || "", x.stop ? [x.stop.unitId] : []), stop_day:x.stop?.day ?? null, action_taken:f(x.stop ? (x.stop.action === "interrupted" ? "Drug interrupted" : "Drug withdrawn") : "", x.stop ? [x.stop.unitId] : []),
+      dechallenge:f(dech.value, []), dechallenge_basis:dech.basis, rechallenge:f(rech.value, []), rechallenge_basis:rech.basis, indication:f(patient.events.find(e => e.category === "indication")?.verbatim || "", patient.events.filter(e => e.category === "indication").flatMap(e => e.mentions.map(m => m.unitId))) })),
+    ...patient.drugs.filter(x => x.role === "interacting" || x.role === "concomitant").map(x => ({ role:x.role, name:f(x.name, x.mentions.map(m => m.unitId)), dose:f(x.dose, x.mentions.map(m => m.unitId)), route:f(x.route, []), frequency:f(x.frequency, []) }))];
+  const top = ex.reporters.candidates[0] || {}, article0 = article;
+  const data = normalizeCase({ source_type:"literature", receipt_date:"", patient:{ identifier:f([d.age && d.age + "-" + String(d.ageUnit || "years").replace(/s$/, "") + "-old", d.sex && d.sex.toLowerCase(), d.labelText].filter(Boolean).join(" ") + " (name withheld in the publication)", patient.evidence.map(e => e.unitId)), age:f(d.age, patient.evidence.map(e => e.unitId)), age_unit:icsrField(d.ageUnit || "years", "proposed"), sex:f(d.sex, patient.evidence.map(e => e.unitId)), medical_history:history, country:f(article0.patientCountry?.name || "", []) },
+    reporter:{ identifier:icsrField(top.name ? top.name + (top.corresponding ? " (corresponding author)" : " (first author)") : "", "proposed", []), qualification:icsrField("Health professional (published literature)", "proposed"), country:icsrField(article0.affiliationCountry || "", "proposed"), organisation:icsrField(top.affiliations?.[0] || article0.affiliation || "", "proposed"), email:icsrField(top.email || ex.reporters.correspondenceEmails[0] || "", "proposed") },
+    sender:{ type:icsrField(settings.senderType || "Pharmaceutical company", "proposed"), organisation:icsrField(settings.senderOrg || ""), name:icsrField(settings.senderName || ""), email:icsrField(settings.senderEmail || ""), phone:icsrField(settings.senderPhone || ""), country:icsrField(settings.senderCountry || "") },
+    products, events, drug_history:patient.drugs.filter(x => x.role === "prior").map(x => x.name),
+    treatment_given:[...patient.drugs.filter(x => x.role === "treatment").map(x => x.name), ...patient.procedures.map(x => x.name)], treatment_refs:[...patient.drugs.filter(x => x.role === "treatment").map(x => ({ name:x.name, evidence:evid(x.mentions.map(m => m.unitId)) })), ...patient.procedures.map(x => ({ name:x.name, evidence:evid(x.mentions.map(m => m.unitId)) }))], confounders:[...patient.events.filter(e => e.category === "history" || e.category === "alternative").map(e => ({ type:e.category === "history" ? "Comorbidity" : "Other cause", text:e.verbatim, evidence:e.mentions[0]?.sentence || "" })), ...patient.events.filter(e => e.category === "lab").map(e => ({ type:"Laboratory finding", text:e.verbatim, evidence:e.mentions[0]?.sentence || "" }))],
+    source_summary:cite + (article.abstract ? "\n\nAbstract: " + article.abstract : ""), source_documents:[{ filename:article.fullTextKey ? "PMID_" + article.id : "PMID " + article.id + " citation and abstract", media_type:"text/plain", source_type:article.fullTextKey ? "full text" : "citation" }],
+    dates:{ publication:article.date || "", retrieved:article.pullAt || article.abstractCheckedAt || "", reviewed:null, awareness:null }, reportability:{ decision:null, basis:"", by:"", at:"" }, minimum_criteria:criteria, patient_ref:{ id:patient.id, label:patient.label },
+    warnings:["Pre-filled from the published article for " + (patient.label || patient.id) + " only. Every value is a proposal with its source sentence; a reviewer confirms it.", ...(ex.ambiguous.length ? ["Some sentences refer to several patients and were not attributed to this one."] : [])] });
+  // Event timing that is only a day number stays as text: a day of the report is not a calendar date.
+  return data;
+}
+// ---- Case versions (every edit, review, approval and export is a version with a content hash and a stored snapshot), field-level diffs, and duplicate / follow-up detection. ----
+async function recordVersion(env, rec, action, by, note = "") {
+  const snapshot = JSON.stringify({ id:rec.id, number:rec.number, status:rec.status, data:rec.data, notes:rec.notes || "", assignee:rec.assignee || "", approval:rec.approval || null, provenance:rec.provenance || null }), hash = await sha256Hex(snapshot), key = "cases/" + rec.id + "/" + hash.slice(0, 16) + ".json";
+  await env.BUCKET.put(key, snapshot, { httpMetadata:{ contentType:"application/json" } });
+  return { at:new Date().toISOString(), by, action, hash, key, note:String(note).slice(0, 300) };
+}
+const pushVersion = (rec, entry) => { (rec.versions ||= []).push({ n:rec.versions.length + 1, ...entry }); };
+const caseDataHash = async rec => sha256Hex(canonicalJson({ data:rec.data, status:rec.status }));
+function allocateCaseNumber(data) {
+  const year = new Date().getFullYear(), counters = data.caseSeq ||= {};
+  const seq = (counters[year] ?? Math.max(0, ...(data.cases || []).filter(c => c.number.startsWith("LS-" + year)).map(c => Number(c.number.split("-")[2]) || 0))) + 1;
+  counters[year] = seq;
+  return "LS-" + year + "-" + String(seq).padStart(4, "0");
+}
+function flattenCase(data) {
+  const c = normalizeCase(data), out = {}, put = (path, value) => { if (value !== undefined && value !== null && String(value) !== "") out[path] = String(value); };
+  put("patient.age", v(c.patient.age) && v(c.patient.age) + " " + v(c.patient.age_unit)); put("patient.sex", v(c.patient.sex)); put("patient.country", v(c.patient.country)); put("reporter", v(c.reporter.identifier)); put("reporter.organisation", v(c.reporter.organisation));
+  c.patient.medical_history.forEach(h => put("history: " + v(h), "present"));
+  c.products.forEach(p => { const k = "product " + p.role + " " + v(p.name); put(k, "present"); for (const f of ["dose", "route", "frequency", "start_date", "stop_date", "action_taken", "dechallenge", "rechallenge", "indication"]) put(k + " / " + f, v(p[f])); });
+  c.events.forEach(e => { const k = "event " + v(e.verbatim); put(k, "present"); for (const f of ["pt", "onset_date", "time_to_onset", "outcome", "causality_reporter", "causality_reviewer"]) put(k + " / " + f, v(e[f])); put(k + " / serious", e.seriousness?.serious ? "serious" : ""); });
+  put("dates.publication", c.dates.publication); put("dates.awareness", c.dates.awareness?.value); put("reportability", c.reportability.decision); c.treatment_given.forEach(t => put("treatment: " + t, "given"));
+  return out;
+}
+function diffCaseData(a, b) {
+  const x = flattenCase(a), y = flattenCase(b), changes = [];
+  for (const k of new Set([...Object.keys(x), ...Object.keys(y)])) { if (x[k] === y[k]) continue; changes.push({ path:k, from:x[k] ?? null, to:y[k] ?? null, kind:x[k] === undefined ? "added" : y[k] === undefined ? "removed" : "changed" }); }
+  return changes.sort((p, q) => p.path.localeCompare(q.path));
+}
+const words = text => new Set(imeNorm(text).split(" ").filter(w => w.length > 3));
+const overlap = (a, b) => { const x = words(a), y = words(b); if (!x.size || !y.size) return 0; return [...x].filter(w => y.has(w)).length / Math.min(x.size, y.size); };
+// Why two cases might be the same patient: patient descriptors, product-event pairs, author or site, and chronology. Every point scored is given as a reason.
+function duplicateSignals(a, b, artA, artB) {
+  const A = normalizeCase(a.data), B = normalizeCase(b.data), reasons = []; let score = 0;
+  const add = (points, text) => { score += points; reasons.push({ points, text }); };
+  const ageA = v(A.patient.age), ageB = v(B.patient.age), sexA = v(A.patient.sex), sexB = v(B.patient.sex);
+  if (ageA && ageB && ageA === ageB && sexA && sexB && sexA === sexB) add(3, "Same patient descriptors: " + ageA + " " + v(A.patient.age_unit) + ", " + sexA);
+  else if (sexA && sexB && sexA !== sexB) add(-4, "Different sex (" + sexA + " and " + sexB + ")");
+  else if (ageA && ageB && Math.abs(Number(ageA) - Number(ageB)) > 2 && v(A.patient.age_unit) === v(B.patient.age_unit)) add(-3, "Ages differ (" + ageA + " and " + ageB + ")");
+  const namesOf = c => c.products.filter(p => p.role === "suspect").map(p => v(p.name).toLowerCase()).filter(Boolean), pa = namesOf(A), pb = namesOf(B), sameProduct = pa.some(n => pb.includes(n));
+  if (sameProduct) add(2, "Same suspect product: " + pa.find(n => pb.includes(n)));
+  const evKey = e => imeNorm(v(e.pt) || v(e.verbatim)), ea = A.events.filter(e => hasVal(e.verbatim)), eb = B.events.filter(e => hasVal(e.verbatim));
+  const pair = ea.find(x => eb.some(y => evKey(x) === evKey(y) || (hasVal(x.pt_code) && v(x.pt_code) === v(y.pt_code)) || overlap(v(x.verbatim), v(y.verbatim)) >= 0.6));
+  if (pair) add(sameProduct ? 3 : 2, "Same " + (sameProduct ? "product-event pair" : "event") + ": " + v(pair.verbatim));
+  const authA = (artA?.authors || [])[0] || "", authB = (artB?.authors || [])[0] || "";
+  if (authA && authB && authA.split(" ")[0].toLowerCase() === authB.split(" ")[0].toLowerCase()) add(2, "Same first author: " + authA);
+  const siteA = v(A.reporter.organisation) || artA?.affiliation || "", siteB = v(B.reporter.organisation) || artB?.affiliation || "";
+  if (siteA && siteB && overlap(siteA, siteB) >= 0.5) add(1, "Same site or institution");
+  const startA = A.products.find(p => p.role === "suspect"), startB = B.products.find(p => p.role === "suspect");
+  if (hasVal(startA?.start_date) && v(startA.start_date) === v(startB?.start_date)) add(2, "Same therapy start date (" + v(startA.start_date) + ")");
+  if (pair && hasVal(pair.onset_date) && ea.concat(eb).length && eb.some(y => hasVal(y.onset_date) && v(y.onset_date) === v(pair.onset_date))) add(2, "Same event onset date (" + v(pair.onset_date) + ")");
+  const tA = ea.map(e => v(e.time_to_onset)).filter(Boolean), tB = eb.map(e => v(e.time_to_onset)).filter(Boolean);
+  if (tA.some(t => tB.includes(t))) add(1, "Same time to onset (" + tA.find(t => tB.includes(t)) + ")");
+  if (v(A.patient.country) && v(A.patient.country) === v(B.patient.country)) add(0.5, "Same country");
+  const textB = ((artB?.title || "") + " " + (artB?.journal || "")).toLowerCase(), types = (artB?.pubTypes || []).join(" ").toLowerCase();
+  const relation = /correction|erratum|corrigendum/.test(textB + types) ? "correction" : /abstract|congress|annual meeting|conference|supplement/.test(textB + types) ? "conference_abstract" : /follow-?up|update|long-term|years? later|subsequent|outcome/.test(textB) ? "follow_up" : a.pmid === b.pmid ? "same_article" : "";
+  return { score:Number(score.toFixed(1)), level:score >= 8 ? "probable" : score >= 5 ? "possible" : "none", reasons, relation };
+}
+// ---- Evidence-linked narrative. Every statement is written from case fields and carries the source sentences those fields came from. ----
+function buildNarrative(rec) {
+  const c = normalizeCase(rec.data), statements = [];
+  const refs = (...fields) => fields.flatMap(f => (f?.evidence || [])).filter(e => e.excerpt).slice(0, 3).map(e => ({ pmid:rec.pmid, unit:e.unit || "", section:e.section || "", excerpt:e.excerpt, cell:e.cell || null }));
+  const say = (text, evidence, kind, key) => { if (text) statements.push({ id:"s" + (statements.length + 1), kind, key:key || "", text, evidence:evidence || [] }); };
+  const p = c.patient, suspects = c.products.filter(x => x.role === "suspect" && hasVal(x.name)), suspect = suspects[0];
+  say("This case was reported in the published literature" + (rec.data.source_summary ? " (" + String(rec.data.source_summary).split("\n")[0].slice(0, 200) + ")" : "") + ".", [{ pmid:rec.pmid, unit:"", section:"Citation", excerpt:String(rec.data.source_summary || "").split("\n")[0].slice(0, 300), cell:null }], "source");
+  const who = [v(p.age) && v(p.age) + "-" + (v(p.age_unit) || "years").replace(/s$/, "") + "-old", v(p.sex).toLowerCase()].filter(Boolean).join(" ") || "patient of unspecified age and sex";
+  say("The patient was a " + who + (v(p.country) ? " from " + v(p.country) : "") + ".", refs(p.age, p.sex, p.identifier), "patient");
+  if (p.medical_history.length) say("Relevant medical history: " + p.medical_history.map(h => v(h)).filter(Boolean).join("; ") + ".", refs(...p.medical_history), "history");
+  if (c.drug_history.length) say("Earlier treatment: " + c.drug_history.join(", ") + ".", [], "drug_history");
+  if (suspect) say("The patient received " + v(suspect.name) + [v(suspect.dose), v(suspect.route) && "by the " + v(suspect.route) + " route", v(suspect.frequency)].filter(Boolean).map((t, i) => (i ? ", " : " ") + t).join("") + (v(suspect.indication) ? " for " + v(suspect.indication) : "") + (v(suspect.start_date) ? ", started on " + v(suspect.start_date) : suspect.start_day != null ? ", started on day " + suspect.start_day + " of the report" : "") + ".", refs(suspect.name, suspect.dose, suspect.indication, suspect.start_date), "drug", "suspect");
+  const others = c.products.filter(x => x.role !== "suspect" && hasVal(x.name)); if (others.length) say("Other medicines mentioned: " + others.map(x => v(x.name) + (x.role === "interacting" ? " (possible interaction)" : "")).join(", ") + ".", refs(...others.map(x => x.name)), "drug", "other");
+  const order = e => hasVal(e.onset_date) ? Date.parse(v(e.onset_date)) / 86400000 + 1e6 : Number.isFinite(e.onset_day) ? e.onset_day : 1e9;
+  const events = c.events.filter(e => hasVal(e.verbatim)).slice().sort((a, b) => order(a) - order(b));
+  events.forEach((e, i) => {
+    const when = hasVal(e.onset_date) ? "On " + v(e.onset_date) : v(e.time_to_onset) ? "At " + v(e.time_to_onset) : "At an unstated time";
+    const ser = e.seriousness?.serious ? " This was considered serious (" + (v(e.seriousness_basis).replace(/: "[^"]*"/g, "") || "criterion not stated") + ")." : "";
+    say(when + ", the patient " + (i ? "also " : "") + "developed " + v(e.verbatim) + (hasVal(e.pt) && v(e.pt).toLowerCase() !== v(e.verbatim).toLowerCase() ? " (suggested term: " + v(e.pt) + ")" : "") + (e.manifestations?.length ? ", with " + e.manifestations.map(m => m.verbatim).join(" and ") : "") + "." + ser + (hasVal(e.outcome) ? " Outcome: " + v(e.outcome) + "." : ""), refs(e.verbatim, e.onset_date, e.time_to_onset, e.outcome, e.seriousness_basis, { evidence:(e.manifestations || []).flatMap(m => m.evidence || []) }), "event", e.extraction_ref || "");
+  });
+  if (c.treatment_given.length) say("Treatment given: " + c.treatment_given.join(", ") + ".", (c.treatment_refs || []).flatMap(t => t.evidence || []).slice(0, 3), "treatment");
+  if (suspect) {
+    if (hasVal(suspect.action_taken)) say("Action taken with " + v(suspect.name) + ": " + v(suspect.action_taken).toLowerCase() + (suspect.stop_day != null ? " (day " + suspect.stop_day + ")" : "") + ".", refs(suspect.action_taken), "action");
+    say("Dechallenge: " + (hasVal(suspect.dechallenge) ? v(suspect.dechallenge) : ({ unreported:"not reported in the article", not_applicable:"not applicable (the product was not stopped)", unknown:"unknown" }[suspect.dechallenge_basis] || "not reported in the article")) + ". Rechallenge: " + (hasVal(suspect.rechallenge) ? v(suspect.rechallenge) : ({ unreported:"not reported in the article", not_applicable:"not applicable", unknown:"unknown" }[suspect.rechallenge_basis] || "not reported in the article")) + ".", refs(suspect.dechallenge, suspect.rechallenge), "dechallenge");
+  }
+  if (c.confounders.length) say("Possible confounders: " + c.confounders.map(x => x.type + ": " + x.text).join("; ") + ".", c.confounders.slice(0, 3).filter(x => x.evidence).map(x => ({ pmid:rec.pmid, unit:"", section:"", excerpt:x.evidence, cell:null })), "confounders");
+  const rep = events.filter(e => hasVal(e.causality_reporter)).map(e => v(e.verbatim) + ": " + v(e.causality_reporter)), comp = events.filter(e => hasVal(e.causality_reviewer)).map(e => v(e.verbatim) + ": " + v(e.causality_reviewer) + (e.causality_reviewer?.state === "proposed" ? " (suggestion, not yet confirmed)" : ""));
+  if (rep.length) say("Reporter's causality assessment: " + rep.join("; ") + ".", [], "causality_reporter");
+  if (comp.length) say("Company causality assessment: " + comp.join("; ") + ".", [], "causality_company");
+  return { text:statements.map(s => s.text).join(" "), statements, generatedAt:new Date().toISOString(), basedOn:null, edited:false };
+}
+// ---- E2B(R3): regional profiles, field-level validation, and the approval gate for final output. Transmission to a regulator is outside this release. ----
+const E2B_PROFILES = {
+  ICH:{ label:"ICH E2B(R3) base message", batchReceiver:"RECEIVER", messageReceiver:"RECEIVER", supportedForFinal:true, medDraRequired:false },
+  EU:{ label:"EU (EMA / EudraVigilance) E2B(R3)", batchReceiver:"EMA", messageReceiver:"EMA", supportedForFinal:true, medDraRequired:true },
+  FDA:{ label:"FDA E2B(R3), postmarket (review only)", batchReceiver:"ZZFDA", messageReceiver:"CDER", supportedForFinal:false, medDraRequired:true,
+    note:"FDA regional elements (for example FDA.C.1.7.1 local criteria report type and FDA.C.1.12 combination product flag) are required by the FDA regional guide but are not generated in this release, so FDA files are for review only." } };
+function validateE2b(rec, article, profileName = "ICH") {
+  const profile = E2B_PROFILES[profileName] || E2B_PROFILES.ICH, c = normalizeCase(rec.data), issues = [];
+  const add = (severity, field, path, message) => issues.push({ severity, field, path, message, profile:profileName });
+  const date = x => /^\d{4}-\d{2}-\d{2}$/.test(x);
+  if (!rec.number) add("error", "C.1.1", "number", "The sender's safety report identifier is missing."); else if (rec.number.length > 100) add("error", "C.1.1", "number", "C.1.1 is limited to 100 characters.");
+  if (!c.dates.awareness?.value) add("error", "C.1.4", "dates.awareness", "The date the report was first received from the source has not been confirmed by a reviewer. It is recorded separately from the publication and retrieval dates.");
+  else if (!date(c.dates.awareness.value)) add("error", "C.1.4", "dates.awareness", "The awareness date must be a calendar date (YYYY-MM-DD).");
+  if (!(rec.versions || []).length && !rec.updatedAt) add("error", "C.1.5", "versions", "The date of most recent information cannot be determined.");
+  if (!String(c.source_summary || "").trim()) add("error", "C.4.r.1", "source_summary", "A literature case needs the literature reference.");
+  if (!hasVal(c.reporter.identifier) && !hasVal(c.reporter.organisation)) add("error", "C.2.r", "reporter", "No primary source (reporter) is identified.");
+  else { if (!hasVal(c.reporter.qualification)) add("error", "C.2.r.4", "reporter.qualification", "The reporter's qualification is required."); if (!hasVal(c.reporter.country)) add(profile.medDraRequired ? "error" : "warning", "C.2.r.3", "reporter.country", "The reporter's country is missing."); }
+  if (!hasVal(c.patient.identifier) && !hasVal(c.patient.age) && !hasVal(c.patient.sex)) add("error", "D", "patient", "The patient is not identifiable: give initials or a label, age, or sex.");
+  if (hasVal(c.patient.age) && !/^\d+(\.\d+)?$/.test(v(c.patient.age))) add("error", "D.2.2a", "patient.age", "Age must be a number.");
+  const suspects = c.products.filter(p => p.role === "suspect" && hasVal(p.name)); if (!suspects.length) add("error", "G.k.1", "products", "At least one suspect drug is required.");
+  c.products.forEach((p, i) => { if (!hasVal(p.name)) add("error", "G.k.2.2", "products[" + i + "].name", "Every drug needs a name."); else if (v(p.name).length > 250) add("error", "G.k.2.2", "products[" + i + "].name", "The drug name is limited to 250 characters."); });
+  suspects.forEach((p, i) => { if (!hasVal(p.dose) && !hasVal(p.frequency)) add("warning", "G.k.4.r", "products[" + i + "].dose", "No dosage information for " + v(p.name) + "."); if (!hasVal(p.action_taken)) add("warning", "G.k.8", "products[" + i + "].action_taken", "Action taken with " + v(p.name) + " is not recorded."); for (const f of ["start_date", "stop_date"]) if (hasVal(p[f]) && !date(v(p[f]))) add("error", "G.k.4.r.4", "products[" + i + "]." + f, "Dates must be YYYY-MM-DD."); });
+  const events = c.events.filter(e => hasVal(e.verbatim)); if (!events.length) add("error", "E.i.1.1a", "events", "At least one reaction or event is required.");
+  events.forEach((e, i) => {
+    const at = "events[" + i + "]";
+    if (v(e.verbatim).length > 250) add("error", "E.i.1.1a", at + ".verbatim", "The reaction as reported is limited to 250 characters.");
+    if (!hasVal(e.pt_code)) add(profile.medDraRequired ? "error" : "warning", "E.i.2.1b", at + ".pt_code", "No MedDRA PT code for \"" + v(e.verbatim) + "\"." + (profile.medDraRequired ? " This profile requires MedDRA coding; code it in your licensed MedDRA browser." : ""));
+    else if (!/^\d{8}$/.test(v(e.pt_code))) add("error", "E.i.2.1b", at + ".pt_code", "A MedDRA code has 8 digits.");
+    if (hasVal(e.pt_code) && !hasVal(e.meddra_version)) add("error", "E.i.2.1a", at + ".meddra_version", "The MedDRA version is needed with a code.");
+    if (!hasVal(e.outcome)) add("error", "E.i.7", at + ".outcome", "The outcome is required; record \"unknown\" if it is not known.");
+    if (!e.seriousness?.serious && !hasVal(e.seriousness_basis)) add("warning", "E.i.3.2", at + ".seriousness", "Seriousness has not been assessed for \"" + v(e.verbatim) + "\".");
+    if (!hasVal(e.onset_date) && !hasVal(e.time_to_onset) && !e.onset_not_reported) add("warning", "E.i.4", at + ".onset_date", "No onset date or time to onset for \"" + v(e.verbatim) + "\".");
+    if (hasVal(e.onset_date) && !date(v(e.onset_date))) add("error", "E.i.4", at + ".onset_date", "Dates must be YYYY-MM-DD.");
+    if (!hasVal(e.causality_reviewer) && !hasVal(e.causality_reporter)) add("warning", "G.k.9.i", at + ".causality", "No causality assessment for \"" + v(e.verbatim) + "\".");
+    for (const j of e.needs_medical_judgment || []) add("warning", "review", at, v(e.verbatim) + ": " + j);
+  });
+  if (!String(c.narrative?.text || "").trim()) add("error", "H.1", "narrative", "The case narrative is missing. Generate and review it.");
+  if (c.minimum_criteria && c.minimum_criteria.overall !== "supported" && !rec.provenance?.forced) add("warning", "E2D", "minimum_criteria", "The minimum criteria are not all supported.");
+  if (profileName === "FDA") { add("error", "FDA.C.1.7.1", "regional", "Required by the FDA regional guide (local criteria report type); not generated by this release."); add("error", "FDA.C.1.12", "regional", "Required by the FDA regional guide for postmarket reports (combination product flag); not generated by this release."); }
+  return issues;
+}
+async function structuralXsd(env, xml) {
+  if (typeof env.XSD_VALIDATE !== "function") return { available:false, errors:[], note:"Schema validation needs the ICH schema files on the server (see deploy/enable-xsd.sh); only the business rules were checked." };
+  try { return { available:true, errors:await env.XSD_VALIDATE(xml) }; } catch (error) { return { available:false, errors:[], note:"Schema validation could not run: " + error.message }; }
+}
+const approvalValid = async rec => Boolean(rec.approval?.status === "approved" && rec.approval.hash === await caseDataHash(rec));
 const safetyFilter = '("adverse effects"[sh] OR "drug-related side effects and adverse reactions"[MeSH Terms] OR safety[tiab] OR toxicity[tiab] OR "adverse event*"[tiab] OR "adverse reaction*"[tiab] OR "adverse drug reaction*"[tiab] OR "side effect*"[tiab])';
 function buildQuery(names, safetyOnly) {
   const clean = [...new Set(names.map(n => String(n || "").replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim()).filter(Boolean))];
@@ -1797,7 +2039,7 @@ const addDaysIso = (date, days) => { const d = new Date(date); return Number.isN
 function regulatoryContext(maList, data, molecule) {
   const country = data.patient?.country?.value || data.reporter?.country?.value || "", info = countryInfo(country), ma = country ? maFor(maList, molecule, country) : null;
   const serious = (data.events || []).some(e => Object.values(e.seriousness || {}).some(Boolean));
-  const days = serious ? ma?.serious_days || 15 : ma?.nonserious_days || 90, day0 = data.receipt_date || "";
+  const days = serious ? ma?.serious_days || 15 : ma?.nonserious_days || 90, day0 = data.dates?.awareness?.value || data.receipt_date || "";
   return { country:info?.name || country || "", regulator:info?.regulator || (country ? "Local competent authority" : ""), ma, serious, days, day0, due:day0 ? addDaysIso(day0, days) : "",
     note:!country ? "Set the country where the event occurred; it decides the regulator, marketing-authorisation status and reporting clock." : !ma ? "No marketing-authorisation record for " + molecule + " in " + (info?.name || country) + ". Add one in Settings, or confirm local obligations." : ma.status !== "Authorised" ? "Marketing authorisation status in " + ma.country + ": " + ma.status + "." : "",
     clock:"Default clock: " + (serious ? "15 days for serious" : "90 days for non-serious") + " cases unless the authorisation record sets its own; confirm with local regulations." };
@@ -1810,7 +2052,7 @@ const FIELDS = {
   sender:["type", "organisation", "name", "email", "phone", "address", "country"],
   product:["name", "dose", "frequency", "route", "indication", "start_date", "stop_date", "action_taken", "dechallenge", "rechallenge"],
   event:["verbatim", "onset_date", "stop_date", "outcome", "expectedness", "coded_term", "time_to_onset", "llt", "pt", "pt_code", "hlt", "hlgt", "soc", "meddra_version", "coding_status",
-    "causality_reporter", "causality_reviewer", "causality_method", "temporal_relationship", "alternative_causes", "concomitant_factors", "objective_evidence", "listedness", "assessed_term", "rsi", "causality_rationale", "reviewer_comment"] };
+    "seriousness_basis", "causality_reporter", "causality_reviewer", "causality_method", "temporal_relationship", "alternative_causes", "concomitant_factors", "objective_evidence", "listedness", "assessed_term", "rsi", "causality_rationale", "reviewer_comment"] };
 const WHO_UMC = ["Certain", "Probable/Likely", "Possible", "Unlikely", "Conditional/Unclassified", "Unassessable/Unclassifiable"];
 const AGE_GROUPS = ["Foetus", "Neonate", "Infant", "Child", "Adolescent", "Adult", "Elderly"];
 // ICH E2B(R3) D.2.3 age groups, from an age in years (neonate to 27 days, infant to 23 months, child to 11, adolescent to 17, adult to 64).
@@ -1835,9 +2077,14 @@ function normalizeCase(input) {
     patient:group(data.patient, FIELDS.patient, { medical_history:(data.patient?.medical_history || []).slice(0, 50).map(fixField) }),
     reporter:group(data.reporter, FIELDS.reporter), sender:group(data.sender, FIELDS.sender),
     source_type:data.source_type === "social" ? "social" : "literature", source_platform:String(data.source_platform || "").slice(0, 60),
+    drug_history:(data.drug_history || []).map(String).map(t => t.slice(0, 200)).slice(0, 30), patient_ref:data.patient_ref ? { id:String(data.patient_ref.id || "").slice(0, 20), label:String(data.patient_ref.label || "").slice(0, 100) } : null,
+    dates:{ publication:String(data.dates?.publication || ""), retrieved:String(data.dates?.retrieved || ""), reviewed:data.dates?.reviewed || null, awareness:data.dates?.awareness || null },
+    reportability:{ decision:["reportable", "not_reportable", "undetermined"].includes(data.reportability?.decision) ? data.reportability.decision : null, basis:String(data.reportability?.basis || "").slice(0, 1000), by:String(data.reportability?.by || ""), at:String(data.reportability?.at || "") },
+    treatment_refs:(data.treatment_refs || []).slice(0, 30), minimum_criteria:data.minimum_criteria || null, narrative:data.narrative || null, market:String(data.market || "").slice(0, 80),
     general_comments:String(data.general_comments || "").slice(0, 4000), sender_comments:String(data.sender_comments || "").slice(0, 4000),
-    products:(data.products || []).slice(0, 30).map(p => ({ ...group(p, FIELDS.product), role:["suspect", "concomitant", "interacting"].includes(p?.role) ? p.role : "suspect", start_not_reported:p?.start_not_reported === true })),
-    events:(data.events || []).slice(0, 30).map(e => ({ ...group(e, FIELDS.event), onset_not_reported:e?.onset_not_reported === true, seriousness:Object.fromEntries(SERIOUS_FLAGS.map(k => [k, Boolean(e?.seriousness?.[k])])) })),
+    products:(data.products || []).slice(0, 30).map(p => ({ ...group(p, FIELDS.product), role:["suspect", "concomitant", "interacting"].includes(p?.role) ? p.role : "suspect", start_not_reported:p?.start_not_reported === true,
+      dechallenge_basis:["reported", "unknown", "unreported", "not_applicable"].includes(p?.dechallenge_basis) ? p.dechallenge_basis : "", rechallenge_basis:["reported", "unknown", "unreported", "not_applicable"].includes(p?.rechallenge_basis) ? p.rechallenge_basis : "", start_day:Number.isFinite(p?.start_day) ? p.start_day : null, stop_day:Number.isFinite(p?.stop_day) ? p.stop_day : null })),
+    events:(data.events || []).slice(0, 30).map(e => ({ ...group(e, FIELDS.event), onset_not_reported:e?.onset_not_reported === true, ime_flag:e?.ime_flag === true, onset_day:Number.isFinite(e?.onset_day) ? e.onset_day : null, needs_medical_judgment:(e?.needs_medical_judgment || []).map(String).slice(0, 10), manifestations:(e?.manifestations || []).slice(0, 20), extraction_ref:String(e?.extraction_ref || ""), listedness_assessment:e?.listedness_assessment || null, seriousness:Object.fromEntries(SERIOUS_FLAGS.map(k => [k, Boolean(e?.seriousness?.[k])])) })),
     labs:Array.isArray(data.labs) ? data.labs.slice(0, 100) : [], source_documents:(data.source_documents || []).slice(0, 20).map(d => ({ filename:String(d?.filename || "").slice(0, 200), media_type:d?.media_type || null, size_bytes:Number(d?.size_bytes) || 0, source_type:d?.source_type || "unknown" })),
     source_summary:String(data.source_summary || "").slice(0, 20000), warnings:(data.warnings || []).map(String).slice(0, 20), special_situations:(data.special_situations || []).map(String).slice(0, 30),
     // LiteraSift extensions (PV Nexus ignores unknown keys): care given for the event, and factors that confound the assessment.
@@ -2026,10 +2273,9 @@ function pickCaseAssignee(data, rec) {
 // Reporting due date from the case's country, seriousness and marketing-authorisation record (15 days serious / 90 days non-serious by default).
 function refreshDue(data, rec) { rec.dueAt = regulatoryContext(data.settings?.marketAuth || [], rec.data, rec.molecule).due || ""; }
 function makeCase(data, article, item, by, intake, assignTo = "") {
-  const year = new Date().getFullYear(), at = new Date().toISOString(), counters = data.caseSeq ||= {};
-  const seq = (counters[year] ?? Math.max(0, ...(data.cases || []).filter(c => c.number.startsWith("LS-" + year)).map(c => Number(c.number.split("-")[2]) || 0))) + 1;
-  counters[year] = seq;
-  const created = { id:crypto.randomUUID(), number:"LS-" + year + "-" + String(seq).padStart(4, "0"), pmid:article.id, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"",
+  const at = new Date().toISOString();
+  const number = allocateCaseNumber(data);
+  const created = { id:crypto.randomUUID(), number, pmid:article.id, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"",
     data:caseFromArticle(article, item, data.settings || {}), createdBy:by, createdAt:at, updatedAt:at, intake,
     history:[{ at, by, action:(intake === "automatic" ? "added automatically from the full text of PMID " : "created from PMID ") + article.id }] };
   created.data.case_id = created.number;
@@ -2093,7 +2339,7 @@ const codeFrom = (table, text) => (table.find(([re]) => re.test(String(text || "
 const OID = { c11:"2.16.840.1.113883.3.989.2.1.3.1", c181:"2.16.840.1.113883.3.989.2.1.3.2", obs:"2.16.840.1.113883.3.989.2.1.1.19", meddra:"2.16.840.1.113883.6.163", batch:"2.16.840.1.113883.3.989.2.1.3.22",
   msgSender:"2.16.840.1.113883.3.989.2.1.3.11", msgReceiver:"2.16.840.1.113883.3.989.2.1.3.12", sender:"2.16.840.1.113883.3.989.2.1.3.13", receiver:"2.16.840.1.113883.3.989.2.1.3.14", patient:"2.16.840.1.113883.3.989.2.1.3.7" };
 function e2bCase(rec, article, opts = {}) {
-  const c = normalizeCase(rec.data), p = c.patient, suspect = firstSuspect(c), narrative = caseNarrativeText(c, rec.data.source_summary ? String(rec.data.source_summary).split("\n")[0] : "");
+  const c = normalizeCase(rec.data), p = c.patient, suspect = firstSuspect(c), narrative = c.narrative?.text || caseNarrativeText(c, rec.data.source_summary ? String(rec.data.source_summary).split("\n")[0] : "");
   const uid = () => crypto.randomUUID(), obs = (code, name, valueXml, extra = "") => `<observation classCode="OBS" moodCode="EVN"><code code="${code}" codeSystem="${OID.obs}" displayName="${xmlEsc(name)}"/>${extra}${valueXml}</observation>`;
   const sexCode = /^male$/i.test(v(p.sex)) ? "1" : /^female$/i.test(v(p.sex)) ? "2" : "";
   const evs = c.events.filter(e => hasVal(e.verbatim)), reactionIds = evs.map(() => uid()), drugList = c.products.filter(x => hasVal(x.name)), drugIds = drugList.map(() => uid());
@@ -2104,7 +2350,7 @@ function e2bCase(rec, article, opts = {}) {
     return `<subjectOf2 typeCode="SBJ"><observation classCode="OBS" moodCode="EVN"><id root="${reactionIds[ei]}"/><code code="29" codeSystem="${OID.obs}" displayName="reaction"/>` +
       (start || stop ? `<effectiveTime xsi:type="IVL_TS">${start ? `<low value="${start}"/>` : ""}${stop ? `<high value="${stop}"/>` : ""}</effectiveTime>` : "") +
       `<value xsi:type="CE"${hasVal(e.pt_code) ? ` code="${xmlEsc(v(e.pt_code))}" codeSystem="${OID.meddra}"${hasVal(e.meddra_version) ? ` codeSystemVersion="${xmlEsc(v(e.meddra_version))}"` : ""}` : ""}><originalText>${xmlEsc(v(e.verbatim))}</originalText></value>` +
-      (crit || outcome ? `<outboundRelationship2 typeCode="PERT">${outcome ? obs("27", "outcome", `<value xsi:type="CE" code="${outcome}" codeSystem="2.16.840.1.113883.3.989.2.1.1.11"/>`) : ""}</outboundRelationship2>` : "") + `</observation></subjectOf2>` + (crit ? crit.split("</observation>").filter(Boolean).map(o => `<subjectOf2 typeCode="SBJ">${o}</observation></subjectOf2>`).join("") : "");
+      (outcome ? `<outboundRelationship2 typeCode="PERT">${obs("27", "outcome", `<value xsi:type="CE" code="${outcome}" codeSystem="2.16.840.1.113883.3.989.2.1.1.11"/>`)}</outboundRelationship2>` : "") + `</observation></subjectOf2>` + (crit ? crit.split("</observation>").filter(Boolean).map(o => `<subjectOf2 typeCode="SBJ">${o}</observation></subjectOf2>`).join("") : "");
   }).join("");
   const drugs = drugList.map((x, di) => {
     const role = x.role === "suspect" ? "1" : x.role === "interacting" ? "3" : "2", action = codeFrom(E2B_ACTION, v(x.action_taken)), start = hl7Date(v(x.start_date)), stop = hl7Date(v(x.stop_date));
@@ -2130,7 +2376,7 @@ function e2bCase(rec, article, opts = {}) {
   const weight = v(p.weight) ? `<subjectOf2 typeCode="SBJ">${obs("7", "bodyWeight", `<value xsi:type="PQ" value="${xmlEsc(v(p.weight))}" unit="kg"/>`)}</subjectOf2>` : "";
   const received = hl7Date(rec.data.receipt_date) || hl7Date(rec.createdAt);
   const message = `<PORR_IN049016UV><id root="${OID.msgSender}" extension="${xmlEsc(rec.number)}"/><creationTime value="${hl7Now()}"/><interactionId root="2.16.840.1.113883.1.6" extension="PORR_IN049016UV"/><processingCode code="P"/><processingModeCode code="T"/><acceptAckCode code="AL"/>` +
-    `<receiver typeCode="RCV"><device classCode="DEV" determinerCode="INSTANCE"><id root="${OID.msgReceiver}" extension="${xmlEsc(opts.receiver || "RECEIVER")}"/></device></receiver><sender typeCode="SND"><device classCode="DEV" determinerCode="INSTANCE"><id root="${OID.msgSender}" extension="${xmlEsc(opts.sender || "LITERASIFT")}"/></device></sender>` +
+    `<receiver typeCode="RCV"><device classCode="DEV" determinerCode="INSTANCE"><id root="${OID.msgReceiver}" extension="${xmlEsc(opts.messageReceiver || opts.receiver || "RECEIVER")}"/></device></receiver><sender typeCode="SND"><device classCode="DEV" determinerCode="INSTANCE"><id root="${OID.msgSender}" extension="${xmlEsc(opts.sender || "LITERASIFT")}"/></device></sender>` +
     `<controlActProcess classCode="CACT" moodCode="EVN"><code code="PORR_TE049016UV" codeSystem="2.16.840.1.113883.1.18"/><subject typeCode="SUBJ"><investigationEvent classCode="INVSTG" moodCode="EVN">` +
     `<id root="${OID.c11}" extension="${xmlEsc(rec.number)}"/><id root="${OID.c181}" extension="${xmlEsc(rec.number)}"/><code code="PAT_ADV_EVNT" codeSystem="2.16.840.1.113883.5.4"/><text>${xmlEsc(narrative)}</text><statusCode code="active"/>` +
     (received ? `<effectiveTime><low value="${received}"/></effectiveTime><availabilityTime value="${received}"/>` : "") +
@@ -2143,12 +2389,14 @@ function e2bCase(rec, article, opts = {}) {
   return message;
 }
 function e2bBatch(records, articles, opts = {}) {
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<MCCI_IN200100UV01 ITSVersion="XML_1.0" xmlns="urn:hl7-org:v3" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><id root="${OID.batch}" extension="${xmlEsc(opts.batchId || "LS-" + hl7Now())}"/><creationTime value="${hl7Now()}"/><responseModeCode code="D"/><interactionId root="2.16.840.1.113883.1.6" extension="MCCI_IN200100UV01"/>` +
+  const profile = E2B_PROFILES[opts.profile] || E2B_PROFILES.ICH, receiver = opts.receiver || profile.batchReceiver, messageReceiver = opts.receiver || profile.messageReceiver;
+  opts = { ...opts, receiver, messageReceiver };
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<!-- ${xmlEsc(opts.watermark || "DRAFT: not approved for submission")} · profile ${xmlEsc(opts.profile || "ICH")} · generated ${new Date().toISOString()} -->\n<MCCI_IN200100UV01 ITSVersion="XML_1.0" xmlns="urn:hl7-org:v3" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><id root="${OID.batch}" extension="${xmlEsc(opts.batchId || "LS-" + hl7Now())}"/><creationTime value="${hl7Now()}"/><responseModeCode code="D"/><interactionId root="2.16.840.1.113883.1.6" extension="MCCI_IN200100UV01"/>` +
     `<name code="1" codeSystem="2.16.840.1.113883.3.989.2.1.1.1"/>` + records.map(r => e2bCase(r, articles[r.pmid], opts)).join("") +
     `<receiver typeCode="RCV"><device classCode="DEV" determinerCode="INSTANCE"><id root="${OID.receiver}" extension="${xmlEsc(opts.receiver || "RECEIVER")}"/></device></receiver><sender typeCode="SND"><device classCode="DEV" determinerCode="INSTANCE"><id root="${OID.sender}" extension="${xmlEsc(opts.sender || "LITERASIFT")}"/></device></sender></MCCI_IN200100UV01>\n`;
 }
 // CIOMS I report in the layout used by PV Nexus exports: sections 0 to X, a frame and running header on every page, navy section bars, labelled cells, one row per event.
-function ciomsPdf(rec, article) {
+function ciomsPdf(rec, article, opts = {}) {
   const c = normalizeCase(rec.data), p = c.patient, events = c.events.filter(e => hasVal(e.verbatim)), suspects = c.products.filter(x => x.role === "suspect" && hasVal(x.name)), others = c.products.filter(x => x.role !== "suspect" && hasVal(x.name));
   const assessment = localAssessment(c), reg = regulatoryContext([], c, rec.molecule), signature = activeSignature(rec);
   const [pw, ph] = pdfPage, left = 44, width = pw - 88, top0 = ph - 58, bottom = 56, NAVY = [0.12, 0.23, 0.54], GRAY = [0.45, 0.47, 0.52], DARK = [0.1, 0.1, 0.12];
@@ -2211,7 +2459,8 @@ function ciomsPdf(rec, article) {
   text(left, y - 22, "INDIVIDUAL CASE SAFETY REPORT", 24, false); text(left, y - 40, "CIOMS I form · Suspect Adverse Reaction Report", 11, false, GRAY);
   text(left, y - 56, [v(suspects[0]?.name), v(events[0]?.verbatim)].filter(Boolean).join(" · "), 10.5, false, NAVY); y -= 66;
   ops.push(`0.12 0.23 0.54 RG 1 w ${left} ${y} m ${left + width} ${y} l S`); y -= 12;
-  warn("Causality, seriousness, dechallenge, rechallenge and expectedness reflect the latest saved case data" + (signature ? ", signed by " + signature.signer_name + " on " + signature.signed_at.slice(0, 10) + "." : "; a human-confirmed medical assessment has not yet been recorded for this case."));
+  warn(opts.final ? "FINAL: approved by " + opts.approval.by + " on " + opts.approval.at.slice(0, 10) + " for the " + opts.approval.profile + " profile (content SHA-256 " + opts.approval.hash.slice(0, 16) + "). Transmission to a regulator is not part of LiteraSift."
+    : "DRAFT: causality, seriousness, dechallenge, rechallenge and expectedness reflect the latest saved case data" + (signature ? ", signed by " + signature.signer_name + " on " + signature.signed_at.slice(0, 10) + "." : "; a human-confirmed medical assessment has not yet been recorded for this case."));
   if (c.warnings.length && !signature) warn("Values marked as proposed were filled from the article and have not been confirmed by a reviewer yet.");
   band("0. ADMINISTRATIVE INFORMATION");
   cells([{ label:"Sender case identifier", value:rec.number }, { label:"Report type", value:"initial" }, { label:"Source type", value:c.source_type === "social" ? "social media (patient-reported)" : "literature" }]);
@@ -2244,7 +2493,7 @@ function ciomsPdf(rec, article) {
     caption("Causality rationale"); box(v(e.causality_rationale) || "-");
     caption("Medical reviewer comment"); box(v(e.reviewer_comment) || " ");
   });
-  band("VI. NARRATIVE SUMMARY"); box(caseNarrativeText(c, ""));
+  band("VI. NARRATIVE SUMMARY"); box(c.narrative?.text || caseNarrativeText(c, ""));
   band("VII. REPORTER AND SENDER INFORMATION");
   table(["30. Qualification", "Type", "31. Country", "Organization", "Primary"], [2, 1.2, 1.2, 2.6, 0.9], [[v(c.reporter.qualification) || v(c.reporter.identifier), c.source_type === "social" ? "consumer" : "literature", v(c.reporter.country), v(c.reporter.organisation), "Yes"]]);
   cells([{ label:"Reporter (first author)", value:v(c.reporter.identifier) }, { label:"Reporter e-mail / phone", value:[v(c.reporter.email), v(c.reporter.phone)].filter(Boolean).join(" · ") }, { label:"Reporter address", value:[v(c.reporter.department), v(c.reporter.address)].filter(Boolean).join(", ") }]);
@@ -2275,7 +2524,7 @@ function ciomsPdf(rec, article) {
   // running footer with page numbers
   pages.forEach((page, i) => {
     ops = page;
-    text(left - 2, 40, "DRAFT - pending human-confirmed medical assessment" + (signature ? " (signed " + signature.signed_at.slice(0, 10) + ")" : ""), 8, false, [0.8, 0.4, 0.1]);
+    text(left - 2, 40, opts.final ? "FINAL - approved " + opts.approval.at.slice(0, 10) + " by " + opts.approval.by : "DRAFT - pending human-confirmed medical assessment" + (signature ? " (signed " + signature.signed_at.slice(0, 10) + ")" : ""), 8, false, opts.final ? [0.1, 0.45, 0.2] : [0.8, 0.4, 0.1]);
     text(pw - left - 120, 40, rec.number + "  |  Page " + (i + 1) + " of " + pages.length, 8, false, GRAY);
   });
   const objects = [["<< /Type /Catalog /Pages 2 0 R >>"], [`<< /Type /Pages /Kids [${pages.map((_, i) => 5 + i * 2 + " 0 R").join(" ")}] /Count ${pages.length} >>`], ["<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"], ["<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>"]];
@@ -2844,10 +3093,10 @@ async function apiCore(request, env, path) {
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
-      cases:await Promise.all((state.cases || []).filter(c => manager || c.createdBy === email || c.assignee === email).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
+      cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
       dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [],
       monitoring:monitoringCounts(state, viewer),
-      series:seriesSummary((state.cases || []).filter(c => manager || c.createdBy === email || c.assignee === email)), config:{ retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c))), config:{ retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -3014,6 +3263,184 @@ async function apiCore(request, env, path) {
       return json({ ok:true });
     }
   }
+  if (["/api/criteria", "/api/drafts-create", "/api/duplicates", "/api/duplicate-decide", "/api/case-versions", "/api/case-diff", "/api/case-dates", "/api/reportability"].includes(path) && viewer) {
+    const at = new Date().toISOString(), ownsCase = c => caseVisible(state, viewer, c);
+    const freshExtraction = async article => { let ex = article.extraction; if (!ex || ex.version !== EXTRACTION_VERSION || ex.source?.fullTextSha256 !== (article.evidence?.fulltext?.sha256 || null)) { ex = await extractClinical(withSettings(env, state), article, state); await write(env, data => { if (data.articles[article.id]) data.articles[article.id].extraction = ex; }); } return ex; };
+    if (path === "/api/criteria" || path === "/api/drafts-create") {
+      const item = state.assignments.find(a => a.id === body.id);
+      if (!item || !mayAccess(state, viewer, item)) return json({ error:"Assignment not found." }, 404);
+      const article = state.articles[item.pmid]; if (!article) return json({ error:"Article not found." }, 404);
+      const ex = await freshExtraction(article), decisions = item.extractionDecisions || {}, pdec = item.patientDecisions || {};
+      const assessed = ex.patients.map(p => ({ patient:p, assessment:assessMinimumCriteria(ex, p, decisions), excluded:pdec[p.id]?.action === "exclude" }));
+      if (path === "/api/criteria") return json({ aggregateOnly:ex.aggregateOnly, patients:assessed.map(x => ({ id:x.patient.id, label:x.patient.label, excluded:x.excluded, ...x.assessment })), screening:item.disposition || null, existingDrafts:(state.cases || []).filter(c => c.pmid === item.pmid && c.portfolio === item.portfolio).map(c => ({ number:c.number, patient:c.provenance?.patientId })) });
+      const pm = isPortfolioManager(state, viewer, item.portfolio), roles = rolesIn(state, email, item.portfolio);
+      if (!(item.reviewer === email || pm || roles.has("medical_reviewer"))) return json({ error:"Only the assigned reviewer, a medical reviewer or a manager can create drafts." }, 403);
+      if (item.disposition?.value !== "potential_icsr") return json({ error:"Record the screening disposition 'potential ICSR' first. Drafts are only made for potential cases." }, 409);
+      if (item.qc && item.qc.status !== "approved") return json({ error:"This disposition has not passed QC yet." }, 409);
+      if (ex.aggregateOnly) return json({ error:"The article reports aggregate data only; aggregate counts do not become individual case drafts." }, 409);
+      const force = body.force && typeof body.force === "object" ? body.force : {}, wanted = Array.isArray(body.patientIds) ? new Set(body.patientIds.map(String)) : null;
+      const created = [], existing = [], skipped = [], prepared = [];
+      for (const x of assessed) {
+        const p = x.patient; if (wanted && !wanted.has(p.id)) continue;
+        if (x.excluded) { skipped.push({ patient:p.id, reason:"Excluded by the reviewer: " + (pdec[p.id].reason || "") }); continue; }
+        if (x.assessment.overall === "not_met") { skipped.push({ patient:p.id, reason:"Minimum criteria not met: " + Object.entries(x.assessment.criteria).filter(([, c]) => c.status === "missing").map(([k, c]) => k + " (" + c.basis + ")").join("; ") }); continue; }
+        if (x.assessment.overall === "uncertain" && String(force[p.id] || "").trim().length < 5) { skipped.push({ patient:p.id, reason:"Some criteria are uncertain. Confirm them and give a reason (5+ characters) to create the draft anyway.", uncertain:Object.entries(x.assessment.criteria).filter(([, c]) => c.status === "uncertain").map(([k]) => k) }); continue; }
+        prepared.push({ p, assessment:x.assessment, forced:x.assessment.overall === "uncertain" ? String(force[p.id]).trim() : "" });
+      }
+      const ime = await loadIme(env), cfg = withSettings(env, state);
+      const outcome = await write(env, data => {
+        const done = [];
+        for (const { p, assessment, forced } of prepared) {
+          const idem = ["draft", item.pmid, p.id, item.portfolio].join("|"), old = (data.cases || []).find(c => c.provenance?.idempotencyKey === idem);
+          if (old) { done.push({ existing:true, number:old.number, patient:p.id }); continue; }
+          const number = allocateCaseNumber(data), a = data.assignments.find(x => x.id === item.id);
+          const caseData = caseFromPatient(data.articles[item.pmid], p, ex, a, data.settings || {}, { criteria:assessment, decisions:a.extractionDecisions || {}, ime });
+          caseData.case_id = number;
+          const rec = { id:crypto.randomUUID(), number, pmid:item.pmid, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"", data:caseData, createdBy:email, createdAt:at, updatedAt:at, assignee:item.reviewer || email, intake:"patient-draft",
+            provenance:{ idempotencyKey:idem, patientId:p.id, patientLabel:p.label, extractionVersion:ex.version, extractedAt:ex.createdAt, fullTextSha256:ex.source.fullTextSha256, assignmentId:item.id, criteriaOverall:assessment.overall, forced },
+            history:[{ at, by:email, action:"draft created for " + (p.label || p.id) + " from PMID " + item.pmid + " (" + item.portfolio + ")" }] };
+          refreshDue(data, rec); (data.cases ||= []).push(rec); done.push({ existing:false, number, patient:p.id, id:rec.id });
+        }
+        return done;
+      });
+      for (const o of outcome) { if (o.existing) existing.push(o); else created.push(o); }
+      for (const o of created) {
+        const fresh = (await load(env)).state.cases.find(c => c.id === o.id), entry = await recordVersion(env, fresh, "created", email, "Draft created from the extraction of PMID " + item.pmid);
+        await write(env, data => { const c = data.cases.find(x => x.id === o.id); pushVersion(c, entry); });
+        await audit(env, { by:email, action:"case.draft_created", entityType:"Case", entityId:o.number, detail:{ pmid:item.pmid, patient:o.patient, portfolio:item.portfolio, assessment:assessed.find(x => x.patient.id === o.patient)?.assessment.overall } });
+      }
+      void cfg;
+      return json({ created, existing, skipped, patients:ex.patients.length });
+    }
+    if (path === "/api/duplicates" || path === "/api/duplicate-decide" || path === "/api/case-versions" || path === "/api/case-diff" || path === "/api/case-dates" || path === "/api/reportability") {
+      const rec = (state.cases || []).find(c => c.id === body.caseId);
+      if (!rec || !ownsCase(rec)) return json({ error:"Case not found." }, 404);
+      const pm = isPortfolioManager(state, viewer, rec.portfolio), roles = rolesIn(state, email, rec.portfolio), mayDecide = pm || roles.has("medical_reviewer") || rec.assignee === email || rec.createdBy === email;
+      if (path === "/api/case-versions") return json({ versions:(rec.versions || []).map(({ n, at, by, action, hash, note }) => ({ n, at, by, action, hash, note })) });
+      if (path === "/api/case-diff") {
+        const load2 = async n => { const ver = (rec.versions || []).find(x => x.n === Number(n)); const o = ver && await env.BUCKET.get(ver.key); return o ? JSON.parse(await o.text()).data : null; };
+        let a, b, label;
+        if (body.otherId) { const other = (state.cases || []).find(c => c.id === body.otherId); if (!other || !ownsCase(other)) return json({ error:"Other case not found." }, 404); a = other.data; b = rec.data; label = other.number + " -> " + rec.number; }
+        else { a = await load2(body.from); b = body.to ? await load2(body.to) : rec.data; label = "v" + body.from + " -> " + (body.to ? "v" + body.to : "current"); if (!a || !b) return json({ error:"Version not found." }, 404); }
+        return json({ label, changes:diffCaseData(a, b) });
+      }
+      if (path === "/api/duplicates") {
+        const art = state.articles[rec.pmid], out = [];
+        for (const other of state.cases || []) {
+          if (other.id === rec.id || !ownsCase(other) || (other.pmid === rec.pmid && other.provenance?.patientId !== rec.provenance?.patientId && other.pmid === rec.pmid && rec.provenance?.patientId)) continue;
+          const sig = duplicateSignals(rec, other, art, state.articles[other.pmid]); if (sig.level === "none") continue;
+          const link = (rec.links || []).find(l => l.otherId === other.id);
+          out.push({ caseId:other.id, number:other.number, pmid:other.pmid, portfolio:other.portfolio, score:sig.score, level:sig.level, relation:sig.relation, reasons:sig.reasons, link:link ? { kind:link.kind, status:link.status, by:link.by, at:link.at } : null, createdAt:other.createdAt });
+        }
+        return json({ candidates:out.sort((x, y) => y.score - x.score).slice(0, 10) });
+      }
+      if (path === "/api/duplicate-decide") {
+        if (!mayDecide) return json({ error:"Only the case's reviewer, a medical reviewer or a manager can confirm a link." }, 403);
+        const other = (state.cases || []).find(c => c.id === body.otherId); if (!other || !ownsCase(other) || other.id === rec.id) return json({ error:"Other case not found." }, 404);
+        const decision = String(body.decision || ""), note = String(body.note || "").trim();
+        if (!["duplicate", "follow_up", "not_duplicate"].includes(decision) || note.length < 5) return json({ error:"Choose duplicate, follow-up or not a duplicate, and explain it (5+ characters). A person must confirm every link." }, 400);
+        const sig = duplicateSignals(rec, other, state.articles[rec.pmid], state.articles[other.pmid]);
+        // A follow-up points from the later case to the earlier one; the earlier case is never changed.
+        const [later, earlier] = rec.createdAt >= other.createdAt ? [rec, other] : [other, rec];
+        await write(env, data => {
+          const link = (self, o, kind) => { const c = data.cases.find(x => x.id === self.id); c.links = (c.links || []).filter(l => l.otherId !== o.id); c.links.push({ otherId:o.id, otherNumber:o.number, kind, status:decision === "not_duplicate" ? "rejected" : "confirmed", by:email, at, note, score:sig.score, reasons:sig.reasons.map(r => r.text) }); (c.history ||= []).push({ at, by:email, action:"link " + decision + " with " + o.number + ": " + note.slice(0, 160) }); };
+          const kindFor = (self, o) => decision === "follow_up" ? (self.id === later.id ? "follow_up_of" : "has_follow_up") : decision === "duplicate" ? (self.id === later.id ? "duplicate_of" : "has_duplicate") : "not_duplicate";
+          link(rec, other, kindFor(rec, other)); link(other, rec, kindFor(other, rec));
+          if (decision !== "not_duplicate") { const l = data.cases.find(x => x.id === later.id); l[decision === "follow_up" ? "followUpOf" : "duplicateOf"] = earlier.id; }
+        });
+        await audit(env, { by:email, action:"case.link", entityType:"Case", entityId:rec.number, detail:{ with:other.number, decision, note, score:sig.score, reasons:sig.reasons.map(r => r.text).join("; ") } });
+        return json({ ok:true, later:later.number, earlier:earlier.number });
+      }
+      if (path === "/api/case-dates") {
+        if (!mayDecide) return json({ error:"Only the case's reviewer, a medical reviewer or a manager can record these dates." }, 403);
+        const awareness = String(body.awareness || "");
+        if (awareness && !/^\d{4}-\d{2}-\d{2}$/.test(awareness)) return json({ error:"Enter the awareness date as YYYY-MM-DD." }, 400);
+        if (rec.locked) return json({ error:"This case is signed and locked." }, 409);
+        await write(env, data => { const c = data.cases.find(x => x.id === rec.id); c.data.dates = { ...(c.data.dates || {}), reviewed:{ by:email, at }, ...(awareness ? { awareness:{ value:awareness, confirmedBy:email, confirmedAt:at, note:String(body.note || "").slice(0, 300) } } : {}) }; refreshDue(data, c); (c.history ||= []).push({ at, by:email, action:"dates: reviewed" + (awareness ? ", awareness date " + awareness + " confirmed" : "") }); });
+        await audit(env, { by:email, action:"case.dates", entityType:"Case", entityId:rec.number, detail:{ awareness, reviewed:true } });
+        return json({ ok:true });
+      }
+      if (path === "/api/reportability") {
+        if (!(pm || roles.has("medical_reviewer"))) return json({ error:"Reportability is decided by a medical reviewer or a manager." }, 403);
+        const decision = String(body.decision || ""), basis = String(body.basis || "").trim();
+        if (!["reportable", "not_reportable", "undetermined"].includes(decision) || basis.length < 5) return json({ error:"Choose reportable, not reportable or undetermined, with the basis (5+ characters)." }, 400);
+        await write(env, data => { const c = data.cases.find(x => x.id === rec.id); c.data.reportability = { decision, basis:basis.slice(0, 1000), by:email, at }; (c.history ||= []).push({ at, by:email, action:"reportability: " + decision }); });
+        await audit(env, { by:email, action:"case.reportability", entityType:"Case", entityId:rec.number, detail:{ decision, basis } });
+        return json({ ok:true });
+      }
+    }
+  }
+  if (["/api/narrative-generate", "/api/narrative-save", "/api/e2b-validate", "/api/case-review", "/api/case-approve", "/api/rsi-save", "/api/rsi-list", "/api/listedness-suggest", "/api/listedness-decide"].includes(path) && viewer) {
+    const at = new Date().toISOString();
+    if (path === "/api/rsi-save" || path === "/api/rsi-list") {
+      if (!manager) return json({ error:"Manager access required." }, 403);
+      if (path === "/api/rsi-list") return json({ rsi:(state.rsi || []).map(({ id, product, market, version, effectiveDate, source, hash, at, by }) => ({ id, product, market, version, effectiveDate, source, hash, at, by })) });
+      const product = String(body.product || "").trim().slice(0, 100), market = String(body.market || "").trim().slice(0, 80), version = String(body.version || "").trim().slice(0, 60), text = String(body.text || ""), source = String(body.source || "").trim().slice(0, 200);
+      if (!product || !version || text.length < 100 || text.length > 2_000_000) return json({ error:"Give the product, the version, and the authorised text of the reference safety information (at least 100 characters)." }, 400);
+      const id = crypto.randomUUID(), hash = await sha256Hex(text);
+      await env.BUCKET.put("rsi/" + id + ".txt", text, { httpMetadata:{ contentType:"text/plain; charset=utf-8" } });
+      await write(env, data => { (data.rsi ||= []).push({ id, product, market, version, effectiveDate:/^\d{4}-\d{2}-\d{2}$/.test(body.effectiveDate || "") ? body.effectiveDate : "", source, hash, at, by:email }); });
+      await audit(env, { by:email, action:"rsi.saved", entityType:"Reference data", entityId:product + " v" + version, detail:{ market, hash, source } });
+      return json({ ok:true, id });
+    }
+    const rec = (state.cases || []).find(c => c.id === body.caseId);
+    if (!rec || !caseVisible(state, viewer, rec)) return json({ error:"Case not found." }, 404);
+    const pm = isPortfolioManager(state, viewer, rec.portfolio), roles = rolesIn(state, email, rec.portfolio), medical = pm || roles.has("medical_reviewer"), mayEdit = medical || rec.assignee === email || rec.createdBy === email;
+    if (rec.locked && path !== "/api/e2b-validate" && path !== "/api/listedness-suggest") return json({ error:"This case is signed and locked." }, 409);
+    const profileName = ["ICH", "EU", "FDA"].includes(body.profile) ? body.profile : "ICH";
+    if (path === "/api/narrative-generate" || path === "/api/narrative-save") {
+      if (!mayEdit) return json({ error:"Only the case's reviewer, a medical reviewer or a manager can change the narrative." }, 403);
+      let narrative;
+      if (path === "/api/narrative-generate") { narrative = buildNarrative(rec); narrative.basedOn = await caseDataHash(rec); }
+      else { const text = String(body.text || "").trim(); if (text.length < 20 || text.length > 100000) return json({ error:"The narrative must be between 20 and 100,000 characters." }, 400); narrative = { ...(rec.data.narrative || buildNarrative(rec)), text, edited:true, editedBy:email, editedAt:at }; }
+      const entry = await recordVersion(env, { ...rec, data:{ ...rec.data, narrative } }, "edited", email, path === "/api/narrative-generate" ? "Narrative generated from the case fields" : "Narrative edited");
+      await write(env, data => { const c = data.cases.find(x => x.id === rec.id); c.data.narrative = narrative; c.updatedAt = at; (c.history ||= []).push({ at, by:email, action:path === "/api/narrative-generate" ? "narrative generated" : "narrative edited" }); pushVersion(c, entry); });
+      await audit(env, { by:email, action:path === "/api/narrative-generate" ? "case.narrative_generated" : "case.narrative_edited", entityType:"Case", entityId:rec.number, detail:{ statements:narrative.statements?.length || 0 } });
+      return json({ narrative });
+    }
+    if (path === "/api/e2b-validate") {
+      const issues = validateE2b(rec, state.articles[rec.pmid], profileName), xml = e2bBatch([rec], state.articles, { profile:profileName, watermark:"VALIDATION COPY" }), xsd = await structuralXsd(env, xml);
+      const errors = issues.filter(i => i.severity === "error").length + xsd.errors.length;
+      return json({ profile:{ id:profileName, ...E2B_PROFILES[profileName] }, issues, xsd, ok:errors === 0, errors, warnings:issues.filter(i => i.severity === "warning").length });
+    }
+    if (path === "/api/listedness-suggest" || path === "/api/listedness-decide") {
+      const index = Number(body.eventIndex), event = rec.data.events?.[index], rsi = (state.rsi || []).find(r => r.id === body.rsiId);
+      if (!event || !rsi) return json({ error:"Choose an event and a reference safety information document." }, 404);
+      const object = await env.BUCKET.get("rsi/" + rsi.id + ".txt"), text = object ? await object.text() : "";
+      if (path === "/api/listedness-suggest") {
+        const terms = uniq([v(event.pt), v(event.verbatim), ...(event.manifestations || []).map(m => m.verbatim), ...EVENT_LEXICON.filter(([, , , pt]) => pt && pt.toLowerCase() === v(event.pt).toLowerCase()).map(l => l[0])].filter(Boolean).map(t => t.toLowerCase()));
+        const lines = text.split(/\r?\n/), found = [];
+        lines.forEach((line, i) => { const lower = line.toLowerCase(); const hit = terms.find(t => lower.includes(t)); if (hit) { let heading = ""; for (let j = i; j >= 0 && j > i - 40; j--) if (/^\s*(?:section\s+)?\d+(?:\.\d+)*\s+\S/.test(lines[j]) && lines[j].length < 90) { heading = lines[j].trim(); break; } found.push({ line:i + 1, term:hit, passage:line.trim().slice(0, 600), heading }); } });
+        return json({ rsi:{ id:rsi.id, product:rsi.product, market:rsi.market, version:rsi.version, hash:rsi.hash }, terms, passages:found.slice(0, 8), note:found.length ? "Passages are quoted exactly from the document you uploaded. The reviewer decides." : "No passage mentions this event. That does not by itself make it unlisted; the reviewer decides." });
+      }
+      if (!medical && !mayEdit) return json({ error:"Not permitted." }, 403);
+      const decision = String(body.decision || ""), passage = String(body.passage || "").trim(), note = String(body.note || "").trim();
+      if (!["listed", "unlisted", "unknown"].includes(decision) || note.length < 5) return json({ error:"Record listed, unlisted or unknown, with a note (5+ characters)." }, 400);
+      if (decision === "listed" && !passage) return json({ error:"Listed needs the exact label passage. Use a suggested passage." }, 400);
+      if (passage && !text.includes(passage)) return json({ error:"That passage is not in the selected document, so it cannot be cited." }, 400);
+      const assessment = { rsiId:rsi.id, product:rsi.product, market:rsi.market, version:rsi.version, hash:rsi.hash, decision, passage:passage.slice(0, 1000), note:note.slice(0, 500), by:email, at };
+      await write(env, data => { const c = data.cases.find(x => x.id === rec.id), e = c.data.events[index]; e.listedness_assessment = assessment; e.expectedness = icsrField(decision === "listed" ? "Listed" : decision === "unlisted" ? "Unlisted" : "Unknown", "edited"); e.listedness = icsrField(decision === "listed" ? "Listed" : decision === "unlisted" ? "Unlisted" : "Unknown", "edited"); e.rsi = icsrField(rsi.product + " RSI v" + rsi.version + (rsi.market ? " (" + rsi.market + ")" : ""), "edited"); c.updatedAt = at; (c.history ||= []).push({ at, by:email, action:"listedness of " + v(e.verbatim) + ": " + decision }); });
+      await audit(env, { by:email, action:"case.listedness", entityType:"Case", entityId:rec.number, detail:{ event:v(event.verbatim), decision, rsi:rsi.product + " v" + rsi.version, market:rsi.market } });
+      return json({ ok:true, assessment });
+    }
+    if (!medical) return json({ error:"A medical reviewer or manager is required." }, 403);
+    if (path === "/api/case-review") {
+      const entry = await recordVersion(env, rec, "reviewed", email, String(body.note || "Medical review recorded"));
+      await write(env, data => { const c = data.cases.find(x => x.id === rec.id); c.data.dates = { ...(c.data.dates || {}), reviewed:{ by:email, at } }; (c.history ||= []).push({ at, by:email, action:"medical review recorded" }); pushVersion(c, entry); });
+      await audit(env, { by:email, action:"case.reviewed", entityType:"Case", entityId:rec.number, detail:{ note:String(body.note || "") } });
+      return json({ ok:true });
+    }
+    // approval
+    const profile = E2B_PROFILES[profileName];
+    if (!profile.supportedForFinal) return json({ error:profile.label + ": " + profile.note, profile:profileName }, 409);
+    const issues = validateE2b(rec, state.articles[rec.pmid], profileName), blocking = issues.filter(i => i.severity === "error");
+    if (blocking.length) return json({ error:"The case has " + blocking.length + " validation error" + (blocking.length === 1 ? "" : "s") + " for the " + profileName + " profile. Fix them before approval.", issues:blocking }, 409);
+    const hash = await caseDataHash(rec), approval = { status:"approved", by:email, at, hash, profile:profileName, note:String(body.note || "").slice(0, 500) };
+    const entry = await recordVersion(env, { ...rec, approval }, "approved", email, "Approved for " + profileName + " output");
+    await write(env, data => { const c = data.cases.find(x => x.id === rec.id); c.approval = approval; (c.history ||= []).push({ at, by:email, action:"approved for " + profileName + " output" }); pushVersion(c, entry); });
+    await audit(env, { by:email, action:"case.approved", entityType:"Case", entityId:rec.number, detail:{ profile:profileName, content_sha256:hash, warnings:issues.length } });
+    return json({ ok:true, approval });
+  }
   if (path === "/api/icsr-intake" && viewer) {
     const result = await write(env, data => icsrIntake(data, email, a => mayAccess(data, viewer, a), 1000, manager ? "" : email));
     if (result.created.length) await audit(env, { by:email, action:"case.intake", target:result.created.length + " cases", detail:{ cases:result.created.slice(0, 50).join(", "), source:"articles with stored full text" } });
@@ -3021,7 +3448,7 @@ async function apiCore(request, env, path) {
   }
   if ((path === "/api/sign-preview" || path === "/api/sign" || path === "/api/supersede") && viewer) {
     const kind = body.kind === "screening" ? "screening" : "case";
-    const record = kind === "case" ? (state.cases || []).find(c => c.id === body.id && (manager || c.createdBy === email || c.assignee === email)) : state.assignments.find(a => a.id === body.id && mayAccess(state, viewer, a));
+    const record = kind === "case" ? (state.cases || []).find(c => c.id === body.id && caseVisible(state, viewer, c)) : state.assignments.find(a => a.id === body.id && mayAccess(state, viewer, a));
     if (!record) return json({ error:"Record not found." }, 404);
     const article = state.articles[record.pmid] || {};
     if (path === "/api/supersede") {
@@ -3062,7 +3489,7 @@ async function apiCore(request, env, path) {
     return json({ signature, record:saved });
   }
   if (path === "/api/cases-export" && viewer) {
-    const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null, list = (state.cases || []).filter(c => (manager || c.createdBy === email || c.assignee === email) && (!wanted || wanted.has(c.id)));
+    const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null, list = (state.cases || []).filter(c => caseVisible(state, viewer, c) && (!wanted || wanted.has(c.id)));
     if (!list.length) return json({ error:"No cases to export." }, 404);
     const format = body.format === "e2b" ? "e2b" : "csv", stamp = new Date().toISOString().slice(0, 10);
     await audit(env, { by:email, action:"case.export", target:list.length + " cases", detail:"batch " + format });
@@ -3182,7 +3609,7 @@ async function apiCore(request, env, path) {
     return json({ ok:true, moved:moved.length });
   }
   if (path.startsWith("/api/case-") && viewer) {
-    const cfg = withSettings(env, state), canSee = c => manager || c.createdBy === email || c.assignee === email, find = id => (state.cases || []).find(c => c.id === id && canSee(c));
+    const cfg = withSettings(env, state), canSee = c => caseVisible(state, viewer, c), find = id => (state.cases || []).find(c => c.id === id && canSee(c));
     if (path === "/api/case-create") {
       const item = state.assignments.find(a => a.pmid === String(body.pmid) && mayAccess(state, viewer, a)), article = item && state.articles[item.pmid];
       if (!article) return json({ error:"Article not found in your queue." }, 404);
@@ -3222,29 +3649,45 @@ async function apiCore(request, env, path) {
         c.status = status;
         return c;
       });
+      { const entry = await recordVersion(env, saved, "edited", email, "status " + saved.status); await write(env, d => { const c = d.cases.find(x => x.id === saved.id); pushVersion(c, entry); }); }
       await audit(env, { by:email, action:"case.save", target:saved.number, detail:"status " + saved.status });
       return json({ case:saved, assessment:withRegulatory(await assessCase(cfg, saved.data), state, saved) });
     }
     if (path === "/api/case-export") {
-      const data = { ...current.data, case_id:current.number }, format = ["package", "e2b", "cioms", "fhir", "csv"].includes(body.format) ? body.format : "json", article0 = state.articles[current.pmid] || {};
-      await audit(env, { by:email, action:"case.export", target:current.number, detail:format });
-      const send = (bytes, type, ext) => new Response(bytes, { headers:{ "Content-Type":type, "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="' + current.number + ext + '"' } });
-      if (format === "e2b") return send(e2bBatch([current], state.articles, { sender:state.settings?.senderId, receiver:state.settings?.receiverId }), "application/xml", "-E2B-R3.xml");
-      if (format === "cioms") return send(ciomsPdf(current, article0), "application/pdf", "-CIOMS-I.pdf");
+      const data = { ...current.data, case_id:current.number }, format = ["package", "e2b", "cioms", "fhir", "csv", "structured"].includes(body.format) ? body.format : "json", article0 = state.articles[current.pmid] || {};
+      const final = body.final === true, profileName = ["ICH", "EU", "FDA"].includes(body.profile) ? body.profile : "ICH";
+      // Final output needs a current human approval; the content cannot have changed since, and an e-mail-ready file never leaves without it. Draft output is always labelled.
+      if (final) {
+        if (!["e2b", "cioms", "structured"].includes(format)) return json({ error:"Final output exists for E2B(R3) XML, CIOMS I and the structured case file." }, 400);
+        if (!(await approvalValid(current))) return json({ error:current.approval?.status === "approved" ? "The case changed after it was approved. It must be approved again." : "A medical reviewer must approve the case before final output.", needsApproval:true }, 409);
+        if (format === "e2b") { if (current.approval.profile !== profileName) return json({ error:"The case was approved for the " + current.approval.profile + " profile, not " + profileName + "." }, 409); const blocking = validateE2b(current, article0, profileName).filter(i => i.severity === "error"); if (blocking.length) return json({ error:"Validation errors remain for the " + profileName + " profile.", issues:blocking }, 409); }
+      }
+      const watermark = final ? "FINAL: approved by " + current.approval.by + " " + current.approval.at + " (content sha256 " + current.approval.hash + "). Not transmitted." : "DRAFT: not approved for submission";
+      await audit(env, { by:email, action:"case.export", target:current.number, detail:{ format, final, profile:format === "e2b" ? profileName : undefined } });
+      const send = (bytes, type, ext) => new Response(bytes, { headers:{ "Content-Type":type, "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="' + current.number + ext + '"', "X-Export-Final":String(final) } });
+      const logVersion = async () => { const entry = await recordVersion(env, current, "exported", email, format + (final ? " (final)" : " (draft)") + (format === "e2b" ? " " + profileName : "")); await write(env, d => { const c = d.cases.find(x => x.id === current.id); pushVersion(c, entry); }); };
+      if (format === "e2b") { await logVersion(); return send(e2bBatch([current], state.articles, { profile:profileName, watermark, sender:state.settings?.senderId, receiver:state.settings?.receiverId }), "application/xml", "-E2B-R3-" + profileName + (final ? "" : "-DRAFT") + ".xml"); }
+      if (format === "cioms") { await logVersion(); return send(ciomsPdf(current, article0, final ? { final:true, approval:current.approval } : {}), "application/pdf", final ? "-CIOMS-I.pdf" : "-CIOMS-I-DRAFT.pdf"); }
+      if (format === "structured") {
+        await logVersion();
+        const issues = validateE2b(current, article0, profileName);
+        return send(JSON.stringify({ case:{ number:current.number, status:current.status, pmid:current.pmid, portfolio:current.portfolio, provenance:current.provenance || null, approval:current.approval || null, final, watermark }, data:current.data, minimum_criteria:current.data.minimum_criteria || null, narrative:current.data.narrative || null,
+          dates:current.data.dates, reportability:current.data.reportability, links:current.links || [], versions:(current.versions || []).map(({ n, at, by, action, hash, note }) => ({ n, at, by, action, hash, note })), validation:{ profile:profileName, issues } }, null, 2), "application/json", "-structured" + (final ? "" : "-DRAFT") + ".json");
+      }
       if (format === "fhir") return send(JSON.stringify(fhirBundle(current, article0), null, 2), "application/fhir+json", "-FHIR.json");
       if (format === "csv") return send(lineListing([current], state.articles), "text/csv; charset=utf-8", "-line-listing.csv");
       if (format !== "package") return new Response(JSON.stringify(data, null, 2), { headers:{ "Content-Type":"application/json", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="' + current.number + '.json"' } });
       const encoder = new TextEncoder(), article = state.articles[current.pmid] || {}, files = [{ name:"icsr.json", data:encoder.encode(JSON.stringify(data, null, 2)) },
-        { name:"assessment.json", data:encoder.encode(JSON.stringify(withRegulatory(await assessCase(cfg, current.data), state, current), null, 2)) },
-        { name:"E2B-R3.xml", data:encoder.encode(e2bBatch([current], state.articles, { sender:state.settings?.senderId, receiver:state.settings?.receiverId })) },
-        { name:"CIOMS-I.pdf", data:ciomsPdf(current, article) },
+        { name:"E2B-R3-DRAFT.xml", data:encoder.encode(e2bBatch([current], state.articles, { profile:profileName, watermark:"DRAFT: not approved for submission", sender:state.settings?.senderId, receiver:state.settings?.receiverId })) },
+        { name:"CIOMS-I-DRAFT.pdf", data:ciomsPdf(current, article) },
         { name:"FHIR-AdverseEvent.json", data:encoder.encode(JSON.stringify(fhirBundle(current, article), null, 2)) },
-        { name:"narrative.txt", data:encoder.encode(caseNarrativeText(normalizeCase(current.data), "") + "\r\n") },
+        { name:"narrative.txt", data:encoder.encode((current.data.narrative?.text || caseNarrativeText(normalizeCase(current.data), "")) + "\r\n") },
+        { name:"assessment.json", data:encoder.encode(JSON.stringify(withRegulatory(await assessCase(cfg, current.data), state, current), null, 2)) },
         { name:"signatures.json", data:encoder.encode(JSON.stringify(current.signatures || [], null, 2)) },
         { name:"SIGNATURES.txt", data:encoder.encode((current.signatures || []).length ? (current.signatures || []).map(signatureText).join("\r\n") : "Not signed.\r\n") },
         { name:"citation.txt", data:encoder.encode(current.data.source_summary + "\r\n\r\nCase " + current.number + " · status " + current.status + "\r\nNotes: " + (current.notes || "") + "\r\n") }];
       for (const [key, name] of [[article.fullTextKey, "source_PMID_" + current.pmid + "." + (/\.(\w+)$/.exec(article.fullTextKey || "")?.[1] || "bin")], [article.fullTextTextKey, "source_PMID_" + current.pmid + "_text.txt"]]) {
-        const object = key && await env.BUCKET.get(key);
+        const object = key && !article.fullTextRestricted && await env.BUCKET.get(key);
         if (object) files.push({ name, data:new Uint8Array(await object.arrayBuffer()) });
       }
       return new Response(zipFiles(files), { headers:{ "Content-Type":"application/zip", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="' + current.number + '-package.zip"' } });
@@ -4710,7 +5153,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  extractClinical, buildUnits, segmentPatients, rolesIn, mayAccess, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  extractClinical, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);

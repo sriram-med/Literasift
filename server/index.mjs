@@ -10,6 +10,7 @@ import { mailConfigured, sendMail } from "./mail.mjs";
 import { makeScreenshotFn } from "./screenshots.mjs";
 import { makePdfTextFn } from "./pdftext.mjs";
 import { makeOcrFn, looksScanned } from "./ocr.mjs";
+import { makeXsdValidator } from "./xsd.mjs";
 import { mirrorLibrary } from "./library.mjs";
 
 const e = process.env;
@@ -38,6 +39,9 @@ if (pdfTextFn || ocrFn) env.PDF_TEXT_FN = async (bytes, info = {}) => {
   return text;
 };
 console.log(pdfTextFn ? "PDF text: on" : "PDF text: off (run deploy/enable-pdf-text.sh to read PDF full texts)", "|", ocrFn ? "OCR: on" : "OCR: off (run deploy/enable-ocr.sh to read scanned PDFs)");
+const xsdValidator = await makeXsdValidator();
+if (xsdValidator) env.XSD_VALIDATE = xsdValidator;
+console.log(xsdValidator ? "E2B schema validation: on" : "E2B schema validation: off (run deploy/enable-xsd.sh)");
 const screenshotFn = await makeScreenshotFn();
 if (screenshotFn) env.SCREENSHOT_FN = screenshotFn;
 console.log(screenshotFn ? "Local screenshots: on" : "Local screenshots: off (run deploy/enable-screenshots.sh to turn on)");

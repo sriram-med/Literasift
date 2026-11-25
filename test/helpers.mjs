@@ -76,3 +76,8 @@ export const JATS = `<?xml version="1.0"?><article><front><article-meta><title-g
 <sec><title>Discussion</title><p>Renal impairment increases exposure.</p></sec>
 <table-wrap id="t1"><label>Table 1</label><caption><p>Laboratory course</p></caption><table><thead><tr><th>Day</th><th>Creatinine (mg/dL)</th></tr></thead><tbody><tr><td>1</td><td>1.0</td></tr><tr><td>3</td><td>2.4</td></tr></tbody></table></table-wrap>
 <fig id="f1"><label>Figure 1</label><caption><p>EEG showing generalised discharges</p></caption></fig></body></article>`;
+
+import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+export const ICH_DIR = process.env.ICH_SCHEMA_DIR || "/home/user/oss-clones/icsrmaker/schemas/multicacheschemas";
+export const haveXsd = existsSync(ICH_DIR + "/MCCI_IN200100UV01.xsd") && !spawnSync("xmllint", ["--version"]).error;
