@@ -3373,8 +3373,8 @@ async function apiCore(request, env, path) {
   if (["/api/narrative-generate", "/api/narrative-save", "/api/e2b-validate", "/api/case-review", "/api/case-approve", "/api/rsi-save", "/api/rsi-list", "/api/listedness-suggest", "/api/listedness-decide"].includes(path) && viewer) {
     const at = new Date().toISOString();
     if (path === "/api/rsi-save" || path === "/api/rsi-list") {
-      if (!manager) return json({ error:"Manager access required." }, 403);
       if (path === "/api/rsi-list") return json({ rsi:(state.rsi || []).map(({ id, product, market, version, effectiveDate, source, hash, at, by }) => ({ id, product, market, version, effectiveDate, source, hash, at, by })) });
+      if (!manager) return json({ error:"Manager access required." }, 403);
       const product = String(body.product || "").trim().slice(0, 100), market = String(body.market || "").trim().slice(0, 80), version = String(body.version || "").trim().slice(0, 60), text = String(body.text || ""), source = String(body.source || "").trim().slice(0, 200);
       if (!product || !version || text.length < 100 || text.length > 2_000_000) return json({ error:"Give the product, the version, and the authorised text of the reference safety information (at least 100 characters)." }, 400);
       const id = crypto.randomUUID(), hash = await sha256Hex(text);
@@ -4077,7 +4077,7 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 <main id="content"><div class="skel"></div><div class="skel"></div><div class="skel"></div></main></div></div>
 <div id="toast" role="status"></div>
 <dialog id="casedlg" style="width:min(1180px,96vw);max-height:92vh;overflow:auto"><div id="casehead" style="display:flex;justify-content:space-between;gap:12px;align-items:flex-end;margin-bottom:14px"></div>
-<div style="display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));align-items:start"><div id="casebody"></div><div><div id="caseassess"></div></div></div>
+<div style="display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));align-items:start"><div id="casebody"></div><div><div id="caseassess"></div></div></div><div id="casereview" style="margin-top:12px"></div>
 <p id="caseerr" class="msg" style="color:var(--red)" role="alert"></p>
 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"><button type="button" class="btn" data-caseact="save">Save</button><button type="button" class="btn outline" data-caseact="assess">Assess</button><button type="button" class="btn outline" data-caseact="json">Download ICSR JSON</button><button type="button" class="btn outline" data-caseact="package">Download package (ZIP)</button><button type="button" class="btn outline" data-caseact="e2b">E2B(R3) XML</button><button type="button" class="btn outline" data-caseact="cioms">CIOMS I (PDF)</button><button type="button" class="btn outline" data-caseact="fhir">FHIR JSON</button><button type="button" class="btn outline" data-caseact="csv">Line listing (CSV)</button><button type="button" class="btn outline" data-signopen="case" id="casesign">Signature…</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div>
 <p class="sub" style="margin-top:10px">Human-in-the-loop: values pre-filled from the article are only proposals. Causality and QC are aids; a qualified reviewer decides.</p></dialog>
@@ -4213,6 +4213,7 @@ function renderCase(){
   $("casehead").innerHTML='<div><b style="font-size:18px">'+esc(curCase.number)+'</b> <span class="sub">from PMID '+esc(curCase.pmid)+'</span><div class="sub">'+esc(art.title||"")+'</div></div><button type="button" class="btn outline sm" data-backtolit="1" title="Open the article in LiteraSift">Open article in LiteraSift</button><label style="min-width:240px">Status<select id="casestatus">'+data.config.caseStatuses.map(s=>'<option'+(s===curCase.status?" selected":"")+'>'+esc(s)+'</option>').join("")+'</select></label>';
   $("casebody").innerHTML=caseForm();
   $("caseassess").innerHTML=assessmentHtml(curAssess);
+  loadReview();
   $("caseerr").textContent="";
   $("casedel").style.display=data.viewer.role==="manager"?"":"none";
   $("casesign").dataset.id=curCase.id;$("casesign").textContent=(curCase.signatures||[]).some(x=>!x.superseded)?(curCase.signature_intact===false?"Signature: changed after signing":"Signed · view signature"):"Signature…";
@@ -4261,9 +4262,81 @@ async function loadExtraction(){
         (p.timeline.length?'<div class="sub" style="margin:8px 0 2px">Chronology</div><div class="chips">'+p.timeline.map(t=>tbadge((t.when.date||(t.when.day!==undefined?"day "+t.when.day:t.when.text))+": "+t.text,t.kind==="lab"?"":"blue",t.sentence)).join("")+'</div>':"")+'</div>';
     }
     if(!ex.patients.length&&!ex.aggregateOnly)html+='<div class="sub">No individual patient was found in the text available.</div>';
-    box.innerHTML='<h3 style="margin:6px 0 8px">Patients, drugs and events</h3>'+html;
+    box.innerHTML='<h3 style="margin:6px 0 8px">Patients, drugs and events</h3>'+html;await loadCriteria(box);
   }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
 }
+
+async function loadCriteria(box){
+  try{
+    const r=await api("criteria",{id:active.id}), tone={supported:"green",uncertain:"amber",missing:"red",not_met:"red"};
+    let h='<h3 style="margin:18px 0 8px">Minimum criteria and case drafts</h3><div class="sub">Screening disposition, minimum-criteria assessment and reportability are separate decisions. One draft is made per supported patient.</div>';
+    if(r.aggregateOnly)h+='<div class="sub" style="margin-top:6px">Aggregate data only: no individual case draft can be created from counts.</div>';
+    h+=r.patients.map(p=>{
+      const made=(r.existingDrafts||[]).find(d=>d.patient===p.id);
+      return '<div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:8px"><b>'+esc(p.label||p.id)+'</b> '+badge(String(p.overall).replace("_"," "),tone[p.overall]||"")+
+        Object.entries(p.criteria).map(([k,c])=>'<div class="sub"><b>'+esc(k)+'</b> '+badge(c.status,tone[c.status]||"")+" "+esc(c.basis||"")+((c.evidence||[])[0]?' <i>“'+esc(c.evidence[0].sentence||"")+'”</i>':"")+'</div>').join("")+
+        ((p.gaps||[]).length?'<div class="sub" style="margin-top:4px"><b>Follow-up checklist:</b> '+esc(p.gaps.map(g=>g.item).join("; "))+'</div>':"")+
+        '<div style="margin-top:8px">'+(made?badge("Draft "+made.number,"green"):(p.excluded?badge("Excluded by reviewer",""):'<button type="button" class="btn sm" data-p3="draft|'+esc(p.id)+"|"+esc(p.overall)+'">Create draft case</button>'))+'</div></div>';
+    }).join("");
+    box.insertAdjacentHTML("beforeend",h);
+  }catch(e){box.insertAdjacentHTML("beforeend",'<div class="sub">'+esc(e.message)+'</div>');}
+}
+async function downloadPost(route,body,fallback){
+  const res=await fetch(route,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||"Download failed.");}
+  const name=(/filename="([^"]+)"/.exec(res.headers.get("Content-Disposition")||"")||[])[1]||fallback;
+  const link=document.createElement("a");link.href=URL.createObjectURL(await res.blob());link.download=name;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
+}
+async function loadReview(){
+  const box=$("casereview");if(!box||!curCase)return;
+  const id=curCase.id, d=curCase.data, dt=d.dates||{}, nar=d.narrative;
+  let versions=[],dups=[],rsi=[];
+  try{versions=(await api("case-versions",{caseId:id})).versions;}catch(e){}
+  try{dups=(await api("duplicates",{caseId:id})).candidates;}catch(e){}
+  try{rsi=(await api("rsi-list",{})).rsi;}catch(e){}
+  const dateRow=(label,v)=>'<div class="row"><span>'+label+'</span><b>'+esc(v&&v.value?v.value:(typeof v==="string"?v:"Not recorded"))+(v&&v.confirmedBy?' <span class="sub">confirmed by '+esc(v.confirmedBy)+'</span>':"")+'</b></div>';
+  let h='<h3 style="margin:18px 0 8px">Medical review, narrative and regulatory output</h3>';
+  h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Dates (kept separate)</b>'+dateRow("Publication",dt.publication)+dateRow("Retrieved",dt.retrieved)+dateRow("Reviewed",dt.reviewed)+dateRow("Awareness (reviewer-confirmed)",dt.awareness)+
+    '<div style="display:flex;gap:6px;margin-top:6px"><input type="date" id="awaredate" aria-label="Awareness date"><button type="button" class="btn outline sm" data-p3="aware">Confirm awareness date</button></div></div>';
+  h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Evidence-linked narrative</b>'+(nar?'<textarea id="narrtext" rows="9" style="width:100%;margin-top:6px">'+esc(nar.text)+'</textarea><div class="sub">'+(nar.statements||[]).length+' statements, each linked to source sentences'+(nar.edited?" · edited by "+esc(nar.editedBy||""):"")+'</div>'+
+    (nar.statements||[]).slice(0,40).map(s=>'<div class="sub">• '+esc(s.text)+((s.evidence||[])[0]?' <i>— “'+esc(String(s.evidence[0].excerpt||s.evidence[0].sentence||"").slice(0,140))+'”</i>':"")+'</div>').join(""):'<div class="sub">Not generated yet.</div>')+
+    '<div style="display:flex;gap:6px;margin-top:6px"><button type="button" class="btn outline sm" data-p3="narrgen">Generate from case fields</button>'+(nar?'<button type="button" class="btn sm" data-p3="narrsave">Save edits</button>':"")+'</div></div>';
+  h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Validation and approval</b><div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap"><select id="e2bprofile" aria-label="Regional profile"><option value="ICH">ICH E2B(R3)</option><option value="EU">EU (EMA)</option><option value="FDA">FDA (review only)</option></select>'+
+    '<button type="button" class="btn outline sm" data-p3="validate">Validate</button><button type="button" class="btn sm" data-p3="approve">Approve current version</button></div><div id="e2bresult" class="sub" style="margin-top:6px"></div>'+
+    '<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap"><button type="button" class="btn outline sm" data-p3="export|e2b|1">E2B(R3) XML (final)</button><button type="button" class="btn outline sm" data-p3="export|cioms|1">CIOMS I PDF (final)</button><button type="button" class="btn outline sm" data-p3="export|structured|1">Case JSON (final)</button>'+
+    '<button type="button" class="btn outline sm" data-p3="export|e2b|">E2B draft</button><button type="button" class="btn outline sm" data-p3="export|cioms|">CIOMS draft</button></div>'+
+    '<div class="sub" style="margin-top:4px">Final outputs need a medical-reviewer approval of the exact current version. Transmission to a regulator is outside this tool.'+(d.approval?" Approved by "+esc(d.approval.by||"")+" for "+esc(d.approval.profile||"")+".":"")+'</div></div>';
+  h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Duplicates and follow-ups</b>'+(dups.length?dups.map(c=>'<div style="margin-top:6px"><b>'+esc(c.number)+'</b> '+badge(c.level,c.level==="probable"?"amber":"")+(c.link?" "+badge(c.link.kind.replace(/_/g," ")+" ("+c.link.status+")","green"):"")+'<div class="sub">'+esc(c.reasons.map(r=>r.text).join(" · "))+'</div>'+
+    (c.link?"":'<div style="display:flex;gap:6px;margin-top:4px"><button type="button" class="btn outline sm" data-p3="dup|'+esc(c.caseId)+'|follow_up">This is a follow-up</button><button type="button" class="btn outline sm" data-p3="dup|'+esc(c.caseId)+'|duplicate">Duplicate</button><button type="button" class="btn outline sm" data-p3="dup|'+esc(c.caseId)+'|not_duplicate">Not a duplicate</button></div>')+'</div>').join(""):'<div class="sub">No potential duplicates found. Nothing is linked without a reviewer confirming it.</div>')+'</div>';
+  h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Listedness against reference safety information</b>'+(rsi.length?'<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap"><select id="rsisel" aria-label="Reference safety information">'+rsi.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.product+" v"+x.version+(x.market?" ("+x.market+")":""))+'</option>').join("")+'</select><select id="rsievent" aria-label="Event">'+d.events.map((e,i)=>'<option value="'+i+'">'+esc(e.verbatim&&e.verbatim.value||"event "+(i+1))+'</option>').join("")+'</select><button type="button" class="btn outline sm" data-p3="lsug">Find label passages</button></div><div id="lresult" class="sub"></div>':'<div class="sub">No reference safety information is loaded. A manager can add authorised RSI text below; listedness stays unknown until a reviewer decides against it.</div>')+
+    '<details style="margin-top:6px"><summary class="sub">Add reference safety information (manager)</summary><input id="rsiprod" placeholder="Product" style="width:100%;margin-top:4px"><input id="rsiver" placeholder="Version" style="width:48%"><input id="rsimarket" placeholder="Market" style="width:48%"><textarea id="rsitext" rows="4" placeholder="Authorised text (e.g. SmPC section 4.8)" style="width:100%"></textarea><button type="button" class="btn sm" data-p3="rsisave">Save RSI version</button></details></div>';
+  h+='<div class="card" style="padding:10px"><b>Version history</b>'+versions.map(v=>'<div class="sub">v'+v.n+" · "+esc(v.action)+" · "+esc(v.by||"")+" · "+esc(String(v.at||"").slice(0,16).replace("T"," "))+(v.note?" · "+esc(v.note):"")+'</div>').join("")+'</div>';
+  box.innerHTML=h;
+}
+async function p3action(target){
+  const [act,a1,a2]=target.dataset.p3.split("|"), res=m=>{const el=$("e2bresult");if(el)el.textContent=m;};
+  try{
+    if(act==="draft"){let force={};if(a2==="uncertain"){const why=prompt("Some criteria are uncertain. Why can this draft be created anyway? (recorded)","");if(!why)return;force[a1]=why;}
+      const r=await api("drafts-create",{id:active.id,patientIds:[a1],force});await refresh();message(r.created.length?"Draft "+r.created[0].number+" created.":(r.skipped[0]?r.skipped[0].reason:"Nothing new to create."),!r.created.length&&!r.existing.length);loadExtraction();return;}
+    if(act==="aware"){const v=$("awaredate").value;if(!v)return message("Pick the date.",true);const note=prompt("Basis for this awareness date (recorded)","Article retrieved and read");if(!note)return;await api("case-dates",{caseId:curCase.id,awareness:v,note});await refreshCase();return;}
+    if(act==="narrgen"){await api("narrative-generate",{caseId:curCase.id});await refreshCase();return;}
+    if(act==="narrsave"){await api("narrative-save",{caseId:curCase.id,text:$("narrtext").value});await refreshCase();return;}
+    if(act==="validate"||act==="approve"){
+      const profile=$("e2bprofile").value;
+      if(act==="approve"){const note=prompt("Approval note (recorded)","Checked against the article");if(!note)return;await api("case-approve",{caseId:curCase.id,profile,note});message("Approved for "+profile+".");await refreshCase();return;}
+      const r=await api("e2b-validate",{caseId:curCase.id,profile});
+      const lines=r.issues.map(i=>(i.severity==="error"?"ERROR ":"warning ")+i.field+" "+i.message+" ("+i.path+")");
+      const el=$("e2bresult");el.innerHTML=(r.ok?badge("Valid","green"):badge("Not valid","red"))+" "+(r.xsd&&r.xsd.available?"Schema checked":"Schema check not available on this host")+"<br>"+lines.map(esc).join("<br>");return;}
+    if(act==="export"){await downloadPost("/api/case-export",{id:curCase.id,format:a1,final:Boolean(a2),profile:$("e2bprofile").value},"case-"+a1);message("Downloaded.");await refreshCase();return;}
+    if(act==="dup"){const note=prompt("Reason for this decision (recorded)","");if(!note)return;await api("duplicate-decide",{caseId:curCase.id,otherId:a1,decision:a2,note});message("Decision recorded.");await refreshCase();return;}
+    if(act==="lsug"){const r=await api("listedness-suggest",{caseId:curCase.id,eventIndex:Number($("rsievent").value),rsiId:$("rsisel").value});
+      $("lresult").innerHTML=(r.passages.length?r.passages.map((p,i)=>'<div style="margin-top:4px">“'+esc(p.passage)+'” <span class="badge">'+esc(p.heading||"line "+p.line)+'</span> <button type="button" class="btn outline sm" data-p3="ldec|'+i+'|listed">Listed</button></div>').join(""):esc(r.note))+'<div style="margin-top:4px"><button type="button" class="btn outline sm" data-p3="ldec|-1|unlisted">Unlisted</button> <button type="button" class="btn outline sm" data-p3="ldec|-1|unknown">Unknown</button></div>';
+      window.lpass=r.passages;return;}
+    if(act==="ldec"){const note=prompt("Reason for the listedness decision (recorded)","");if(!note)return;const p=a1>=0&&window.lpass?window.lpass[a1]:null;await api("listedness-decide",{caseId:curCase.id,eventIndex:Number($("rsievent").value),rsiId:$("rsisel").value,decision:a2,passage:p?p.passage:"",note});await refreshCase();return;}
+    if(act==="rsisave"){await api("rsi-save",{product:$("rsiprod").value,version:$("rsiver").value,market:$("rsimarket").value,text:$("rsitext").value});message("Reference safety information saved.");await loadReview();return;}
+  }catch(e){message(e.message,true);}
+}
+async function refreshCase(){await refresh();const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}}
 const covBadge=c=>({reconciled:badge("Reconciled","green"),zero_results:badge("Zero results",""),partial:badge("Partially imported","amber"),failed:badge("Failed","red"),running:badge("Running","blue"),legacy:badge("Imported (earlier)","")}[c]||badge(c||"legacy",""));
 async function loadBatches(){
   const box=$("batchcov");if(!box)return;
@@ -4776,7 +4849,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -4964,6 +5037,7 @@ document.addEventListener("click",event=>{
   if(target.dataset.dispsave){const val=(document.querySelector('input[name="dispo"]:checked')||{}).value;if(!val){message("Choose a disposition.",true);return;}target.disabled=true;api("disposition",{id:active.id,value:val,reason:$("dispreason").value,note:$("dispnote").value}).then(async r=>{await refresh();message("Disposition saved"+(r.qc?(r.qc.reviewer?"; sent to QC ("+r.qc.reviewer+")":"; waiting for a QC reviewer"):"")+".");active=data.assignments.find(x=>x.id===active.id)||active;renderDispo();}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}
   if(target.dataset.qcdec){target.disabled=true;api("qc-decision",{id:active.id,decision:target.dataset.qcdec,note:$("qcnote")?$("qcnote").value:""}).then(async()=>{await refresh();message("QC decision recorded.");active=data.assignments.find(x=>x.id===active.id)||active;renderDispo();}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}
   if(target.dataset.reassign){api("reassign",{ids:[active.id],to:$("reassignto").value,reason:$("reassignreason").value}).then(async()=>{await refresh();message("Reassigned.");$("dialog").close();}).catch(e=>message(e.message,true));return;}
+  if(target.dataset.p3){p3action(target);return;}
   if(target.dataset.exdec){const [action,eid]=target.dataset.exdec.split("|");let reason="";if(action==="exclude"){reason=prompt("Why is this not captured? (recorded)","");if(!reason)return;}api("extraction-decide",{id:active.id,eventId:eid,action,reason}).then(()=>loadExtraction()).catch(e=>message(e.message,true));return;}
   if(target.dataset.resume){target.disabled=true;message("Resuming the import…");api("import-resume",{runId:target.dataset.resume,retryFailed:true}).then(async r=>{await refresh();message("Import is now "+r.coverage.replace("_"," ")+(r.gaps.length?" with "+r.gaps.length+" gap"+(r.gaps.length===1?"":"s"):"")+".",r.coverage!=="reconciled"&&r.coverage!=="zero_results");}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}
   if(target.dataset.evretry){target.disabled=true;message("Retrying only what is missing…");api("evidence-retry",{runId:target.dataset.evretry}).then(async r=>{await refresh();message(r.retried+" PMID"+(r.retried===1?"":"s")+" retried; "+r.readiness.pending+" still pending.");}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}

@@ -211,3 +211,5 @@ Settings > **Coding memory** lists the MedDRA codings reviewers marked as Review
 
 A manager can delete articles from the library: a whole folder (Library tab, **Delete** next to ZIP, PDF and RIS) or one article (**Delete this article from the library** in its Review dialog). The article, its queue entries and its stored files and snapshots are removed, and the folder on disk is cleaned up. Articles that have an ICSR case are kept, because the case and its signatures refer to them. A reason is required, and each deletion is recorded in the audit trail with the PMIDs, titles, number of files removed and the reason.
 PDF exports (and the PDFs of library folders) take a fresh snapshot of any article whose stored snapshot predates the current record-card layout, and print the search query, date range, retrieval time and snapshot time.
+
+See [docs/WORKBENCH.md](docs/WORKBENCH.md) for the screening-to-ICSR workbench, store migration and backups.
