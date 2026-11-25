@@ -4073,8 +4073,8 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 <div class="shell"><aside><div class="brand"><span class="logo"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18M6 12h12M10 19h4"/></svg></span>LiteraSift</div><nav id="nav" aria-label="LiteraSift"></nav><div class="spacer"></div><div class="who" id="identity"></div></aside>
-<div><div class="top"><div><h1 id="heading">LiteraSift</h1><p id="subhead"></p></div><button class="btn outline icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button></div>
-<main id="content"><div class="skel"></div><div class="skel"></div><div class="skel"></div></main></div></div>
+<div><div class="top"><div><h1 id="heading">LiteraSift</h1><p id="subhead"></p></div><span class="sub" style="margin-left:auto;margin-right:8px;white-space:nowrap">v0.01 · Dr Sriram</span><button class="btn outline icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button></div>
+<main id="content"><div class="skel"></div><div class="skel"></div><div class="skel"></div></main><footer class="sub" style="margin:28px 0 12px;text-align:center">LiteraSift v0.01 · Developed by Dr Sriram</footer></div></div>
 <div id="toast" role="status"></div>
 <dialog id="casedlg" style="width:min(1180px,96vw);max-height:92vh;overflow:auto"><div id="casehead" style="display:flex;justify-content:space-between;gap:12px;align-items:flex-end;margin-bottom:14px"></div>
 <div style="display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));align-items:start"><div id="casebody"></div><div><div id="caseassess"></div></div></div><div id="casereview" style="margin-top:12px"></div>
