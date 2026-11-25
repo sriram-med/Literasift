@@ -73,44 +73,6 @@ async function searchIds(env, watch, from, to, depth = 0) {
   const right = await searchIds(env, watch, addDays(middle, 1), to, depth + 1);
   return [...new Set([...left, ...right])];
 }
-async function importWatch(env, watch, from, to) {
-  env = withSettings(env, (await load(env)).state);
-  const result = { idlist: await searchIds(env, watch, from, to) };
-  const articles = {};
-  for (let offset = 0; offset < result.idlist.length; offset += 100) {
-    const ids = result.idlist.slice(offset, offset + 100);
-    const { result: summary } = await pubmed(env, "esummary", { id: ids.join(","), retmode: "json" });
-    for (const id of ids) {
-      const citation = summary?.[id];
-      if (!citation?.title) throw new Error("Missing citation for PMID " + id);
-      articles[id] = { id, source:"PubMed", title:citation.title, journal:citation.fulljournalname, date:citation.pubdate,
-        doi:citation.articleids?.find(a => a.idtype === "doi")?.value || "",
-        pmcid:citation.articleids?.find(a => a.idtype === "pmc")?.value || "",
-        pubmedRetracted:(citation.pubtype || []).includes("Retracted Publication"),
-        url:"https://pubmed.ncbi.nlm.nih.gov/" + id + "/" };
-    }
-    const details = await fetchPubmedDetails(env, ids).catch(() => ({}));
-    for (const id of ids) if (details[id]) Object.assign(articles[id], details[id], { abstractSource:details[id].abstract ? "PubMed" : "", abstractCheckedAt:new Date().toISOString() });
-  }
-  return write(env, state => {
-    for (const [id, article] of Object.entries(articles)) state.articles[id] = { ...state.articles[id], ...article, pullQuery:watch.query, pullRange:from + " to " + to, pullAt:new Date().toISOString() };
-    const run = { id:crypto.randomUUID(), source:"PubMed", portfolio:watch.portfolio, molecule:watch.molecule || "", from, to, count:result.idlist.length,
-      ids:result.idlist, time:new Date().toISOString(), query:watch.query, status:"Imported" };
-    state.runs.unshift(run);
-    for (const id of result.idlist) {
-      // One assignment per citation and portfolio; further matching molecules are tagged onto it.
-      const existing = state.assignments.find(a => a.pmid === id && a.portfolio === watch.portfolio);
-      if (existing) {
-        if (watch.molecule && !(existing.molecules || []).includes(watch.molecule) && (existing.molecules || []).length < 20) (existing.molecules ||= []).push(watch.molecule);
-        continue;
-      }
-      const item = { id:crypto.randomUUID(), pmid:id, portfolio:watch.portfolio, molecules:watch.molecule ? [watch.molecule] : [], reviewer:"", status:"Pending" };
-      allocate(state, item);
-      state.assignments.push(item);
-    }
-    return run;
-  });
-}
 // ---- Patient-reported posts (social media or forums), added by hand. Personal data is masked before anything is stored. The idea follows DrishtiAI (listening for patient-reported
 // events, masking identifiers, explainable scoring); this is a separate implementation, and posts are never collected automatically (platform terms and privacy law). ----
 function maskPii(text) {
@@ -196,13 +158,167 @@ async function importPmidList(env, list, portfolio, molecule) {
   });
   return { run, missing };
 }
-async function execute(env, watch, from, to) {
-  try { return await importWatch(env, watch, from, to); }
-  catch (error) {
-    await write(env, state => state.runs.unshift({ id:crypto.randomUUID(), source:"PubMed", portfolio:watch.portfolio, molecule:watch.molecule || "", from, to,
-      query:watch.query, status:"Failed", error:error.message, time:new Date().toISOString(), ids:[], count:0 }));
-    throw error;
+// ---- Imports as restartable jobs. A search range is cut into bounded date windows; each window is searched, reconciled (count reported by PubMed against unique PMIDs retrieved)
+// and checkpointed before the next one starts, so a failure resumes where it stopped and a replay changes nothing that was already decided. ----
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const DATE_FIELDS = { crdt:{ label:"Create Date", tag:"crdt" }, pdat:{ label:"Publication Date", tag:"dp" } };
+async function withRetry(env, fn, { tries = 4 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await fn(); }
+    catch (error) {
+      const retryable = /HTTP (429|5\d\d)|timed? ?out|aborted|fetch failed|network|incomplete/i.test(String(error.message));
+      if (!retryable || attempt >= tries - 1) throw error;
+      await sleep(Number(env.RETRY_BASE_MS ?? 700) * 2 ** attempt + Math.random() * 100);
+    }
   }
+}
+const uniq = list => [...new Set(list)];
+// The query version in effect on a date. Versions are applied prospectively: executed searches keep the version they ran with.
+function queryAt(watch, date) {
+  const versions = (watch.versions || []).slice().sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
+  let hit = null; for (const v of versions) if (v.effectiveFrom <= date) hit = v;
+  return hit || (versions[0] ? { ...versions[0] } : { version:1, query:watch.query, effectiveFrom:"0000-00-00" });
+}
+const searchTerm = (query, from, to, dateField) => { const tag = DATE_FIELDS[dateField].tag, d = x => x.replaceAll("-", "/"); return "(" + query + ") AND (" + d(from) + "[" + tag + "]:" + d(to) + "[" + tag + "])"; };
+function makeWindows(watch, from, to, days, dateField) {
+  const out = []; let start = from;
+  while (start <= to) {
+    const end = addDays(start, days - 1) < to ? addDays(start, days - 1) : to, q = queryAt(watch, start);
+    out.push({ from:start, to:end, state:"pending", attempts:0, queryVersion:q.version, query:q.query, term:searchTerm(q.query, start, end, dateField) });
+    start = addDays(end, 1);
+  }
+  return out;
+}
+// Coverage of a whole import, from its windows: running, reconciled, zero_results, partial or failed. Any window that is not reconciled stays listed as a gap.
+function summarizeRun(run) {
+  const ws = run.windows || [], count = state => ws.filter(w => w.state === state).length;
+  const unresolved = ws.filter(w => !["reconciled", "zero_results"].includes(w.state));
+  run.gaps = unresolved.map(w => ({ from:w.from, to:w.to, state:w.state, expected:w.expected ?? null, retrieved:w.retrieved ?? 0, error:w.error || "", missing:(w.missing || []).slice(0, 50) }));
+  run.expected = ws.reduce((n, w) => n + (w.expected || 0), 0); run.retrieved = uniq(run.ids || []).length;
+  run.coverage = count("pending") || count("running") ? "running" : count("failed") === ws.length ? "failed" : unresolved.length ? "partial" : count("zero_results") === ws.length ? "zero_results" : "reconciled";
+  run.status = run.coverage === "running" ? "Running" : run.coverage === "failed" && !(run.ids || []).length ? "Failed" : "Imported";
+  run.count = (run.ids || []).length;
+  return run;
+}
+async function fetchCitations(env, ids) {
+  const articles = {}, missing = [], xml = {};
+  for (let offset = 0; offset < ids.length; offset += 100) {
+    const chunk = ids.slice(offset, offset + 100);
+    const { result: summary } = await withRetry(env, () => pubmed(env, "esummary", { id:chunk.join(","), retmode:"json" }));
+    const found = [];
+    for (const id of chunk) {
+      const citation = summary?.[id];
+      if (!citation?.title) { missing.push(id); continue; }
+      found.push(id);
+      articles[id] = { id, source:"PubMed", title:citation.title, journal:citation.fulljournalname, date:citation.pubdate, doi:citation.articleids?.find(a => a.idtype === "doi")?.value || "", pmcid:citation.articleids?.find(a => a.idtype === "pmc")?.value || "",
+        pubmedRetracted:(citation.pubtype || []).includes("Retracted Publication"), url:"https://pubmed.ncbi.nlm.nih.gov/" + id + "/" };
+    }
+    const raw = {};
+    const details = found.length ? await withRetry(env, () => fetchPubmedDetails(env, found, raw)).catch(error => ({ __error:error.message })) : {};
+    for (const id of found) {
+      if (details[id]) Object.assign(articles[id], details[id], { abstractSource:details[id].abstract ? "PubMed" : "", abstractCheckedAt:new Date().toISOString() });
+      if (raw[id]) xml[id] = raw[id]; else articles[id].citationXmlStatus = details.__error ? "Failed: " + details.__error.slice(0, 120) : "Missing from the EFetch response";
+    }
+  }
+  return { articles, missing, xml };
+}
+const sha256Hex = async data => [...new Uint8Array(await crypto.subtle.digest("SHA-256", typeof data === "string" ? new TextEncoder().encode(data) : data))].map(b => b.toString(16).padStart(2, "0")).join("");
+async function processWindow(env, runId, index) {
+  const { state } = await load(env), run = state.runs.find(r => r.id === runId), win = run?.windows?.[index];
+  if (!win) return null;
+  const mark = patch => write(env, data => { const r = data.runs.find(x => x.id === runId), w = r.windows[index]; Object.assign(w, patch); summarizeRun(r); });
+  try {
+    await mark({ state:"running", attempts:win.attempts + 1, error:"" });
+    const { esearchresult: result } = await withRetry(env, () => pubmed(env, "esearch", { term:win.term, retmode:"json", retmax:"9999" }));
+    if (!result?.idlist) throw new Error("PubMed search was incomplete.");
+    const expected = Number(result.count), ids = uniq(result.idlist);
+    if (expected > ids.length && win.from < win.to) {
+      // More records than one search can return: split the window in two. Both halves keep the same query version.
+      const middle = addDays(win.from, Math.floor((Date.parse(win.to) - Date.parse(win.from)) / 86400000 / 2));
+      await write(env, data => { const r = data.runs.find(x => x.id === runId), w = r.windows[index];
+        const left = { ...w, to:middle, state:"pending", attempts:0, term:searchTerm(w.query, w.from, middle, run.dateField) }, right = { ...w, from:addDays(middle, 1), state:"pending", attempts:0, term:searchTerm(w.query, addDays(middle, 1), w.to, run.dateField) };
+        r.windows.splice(index, 1, left, right); summarizeRun(r); });
+      return { split:true };
+    }
+    if (expected > ids.length) throw new Error("A single day has more than 9,999 records. Narrow the query.");
+    const fetched = ids.length ? await fetchCitations(env, ids) : { articles:{}, missing:[], xml:{} };
+    // Original EFetch XML, one object per PMID with its hash, kept apart from full texts and screenshots.
+    const evidence = {};
+    for (const [id, xml] of Object.entries(fetched.xml)) {
+      const key = "evidence/" + id + "/efetch.xml", hash = await sha256Hex(xml);
+      await env.BUCKET.put(key, xml, { httpMetadata:{ contentType:"application/xml" } });
+      evidence[id] = { key, sha256:hash, bytes:xml.length, source:"NCBI EFetch (PubMed)", license:"NLM data; abstracts remain the property of their publishers", retrievedAt:new Date().toISOString(), parser:"efetch-parser/1" };
+    }
+    const missing = uniq([...fetched.missing, ...ids.filter(id => fetched.articles[id] && !fetched.xml[id])]);
+    const reconciled = ids.length === expected && missing.length === 0;
+    await write(env, data => {
+      const r = data.runs.find(x => x.id === runId), w = r.windows[index], watch = data.watches.find(x => x.portfolio === r.portfolio && (x.molecule || "") === (r.molecule || "")) || { portfolio:r.portfolio, molecule:r.molecule };
+      let imported = 0;
+      for (const [id, article] of Object.entries(fetched.articles)) {
+        if (!data.articles[id]) imported++;
+        data.articles[id] = { ...data.articles[id], ...article, pullQuery:w.query, pullRange:w.from + " to " + w.to, pullAt:new Date().toISOString(), pullDateField:DATE_FIELDS[r.dateField].label, pullQueryVersion:w.queryVersion,
+          evidence:{ ...(data.articles[id]?.evidence || {}), ...(evidence[id] ? { efetch:evidence[id] } : {}) } };
+      }
+      for (const id of ids) {
+        if (!data.articles[id]) continue;
+        const existing = data.assignments.find(a => a.pmid === id && a.portfolio === r.portfolio);
+        if (existing) { if (watch.molecule && !(existing.molecules || []).includes(watch.molecule) && (existing.molecules || []).length < 20) (existing.molecules ||= []).push(watch.molecule); continue; }
+        const item = { id:crypto.randomUUID(), pmid:id, portfolio:r.portfolio, molecules:watch.molecule ? [watch.molecule] : [], reviewer:"", status:"Pending" };
+        allocate(data, item); data.assignments.push(item);
+      }
+      r.ids = uniq([...(r.ids || []), ...ids.filter(id => data.articles[id])]);
+      Object.assign(w, { expected, retrieved:ids.length, imported, missing, state:expected === 0 ? "zero_results" : reconciled ? "reconciled" : "partial", error:"", completedAt:new Date().toISOString() });
+      summarizeRun(r);
+    });
+    return { done:true };
+  } catch (error) {
+    await mark({ state:"failed", error:String(error.message).slice(0, 300) });
+    return { failed:true };
+  }
+}
+// Runs the pending and failed windows of an import, a few at a time. Safe to call again at any point: finished windows are never repeated.
+async function runImport(env, runId, budget = 12) {
+  env = withSettings(env, (await load(env)).state);
+  for (let step = 0; step < budget; step++) {
+    const { state } = await load(env), run = state.runs.find(r => r.id === runId);
+    const index = run?.windows?.findIndex(w => w.state === "pending" || w.state === "running" || (w.state === "failed" && w.attempts < 8));
+    if (index === undefined || index < 0) break;
+    await processWindow(env, runId, index);
+  }
+  return (await load(env)).state.runs.find(r => r.id === runId);
+}
+async function execute(env, watch, from, to, { mode = "monitor", dateField, force = false } = {}) {
+  env = withSettings(env, (await load(env)).state);
+  const field = DATE_FIELDS[dateField] ? dateField : mode === "backfill" ? "pdat" : "crdt", windows = makeWindows(watch, from, to, mode === "backfill" ? 14 : 7, field);
+  const key = [watchKey(watch), mode, field, from, to, windows.map(w => w.queryVersion).join(",")].join("|");
+  const { state } = await load(env), existing = state.runs.find(r => r.idem === key);
+  if (existing && !force) {
+    if (["reconciled", "zero_results"].includes(existing.coverage)) return { ...existing, replayed:true };
+    return runImport(env, existing.id);
+  }
+  const run = { id:crypto.randomUUID(), source:"PubMed", portfolio:watch.portfolio, molecule:watch.molecule || "", from, to, mode, dateField:field, dateFieldLabel:DATE_FIELDS[field].label, windows, ids:[], count:0, time:new Date().toISOString(), searchedAt:new Date().toISOString(),
+    query:windows[windows.length - 1].query, queryVersions:uniq(windows.map(w => w.queryVersion)), executedQueries:uniq(windows.map(w => w.term)).slice(0, 50), idem:key, status:"Running", coverage:"running" };
+  await write(env, data => { data.runs.unshift(run); });
+  return runImport(env, run.id);
+}
+// ---- Product dictionaries and watchlist versions. A portfolio dictionary lists, for each product, its generic names, brands, salts and approved aliases; a watchlist query is built from them.
+// Every change to a query is a new version with an effective date, and imports record the version they ran with. ----
+const splitNames = value => uniq((Array.isArray(value) ? value : String(value || "").split(/[,;\n]/)).map(x => String(x).replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim()).filter(x => x && x.length <= 100)).slice(0, 40);
+const dictNames = p => uniq([p.name, ...(p.generics || []), ...(p.brands || []), ...(p.salts || []), ...(p.aliases || [])].map(x => String(x || "").trim()).filter(Boolean));
+const dictionaryFor = (state, portfolio, molecule) => (state.dictionaries?.[portfolio]?.products || []).find(p => dictNames(p).some(n => n.toLowerCase() === String(molecule || "").toLowerCase())) || null;
+const namesWithDictionary = (state, portfolio, names) => { const entry = names.map(n => dictionaryFor(state, portfolio, n)).find(Boolean); return entry ? uniq([...names, ...dictNames(entry)]) : names; };
+const queryTerms = query => uniq([...String(query).matchAll(/"([^"]+)"\[(?:tiab|MeSH Terms|Supplementary Concept)\]/g)].map(m => m[1]));
+function commitWatch(data, watch, by, note = "query edited") {
+  const old = data.watches.find(w => watchKey(w) === watchKey(watch)), at = new Date().toISOString();
+  const versions = (old?.versions || (old ? [{ version:1, query:old.query, effectiveFrom:"0000-00-00", createdAt:at, by:"system", note:"initial" }] : [])).slice();
+  if (!old) versions.push({ version:1, query:watch.query, effectiveFrom:"0000-00-00", createdAt:at, by, note:"created" });
+  else if (old.query !== watch.query) versions.push({ version:Math.max(...versions.map(v => v.version)) + 1, query:watch.query, effectiveFrom:day(), createdAt:at, by, note });
+  watch.versions = versions;
+  data.watches = data.watches.filter(w => watchKey(w) !== watchKey(watch)); data.watches.push(watch);
+}
+async function esearchCount(env, query, from, to, dateField) {
+  const { esearchresult: r } = await withRetry(env, () => pubmed(env, "esearch", { term:searchTerm(query, from, to, dateField), retmode:"json", retmax:"0" }), { tries:2 });
+  return Number(r?.count ?? NaN);
 }
 const safetyFilter = '("adverse effects"[sh] OR "drug-related side effects and adverse reactions"[MeSH Terms] OR safety[tiab] OR toxicity[tiab] OR "adverse event*"[tiab] OR "adverse reaction*"[tiab] OR "adverse drug reaction*"[tiab] OR "side effect*"[tiab])';
 function buildQuery(names, safetyOnly) {
@@ -277,13 +393,16 @@ function parsePubmedXml(xml) {
   }
   return out;
 }
-async function fetchPubmedDetails(env, ids) {
+async function fetchPubmedDetails(env, ids, xmlOut) {
   await ncbiThrottle(env);
   const url = new URL("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi");
   url.search = new URLSearchParams({ db:"pubmed", ...ncbiParams(env), retmode:"xml", id:ids.join(",") });
   const response = await fetch(url, { signal:AbortSignal.timeout(25000) });
   if (!response.ok) throw new Error("PubMed efetch returned HTTP " + response.status);
-  return parsePubmedXml(await response.text());
+  const xml = await response.text();
+  // The original XML of each article is handed back too, so it can be stored untouched.
+  if (xmlOut) for (const block of xml.split("<PubmedArticle>").slice(1)) { const pmid = /<PMID[^>]*>(\d+)<\/PMID>/.exec(block)?.[1]; if (pmid) xmlOut[pmid] = '<?xml version="1.0" encoding="UTF-8"?>\n<PubmedArticleSet><PubmedArticle>' + block.replace(/<\/PubmedArticleSet>\s*$/, "").trimEnd() + "</PubmedArticleSet>"; }
+  return parsePubmedXml(xml);
 }
 const epmcBase = "https://www.ebi.ac.uk/europepmc/webservices/rest";
 async function europePmcCore(article) {
@@ -2625,13 +2744,16 @@ async function apiCore(request, env, path) {
   if (path === "/api/scheduled" && (service || manager)) {
     const results = [];
     const to = new Date(Date.parse(day()) - 86400000).toISOString().slice(0,10);
-    const same = watch => r => r.portfolio === watch.portfolio && (r.molecule || "") === (watch.molecule || "") && r.query === watch.query;
-    // Watchlists never attempted go first, then the least recently attempted; at most maxWatchesPerRun run per call.
-    const due = state.watches.map(watch => ({ watch, previous:state.runs.find(r => same(watch)(r) && r.status === "Imported"),
+    const same = watch => r => r.portfolio === watch.portfolio && (r.molecule || "") === (watch.molecule || "") && (r.mode || "monitor") === "monitor";
+    const okRun = r => r.status === "Imported" && (!r.coverage || ["reconciled", "zero_results"].includes(r.coverage));
+    // Unfinished imports resume first, from the window where they stopped. Then watchlists never attempted go first, then the least recently attempted.
+    const unfinished = state.runs.filter(r => r.windows?.some(w => w.state === "pending" || w.state === "running" || (w.state === "failed" && w.attempts < 8))).slice(0, 3);
+    for (const run of unfinished) { try { results.push(await runImport(env, run.id)); } catch (error) { results.push({ portfolio:run.portfolio, molecule:run.molecule, error:error.message }); } }
+    const due = state.watches.map(watch => ({ watch, previous:state.runs.find(r => same(watch)(r) && okRun(r)),
         attempt:state.runs.find(same(watch))?.time || "" }))
       .filter(({ previous }) => !(previous?.to >= to)).sort((a, b) => a.attempt.localeCompare(b.attempt));
     for (const { watch, previous } of due.slice(0, maxWatchesPerRun)) {
-      try { results.push(await execute(env, watch, previous?.to || to, to)); }
+      try { results.push(await execute(env, watch, previous?.to || to, to, { mode:"monitor" })); }
       catch (error) { results.push({ portfolio:watch.portfolio, molecule:watch.molecule || "", error:error.message }); }
     }
     return json({ results, remaining:Math.max(0, due.length - maxWatchesPerRun), evidence:await collectEvidence(env) });
@@ -2793,14 +2915,54 @@ async function apiCore(request, env, path) {
       else throw new Error("The owner profile cannot be replaced.");
       data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data,a));
     });
+  } else if (path === "/api/dictionary-save") {
+    const portfolio = String(body.portfolio || "").trim().slice(0, 100);
+    if (!portfolio || !Array.isArray(body.products) || body.products.length > 300) return json({ error:"Enter a portfolio and up to 300 products." }, 400);
+    const products = body.products.map(p => ({ name:String(p?.name || "").trim().slice(0, 100), generics:splitNames(p?.generics), brands:splitNames(p?.brands), salts:splitNames(p?.salts), aliases:splitNames(p?.aliases) })).filter(p => p.name);
+    if (!products.length) return json({ error:"Each product needs a name." }, 400);
+    const seen = new Map();
+    for (const p of products) for (const n of dictNames(p)) { const other = seen.get(n.toLowerCase()); if (other && other !== p.name) return json({ error:"\"" + n + "\" is listed under both " + other + " and " + p.name + ". A name can belong to one product only." }, 400); seen.set(n.toLowerCase(), p.name); }
+    const saved = await write(env, data => { const old = (data.dictionaries ||= {})[portfolio]; data.dictionaries[portfolio] = { version:(old?.version || 0) + 1, updatedAt:new Date().toISOString(), by:email, products, history:[...(old?.history || []).slice(-19), ...(old ? [{ version:old.version, at:old.updatedAt, by:old.by, products:old.products.length }] : [])] }; return data.dictionaries[portfolio]; });
+    await audit(env, { by:email, action:"dictionary.save", target:portfolio, detail:{ version:saved.version, products:products.length, names:products.reduce((n, p) => n + dictNames(p).length, 0) } });
+    return json({ ok:true, version:saved.version });
+  } else if (path === "/api/watch-preview" || path === "/api/watch-version") {
+    const portfolio = String(body.portfolio || "").trim(), molecule = String(body.molecule || "").trim();
+    const watch = state.watches.find(w => w.portfolio === portfolio && (w.molecule || "") === molecule);
+    const entry = dictionaryFor(state, portfolio, molecule), names = body.useDictionary !== false && entry ? dictNames(entry) : [molecule, ...splitNames(body.synonyms)].filter(Boolean);
+    const proposed = String(body.query || "").trim() || (names.length ? buildQuery(names, body.safetyOnly === true) : "");
+    if (!portfolio || !proposed || proposed.length > 1500) return json({ error:"Enter a portfolio and a molecule or a query (up to 1,500 characters)." }, 400);
+    const effectiveFrom = /^\d{4}-\d{2}-\d{2}$/.test(body.effectiveFrom || "") ? body.effectiveFrom : addDays(day(), 1);
+    if (path === "/api/watch-preview") {
+      const current = watch ? queryAt(watch, day()) : null, before = queryTerms(current?.query || ""), after = queryTerms(proposed), from = addDays(day(), -30);
+      const counts = { current:null, proposed:null, window:{ from, to:day(), dateField:"crdt" } };
+      try { if (current) counts.current = await esearchCount(withSettings(env, state), current.query, from, day(), "crdt"); counts.proposed = await esearchCount(withSettings(env, state), proposed, from, day(), "crdt"); } catch { /* counts are a convenience */ }
+      return json({ exists:Boolean(watch), current:current && { version:current.version, query:current.query }, proposed:{ query:proposed, names }, added:after.filter(t => !before.includes(t)), removed:before.filter(t => !after.includes(t)), counts, effectiveFrom, note:"Applied prospectively: imports already executed keep the version they ran with; the new version is used for dates from " + effectiveFrom + "." });
+    }
+    const created = await write(env, data => {
+      let w = data.watches.find(x => watchKey(x) === watchKey({ portfolio, molecule }));
+      if (!w) { w = { portfolio, molecule, query:proposed }; commitWatch(data, w, email); w = data.watches.find(x => watchKey(x) === watchKey({ portfolio, molecule })); return w.versions.at(-1); }
+      if (!w.versions) w.versions = [{ version:1, query:w.query, effectiveFrom:"0000-00-00", createdAt:new Date().toISOString(), by:"system", note:"initial" }];
+      const last = w.versions.slice().sort((a, b) => a.version - b.version).at(-1);
+      if (last.query === proposed) return last;
+      const version = { version:last.version + 1, query:proposed, effectiveFrom, createdAt:new Date().toISOString(), by:email, note:String(body.note || "").slice(0, 300), dictionaryVersion:data.dictionaries?.[portfolio]?.version || null };
+      w.versions.push(version); w.query = queryAt(w, day()).query;
+      return version;
+    });
+    await audit(env, { by:email, action:"watch.versioned", target:portfolio + (molecule ? " · " + molecule : ""), detail:{ version:created.version, effectiveFrom:created.effectiveFrom, note:created.note || "" } });
+    return json({ ok:true, version:created });
+  } else if (path === "/api/import-resume") {
+    const run = state.runs.find(r => r.id === body.runId);
+    if (!run?.windows) return json({ error:"That import cannot be resumed." }, 404);
+    // Windows that stopped after too many failures are given a fresh set of attempts on request.
+    if (body.retryFailed === true) await write(env, data => { for (const w of data.runs.find(r => r.id === run.id).windows) if (w.state === "failed") w.attempts = 0; });
+    const resumed = await runImport(env, run.id);
+    await audit(env, { by:email, action:"import.resumed", target:run.portfolio + (run.molecule ? " · " + run.molecule : ""), detail:{ run:run.id, coverage:resumed.coverage, gaps:resumed.gaps.length } });
+    return json(resumed);
   } else if (path === "/api/watch") {
     const watch = { portfolio:String(body.portfolio || "").trim(), molecule:String(body.molecule || "").trim().slice(0,100), query:String(body.query || "").trim() };
     if (!watch.portfolio || !watch.query || watch.query.length > 1500) return json({error:"Enter a portfolio and a PubMed query."},400);
-    await write(env, data => {
-      keepOwner(data, watch);
-      data.watches = data.watches.filter(w => watchKey(w) !== watchKey(watch));
-      data.watches.push(watch);
-    });
+    await write(env, data => { keepOwner(data, watch); commitWatch(data, watch, email); });
+    await audit(env, { by:email, action:"watch.save", target:watch.portfolio + (watch.molecule ? " · " + watch.molecule : ""), detail:{ version:watch.versions.at(-1).version } });
   } else if (path === "/api/watches") {
     const portfolio = String(body.portfolio || "").trim();
     if (!portfolio || !Array.isArray(body.rows) || !body.rows.length || body.rows.length > 500) return json({error:"Enter a portfolio and 1 to 500 molecules."},400);
@@ -2808,15 +2970,13 @@ async function apiCore(request, env, path) {
     const bulkOwner = String(body.owner || "").trim().toLowerCase();
     if (bulkOwner && !state.profiles.some(p => p.email === bulkOwner && p.active)) return json({error:"Choose an active team member."},400);
     for (const row of body.rows) {
-      const names = [row?.molecule, ...(Array.isArray(row?.synonyms) ? row.synonyms : [])];
+      const names = namesWithDictionary(state, portfolio, [row?.molecule, ...(Array.isArray(row?.synonyms) ? row.synonyms : [])].filter(Boolean));
       const molecule = String(row?.molecule || "").trim().slice(0,100);
       const query = molecule && buildQuery(names, body.safetyOnly === true);
       if (query) created.push({ portfolio, molecule, query, ...(bulkOwner ? { owner:bulkOwner } : {}) }); else skipped.push(molecule || "(blank)");
     }
     await write(env, data => {
-      const keys = new Set(created.map(watchKey));
-      created.forEach(w => keepOwner(data, w));
-      data.watches = data.watches.filter(w => !keys.has(watchKey(w))).concat(created);
+      created.forEach(w => { keepOwner(data, w); commitWatch(data, w, email); });
     });
     return json({ created:created.length, skipped });
   } else if (path === "/api/pull") {
@@ -2826,7 +2986,7 @@ async function apiCore(request, env, path) {
     const molecule = String(body.molecule || "").trim().slice(0,100);
     const synonyms = String(body.synonyms || "").split(/[,;\n]/).map(x => x.trim()).filter(Boolean);
     const portfolio = String(body.portfolio || "").trim().slice(0,100) || molecule;
-    let query = molecule && buildQuery([molecule, ...synonyms], body.safetyOnly === true);
+    let query = molecule && buildQuery(namesWithDictionary(state, portfolio, [molecule, ...synonyms]), body.safetyOnly === true);
     if (!query) return json({error:"Enter a molecule name (up to 30 names, 100 characters each)."},400);
     // Optional PubMed filters, written in PubMed's own field syntax.
     const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
@@ -2838,12 +2998,8 @@ async function apiCore(request, env, path) {
     const owner = String(body.owner || "").trim().toLowerCase();
     if (owner && !state.profiles.some(p => p.email === owner && p.active)) return json({error:"Choose an active team member."},400);
     const watch = { portfolio, molecule, query, ...(owner ? { owner } : {}) };
-    await write(env, data => {
-      keepOwner(data, watch);
-      data.watches = data.watches.filter(w => watchKey(w) !== watchKey(watch));
-      data.watches.push(watch);
-    });
-    const run = await execute(env, watch, body.from, body.to);
+    await write(env, data => { keepOwner(data, watch); commitWatch(data, watch, email); });
+    const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField });
     await collectEvidence(env, run.ids);
     return json(run);
   } else if (path === "/api/social-add") {
@@ -2869,7 +3025,7 @@ async function apiCore(request, env, path) {
     if (!watch || !valid(body.from) || !valid(body.to) || body.from > body.to || body.to > day()) {
       return json({error:"Choose a saved portfolio and a valid date range through today."},400);
     }
-    const run = await execute(env, watch, body.from, body.to);
+    const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField });
     await collectEvidence(env, run.ids);
     return json(run);
   } else return json({ error:"Route unavailable." },404);
@@ -3917,7 +4073,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);
