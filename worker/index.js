@@ -765,6 +765,8 @@ function dechallengeFor(drug, events, ex, patient) {
     : /\b(continued|continuing|remained on|maintained)\b/i.test(text) ? { value:"", basis:"not_applicable" } : { value:"", basis:"unreported" };
   const rechText = /\b(re-?challenge|re-?introduc\w+|restart\w+|resum\w+|re-?exposure)\b/i.test(text) ? (/\b(not|no)\s+(?:re-?challenge|re-?introduc|restart)\w*|without\s+re-?challenge/i.test(text) ? "not_done" : "reported") : "";
   const rech = rechText === "reported" ? { value:recur ? "Positive: the event recurred when the product was given again" : "Product given again; the effect is not stated", basis:recur ? "reported" : "unknown" } : rechText === "not_done" ? { value:"Not done", basis:"not_applicable" } : { value:"", basis:drug?.stop ? "unreported" : "not_applicable" };
+  const treated = [...patient.drugs.filter(x => x.role === "treatment").map(x => x.name), ...(patient.procedures || []).map(x => x.name)];
+  if (dech.basis === "reported" && /^Positive/.test(dech.value) && treated.length) { dech.value += " (confounded by treatment: " + treated.slice(0, 4).join(", ") + ")"; dech.confounded = treated; }
   return { dech, rech };
 }
 function caseFromPatient(article, patient, ex, assignment, settings, ctx) {
@@ -2282,6 +2284,102 @@ function caseClass(c) {
   return { serious:m.serious ? m.serious === "serious" : serious, criteria:[...criteria], listedness:m.listedness || listedness, manual:Boolean(m.serious || m.listedness) };
 }
 const ARCHIVE_REASONS = ["Case complete", "Follow-up closed", "Duplicate", "Not a valid ICSR", "Pulled in error", "Retention / end of review", "Other"];
+
+// ---- Routing: screening, then QC, then medical review. A manager or a medical reviewer can route any item to any active person at any stage. ----
+const STAGES = ["screening", "qc", "medical_review", "closed"];
+const STAGE_LABEL = { screening:"Screening", qc:"QC", medical_review:"Medical review", closed:"Closed" };
+function stageOf(a) {
+  if (a.stage) return a.stage;
+  if (!a.disposition) return "screening";
+  if (a.qc?.status === "pending") return "qc";
+  if (a.qc?.status === "returned") return "screening";
+  return a.disposition.value === "potential_icsr" ? "medical_review" : "closed";
+}
+function pickMedical(state, portfolio, exclude = "") {
+  const today = day(), away = p => p.awayFrom && p.awayFrom <= today && (!p.awayUntil || p.awayUntil >= today);
+  const pool = state.profiles.filter(p => p.active && p.email !== exclude && !away(p) && (state.memberships || []).some(m => m.email === p.email && m.role === "medical_reviewer" && (m.portfolio === "*" || m.portfolio === portfolio)));
+  const load = p => state.assignments.filter(a => a.medicalReviewer === p.email && stageOf(a) === "medical_review").length + (state.cases || []).filter(c => c.assignee === p.email && !caseClosed(c)).length;
+  return pool.map(p => ({ p, n:load(p) })).sort((x, y) => x.n - y.n || x.p.email.localeCompare(y.p.email))[0]?.p.email || "";
+}
+// Reporting timeline of a case: serious cases 15 days, non-serious 90 (or the marketing-authorisation record), counted from the reviewer-confirmed awareness date.
+function caseTimeline(state, c, today = day()) {
+  const cls = caseClass(c), reg = regulatoryContext(state.settings?.marketAuth || [], c.data || {}, c.molecule || ""), days = cls.serious ? (reg.ma?.serious_days || 15) : (reg.ma?.nonserious_days || 90);
+  const confirmed = c.data?.dates?.awareness?.value || "", start = confirmed || c.data?.receipt_date || (c.createdAt || "").slice(0, 10), due = start ? addDays(start, days) : "";
+  const left = due ? Math.round((Date.parse(due) - Date.parse(today)) / 864e5) : null;
+  return { category:(cls.serious ? "Serious" : "Non-serious") + " · " + (cls.listedness === "listed" ? "Listed" : cls.listedness === "unlisted" ? "Unlisted" : "Listedness unknown"), serious:cls.serious, listedness:cls.listedness, days, start, startBasis:confirmed ? "awareness date confirmed" : "case created (awareness not confirmed)", due, left, status:left === null ? "no date" : left < 0 ? "overdue" : left <= 3 ? "due soon" : "on time", regulator:reg.regulator || "", clock:(cls.serious ? "Serious: " : "Non-serious: ") + days + " days" };
+}
+function confoundedFlags(c, prod) {
+  const dc = String(v(prod.dechallenge)).toLowerCase(), rc = String(v(prod.rechallenge)).toLowerCase(), conf = c.data?.confounders || [], treated = (c.data?.treatment_given || []).length > 0;
+  return { dc:Boolean(dc) && (dc.includes("confound") || (dc.includes("positive") && treated) || conf.some(x => /treatment|alternative/i.test(x.type || ""))), rc:Boolean(rc) && (rc.includes("confound") || conf.some(x => /rechallenge|concomitant restart/i.test(x.type || ""))) };
+}
+function clinicalSummary(c) {
+  const prods = (c.data?.products || []).filter(p => p.role === "suspect"), list = prods.length ? prods : (c.data?.products || []).slice(0, 1);
+  return list.slice(0, 3).map(p => { const f = confoundedFlags(c, p); return { drug:v(p.name), indication:v(p.indication), action:v(p.action_taken), dechallenge:v(p.dechallenge) || ({ unreported:"Not reported", not_applicable:"Not applicable", unknown:"Unknown" }[p.dechallenge_basis] || ""), rechallenge:v(p.rechallenge) || ({ unreported:"Not reported", not_applicable:"Not applicable", unknown:"Unknown" }[p.rechallenge_basis] || ""), dcConfounded:f.dc, rcConfounded:f.rc }; });
+}
+
+// ---- Drug and brand-name knowledge base. Generic names, brands and salts are pulled from RxNorm (US National Library of Medicine) and openFDA labels, stored in the private bucket,
+// and interlinked: any name finds its ingredient and every other name of it. Search, dictionaries and case views use the links. ----
+const KB_KEY = "drugkb.json", RXNAV = "https://rxnav.nlm.nih.gov/REST", OPENFDA = "https://api.fda.gov/drug/label.json";
+const kbName = x => String(x || "").toLowerCase().replace(/\s+/g, " ").trim();
+async function loadKb(env) {
+  const o = await env.BUCKET.get(KB_KEY); let kb = null;
+  if (o) { try { kb = JSON.parse(await o.text()); } catch { kb = null; } }
+  kb ||= { version:1, updatedAt:null, ingredients:{}, sync:{} };
+  const index = new Map();
+  for (const [key, ing] of Object.entries(kb.ingredients)) { index.set(key, { key, type:"generic" }); for (const b of ing.brands || []) if (!index.has(kbName(b))) index.set(kbName(b), { key, type:"brand" }); for (const x of ing.salts || []) if (!index.has(kbName(x))) index.set(kbName(x), { key, type:"salt" }); for (const x of ing.synonyms || []) if (!index.has(kbName(x))) index.set(kbName(x), { key, type:"synonym" }); }
+  Object.defineProperty(kb, "index", { value:index, enumerable:false });
+  return kb;
+}
+const saveKb = async (env, kb) => { kb.updatedAt = new Date().toISOString(); await env.BUCKET.put(KB_KEY, JSON.stringify(kb), { httpMetadata:{ contentType:"application/json" } }); };
+function kbLookup(kb, text) {
+  const hit = kb.index.get(kbName(text)); if (!hit) return null;
+  const ing = kb.ingredients[hit.key]; return { name:ing.name, matchedAs:hit.type, brands:ing.brands || [], salts:ing.salts || [], synonyms:ing.synonyms || [], atc:ing.atc || [], rxcui:ing.rxcui || "", sources:ing.sources || [], enriched:Boolean(ing.enrichedAt) };
+}
+const kbNames = ing => [...new Set([ing.name, ...(ing.brands || []), ...(ing.salts || []), ...(ing.synonyms || [])].map(kbName).filter(Boolean))];
+function kbExpand(kb, text) { const hit = kb.index.get(kbName(text)); return hit ? kbNames(kb.ingredients[hit.key]) : [kbName(text)]; }
+async function kbFetch(env, url) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await sleep(Number(env.RXNORM_GAP_MS ?? 60));
+    try { const r = await fetch(url, { headers:{ Accept:"application/json", "User-Agent":"LiteraSift/0.01" } }); if (r.status === 404) return null; if (r.ok) return await r.json(); if (r.status !== 429 && r.status < 500) return null; } catch { /* retry */ }
+    await sleep(Number(env.RETRY_BASE_MS ?? 400) * (attempt + 1));
+  }
+  throw new Error("The drug name source did not answer. Try again in a moment.");
+}
+const rxGroup = (json, tty) => (json?.relatedGroup?.conceptGroup || []).filter(g => g.tty === tty).flatMap(g => g.conceptProperties || []);
+// Resolves a name (generic, brand or salt) through RxNorm to its ingredient, then collects brands, salts and synonyms; openFDA label brand names add to the brands.
+async function kbPull(env, kb, name, { openfda = true } = {}) {
+  const at = new Date().toISOString(), clean = String(name || "").trim(); if (clean.length < 2) return null;
+  const found = await kbFetch(env, RXNAV + "/rxcui.json?search=2&name=" + encodeURIComponent(clean));
+  let rxcui = (found?.idGroup?.rxnormId || [])[0] || "", ingName = "", ingRx = rxcui;
+  if (rxcui) {
+    const props = await kbFetch(env, RXNAV + "/rxcui/" + rxcui + "/properties.json"), tty = props?.properties?.tty, own = props?.properties?.name || clean;
+    if (tty === "IN" || tty === "MIN") { ingName = own; }
+    else { const inn = await kbFetch(env, RXNAV + "/rxcui/" + rxcui + "/related.json?tty=IN+MIN"); const first = rxGroup(inn, "IN")[0] || rxGroup(inn, "MIN")[0]; if (first) { ingName = first.name; ingRx = first.rxcui; } }
+  }
+  if (!ingName) { const lower = kbName(clean); if (!kb.index.has(lower) && !openfda) return null; ingName = kb.index.get(lower) ? kb.ingredients[kb.index.get(lower).key].name : clean; ingRx = ""; }
+  const key = kbName(ingName), created = !kb.ingredients[key], ing = kb.ingredients[key] ||= { name:ingName, rxcui:ingRx, brands:[], salts:[], synonyms:[], atc:[], sources:[] };
+  if (ingRx) {
+    ing.rxcui = ingRx;
+    const rel = await kbFetch(env, RXNAV + "/rxcui/" + ingRx + "/related.json?tty=BN+PIN"), bn = rxGroup(rel, "BN").map(x => x.name), pin = rxGroup(rel, "PIN").map(x => x.name);
+    ing.brands = [...new Set([...(ing.brands || []), ...bn])]; ing.salts = [...new Set([...(ing.salts || []), ...pin])];
+    if (!(ing.sources || []).some(x => x.name === "RxNorm")) (ing.sources ||= []).push({ name:"RxNorm", url:"https://rxnav.nlm.nih.gov/REST/rxcui/" + ingRx, at });
+  }
+  if (openfda) {
+    const q = OPENFDA + "?search=openfda.generic_name.exact:%22" + encodeURIComponent(ingName.toUpperCase()) + "%22&count=openfda.brand_name.exact&limit=100", j = await kbFetch(env, q).catch(() => null);
+    const brands = (j?.results || []).map(r => String(r.term || "").trim()).filter(Boolean).map(t => t.toLowerCase().replace(/(^|[\s-])([a-z])/g, (m, sep, ch) => sep + ch.toUpperCase()));
+    if (brands.length) { const have = new Set((ing.brands || []).map(kbName)); ing.brands = [...(ing.brands || []), ...brands.filter(b => !have.has(kbName(b)))]; if (!(ing.sources || []).some(x => x.name === "openFDA labels")) ing.sources.push({ name:"openFDA labels", url:"https://api.fda.gov/drug/label.json", at }); }
+  }
+  if (kbName(clean) !== key && !(ing.brands || []).concat(ing.salts || [], ing.synonyms || []).map(kbName).includes(kbName(clean))) (ing.synonyms ||= []).push(clean);
+  if (created && !ing.rxcui && !(ing.brands || []).length) { delete kb.ingredients[key]; return null; }
+  ing.enrichedAt = at; return key;
+}
+function kbTargets(state) {
+  const names = new Set();
+  for (const d of Object.values(state.dictionaries || {})) for (const p of d.products || []) dictNames(p).forEach(n => names.add(n));
+  for (const w of state.watches || []) if (w.molecule) names.add(w.molecule);
+  for (const c of state.cases || []) for (const p of c.data?.products || []) if (v(p.name)) names.add(v(p.name));
+  return [...names].filter(n => n.length > 1);
+}
 function parseSearch(q) {
   const terms = [], re = /(-?)(?:(\w+):)?(?:"([^"]+)"|(\S+))/g; let m;
   while ((m = re.exec(String(q || "").slice(0, 300)))) { const field = m[2] && ["pmid", "case", "drug", "event", "tag", "status", "portfolio", "author", "journal", "doi", "patient", "assignee", "title", "text"].includes(m[2].toLowerCase()) ? m[2].toLowerCase() : "", text = (m[3] || m[4] || "").toLowerCase(); const word = field || !m[2] ? text : (m[2] + ":" + text).toLowerCase(); if (word) terms.push({ neg:m[1] === "-", field, text:word }); }
@@ -2292,10 +2390,10 @@ function searchFields(state, c, a) {
   return { case:[c.number], pmid:[c.pmid], drug:[...prods.map(p => v(p.name)), c.molecule], event:evs.flatMap(e => [v(e.verbatim), v(e.pt)]), tag:(c.tags || []).map(t => t.tag), status:[c.status, c.archived ? "archived" : ""], portfolio:[c.portfolio], assignee:[c.assignee, ((state.profiles || []).find(p => p.email === c.assignee) || {}).name],
     patient:[v(d.patient?.identifier), v(d.patient?.age), v(d.patient?.sex), ...(d.patient?.medical_history || []).map(h => h.value)], author:a?.authors || [], journal:[a?.journal], doi:[a?.doi], title:[a?.title], text:[a?.abstract, d.narrative?.text, c.notes, d.general_comments, folder?.name] };
 }
-function runSearch(state, viewer, body) {
-  const terms = parseSearch(body.q), f = body.filters && typeof body.filters === "object" ? body.filters : {}, scope = ["all", "articles", "cases"].includes(body.scope) ? body.scope : "all";
+function runSearch(state, viewer, body, kb) {
+  const terms = parseSearch(body.q).map(t => ({ ...t, alts:kb && (t.field === "drug" || !t.field) ? kbExpand(kb, t.text) : [t.text] })), f = body.filters && typeof body.filters === "object" ? body.filters : {}, scope = ["all", "articles", "cases"].includes(body.scope) ? body.scope : "all";
   const caseOnly = Boolean(f.serious || f.listed || f.tag || f.folder || f.archived === "yes" || f.status || f.assignee), lower = x => String(x ?? "").toLowerCase();
-  const hit = (fields, all) => { let score = 0; for (const t of terms) { const pool = t.field ? (fields[t.field] || []) : all; const found = pool.some(x => lower(x).includes(t.text)); const exact = pool.some(x => lower(x) === t.text); if (t.neg ? found : !found) return 0; if (!t.neg) score += (exact ? 6 : 2) + (t.field ? 2 : 0); } return score || (terms.length ? 0 : 1); };
+  const hit = (fields, all) => { let score = 0; for (const t of terms) { const pool = t.field ? (fields[t.field] || []) : all; const found = pool.some(x => t.alts.some(alt => lower(x).includes(alt))); const exact = pool.some(x => t.alts.some(alt => lower(x) === alt)); if (t.neg ? found : !found) return 0; if (!t.neg) score += (exact ? 6 : 2) + (t.field ? 2 : 0); } return score || (terms.length ? 0 : 1); };
   const isManager = viewer?.role === "manager", myItems = state.assignments.filter(a => mayAccess(state, viewer, a)), results = { articles:[], cases:[], counts:{} };
   if (scope !== "cases" && !caseOnly) {
     const ids = isManager ? Object.keys(state.articles) : [...new Set(myItems.map(a => a.pmid))];
@@ -2319,7 +2417,7 @@ function runSearch(state, viewer, body) {
     }
   }
   results.articles.sort((x, y) => y.score - x.score); results.cases.sort((x, y) => y.score - x.score);
-  results.counts = { articles:results.articles.length, cases:results.cases.length };
+  results.counts = { articles:results.articles.length, cases:results.cases.length }; results.expanded = terms.filter(t => t.alts.length > 1 && !t.neg).map(t => ({ term:t.text, alsoSearched:t.alts.filter(a => a !== t.text).slice(0, 30) }));
   results.articles = results.articles.slice(0, 100); results.cases = results.cases.slice(0, 200);
   return results;
 }
@@ -3159,7 +3257,7 @@ async function apiCore(request, env, path) {
     const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
       cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
-      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
+      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c) }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
       monitoring:monitoringCounts(state, viewer),
       series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
@@ -3241,11 +3339,77 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"upload.fulltext", target:"PMID " + id, detail:{ type:ext, bytes:bytes.length, text_read:Boolean(text) } });
     return json({ ok:true, textRead:Boolean(text), events:(status.events || []).length });
   }
+  if (["/api/drugkb-status", "/api/drugkb-sync", "/api/drug-lookup", "/api/dictionary-from-kb"].includes(path) && viewer) {
+    const at = new Date().toISOString(), kb = await loadKb(env), cfg = withSettings(env, state);
+    if (path === "/api/drugkb-status") { const all = Object.values(kb.ingredients); return json({ updatedAt:kb.updatedAt, ingredients:all.length, enriched:all.filter(x => x.enrichedAt).length, brands:all.reduce((n, x) => n + (x.brands || []).length, 0), sync:kb.sync || {}, targets:kbTargets(state).length, sources:["RxNorm (NLM)", "openFDA drug labels"] }); }
+    if (path === "/api/drug-lookup") {
+      const name = String(body.name || "").trim().slice(0, 100); if (name.length < 2) return json({ error:"Enter a drug or brand name." }, 400);
+      let hit = kbLookup(kb, name), pulled = false;
+      if ((!hit || !hit.enriched) && body.online !== false) {
+        try { const key = await kbPull(cfg, kb, name); if (key) { await saveKb(env, kb); pulled = true; } } catch (e) { if (!hit) return json({ error:e.message }, 502); }
+        const fresh = await loadKb(env); hit = kbLookup(fresh, name);
+        await audit(env, { by:email, action:"drugkb.lookup", target:name, detail:{ found:Boolean(hit), pulled } });
+      }
+      return json({ query:name, found:Boolean(hit), pulled, ...(hit || {}) });
+    }
+    if (!manager) return json({ error:"Manager access required." }, 403);
+    if (path === "/api/dictionary-from-kb") {
+      const portfolio = String(body.portfolio || "").trim(), names = (Array.isArray(body.names) ? body.names : []).map(x => String(x).trim()).filter(Boolean).slice(0, 50);
+      if (!portfolio || !names.length) return json({ error:"Choose a portfolio and at least one drug name." }, 400);
+      const products = [], missing = [];
+      for (const n of names) { const hit = kbLookup(kb, n); if (!hit) { missing.push(n); continue; } products.push({ name:hit.name, generics:[hit.name], brands:hit.brands.slice(0, 60), salts:hit.salts.slice(0, 30), aliases:hit.synonyms.slice(0, 30) }); }
+      if (!products.length) return json({ error:"None of those names is in the drug name list yet. Pull them first.", missing }, 404);
+      let merged = 0; await write(env, data => { const d = (data.dictionaries ||= {})[portfolio] ||= { version:0, products:[], history:[] }; const old = d.products || [];
+        for (const p of products) { const at0 = old.find(x => kbName(x.name) === kbName(p.name)); if (at0) { for (const k of ["generics", "brands", "salts", "aliases"]) at0[k] = [...new Set([...(at0[k] || []), ...p[k]])]; } else old.push(p); merged++; }
+        d.products = old; d.version = (d.version || 0) + 1; d.updatedAt = at; d.by = email; });
+      await audit(env, { by:email, action:"dictionary.kb_merge", target:portfolio, detail:{ products:products.map(p => p.name).join(", "), brands:products.reduce((n, p) => n + p.brands.length, 0), missing:missing.join(", ") } });
+      return json({ ok:true, merged, missing });
+    }
+    // path === "/api/drugkb-sync": restartable; "watchlist" pulls every name your dictionaries, watchlists and cases use, "ingredients" loads the RxNorm ingredient list, "enrich" adds brands to the next ingredients.
+    const mode = ["watchlist", "ingredients", "enrich"].includes(body.mode) ? body.mode : "watchlist", limit = Math.min(Math.max(Number(body.limit) || 25, 1), 100), done = [], failed = [];
+    if (mode === "ingredients") {
+      const j = await kbFetch(cfg, RXNAV + "/allconcepts.json?tty=IN").catch(e => { failed.push(e.message); return null; });
+      let added = 0; for (const c of j?.minConceptGroup?.minConcept || []) { const key = kbName(c.name); if (key && !kb.ingredients[key]) { kb.ingredients[key] = { name:c.name, rxcui:String(c.rxcui || ""), brands:[], salts:[], synonyms:[], atc:[], sources:[{ name:"RxNorm", url:"https://rxnav.nlm.nih.gov/REST/allconcepts.json?tty=IN", at }] }; added++; } }
+      kb.sync = { ...kb.sync, ingredientsLoadedAt:at, by:email }; if (added || !failed.length) await saveKb(env, kb);
+      await audit(env, { by:email, action:"drugkb.sync", target:"ingredients", detail:{ added, failed:failed.length } }); return json({ ok:!failed.length, mode, added, failed });
+    }
+    const todo = mode === "watchlist" ? kbTargets(state).filter(n => { const h = kbLookup(kb, n); return !h || !h.enriched; }) : Object.values(kb.ingredients).filter(x => !x.enrichedAt).map(x => x.name);
+    for (const n of todo.slice(0, limit)) { try { const key = await kbPull(cfg, kb, n, { openfda:mode === "watchlist" }); done.push(key || n); if (!key) failed.push(n + ": not found"); } catch (e) { failed.push(n + ": " + e.message); break; } }
+    kb.sync = { ...kb.sync, lastMode:mode, lastRunAt:at, by:email }; await saveKb(env, kb);
+    await audit(env, { by:email, action:"drugkb.sync", target:mode, detail:{ pulled:done.length, remaining:Math.max(0, todo.length - done.length), failed:failed.slice(0, 5).join("; ") } });
+    return json({ ok:true, mode, pulled:done.length, remaining:Math.max(0, todo.length - done.length), failed });
+  }
+  if (path === "/api/route" && viewer) {
+    const stage = String(body.stage || ""), to = String(body.to || "").trim().toLowerCase(), reason = String(body.reason || "").trim(), ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), at = new Date().toISOString();
+    if (!STAGES.includes(stage)) return json({ error:"Choose a stage: " + STAGES.join(", ") + "." }, 400);
+    if (stage !== "closed" && !state.profiles.some(p => p.email === to && p.active)) return json({ error:"Choose an active person to route to." }, 400);
+    if (reason.length < 5) return json({ error:"Give a reason of at least 5 characters." }, 400);
+    const kind = body.kind === "case" ? "case" : "assignment", may = pf => isPortfolioManager(state, viewer, pf) || rolesIn(state, email, pf).has("medical_reviewer");
+    const pool = kind === "case" ? (state.cases || []).filter(c => ids.has(c.id) && caseVisible(state, viewer, c)) : state.assignments.filter(a => ids.has(a.id) && mayAccess(state, viewer, a));
+    if (!pool.length) return json({ error:"Choose at least one item." }, 400);
+    if (pool.some(x => !may(x.portfolio))) return json({ error:"Only a manager or a medical reviewer of the portfolio can re-route work." }, 403);
+    if (kind === "assignment" && stage === "qc" && pool.some(a => !a.disposition)) return json({ error:"There is no disposition to send to QC yet." }, 409);
+    const moved = [];
+    await write(env, data => {
+      for (const x of pool) {
+        const label = STAGE_LABEL[stage] + (stage === "closed" ? "" : " (" + to + ")");
+        if (kind === "case") { const c = data.cases.find(y => y.id === x.id); if (c.locked) continue; const from = c.stage || "medical_review"; c.stage = stage; if (stage !== "closed") { c.assignee = to; c.assignedAt = at; } if (stage === "screening" || stage === "qc") { c.status = "Draft"; delete c.approval; if (c.data) delete c.data.approval; }
+          refreshDue(data, c); c.updatedAt = at; (c.history ||= []).push({ at, by:email, action:"routed " + from + " to " + label + ": " + reason.slice(0, 200) }); moved.push(c.number + " " + from + " to " + label); continue; }
+        const a = data.assignments.find(y => y.id === x.id), from = stageOf(a); (a.history ||= []).push({ status:a.status, note:"Routed " + STAGE_LABEL[from] + " to " + label + ": " + reason.slice(0, 200), by:email, at });
+        a.stage = stage;
+        if (stage === "screening") { a.reviewer = to; a.qc = undefined; a.status = "Pending"; a.dueAt = addDays(day(), Number(data.settings?.screeningSlaDays ?? 7)); delete a.routedToMedical; }
+        else if (stage === "qc") { a.qc = { status:"pending", reviewer:to, requestedAt:at, rounds:a.qc?.rounds || 0, reason:"routed by " + email }; a.status = "Awaiting QC"; delete a.routedToMedical; }
+        else if (stage === "medical_review") { a.medicalReviewer = to; a.routedToMedical = { by:email, at, reason:reason.slice(0, 200) }; if (a.status === "Awaiting QC" || a.status === "QC returned") a.status = "Complete"; }
+        moved.push("PMID " + a.pmid + " " + STAGE_LABEL[from] + " to " + label);
+      } });
+    await audit(env, { by:email, action:kind === "case" ? "case.routed" : "review.routed", target:moved.length + " item" + (moved.length === 1 ? "" : "s"), detail:{ stage, to:to || "", reason:reason.slice(0, 300), changes:moved.slice(0, 50).join("; ") } });
+    return json({ ok:true, moved:moved.length });
+  }
   if (["/api/search", "/api/case-tag", "/api/folder-save", "/api/folder-delete", "/api/case-folder", "/api/case-archive", "/api/case-restore", "/api/cases-delete", "/api/case-classify"].includes(path) && viewer) {
     const at = new Date().toISOString(), ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), medical = c => isPortfolioManager(state, viewer, c.portfolio) || rolesIn(state, email, c.portfolio).has("medical_reviewer");
     const editable = c => caseVisible(state, viewer, c) && (medical(c) || c.assignee === email || c.createdBy === email), chosen = pred => (state.cases || []).filter(c => ids.has(c.id) && pred(c));
     if (path === "/api/search") {
-      const results = runSearch(state, viewer, body);
+      const results = runSearch(state, viewer, body, await loadKb(env));
       await audit(env, { by:email, action:"search.run", target:String(body.q || "").slice(0, 120), detail:{ scope:body.scope || "all", filters:Object.entries(body.filters || {}).filter(([, x]) => x).map(([k, x]) => k + "=" + String(x).slice(0, 40)).join(", "), articles:results.counts.articles, cases:results.counts.cases } });
       return json({ ...results, standardTags:STANDARD_TAGS, folders:(state.caseFolders || []) });
     }
@@ -3448,7 +3612,9 @@ async function apiCore(request, env, path) {
         (a.history ||= []).push({ status:a.status, note:"Disposition: " + value + (reason ? " (" + reason + ")" : "") + (note ? " - " + note : ""), by:email, at });
         a.disposition = { value, reason, note, by:email, at };
         a.status = value === "full_text_needed" ? "Full text needed" : needsQc ? "Awaiting QC" : "Complete";
-        a.qc = needsQc ? { status:"pending", reviewer:qcReviewer, requestedAt:at, rounds:(a.qc?.rounds || 0) + (a.qc?.status === "returned" ? 1 : 0), reason:value === "potential_icsr" ? "all potential ICSRs are checked" : "sampled" } : undefined; });
+        a.qc = needsQc ? { status:"pending", reviewer:qcReviewer, requestedAt:at, rounds:(a.qc?.rounds || 0) + (a.qc?.status === "returned" ? 1 : 0), reason:value === "potential_icsr" ? "all potential ICSRs are checked" : "sampled" } : undefined;
+        delete a.stage; delete a.routedToMedical;
+        if (!needsQc && value === "potential_icsr") { a.medicalReviewer = pickMedical(data, a.portfolio, a.reviewer) || a.medicalReviewer || undefined; a.history.push({ status:a.status, note:"Routed to medical review" + (a.medicalReviewer ? ": " + a.medicalReviewer : " (no medical reviewer available)"), by:"routing", at }); } });
       await audit(env, { by:email, action:"review.disposition", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ portfolio:item.portfolio, value, reason, qc:needsQc ? (qcReviewer || "no QC reviewer available") : "not required" } });
       return json({ ok:true, qc:needsQc ? { reviewer:qcReviewer } : null });
     }
@@ -3461,7 +3627,8 @@ async function apiCore(request, env, path) {
       const decision = body.decision === "return" ? "return" : body.decision === "approve" ? "approve" : "", note = String(body.note || "").trim().slice(0, 1000);
       if (!decision || (decision === "return" && note.length < 5)) return json({ error:"Approve, or return with a note of at least 5 characters." }, 400);
       await write(env, data => { const a = data.assignments.find(x => x.id === item.id); (a.history ||= []).push({ status:a.status, note:"QC " + (decision === "approve" ? "approved" : "returned") + (note ? ": " + note : ""), by:email, at });
-        a.qc = { ...a.qc, status:decision === "approve" ? "approved" : "returned", decidedBy:email, decidedAt:at, note, reviewer:a.qc.reviewer || email }; a.status = decision === "approve" ? "Complete" : "QC returned"; });
+        a.qc = { ...a.qc, status:decision === "approve" ? "approved" : "returned", decidedBy:email, decidedAt:at, note, reviewer:a.qc.reviewer || email }; a.status = decision === "approve" ? "Complete" : "QC returned"; delete a.stage;
+        if (decision === "approve" && a.disposition?.value === "potential_icsr") { a.medicalReviewer = pickMedical(data, a.portfolio, a.reviewer) || a.medicalReviewer || undefined; a.history.push({ status:a.status, note:"Routed to medical review" + (a.medicalReviewer ? ": " + a.medicalReviewer : " (no medical reviewer available)"), by:"routing", at }); } });
       await audit(env, { by:email, action:"review.qc", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ portfolio:item.portfolio, decision, note, screener:item.reviewer } });
       return json({ ok:true });
     }
@@ -3479,7 +3646,7 @@ async function apiCore(request, env, path) {
       const pm = isPortfolioManager(state, viewer, item.portfolio), roles = rolesIn(state, email, item.portfolio);
       if (!(item.reviewer === email || pm || roles.has("medical_reviewer"))) return json({ error:"Only the assigned reviewer, a medical reviewer or a manager can create drafts." }, 403);
       if (item.disposition?.value !== "potential_icsr") return json({ error:"Record the screening disposition 'potential ICSR' first. Drafts are only made for potential cases." }, 409);
-      if (item.qc && item.qc.status !== "approved") return json({ error:"This disposition has not passed QC yet." }, 409);
+      if (item.qc && item.qc.status !== "approved" && !item.routedToMedical) return json({ error:"This disposition has not passed QC yet." }, 409);
       if (ex.aggregateOnly) return json({ error:"The article reports aggregate data only; aggregate counts do not become individual case drafts." }, 409);
       const force = body.force && typeof body.force === "object" ? body.force : {}, wanted = Array.isArray(body.patientIds) ? new Set(body.patientIds.map(String)) : null;
       const created = [], existing = [], skipped = [], prepared = [];
@@ -3499,7 +3666,7 @@ async function apiCore(request, env, path) {
           const number = allocateCaseNumber(data), a = data.assignments.find(x => x.id === item.id);
           const caseData = caseFromPatient(data.articles[item.pmid], p, ex, a, data.settings || {}, { criteria:assessment, decisions:a.extractionDecisions || {}, ime });
           caseData.case_id = number;
-          const rec = { id:crypto.randomUUID(), number, pmid:item.pmid, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"", data:caseData, createdBy:email, createdAt:at, updatedAt:at, assignee:item.reviewer || email, intake:"patient-draft",
+          const rec = { id:crypto.randomUUID(), number, pmid:item.pmid, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"", data:caseData, createdBy:email, createdAt:at, updatedAt:at, assignee:a.medicalReviewer || pickMedical(data, item.portfolio) || item.reviewer || email, stage:"medical_review", intake:"patient-draft",
             provenance:{ idempotencyKey:idem, patientId:p.id, patientLabel:p.label, extractionVersion:ex.version, extractedAt:ex.createdAt, fullTextSha256:ex.source.fullTextSha256, assignmentId:item.id, criteriaOverall:assessment.overall, forced },
             history:[{ at, by:email, action:"draft created for " + (p.label || p.id) + " from PMID " + item.pmid + " (" + item.portfolio + ")" }] };
           refreshDue(data, rec); (data.cases ||= []).push(rec); done.push({ existing:false, number, patient:p.id, id:rec.id });
@@ -5623,7 +5790,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  extractClinical, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  extractClinical, stageOf, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);
