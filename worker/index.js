@@ -3473,6 +3473,7 @@ const auditRules = {
   "/api/settings":b => ({ action:"settings.update", target:Object.keys(b).join(", "), detail:"storeRestricted" in b ? "storeRestricted=" + b.storeRestricted : "" }),
   "/api/assign-ranges":(b, r) => ({ action:"assign.ranges", target:decodeWatch(b.watch), detail:(b.ranges || []).map(x => "#" + x.from + "-" + x.to + " to " + x.owner).join("; ") + " (" + (b.order || "relevance") + ", " + (b.pool || "open") + "): " + Object.values(r.per || {}).reduce((n, v) => n + v, 0) + " assigned" }),
   "/api/delete-watch":b => ({ action:"watch.delete", target:decodeWatch(b.watch), detail:"" }),
+  "/api/client-permission":b => ({ action:"client.permission", target:String(b.email || ""), detail:b.allowed === true ? "allowed" : "revoked" }),
   "/api/client-save":(b, r) => ({ action:"client.save", target:String(b.name || "").slice(0, 80), detail:b.id ? "edited" : "created" }),
   "/api/client-delete":b => ({ action:"client.delete", target:String(b.id || ""), detail:"" }),
   "/api/client-assign":b => ({ action:"client.assign", target:decodeWatch(b.watch), detail:b.client ? "to client " + b.client : "unlinked" }),
@@ -3521,7 +3522,7 @@ async function apiCore(request, env, path) {
       monitoring:monitoringCounts(state, viewer),
       series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
-      profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
+      profiles:manager ? state.profiles : [viewer], clientAdmin:manager || viewer.canManageClients === true, watches:manager ? state.watches : viewer.canManageClients === true ? state.watches.map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "", client:w.client || "" })) : [],
       runs:manager ? state.runs : [], assignments,
       articles:manager ? state.articles : Object.fromEntries(assignments.map(a => [a.pmid, state.articles[a.pmid]])) });
   }
@@ -4514,7 +4515,43 @@ async function apiCore(request, env, path) {
       h.beats = [{ at:startedAt, ok:!failed.length, batches:results.length, failed:failed.length, remaining }, ...(h.beats || [])].slice(0, 50); });
     return json({ results, remaining, evidence });
   }
+  // Clients are managed by managers, or by a user a manager has allowed to (Settings > User permissions).
+  if (path.startsWith("/api/client-") && path !== "/api/client-permission") {
+    if (!manager && viewer?.canManageClients !== true) return json({ error:"Client management is limited to managers and users a manager has allowed." },403);
+  if (path === "/api/client-save") {
+    const name = String(body.name || "").trim().slice(0, 80), id = String(body.id || "");
+    if (!name) return json({error:"Enter a client name."},400);
+    if ((state.clients || []).some(c => c.id !== id && c.name.toLowerCase() === name.toLowerCase())) return json({error:"A client with that name already exists."},400);
+    const saved = await write(env, data => {
+      data.clients ||= [];
+      let c = id && data.clients.find(x => x.id === id);
+      if (!c) { c = { id:crypto.randomUUID(), created:new Date().toISOString() }; data.clients.push(c); }
+      c.name = name; c.contact = String(body.contact || "").trim().slice(0, 120); c.note = String(body.note || "").trim().slice(0, 400);
+      return c.id;
+    });
+    return json({ ok:true, id:saved });
+  }
+  if (path === "/api/client-delete") {
+    const id = String(body.id || "");
+    if (!(state.clients || []).some(c => c.id === id)) return json({error:"Client not found."},404);
+    await write(env, data => { data.clients = data.clients.filter(c => c.id !== id); data.watches.forEach(w => { if (w.client === id) delete w.client; }); });
+    return json({ ok:true });
+  }
+  if (path === "/api/client-assign") {
+    const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent), client = String(body.client || "");
+    if (!state.watches.some(w => w.portfolio === portfolio && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
+    if (client && !(state.clients || []).some(c => c.id === client)) return json({error:"Choose a client."},400);
+    await write(env, data => { const w = data.watches.find(x => x.portfolio === portfolio && (x.molecule || "") === molecule); if (client) w.client = client; else delete w.client; });
+    return json({ ok:true });
+  }
+  }
   if (!manager) return json({ error:"Manager access required." },403);
+  if (path === "/api/client-permission") {
+    const who = String(body.email || "").trim().toLowerCase();
+    if (!state.profiles.some(p => p.email === who && p.role !== "manager")) return json({error:"Choose a team member (not a manager)."},400);
+    await write(env, data => { const p = data.profiles.find(x => x.email === who); if (body.allowed === true) p.canManageClients = true; else delete p.canManageClients; });
+    return json({ ok:true });
+  }
   if (path === "/api/settings") {
     const email = String(body.unpaywallEmail ?? "").trim();
     if ("pvNexusUrl" in body && body.pvNexusUrl && !/^https?:\/\/[^\s/]+(\/\S*)?$/.test(String(body.pvNexusUrl).trim())) return json({error:"Enter the PV Nexus API address, like https://pv-nexus.example.com"},400);
@@ -4633,32 +4670,6 @@ async function apiCore(request, env, path) {
     const names = Array.isArray(body.names) ? body.names.map(String) : [];
     try { return json({ result:await faersReactions(names) }); } catch (error) { return json({ error:error.message }, 502); }
   }
-  if (path === "/api/client-save") {
-    const name = String(body.name || "").trim().slice(0, 80), id = String(body.id || "");
-    if (!name) return json({error:"Enter a client name."},400);
-    if ((state.clients || []).some(c => c.id !== id && c.name.toLowerCase() === name.toLowerCase())) return json({error:"A client with that name already exists."},400);
-    const saved = await write(env, data => {
-      data.clients ||= [];
-      let c = id && data.clients.find(x => x.id === id);
-      if (!c) { c = { id:crypto.randomUUID(), created:new Date().toISOString() }; data.clients.push(c); }
-      c.name = name; c.contact = String(body.contact || "").trim().slice(0, 120); c.note = String(body.note || "").trim().slice(0, 400);
-      return c.id;
-    });
-    return json({ ok:true, id:saved });
-  }
-  if (path === "/api/client-delete") {
-    const id = String(body.id || "");
-    if (!(state.clients || []).some(c => c.id === id)) return json({error:"Client not found."},404);
-    await write(env, data => { data.clients = data.clients.filter(c => c.id !== id); data.watches.forEach(w => { if (w.client === id) delete w.client; }); });
-    return json({ ok:true });
-  }
-  if (path === "/api/client-assign") {
-    const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent), client = String(body.client || "");
-    if (!state.watches.some(w => w.portfolio === portfolio && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
-    if (client && !(state.clients || []).some(c => c.id === client)) return json({error:"Choose a client."},400);
-    await write(env, data => { const w = data.watches.find(x => x.portfolio === portfolio && (x.molecule || "") === molecule); if (client) w.client = client; else delete w.client; });
-    return json({ ok:true });
-  }
   if (path === "/api/assign-molecule") {
     const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
     const owner = String(body.owner || "").trim().toLowerCase();
@@ -4694,7 +4705,7 @@ async function apiCore(request, env, path) {
     await write(env, data => {
       const existing = data.profiles.findIndex(p => p.email === profile.email);
       if (existing < 0) data.profiles.push(profile);
-      else if (data.profiles[existing].role === "reviewer") data.profiles[existing] = profile;
+      else if (data.profiles[existing].role === "reviewer") data.profiles[existing] = { ...profile, ...(data.profiles[existing].canManageClients ? { canManageClients:true } : {}) };
       else throw new Error("The owner profile cannot be replaced.");
       data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data,a));
     });
@@ -5844,6 +5855,11 @@ function applyFilter(items){
   return items.filter(a=>(!filt.client||(filt.client==="none"?!a.client:a.client===filt.client))&&(!filt.status||a.status===filt.status)&&(!filt.portfolio||a.portfolio===filt.portfolio)&&(!filt.oa||oaGroup(data.articles[a.pmid]||{})===filt.oa)&&(!filt.ft||ftGroup(data.articles[a.pmid]||{})===filt.ft)&&(!filt.source||(filt.source==="pubmed")===(sourceOf(data.articles[a.pmid])==="PubMed"))&&(!filt.country||(artCountry(data.articles[a.pmid])||"Unknown")===filt.country)&&(!filt.ime||(filt.ime==="ime"?(data.articles[a.pmid]&&data.articles[a.pmid].imeCount>0):(data.articles[a.pmid]&&data.articles[a.pmid].caseFacts&&data.articles[a.pmid].caseFacts.minimum.verdict==="Valid ICSR candidate")))&&
     (!q||(a.pmid+" "+(data.articles[a.pmid]?.title||"")+" "+(a.molecules||[]).join(" ")).toLowerCase().includes(q))&&specialOk(a)).sort(filt.sort==="likely"?(x,y)=>Number(isLikely(y))-Number(isLikely(x))||(y.score||0)-(x.score||0):order);
 }
+function userPermsHtml(){
+  const people=data.profiles.filter(p=>p.role!=="manager"&&p.active!==false);
+  const rows=people.map(p=>'<div class="row"><span><b>'+esc(p.name||p.email)+'</b><div class="sub">'+esc(p.email)+'</div></span><span style="display:flex;gap:10px;align-items:center">'+(p.canManageClients?badge("Can manage clients","green"):badge("Standard","")) +'<form data-route="client-permission" style="margin:0"><input type="hidden" name="email" value="'+esc(p.email)+'"><input type="hidden" name="allowed" value="'+(p.canManageClients?"false":"true")+'"><button class="btn outline sm">'+(p.canManageClients?"Revoke":"Allow")+'</button></form></span></div>').join("");
+  return panel("User permissions",people.length?rows:'<div class="empty">No team members yet. Add people in Team.</div>',"Only managers can add clients and group molecules under them. Allow a team member here to let them add clients and assign molecules too. They still cannot change watchlists, users or settings.");
+}
 function clientsHtml(){
   const clients=data.clients||[], items=data.assignments, wk=w=>encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||"");
   const free=data.watches.filter(w=>!w.client);
@@ -5863,7 +5879,7 @@ function clientsHtml(){
 function stat(label,value,icon,warn){return '<div class="card tilt'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Clients","Synchrony","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Queue","Synchrony"]).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
+  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Clients","Synchrony","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Queue","Synchrony"].concat(data.clientAdmin?["Clients"]:[])).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   libNumbers=null;
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
@@ -5990,7 +6006,7 @@ function render() {
     panel("Assign by number",watchOptions?'<div class="grid"><label>Molecule<select id="rkwatch">'+watchOptions+'</select></label><label>Order<select id="rkorder"><option value="relevance">Most relevant first</option><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></label><label>Articles<select id="rkpool"><option value="open">All not yet complete</option><option value="unassigned">Unassigned only</option></select></label></div><div id="rkrows" style="margin-top:12px"></div><div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0"><button type="button" class="btn outline" data-rkadd="1">Add range</button><button type="button" class="btn outline" data-rkpreview="1">Preview ranked list</button><button type="button" class="btn" data-rkapply="1">Assign</button></div><div id="rkpreview"></div>':'<div class="empty">Save a watchlist first.</div>',
       "Number the articles in the order you choose (#1 is the top) and give each range to a person, for example 1 to 20 to one person and 21 to 30 to another. Articles outside the ranges stay as they are.")+
     panel("Saved watchlists ("+data.watches.length+")",table(["Portfolio","Molecule","Owner","Query",""],data.watches.map(w=>[esc(w.portfolio),esc(w.molecule||"—"),w.owner?esc((data.profiles.find(p=>p.email===w.owner)||{name:w.owner}).name):'<span class="sub">Auto</span>','<span class="sub">'+esc(w.query)+"</span>",'<button class="btn outline sm" data-delwatch="'+esc(encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||""))+'">Delete</button>']),"Add a molecule or portfolio watchlist to start."),"",true);
-  if(tab==="Settings") html=panel("Unpaywall (open access)",'<form class="grid" data-route="settings"><label class="wide">Contact email for Unpaywall<input type="email" name="unpaywallEmail" value="'+esc(data.config.unpaywallEmail)+'" placeholder="you@example.com"'+(data.config.unpaywallFromEnv?' disabled':'')+'></label><div><button class="btn"'+(data.config.unpaywallFromEnv?' disabled':'')+'>Save</button></div></form>'+
+  if(tab==="Settings") html=userPermsHtml()+panel("Unpaywall (open access)",'<form class="grid" data-route="settings"><label class="wide">Contact email for Unpaywall<input type="email" name="unpaywallEmail" value="'+esc(data.config.unpaywallEmail)+'" placeholder="you@example.com"'+(data.config.unpaywallFromEnv?' disabled':'')+'></label><div><button class="btn"'+(data.config.unpaywallFromEnv?' disabled':'')+'>Save</button></div></form>'+
       '<div class="row"><span>Status</span>'+(data.config.unpaywall?badge("Active","green"):badge("Not configured","amber"))+'</div>'+
       '<form data-route="recheck-access" style="margin-top:10px"><button class="btn outline">Re-check open access for all articles</button></form>',
       "Unpaywall requires a contact email on each request; it is sent to Unpaywall only. Every article with a DOI gets an open-access status (gold, hybrid, green, bronze or closed). Permissively licensed PDFs are stored, other open copies are linked. Closed articles are re-checked every 30 days."+(data.config.unpaywallFromEnv?" The email is set by the server environment (UNPAYWALL_EMAIL).":""))+
@@ -6466,6 +6482,7 @@ document.addEventListener("submit",async event=>{
   const route=form.dataset.route || "review";
   if(route==="client-delete"&&!confirm("Remove this client? Its molecules are kept."))return;
   if(route==="assign-molecule")body.reassign=body.reassign==="on";
+  if(route==="client-permission")body.allowed=body.allowed==="true";
   if(route==="review")body.id=active.id;
   if(route==="dictionary-save"){body.products=String(body.productsText||"").split(NL).map(l=>l.split("|").map(x=>x.trim())).filter(c=>c[0]).map(c=>({name:c[0],generics:c[1]||"",brands:c[2]||"",salts:c[3]||"",aliases:c[4]||""}));delete body.productsText;}
   if(route==="pull"){["safety","humans","caseReports","english","noReviews"].forEach(k=>{body[k==="safety"?"safetyOnly":k]=body[k]==="on";});}
