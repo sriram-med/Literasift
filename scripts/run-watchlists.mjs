@@ -1,6 +1,7 @@
 const site = new URL(process.env.BENCH_URL || "https://literature-bench.sriram03.chatgpt.site");
 const { SITES_ACCESS_TOKEN, RUN_TOKEN } = process.env;
-if (site.protocol !== "https:" || site.username || site.password || !SITES_ACCESS_TOKEN || !RUN_TOKEN) {
+const loopback = process.env.BENCH_ALLOW_LOOPBACK === "1" && ["127.0.0.1", "localhost"].includes(site.hostname);   // staging and tests only
+if ((site.protocol !== "https:" && !loopback) || site.username || site.password || !SITES_ACCESS_TOKEN || !RUN_TOKEN) {
   console.error("Set BENCH_URL to an HTTPS site and provide SITES_ACCESS_TOKEN and RUN_TOKEN.");
   process.exit(1);
 }

@@ -213,3 +213,25 @@ A manager can delete articles from the library: a whole folder (Library tab, **D
 PDF exports (and the PDFs of library folders) take a fresh snapshot of any article whose stored snapshot predates the current record-card layout, and print the search query, date range, retrieval time and snapshot time.
 
 See [docs/WORKBENCH.md](docs/WORKBENCH.md) for the screening-to-ICSR workbench, store migration and backups.
+
+## Sites deployment with the VPS capture service and scheduler
+
+
+Copy `.env.example` to `.env` and fill it on the VPS. Run `docker compose up -d --build`. The scheduler checks for new batches once per minute. A batch is imported once per completed date window, while subsequent runs keep filling the evidence queue.
+
+The capture service listens on VPS loopback port 3000. Give it a dedicated HTTPS hostname using your reverse proxy, forwarding `/screenshot` to `127.0.0.1:3000`. Set these runtime values on the Site:
+
+- `SCREENSHOT_ENDPOINT`: the HTTPS URL ending in `/screenshot`
+- `SCREENSHOT_AUTH`: `bearer` for the included Playwright service
+- `SCREENSHOT_TOKEN`: the same capture secret as on the VPS, at least 24 characters
+- `NCBI_EMAIL`: your organisation's NCBI integration contact email
+
+For an existing Browserless integration, leave `SCREENSHOT_AUTH` unset to retain its query-token mode. The included capture service accepts canonical PubMed article URLs only.
+
+### Extraction sources
+
+- [NCBI E-utilities](https://www.ncbi.nlm.nih.gov/books/NBK25500/) supplies search results, citation metadata, and EFetch XML, which includes abstracts when available.
+- [PMC Cloud Service](https://pmc.ncbi.nlm.nih.gov/tools/cloud/) supplies eligible full text. The app saves PDF when available or JATS XML and records the source and license.
+- [Playwright](https://github.com/microsoft/playwright) supplies Chromium screenshot capture. Both the npm dependency and container image use version 1.64.1. Build the container to install the pinned dependencies.
+
+Reviewers can download evidence from their assigned articles. The batch CSV reports capture status for citation XML, full text, and screenshots.

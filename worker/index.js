@@ -250,6 +250,15 @@ async function fetchCitations(env, ids) {
   }
   return { articles, missing, xml };
 }
+// One-off, idempotent: gives legacy citation XML a hash and a proper evidence record without moving the file.
+async function adoptLegacyEvidence(env) {
+  const { state } = await load(env), todo = Object.values(state.articles).filter(a => a.citationXmlKey && !a.evidence?.efetch);
+  if (!todo.length) return 0;
+  const found = {};
+  for (const a of todo.slice(0, 200)) { const o = await env.BUCKET.get(a.citationXmlKey); if (!o) continue; const xml = await o.text(); found[a.id] = { key:a.citationXmlKey, sha256:await sha256Hex(xml), bytes:xml.length, source:"NCBI EFetch (PubMed)", license:"NLM data; abstracts remain the property of their publishers", retrievedAt:a.evidenceAttempt || null, parser:"efetch-parser/1", adoptedFrom:"citationXmlKey" }; }
+  await write(env, data => { for (const [id, rec] of Object.entries(found)) if (data.articles[id] && !data.articles[id].evidence?.efetch) data.articles[id].evidence = { ...(data.articles[id].evidence || {}), efetch:rec }; });
+  return Object.keys(found).length;
+}
 const sha256Hex = async data => [...new Uint8Array(await crypto.subtle.digest("SHA-256", typeof data === "string" ? new TextEncoder().encode(data) : data))].map(b => b.toString(16).padStart(2, "0")).join("");
 async function storeEfetch(env, xmlById) {
   const evidence = {};
@@ -265,7 +274,11 @@ async function processWindow(env, runId, index) {
   if (!win) return null;
   const mark = patch => write(env, data => { const r = data.runs.find(x => x.id === runId), w = r.windows[index]; Object.assign(w, patch); summarizeRun(r); });
   try {
-    await mark({ state:"running", attempts:win.attempts + 1, error:"" });
+    // Claim the window atomically; an overlapping worker skips a window that another one is processing.
+    let claimed = false; const now = new Date().toISOString();
+    await write(env, data => { const r = data.runs.find(x => x.id === runId), w = r?.windows?.[index]; if (!w || (w.state === "running" && w.claimUntil && w.claimUntil > now)) return;
+      w.state = "running"; w.claimUntil = new Date(Date.now() + 180000).toISOString(); w.attempts = (w.attempts || 0) + 1; w.lastAttemptAt = now; w.error = ""; claimed = true; summarizeRun(r); });
+    if (!claimed) return { busy:true };
     const { esearchresult: result } = await withRetry(env, () => pubmed(env, "esearch", { term:win.term, retmode:"json", retmax:"9999" }));
     if (!result?.idlist) throw new Error("PubMed search was incomplete.");
     const expected = Number(result.count), ids = uniq(result.idlist);
@@ -273,7 +286,7 @@ async function processWindow(env, runId, index) {
       // More records than one search can return: split the window in two. Both halves keep the same query version.
       const middle = addDays(win.from, Math.floor((Date.parse(win.to) - Date.parse(win.from)) / 86400000 / 2));
       await write(env, data => { const r = data.runs.find(x => x.id === runId), w = r.windows[index];
-        const left = { ...w, to:middle, state:"pending", attempts:0, term:searchTerm(w.query, w.from, middle, run.dateField) }, right = { ...w, from:addDays(middle, 1), state:"pending", attempts:0, term:searchTerm(w.query, addDays(middle, 1), w.to, run.dateField) };
+        const left = { ...w, claimUntil:undefined, to:middle, state:"pending", attempts:0, term:searchTerm(w.query, w.from, middle, run.dateField) }, right = { ...w, claimUntil:undefined, from:addDays(middle, 1), state:"pending", attempts:0, term:searchTerm(w.query, addDays(middle, 1), w.to, run.dateField) };
         r.windows.splice(index, 1, left, right); summarizeRun(r); });
       return { split:true };
     }
@@ -299,39 +312,64 @@ async function processWindow(env, runId, index) {
         allocate(data, item); data.assignments.push(item);
       }
       r.ids = uniq([...(r.ids || []), ...ids.filter(id => data.articles[id])]);
-      Object.assign(w, { expected, retrieved:ids.length, pmids:ids, imported, missing, state:expected === 0 ? "zero_results" : reconciled ? "reconciled" : "partial", error:"", completedAt:new Date().toISOString() });
+      Object.assign(w, { expected, retrieved:ids.length, pmids:ids, imported, missing, state:expected === 0 ? "zero_results" : reconciled ? "reconciled" : "partial", error:"", claimUntil:undefined, completedAt:new Date().toISOString() });
       summarizeRun(r);
     });
     return { done:true };
   } catch (error) {
-    await mark({ state:"failed", error:String(error.message).slice(0, 300) });
+    await mark({ state:"failed", claimUntil:undefined, error:String(error.message).slice(0, 300) });
     return { failed:true };
   }
 }
 // Runs the pending and failed windows of an import, a few at a time. Safe to call again at any point: finished windows are never repeated.
-async function runImport(env, runId, budget = 12) {
+// A failed or partial window is retried at most 8 times with a growing pause (5 minutes doubling to 6 hours); after that it stays visible as an unresolved gap until a manager retries it.
+const MAX_WINDOW_ATTEMPTS = 8, backoffMs = attempts => Math.min(5 * 60000 * 2 ** Math.max(0, attempts - 1), 6 * 3600000);
+const windowRetryable = (w, { ignoreBackoff = false } = {}) => (w.state === "failed" || w.state === "partial") && (w.attempts || 0) < MAX_WINDOW_ATTEMPTS && (ignoreBackoff || !w.lastAttemptAt || Date.parse(w.lastAttemptAt) + backoffMs(w.attempts || 1) <= Date.now());
+async function runImport(env, runId, budget = 12, { respectBackoff = false } = {}) {
   env = withSettings(env, (await load(env)).state);
+  const tried = new Map();
   for (let step = 0; step < budget; step++) {
-    const { state } = await load(env), run = state.runs.find(r => r.id === runId);
-    const index = run?.windows?.findIndex(w => w.state === "pending" || w.state === "running" || (w.state === "failed" && w.attempts < 8));
+    const { state } = await load(env), run = state.runs.find(r => r.id === runId), now = new Date().toISOString();
+    const index = run?.windows?.findIndex((w, i) => (tried.get(w.from + "|" + w.to) || 0) < 2 && (w.state === "pending" || (w.state === "running" && !(w.claimUntil && w.claimUntil > now)) || windowRetryable(w, { ignoreBackoff:!respectBackoff })));
     if (index === undefined || index < 0) break;
+    { const w = run.windows[index], k = w.from + "|" + w.to; tried.set(k, (tried.get(k) || 0) + 1); }
     await processWindow(env, runId, index);
   }
   return (await load(env)).state.runs.find(r => r.id === runId);
+}
+// ---- The ledger of search windows. Coverage is tracked per watchlist, per day and per date field, from the windows that actually ran: a later success never hides an earlier failed or missing day. ----
+const daysIn = (from, to) => { const out = []; for (let d = from; d <= to && out.length < 3700; d = addDays(d, 1)) out.push(d); return out; };
+function ledgerFor(state, watch, field = "crdt") {
+  const days = new Map();
+  for (const r of state.runs) {
+    if (r.portfolio !== watch.portfolio || (r.molecule || "") !== (watch.molecule || "") || (r.dateField || "crdt") !== field) continue;
+    const wins = r.windows?.length ? r.windows : [{ from:r.from, to:r.to, state:r.status === "Imported" ? "reconciled" : "failed", attempts:0, error:r.error || "" }];
+    for (const w of wins) { const covered = ["reconciled", "zero_results"].includes(w.state); for (const d of daysIn(w.from, w.to)) { const cur = days.get(d); if (cur?.covered) continue; days.set(d, { covered, state:w.state, attempts:w.attempts || 0, error:w.error || "", runId:r.id, expected:w.expected ?? null, retrieved:w.retrieved ?? null, lastAttemptAt:w.lastAttemptAt || r.time || "" }); } }
+  }
+  return days;
+}
+// Days from the start of monitoring up to the last complete day that have no reconciled window, merged into windows. A watchlist never monitored starts at yesterday.
+function missedWindows(state, watch, through, field = "crdt") {
+  const days = ledgerFor(state, watch, field), recorded = [...days.keys()].sort(), start = recorded[0] || through, out = [];
+  for (const d of daysIn(start, through)) {
+    const e = days.get(d); if (e?.covered) continue;
+    const info = e ? { state:e.state === "running" || e.state === "pending" ? e.state : e.state, attempts:e.attempts, error:e.error, runId:e.runId, lastAttemptAt:e.lastAttemptAt } : { state:"missing", attempts:0, error:"", runId:"", lastAttemptAt:"" };
+    const last = out[out.length - 1];
+    if (last && last.to === addDays(d, -1) && last.state === info.state && last.runId === info.runId) { last.to = d; last.days++; } else out.push({ portfolio:watch.portfolio, molecule:watch.molecule || "", from:d, to:d, days:1, ...info });
+  }
+  return out.map(m => ({ ...m, exhausted:m.attempts >= MAX_WINDOW_ATTEMPTS && ["failed", "partial"].includes(m.state) }));
 }
 async function execute(env, watch, from, to, { mode = "monitor", dateField, force = false } = {}) {
   env = withSettings(env, (await load(env)).state);
   const field = DATE_FIELDS[dateField] ? dateField : mode === "backfill" ? "pdat" : "crdt", windows = makeWindows(watch, from, to, mode === "backfill" ? 14 : 7, field);
   const key = [watchKey(watch), mode, field, from, to, windows.map(w => w.queryVersion).join(",")].join("|");
-  const { state } = await load(env), existing = state.runs.find(r => r.idem === key);
-  if (existing && !force) {
-    if (["reconciled", "zero_results"].includes(existing.coverage)) return { ...existing, replayed:true };
-    return runImport(env, existing.id);
-  }
   const run = { id:crypto.randomUUID(), source:"PubMed", portfolio:watch.portfolio, molecule:watch.molecule || "", from, to, mode, dateField:field, dateFieldLabel:DATE_FIELDS[field].label, windows, ids:[], count:0, time:new Date().toISOString(), searchedAt:new Date().toISOString(),
     query:windows[windows.length - 1].query, queryVersions:uniq(windows.map(w => w.queryVersion)), executedQueries:uniq(windows.map(w => w.term)).slice(0, 50), idem:key, status:"Running", coverage:"running" };
-  await write(env, data => { data.runs.unshift(run); });
-  return runImport(env, run.id);
+  // The check and the insert happen in one transaction, so overlapping callers share a single run instead of creating twins.
+  let target = run.id, reused = null;
+  await write(env, data => { const ex = data.runs.find(r => r.idem === key); if (ex && !force) { target = ex.id; reused = ex; return; } data.runs.unshift(run); });
+  if (reused && ["reconciled", "zero_results"].includes(reused.coverage)) return { ...reused, replayed:true };
+  return runImport(env, target);
 }
 // ---- Product dictionaries and watchlist versions. A portfolio dictionary lists, for each product, its generic names, brands, salts and approved aliases; a watchlist query is built from them.
 // Every change to a query is a new version with an effective date, and imports record the version they ran with. ----
@@ -419,9 +457,29 @@ function citationSnapshotSvg(article, efetch) {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${Math.ceil(y + 30)}" viewBox="0 0 ${width} ${Math.ceil(y + 30)}"><rect width="100%" height="100%" fill="#ffffff"/><rect x="1" y="1" width="${width - 2}" height="${Math.ceil(y + 28)}" fill="none" stroke="#b45309" stroke-width="2"/>${body}</svg>`;
 }
 // Evidence status per category for one article: available, restricted, missing, failed or pending. Used by the manifest, readiness and targeted retries.
+// Records captured by the earlier deployed build keep their citation XML under citationXmlKey (evidence/<pmid>/pubmed.xml); they count as EFetch evidence until adopted.
+const efetchOf = a => a?.evidence?.efetch || (a?.citationXmlKey ? { key:a.citationXmlKey, legacy:true, source:"NCBI EFetch (earlier capture)" } : null);
+// Which evidence a decision was made on: hashes of the citation XML, full text and image, and the parser and extraction versions, so a later change of evidence is detectable.
+const evidenceRef = a => ({ efetch:efetchOf(a)?.sha256 || null, fulltext:a?.evidence?.fulltext?.sha256 || null, parser:a?.evidence?.parsed?.parser || a?.evidence?.fulltext?.parser || null, image:a?.evidence?.screenshot?.sha256 || a?.evidence?.snapshot?.sha256 || null, extraction:a?.extraction?.version || null, pulledAt:a?.pullAt || null });
+// Possible duplicate publications of the same report (a conference abstract and the full paper, a correction, a follow-up): similar title, or the same first author, year and product with a related title. Always a flag for the reviewer, never a merge.
+const titleWords = t => new Set(String(t || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").split(/\s+/).filter(w => w.length > 3));
+function publicationDuplicates(state, article) {
+  const A = titleWords(article.title), first = x => String((x || [])[0] || "").toLowerCase().split(/[ ,]/)[0], yearOf = x => String(x?.date || "").slice(0, 4), mols = id => uniq(state.assignments.filter(a => a.pmid === id).flatMap(a => (a.molecules || []).map(m => m.toLowerCase()))), out = [];
+  for (const o of Object.values(state.articles)) {
+    if (o.id === article.id) continue;
+    const B = titleWords(o.title), inter = [...A].filter(w => B.has(w)).length, jac = inter / Math.max(1, new Set([...A, ...B]).size), sameAuthor = Boolean(first(article.authors)) && first(article.authors) === first(o.authors), sameYear = yearOf(article) && yearOf(article) === yearOf(o), shared = mols(article.id).filter(m => mols(o.id).includes(m)).length > 0;
+    const reasons = []; if (jac >= .6) reasons.push("Very similar title (" + Math.round(jac * 100) + "% shared words)"); else if (jac >= .35 && sameAuthor && shared) reasons.push("Related title, same first author and same product");
+    if (article.doi && o.doi && article.doi.toLowerCase() === o.doi.toLowerCase()) reasons.push("Same DOI");
+    if (!reasons.length) continue;
+    if (sameAuthor && jac >= .6) reasons.push("Same first author"); if (sameYear) reasons.push("Same year");
+    const kinds = (o.pubTypes || []).concat(article.pubTypes || []).join(" ").toLowerCase(); if (/congress|abstract|conference|meeting/.test(kinds)) reasons.push("One of the two is a conference abstract");
+    out.push({ pmid:o.id, title:o.title || "", journal:o.journal || "", date:o.date || "", similarity:Math.round(jac * 100), reasons, hasCase:(state.cases || []).some(c => c.pmid === o.id) });
+  }
+  return out.sort((a, b) => b.similarity - a.similarity).slice(0, 5);
+}
 function evidenceStatus(article) {
   const ft = article.fullTextStatus || "";
-  const citation = article.evidence?.efetch ? "available" : article.citationXmlStatus ? "failed" : "pending";
+  const citation = efetchOf(article) ? "available" : article.citationXmlStatus ? "failed" : "pending";
   const fulltext = article.fullTextKey ? (article.fullTextRestricted ? "restricted" : "available") : !ft ? "pending" : /Retry needed/i.test(ft) ? "failed" : /not covered|not applicable/i.test(ft) ? "restricted" : "missing";
   const shot = article.evidence?.screenshot, snapshot = article.evidence?.snapshot;
   const screenshot = article.screenshotKey || snapshot ? (article.screenshotKey && article.screenshotKind === "pubmed_page" ? "available" : "citation_snapshot") : article.screenshotStatus === "Blocked" ? "blocked" : article.screenshotStatus === "Retry needed" ? "failed" : shot?.status === "not_configured" ? "not_configured" : "pending";
@@ -2903,9 +2961,11 @@ async function captureScreenshot(env, article) {
   }
   const endpoint = new URL(env.SCREENSHOT_ENDPOINT);
   if (endpoint.protocol !== "https:") throw new Error("Screenshot endpoint must use HTTPS.");
-  endpoint.searchParams.set("token",env.SCREENSHOT_TOKEN);
+  // The bundled Playwright capture service (capture/) takes a bearer token; a Browserless endpoint takes the token in the query string.
+  const headers = {"Content-Type":"application/json"};
+  if (env.SCREENSHOT_AUTH === "bearer") headers.Authorization = "Bearer " + env.SCREENSHOT_TOKEN; else endpoint.searchParams.set("token",env.SCREENSHOT_TOKEN);
   const response = await fetch(endpoint, {method:"POST",redirect:"error",signal:AbortSignal.timeout(30000),
-    headers:{"Content-Type":"application/json"},body:JSON.stringify({url:article.url,options:{fullPage:true,type:"png"}})});
+    headers,body:JSON.stringify({url:article.url,options:{fullPage:true,type:"png"}})});
   if (!response.ok || !response.body || !response.headers.get("content-type")?.includes("image/png")) {
     throw new Error("Screenshot service returned HTTP " + response.status);
   }
@@ -3265,14 +3325,14 @@ async function apiCore(request, env, path) {
       runs:manager ? state.runs : [], assignments,
       articles:manager ? state.articles : Object.fromEntries(assignments.map(a => [a.pmid, state.articles[a.pmid]])) });
   }
-  if (request.method === "GET" && (path.startsWith("/api/full-text/") || path.startsWith("/api/screenshot/"))) {
+  if (request.method === "GET" && (path.startsWith("/api/full-text/") || path.startsWith("/api/screenshot/") || path.startsWith("/api/citation-xml/"))) {
     const id = path.split("/").pop();
     const article = state.articles[id];
-    const key = path.startsWith("/api/screenshot/") ? article?.screenshotKey : article?.fullTextKey;
+    const key = path.startsWith("/api/screenshot/") ? article?.screenshotKey : path.startsWith("/api/citation-xml/") ? (article?.evidence?.efetch?.key || article?.citationXmlKey) : article?.fullTextKey;
     if (!state.assignments.some(a => a.pmid===id && mayAccess(state, viewer, a)) || !key) return json({error:"File unavailable."},404);
     const object = await env.BUCKET.get(key);
     if (!object) return json({error:"File unavailable."},404);
-    await audit(env, { by:email, action:path.startsWith("/api/screenshot/") ? "download.snapshot" : "download.fulltext", target:"PMID " + id, detail:article?.fullTextOrigin || "" });
+    await audit(env, { by:email, action:path.startsWith("/api/screenshot/") ? "download.snapshot" : path.startsWith("/api/citation-xml/") ? "download.citation_xml" : "download.fulltext", target:"PMID " + id, detail:article?.fullTextOrigin || "" });
     const headers = new Headers({"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff",
       "Content-Disposition":'attachment; filename="'+key.split("/").pop()+'"'});
     object.writeHttpMetadata(headers);
@@ -3584,7 +3644,7 @@ async function apiCore(request, env, path) {
         extraction = await extractClinical(withSettings(env, state), article, state);
         await write(env, data => { if (data.articles[item.pmid]) data.articles[item.pmid].extraction = extraction; });
       }
-      return json({ extraction, decisions:item.extractionDecisions || {}, patientDecisions:item.patientDecisions || {} });
+      return json({ extraction, decisions:item.extractionDecisions || {}, patientDecisions:item.patientDecisions || {}, possibleDuplicatePublications:publicationDuplicates(state, article), evidence:evidenceRef(article) });
     }
     if (path === "/api/extraction-decide") {
       if (!isScreener && !pm && !rolesIn(state, email, item.portfolio).has("medical_reviewer")) return json({ error:"Only the assigned reviewer, a medical reviewer or a manager can decide this." }, 403);
@@ -3593,7 +3653,7 @@ async function apiCore(request, env, path) {
       if (action === "exclude" && reason.length < 3) return json({ error:"Give a reason for excluding it." }, 400);
       const extraction = state.articles[item.pmid]?.extraction, known = new Set([...(extraction?.patients || []).flatMap(p => [p.id, ...p.events.map(e => e.id)])]);
       if (!known.has(key)) return json({ error:"That event or patient is not in the extraction. Refresh it first." }, 404);
-      await write(env, data => { const a = data.assignments.find(x => x.id === item.id), bucket = body.patientId ? (a.patientDecisions ||= {}) : (a.extractionDecisions ||= {}); if (action === "reset") delete bucket[key]; else bucket[key] = { action, reason, by:email, at }; });
+      await write(env, data => { const a = data.assignments.find(x => x.id === item.id), bucket = body.patientId ? (a.patientDecisions ||= {}) : (a.extractionDecisions ||= {}); if (action === "reset") delete bucket[key]; else bucket[key] = { action, reason, by:email, at, evidence:evidenceRef(data.articles[a.pmid]) }; });
       await audit(env, { by:email, action:"extraction.decision", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ item:key, action, reason, portfolio:item.portfolio } });
       return json({ ok:true });
     }
@@ -3610,7 +3670,7 @@ async function apiCore(request, env, path) {
       const qcReviewer = needsQc ? qcPool.map(p => ({ p, n:load(p) })).sort((a, b) => a.n - b.n || a.p.email.localeCompare(b.p.email))[0]?.p.email || "" : "";
       await write(env, data => { const a = data.assignments.find(x => x.id === item.id);
         (a.history ||= []).push({ status:a.status, note:"Disposition: " + value + (reason ? " (" + reason + ")" : "") + (note ? " - " + note : ""), by:email, at });
-        a.disposition = { value, reason, note, by:email, at };
+        a.disposition = { value, reason, note, by:email, at, evidence:evidenceRef(data.articles[a.pmid]) };
         a.status = value === "full_text_needed" ? "Full text needed" : needsQc ? "Awaiting QC" : "Complete";
         a.qc = needsQc ? { status:"pending", reviewer:qcReviewer, requestedAt:at, rounds:(a.qc?.rounds || 0) + (a.qc?.status === "returned" ? 1 : 0), reason:value === "potential_icsr" ? "all potential ICSRs are checked" : "sampled" } : undefined;
         delete a.stage; delete a.routedToMedical;
@@ -3627,7 +3687,7 @@ async function apiCore(request, env, path) {
       const decision = body.decision === "return" ? "return" : body.decision === "approve" ? "approve" : "", note = String(body.note || "").trim().slice(0, 1000);
       if (!decision || (decision === "return" && note.length < 5)) return json({ error:"Approve, or return with a note of at least 5 characters." }, 400);
       await write(env, data => { const a = data.assignments.find(x => x.id === item.id); (a.history ||= []).push({ status:a.status, note:"QC " + (decision === "approve" ? "approved" : "returned") + (note ? ": " + note : ""), by:email, at });
-        a.qc = { ...a.qc, status:decision === "approve" ? "approved" : "returned", decidedBy:email, decidedAt:at, note, reviewer:a.qc.reviewer || email }; a.status = decision === "approve" ? "Complete" : "QC returned"; delete a.stage;
+        a.qc = { ...a.qc, status:decision === "approve" ? "approved" : "returned", decidedBy:email, decidedAt:at, note, reviewer:a.qc.reviewer || email, evidence:evidenceRef(data.articles[a.pmid]) }; a.status = decision === "approve" ? "Complete" : "QC returned"; delete a.stage;
         if (decision === "approve" && a.disposition?.value === "potential_icsr") { a.medicalReviewer = pickMedical(data, a.portfolio, a.reviewer) || a.medicalReviewer || undefined; a.history.push({ status:a.status, note:"Routed to medical review" + (a.medicalReviewer ? ": " + a.medicalReviewer : " (no medical reviewer available)"), by:"routing", at }); } });
       await audit(env, { by:email, action:"review.qc", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ portfolio:item.portfolio, decision, note, screener:item.reviewer } });
       return json({ ok:true });
@@ -3642,7 +3702,7 @@ async function apiCore(request, env, path) {
       const article = state.articles[item.pmid]; if (!article) return json({ error:"Article not found." }, 404);
       const ex = await freshExtraction(article), decisions = item.extractionDecisions || {}, pdec = item.patientDecisions || {};
       const assessed = ex.patients.map(p => ({ patient:p, assessment:assessMinimumCriteria(ex, p, decisions), excluded:pdec[p.id]?.action === "exclude" }));
-      if (path === "/api/criteria") return json({ aggregateOnly:ex.aggregateOnly, patients:assessed.map(x => ({ id:x.patient.id, label:x.patient.label, excluded:x.excluded, ...x.assessment })), screening:item.disposition || null, existingDrafts:(state.cases || []).filter(c => c.pmid === item.pmid && c.portfolio === item.portfolio).map(c => ({ number:c.number, patient:c.provenance?.patientId })) });
+      if (path === "/api/criteria") return json({ possibleDuplicatePublications:publicationDuplicates(state, article), aggregateOnly:ex.aggregateOnly, patients:assessed.map(x => ({ id:x.patient.id, label:x.patient.label, excluded:x.excluded, ...x.assessment })), screening:item.disposition || null, existingDrafts:(state.cases || []).filter(c => c.pmid === item.pmid && c.portfolio === item.portfolio).map(c => ({ number:c.number, patient:c.provenance?.patientId })) });
       const pm = isPortfolioManager(state, viewer, item.portfolio), roles = rolesIn(state, email, item.portfolio);
       if (!(item.reviewer === email || pm || roles.has("medical_reviewer"))) return json({ error:"Only the assigned reviewer, a medical reviewer or a manager can create drafts." }, 403);
       if (item.disposition?.value !== "potential_icsr") return json({ error:"Record the screening disposition 'potential ICSR' first. Drafts are only made for potential cases." }, 409);
@@ -3667,7 +3727,7 @@ async function apiCore(request, env, path) {
           const caseData = caseFromPatient(data.articles[item.pmid], p, ex, a, data.settings || {}, { criteria:assessment, decisions:a.extractionDecisions || {}, ime });
           caseData.case_id = number;
           const rec = { id:crypto.randomUUID(), number, pmid:item.pmid, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"", data:caseData, createdBy:email, createdAt:at, updatedAt:at, assignee:a.medicalReviewer || pickMedical(data, item.portfolio) || item.reviewer || email, stage:"medical_review", intake:"patient-draft",
-            provenance:{ idempotencyKey:idem, patientId:p.id, patientLabel:p.label, extractionVersion:ex.version, extractedAt:ex.createdAt, fullTextSha256:ex.source.fullTextSha256, assignmentId:item.id, criteriaOverall:assessment.overall, forced },
+            provenance:{ evidence:evidenceRef(data.articles[item.pmid]), idempotencyKey:idem, patientId:p.id, patientLabel:p.label, extractionVersion:ex.version, extractedAt:ex.createdAt, fullTextSha256:ex.source.fullTextSha256, assignmentId:item.id, criteriaOverall:assessment.overall, forced },
             history:[{ at, by:email, action:"draft created for " + (p.label || p.id) + " from PMID " + item.pmid + " (" + item.portfolio + ")" }] };
           refreshDue(data, rec); (data.cases ||= []).push(rec); done.push({ existing:false, number, patient:p.id, id:rec.id });
         }
@@ -3805,7 +3865,7 @@ async function apiCore(request, env, path) {
     if (!profile.supportedForFinal) return json({ error:profile.label + ": " + profile.note, profile:profileName }, 409);
     const issues = validateE2b(rec, state.articles[rec.pmid], profileName), blocking = issues.filter(i => i.severity === "error");
     if (blocking.length) return json({ error:"The case has " + blocking.length + " validation error" + (blocking.length === 1 ? "" : "s") + " for the " + profileName + " profile. Fix them before approval.", issues:blocking }, 409);
-    const hash = await caseDataHash(rec), approval = { status:"approved", by:email, at, hash, profile:profileName, note:String(body.note || "").slice(0, 500) };
+    const hash = await caseDataHash(rec), approval = { status:"approved", by:email, at, hash, evidence:evidenceRef(state.articles[rec.pmid]), profile:profileName, note:String(body.note || "").slice(0, 500) };
     const entry = await recordVersion(env, { ...rec, approval }, "approved", email, "Approved for " + profileName + " output");
     await write(env, data => { const c = data.cases.find(x => x.id === rec.id); c.approval = approval; (c.history ||= []).push({ at, by:email, action:"approved for " + profileName + " output" }); pushVersion(c, entry); });
     await audit(env, { by:email, action:"case.approved", entityType:"Case", entityId:rec.number, detail:{ profile:profileName, content_sha256:hash, warnings:issues.length } });
@@ -3890,6 +3950,25 @@ async function apiCore(request, env, path) {
     }
     return json({ ok:true, deleted:doomed.length, kept:blocked });
   }
+  if ((path === "/api/scheduler-status" || path === "/api/missed-retry") && viewer) {
+    if (!manager) return json({ error:"Manager access required." }, 403);
+    const through = addDays(day(), -1), staleMin = Number(state.settings?.schedulerStaleMinutes ?? 180), h = state.scheduler || { beats:[] };
+    if (path === "/api/scheduler-status") {
+      const missed = state.watches.flatMap(w => missedWindows(state, w, through)).sort((a, b) => a.from.localeCompare(b.from));
+      const age = h.lastBeatAt ? Math.round((Date.now() - Date.parse(h.lastBeatAt)) / 60000) : null;
+      return json({ expectedThrough:through, heartbeat:{ lastBeatAt:h.lastBeatAt || null, lastFinishedAt:h.lastFinishedAt || null, lastSuccessAt:h.lastSuccessAt || null, running:Boolean(h.running), lastError:h.lastError || "", consecutiveFailures:h.consecutiveFailures || 0, ageMinutes:age, recent:(h.beats || []).slice(0, 12) }, stale:age === null || age > staleMin, staleAfterMinutes:staleMin, lastBatch:h.lastBatch || null, missed, watches:state.watches.length });
+    }
+    const watch = state.watches.find(w => w.portfolio === body.portfolio && (w.molecule || "") === (body.molecule || ""));
+    if (!watch || !/^\d{4}-\d{2}-\d{2}$/.test(body.from || "") || !/^\d{4}-\d{2}-\d{2}$/.test(body.to || "") || body.from > body.to) return json({ error:"Choose a watchlist and a date range." }, 400);
+    await write(env, data => { for (const r of data.runs) { if (r.portfolio !== watch.portfolio || (r.molecule || "") !== (watch.molecule || "") || (r.dateField || "crdt") !== "crdt") continue;
+      for (const w of r.windows || []) if (w.to >= body.from && w.from <= body.to && ["failed", "partial"].includes(w.state)) { w.attempts = 0; w.lastAttemptAt = ""; w.state = "pending"; w.error = ""; } summarizeRun(r); } });
+    const fresh = (await load(env)).state, retried = [];
+    for (const r of fresh.runs.filter(r => r.windows?.some(w => w.state === "pending"))) retried.push((await runImport(env, r.id, 12)).id);
+    const stillMissing = missedWindows((await load(env)).state, watch, through).filter(m => m.state === "missing" && m.to >= body.from && m.from <= body.to);
+    for (const m of stillMissing) await execute(env, watch, m.from < body.from ? body.from : m.from, m.to > body.to ? body.to : m.to, { mode:"monitor" });
+    await audit(env, { by:email, action:"import.missed_retry", target:watch.portfolio + (watch.molecule ? " · " + watch.molecule : ""), detail:{ from:body.from, to:body.to } });
+    return json({ ok:true, missed:missedWindows((await load(env)).state, watch, through) });
+  }
   if ((path === "/api/batch-readiness" || path === "/api/evidence-retry" || path === "/api/batch-zip") && viewer) {
     if (!manager) return json({ error:"Manager access required." }, 403);
     if (path === "/api/batch-readiness") return json({ batches:state.runs.filter(r => r.status !== "Failed" || r.windows).slice(0, 40).map(r => ({ id:r.id, portfolio:r.portfolio, molecule:r.molecule, from:r.from, to:r.to, dateField:r.dateFieldLabel || "", coverage:r.coverage || "legacy", query:r.query, ...batchReadiness(state, r), retryable:undefined })), exports:(state.exports || []).slice(-100).reverse() });
@@ -3898,7 +3977,7 @@ async function apiCore(request, env, path) {
     if (path === "/api/evidence-retry") {
       // Targeted retry: only the PMIDs whose evidence is pending or failed, and only the part that is missing.
       const before = batchReadiness(state, run), ids = before.retryable.slice(0, 300), cfg = withSettings(env, state);
-      const needCitation = ids.filter(id => !state.articles[id]?.evidence?.efetch);
+      const needCitation = ids.filter(id => !efetchOf(state.articles[id]));
       if (needCitation.length) {
         const fetched = await fetchCitations(cfg, needCitation), evidence = await storeEfetch(cfg, fetched.xml);
         await write(env, data => {
@@ -3922,19 +4001,23 @@ async function apiCore(request, env, path) {
       const a = state.articles[id], st = a ? evidenceStatus(a) : { citation:(run.windows || []).some(w => (w.missing || []).includes(id)) ? "failed" : "pending", fulltext:"pending", screenshot:"pending" }, ev = a?.evidence || {}, folder = "PMID_" + id + "/";
       let ftFile = "";
       const add = async (key, name) => { const object = key && await env.BUCKET.get(key); if (!object) return ""; files.push({ name:folder + name, data:new Uint8Array(await object.arrayBuffer()) }); return folder + name; };
-      if (ev.efetch) await add(ev.efetch.key, "efetch.xml");
+      if (efetchOf(a)) await add(efetchOf(a).key, "efetch.xml");
       if (a?.fullTextKey && !a.fullTextRestricted) { ftFile = await add(a.fullTextKey, "fulltext." + (/\.(\w+)$/.exec(a.fullTextKey)?.[1] || "bin")); if (ev.parsed) await add(ev.parsed.key, "fulltext_parsed.json"); } else if (a?.fullTextKey) ftFile = "withheld: restricted licence, kept in the workbench";
       const shotFile = ev.snapshot && st.screenshot === "citation_snapshot" && !a.screenshotKey ? await add(ev.snapshot.key, "citation_snapshot.svg") : a?.screenshotKey ? await add(a.screenshotKey, a.screenshotKind === "pubmed_page" ? "pubmed_page.png" : "citation_snapshot.png") : "";
       const window = (run.windows || []).find(w => (w.pmids || []).includes(id));
       rows.push([id, a?.title || "", a?.journal || "", a?.date || "", a?.doi || "", st.citation, ev.efetch?.sha256 || "", st.fulltext, ev.fulltext?.source || a?.fullTextOrigin || "", ev.fulltext?.license || a?.fullTextLicense || "", ev.fulltext?.sha256 || "", ftFile, ev.fulltext?.extraction?.method || "", ev.parsed?.sections ?? "", ev.parsed?.tables ?? "", ev.parsed?.captions ?? "", st.screenshot, ev.screenshot?.kind || ev.snapshot?.kind || "", ev.screenshot?.sha256 || ev.snapshot?.sha256 || "", window ? "v" + window.queryVersion : "", window ? window.from + " to " + window.to : ""]);
     }
     const manifest = [head, ...rows].map(r => r.map(csvCell).join(",")).join("\r\n") + "\r\n", manifestSha = await sha256Hex(manifest);
-    const previous = (state.exports || []).filter(x => x.runId === run.id).sort((a, b) => b.version - a.version), latest = previous[0];
-    let record = latest && latest.manifestSha256 === manifestSha && body.force !== true ? latest : null;
-    if (!record) {
-      record = { id:crypto.randomUUID(), runId:run.id, version:(latest?.version || 0) + 1, createdAt:new Date().toISOString(), by:email, manifestSha256:manifestSha, pmids:matched.length, files:files.length, previousVersion:latest?.version || null, previousManifestSha256:latest?.manifestSha256 || null, readiness:{ ...batchReadiness(state, run), retryable:undefined }, coverage:run.coverage || "legacy" };
+    // Idempotent: the same manifest content is the same version, and the check and the insert are one transaction, so overlapping requests cannot create twin versions.
+    let record = null, created = false;
+    await write(env, data => {
+      const previous = (data.exports || []).filter(x => x.runId === run.id).sort((a, b) => b.version - a.version), latest = previous[0];
+      if (latest && latest.manifestSha256 === manifestSha && body.force !== true) { record = latest; return; }
+      record = { id:crypto.randomUUID(), runId:run.id, version:(latest?.version || 0) + 1, createdAt:new Date().toISOString(), by:email, manifestSha256:manifestSha, pmids:matched.length, files:files.length, previousVersion:latest?.version || null, previousManifestSha256:latest?.manifestSha256 || null, readiness:{ ...batchReadiness(data, run), retryable:undefined }, coverage:run.coverage || "legacy", job:{ kind:"batch_export", key:run.id + "|" + manifestSha, status:"done" } };
+      (data.exports ||= []).push(record); data.exports = data.exports.slice(-500); created = true;
+    });
+    if (created) {
       await env.BUCKET.put("exports/" + run.id + "/v" + record.version + "/manifest.csv", manifest, { httpMetadata:{ contentType:"text/csv" } });
-      await write(env, data => { (data.exports ||= []).push(record); data.exports = data.exports.slice(-500); });
       await audit(env, { by:email, action:"export.batch", entityType:"Export", entityId:"batch " + run.id.slice(0, 8) + " v" + record.version, detail:{ pmids:record.pmids, files:record.files, manifest_sha256:manifestSha, previous_version:record.previousVersion } });
     }
     const info = { exportVersion:record.version, previousVersion:record.previousVersion, previousManifestSha256:record.previousManifestSha256, manifestSha256:manifestSha, createdAt:record.createdAt, by:record.by, batch:{ id:run.id, portfolio:run.portfolio, molecule:run.molecule, from:run.from, to:run.to, dateField:run.dateFieldLabel || "", coverage:run.coverage || "legacy", expected:run.expected ?? null, retrieved:run.retrieved ?? matched.length, queryVersions:run.queryVersions || [], executedQueries:run.executedQueries || [], windows:(run.windows || []).map(w => ({ from:w.from, to:w.to, state:w.state, expected:w.expected, retrieved:w.retrieved, missing:w.missing || [] })), gaps:run.gaps || [] }, readiness:record.readiness };
@@ -4093,21 +4176,27 @@ async function apiCore(request, env, path) {
       "Content-Disposition":'attachment; filename="literasift-' + day() + '.pdf"' } });
   }
   if (path === "/api/scheduled" && (service || manager)) {
-    const results = [];
-    const to = new Date(Date.parse(day()) - 86400000).toISOString().slice(0,10);
-    const same = watch => r => r.portfolio === watch.portfolio && (r.molecule || "") === (watch.molecule || "") && (r.mode || "monitor") === "monitor";
-    const okRun = r => r.status === "Imported" && (!r.coverage || ["reconciled", "zero_results"].includes(r.coverage));
-    // Unfinished imports resume first, from the window where they stopped. Then watchlists never attempted go first, then the least recently attempted.
-    const unfinished = state.runs.filter(r => r.windows?.some(w => w.state === "pending" || w.state === "running" || (w.state === "failed" && w.attempts < 8))).slice(0, 3);
-    for (const run of unfinished) { try { results.push(await runImport(env, run.id)); } catch (error) { results.push({ portfolio:run.portfolio, molecule:run.molecule, error:error.message }); } }
-    const due = state.watches.map(watch => ({ watch, previous:state.runs.find(r => same(watch)(r) && okRun(r)),
-        attempt:state.runs.find(same(watch))?.time || "" }))
-      .filter(({ previous }) => !(previous?.to >= to)).sort((a, b) => a.attempt.localeCompare(b.attempt));
-    for (const { watch, previous } of due.slice(0, maxWatchesPerRun)) {
-      try { results.push(await execute(env, watch, previous?.to || to, to, { mode:"monitor" })); }
-      catch (error) { results.push({ portfolio:watch.portfolio, molecule:watch.molecule || "", error:error.message }); }
+    // One tick of the unattended scheduler. It needs no signed-in user: the run token is enough. Every tick leaves a heartbeat, so a silent scheduler is visible to the manager.
+    const startedAt = new Date().toISOString(), results = [], through = addDays(day(), -1);
+    const slim = r => r.error ? r : { portfolio:r.portfolio, molecule:r.molecule || "", runId:r.id, from:r.from, to:r.to, coverage:r.coverage, expected:r.expected, retrieved:r.retrieved, gaps:(r.gaps || []).length, replayed:r.replayed || undefined, ...(r.coverage === "failed" ? { error:"Every window failed: " + ((r.gaps || [])[0]?.error || "see the Batches tab") } : {}) };
+    await write(env, data => { const h = data.scheduler ||= { beats:[] }; h.lastBeatAt = startedAt; h.running = true; });
+    await adoptLegacyEvidence(env).catch(() => {});
+    const retryable = w => w.state === "pending" || (w.state === "running" && !(w.claimUntil && w.claimUntil > startedAt)) || windowRetryable(w);
+    let st = (await load(env)).state;
+    for (const run of st.runs.filter(r => r.windows?.some(retryable)).slice(0, 3)) { try { results.push(slim(await runImport(env, run.id, 12, { respectBackoff:true }))); } catch (error) { results.push({ portfolio:run.portfolio, molecule:run.molecule, error:error.message }); } }
+    st = (await load(env)).state;
+    const plan = []; for (const watch of st.watches) for (const m of missedWindows(st, watch, through)) if (m.state === "missing") plan.push({ watch, m });
+    plan.sort((x, y) => x.m.from.localeCompare(y.m.from));
+    for (const { watch, m } of plan.slice(0, maxWatchesPerRun)) {
+      try { results.push(slim(await execute(env, watch, m.from, m.to, { mode:"monitor" }))); }
+      catch (error) { results.push({ portfolio:watch.portfolio, molecule:watch.molecule || "", from:m.from, to:m.to, error:error.message }); }
     }
-    return json({ results, remaining:Math.max(0, due.length - maxWatchesPerRun), evidence:await collectEvidence(env) });
+    const remaining = Math.max(0, plan.length - maxWatchesPerRun), failed = results.filter(r => r.error), good = results.filter(r => !r.error && r.runId && ["reconciled", "zero_results"].includes(r.coverage)).pop();
+    const evidence = await collectEvidence(env);
+    await write(env, data => { const h = data.scheduler ||= { beats:[] }; h.running = false; h.lastFinishedAt = new Date().toISOString(); h.lastError = failed[0]?.error || ""; h.consecutiveFailures = failed.length ? (h.consecutiveFailures || 0) + 1 : 0;
+      if (!failed.length) h.lastSuccessAt = h.lastFinishedAt; if (good) h.lastBatch = { runId:good.runId, portfolio:good.portfolio, molecule:good.molecule, from:good.from, to:good.to, coverage:good.coverage, retrieved:good.retrieved, at:h.lastFinishedAt };
+      h.beats = [{ at:startedAt, ok:!failed.length, batches:results.length, failed:failed.length, remaining }, ...(h.beats || [])].slice(0, 50); });
+    return json({ results, remaining, evidence });
   }
   if (!manager) return json({ error:"Manager access required." },403);
   if (path === "/api/settings") {
@@ -4613,8 +4702,8 @@ async function loadExtraction(){
   try{
     const r=await api("extract",{id:active.id}), ex=r.extraction, dec=r.decisions||{}, mine=active.reviewer===data.viewer.email||data.viewer.role==="manager";
     const unit=id=>ex.unitIndex[id]||{}, quote=(m)=>'<div class="sub" style="margin-top:2px">“'+esc(m.sentence)+'” <span class="badge">'+esc(m.section)+(m.cell?" · "+esc(m.cell.table)+" row "+m.cell.row:"")+'</span></div>';
-    const rep=ex.reporters;
-    let html='<div class="card" style="padding:12px;margin-bottom:10px"><div style="display:flex;justify-content:space-between;gap:8px"><b>Reporter</b>'+badge(rep.status==="supported"?"Supported":rep.status==="uncertain"?"Uncertain":"Missing",rep.status==="supported"?"green":rep.status==="uncertain"?"amber":"red")+'</div>'+
+    const rep=ex.reporters, dups=r.possibleDuplicatePublications||[];
+    let html=(dups.length?'<div class="card" style="padding:12px;margin-bottom:10px;border-color:var(--amber,#d97706)"><b>Possible duplicate publication</b> '+badge("review","amber")+'<div class="sub">The same report may also be described in another citation. Nothing is merged; decide whether it is the same patient.</div>'+dups.map(d=>'<div style="margin-top:6px"><a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(d.pmid)+'/" target="_blank" rel="noopener">'+esc(d.title)+'</a> <span class="sub">PMID '+esc(d.pmid)+' · '+esc(d.journal)+' '+esc(d.date)+' · '+d.similarity+'% similar'+(d.hasCase?' · has a case':'')+'</span><div class="sub">'+esc(d.reasons.join("; "))+'</div></div>').join("")+'</div>':"")+'<div class="card" style="padding:12px;margin-bottom:10px"><div style="display:flex;justify-content:space-between;gap:8px"><b>Reporter</b>'+badge(rep.status==="supported"?"Supported":rep.status==="uncertain"?"Uncertain":"Missing",rep.status==="supported"?"green":rep.status==="uncertain"?"amber":"red")+'</div>'+
       (rep.candidates.length?'<div class="sub">'+rep.candidates.slice(0,3).map(c=>esc(c.role+": "+c.name+(c.email?" <"+c.email+">":"")+(c.affiliations[0]?" · "+c.affiliations[0]:""))).join("<br>")+'</div>':"")+rep.flags.map(f=>'<div class="sub" style="color:var(--amber)">⚠ '+esc(f)+'</div>').join("")+
       (rep.quoted.length?'<div class="sub">Quoted clinicians (not reporters): '+esc(rep.quoted.map(q=>q.name).join(", "))+'</div>':"")+'</div>';
     if(ex.aggregateOnly)html+='<div class="card" style="padding:12px;margin-bottom:10px;border-color:var(--amber)"><b>Aggregate data only</b><div class="sub">No individual patient is described, so no ICSR draft can come from this article. Consider aggregate safety relevance.</div>'+ex.aggregateMentions.slice(0,2).map(m=>'<div class="sub">“'+esc(m.text)+'”</div>').join("")+'</div>';
@@ -4975,6 +5064,25 @@ async function p6action(target){
 async function globalSearch(){
   const q=($("gsearch").value||"").trim();if(!q)return;
   srch.q=q;srch.scope="all";srch.f={};srch.res=null;tab="Search";render();await runSearchUi(true);
+}
+
+async function loadScheduler(){
+  const box=$("schedbox");if(!box)return;
+  try{
+    const s=await api("scheduler-status",{}),h=s.heartbeat,when=x=>x?new Date(x).toLocaleString():"never";
+    const tone=s.stale?"red":s.missed.some(m=>m.state==="failed"||m.exhausted)?"amber":"green";
+    let body='<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">'+badge(s.stale?"Scheduler silent":(s.missed.length?"Running, "+s.missed.length+" missed window"+(s.missed.length===1?"":"s"):"Healthy"),tone)+
+      '<span class="sub">Last heartbeat '+esc(when(h.lastBeatAt))+(h.ageMinutes!==null?" ("+h.ageMinutes+" min ago; silent after "+s.staleAfterMinutes+" min)":"")+'</span></div>'+
+      '<div class="sub" style="margin-top:6px">Last fully successful run: <b>'+esc(when(h.lastSuccessAt))+'</b>'+(h.consecutiveFailures?' · '+badge(h.consecutiveFailures+" failed run"+(h.consecutiveFailures===1?"":"s")+" in a row","red"):"")+(h.lastError?'<br>Last error: '+esc(h.lastError):"")+'</div>'+
+      '<div class="sub" style="margin-top:6px">Last successful batch: '+(s.lastBatch?'<b>'+esc(s.lastBatch.portfolio+(s.lastBatch.molecule?" · "+s.lastBatch.molecule:""))+'</b> '+esc(s.lastBatch.from)+(s.lastBatch.to!==s.lastBatch.from?" to "+esc(s.lastBatch.to):"")+', '+s.lastBatch.retrieved+' PMIDs, '+esc(s.lastBatch.coverage)+' ('+esc(when(s.lastBatch.at))+')':"none yet")+'</div>';
+    body+='<h3 style="margin:12px 0 6px">Missed windows (monitoring through '+esc(s.expectedThrough)+')</h3>'+(s.missed.length?table(["Watchlist","From","To","Days","State","Tries","Detail",""],s.missed.map(m=>[esc(m.portfolio+(m.molecule?" · "+m.molecule:"")),esc(m.from),esc(m.to),m.days,badge(m.exhausted?"gave up":m.state,m.state==="missing"?"amber":"red"),m.attempts,esc(m.error||(m.state==="missing"?"Not attempted yet; the next tick runs it":"")),'<button type="button" class="btn outline sm" data-p7="retry|'+esc(m.portfolio)+'|'+esc(m.molecule)+'|'+esc(m.from)+'|'+esc(m.to)+'">Retry now</button>']),"None"):'<div class="sub">Every day since monitoring began has a reconciled window.</div>');
+    body+='<div class="sub" style="margin-top:8px">Recent ticks: '+(h.recent.length?h.recent.map(b=>'<span class="badge '+(b.ok?"green":"red")+'" title="'+esc(when(b.at))+'">'+b.batches+" batch"+(b.batches===1?"":"es")+(b.failed?", "+b.failed+" failed":"")+'</span>').join(" "):"none")+'</div>';
+    box.innerHTML=body;
+  }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
+}
+async function p7action(target){
+  const [act,pf,mol,from,to]=target.dataset.p7.split("|");
+  if(act==="retry"){target.disabled=true;try{await api("missed-retry",{portfolio:pf,molecule:mol,from,to});await refresh();message("Retried "+from+(to!==from?" to "+to:"")+".");}catch(e){message(e.message,true);}render();}
 }
 const covBadge=c=>({reconciled:badge("Reconciled","green"),zero_results:badge("Zero results",""),partial:badge("Partially imported","amber"),failed:badge("Failed","red"),running:badge("Running","blue"),legacy:badge("Imported (earlier)","")}[c]||badge(c||"legacy",""));
 async function loadBatches(){
@@ -5421,7 +5529,7 @@ function render() {
     '<div class="empty">Save a watchlist before importing a batch.</div>')+
     panel("Batch archive",'<form data-route="evidence" style="margin:0 0 8px"><button class="btn outline">Process pending evidence</button></form>'+table(["Watchlist","Date range","Citations","Status","Manifest"],data.runs.map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-export="'+esc(r.id)+'">CSV</button> <button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF</button> <button class="btn outline sm" data-zip="'+esc(r.id)+'">ZIP</button>':""]),"No batches yet."));
   if(tab==="Batches"){
-    html=panel("Import coverage and batch readiness",'<div id="batchcov"><div class="empty">Loading…</div></div>',"Each import is cut into date windows. A window is reconciled when the number of unique PMIDs retrieved equals the count PubMed reported for it. Windows that are not reconciled stay listed as gaps until they are resolved. Evidence readiness counts the citation XML, full text and snapshot of every matched PMID.")+html;
+    html=panel("Scheduler and missed windows",'<div id="schedbox"><div class="empty">Loading…</div></div>',"The unattended scheduler leaves a heartbeat every time it runs. A day only counts as covered when its search window was reconciled.")+panel("Import coverage and batch readiness",'<div id="batchcov"><div class="empty">Loading…</div></div>',"Each import is cut into date windows. A window is reconciled when the number of unique PMIDs retrieved equals the count PubMed reported for it. Windows that are not reconciled stay listed as gaps until they are resolved. Evidence readiness counts the citation XML, full text and snapshot of every matched PMID.")+html;
     const closedList=Object.values(data.articles).filter(a=>!a.fullTextKey&&a.title&&data.assignments.some(x=>x.pmid===a.id)).slice(0,200), prefix=data.config.proxyPrefix||"";
     html+=panel("Closed articles waiting for a full text ("+closedList.length+(closedList.length===200?"+":"")+")",
       '<div class="row"><span>Download the PDFs you are licensed to use, name each file with its PMID or DOI, and add them all at once.</span><span style="display:flex;gap:8px;flex-wrap:wrap"><input type="file" id="bulkft" multiple accept=".pdf,.xml"><button type="button" class="btn" data-bulkft="1">Match and upload</button></span></div><div id="bulkftresult" class="sub" style="padding:6px 0"></div>'+
@@ -5434,6 +5542,7 @@ function render() {
   if(tab==="Watchlists"&&$("rkrows")){rkAddRow(1,20);rkAddRow(21,30);}
   if(tab==="Settings"&&$("memorybox"))loadMemory();
   if(tab==="Batches"&&$("batchcov"))loadBatches();
+  if(tab==="Batches"&&$("schedbox"))loadScheduler();
   if(tab==="Admin"&&$("kbstatus"))loadKbStatus();
   if(tab==="Watchlists"&&$("dictbox"))loadDictionaries();
   if(tab==="Synchrony"){
@@ -5494,7 +5603,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -5685,6 +5794,7 @@ document.addEventListener("click",event=>{
   if(target.dataset.p3){p3action(target);return;}
   if(target.dataset.p4){p4action(target);return;}
   if(target.dataset.p5){p5action(target);return;}
+  if(target.dataset.p7){p7action(target);return;}
   if(target.dataset.p6){event.preventDefault();p6action(target);return;}
   if(target.dataset.syncat!==undefined){synCat=target.dataset.syncat;render();return;}
   if(target.dataset.synfolder!==undefined){synFolder=target.dataset.synfolder;render();return;}
