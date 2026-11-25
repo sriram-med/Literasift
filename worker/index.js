@@ -1635,7 +1635,7 @@ async function buildPdf(title, subtitle, sections) {
 async function exportPdf(env, state, viewer, manager, body) {
   const wanted = [...new Set(Array.isArray(body.pmids) ? body.pmids.map(String) : [])].slice(0, pdfMaxArticles);
   const sections = [], numbering = new Map();
-  if (body.layout === true || body.layout === "country") for (const e of libraryLayout(state, body.layout === "country" ? "country" : "range")) if (!numbering.has(e.pmid)) numbering.set(e.pmid, e);
+  if (body.layout === true || body.layout === "country" || body.layout === "client") for (const e of libraryLayout(state, body.layout === "country" ? "country" : body.layout === "client" ? "client" : "range")) if (!numbering.has(e.pmid)) numbering.set(e.pmid, e);
   for (const id of wanted) {
     const article = state.articles[id];
     const item = state.assignments.find(a => a.pmid === id && mayAccess(state, viewer, a));
@@ -3075,11 +3075,12 @@ function libraryLayout(state, by = "range") {
   for (const run of [...state.runs].reverse()) {
     if (run.status !== "Imported") continue;
     const source = safeName(run.source || "PubMed"), molecule = safeName(run.molecule || run.portfolio), range = run.from + "_to_" + run.to;
+    const wl = state.watches.find(w => w.portfolio === run.portfolio && (w.molecule || "") === (run.molecule || "")), cl = (state.clients || []).find(c => c.id === wl?.client), client = safeName(cl ? cl.name : "No client");
     for (const pmid of run.ids) {
       if (seen.has(pmid + "|" + source + "|" + molecule)) continue;
       seen.add(pmid + "|" + source + "|" + molecule);
       const c = articleCountry(state.articles[pmid]), country = safeName(c.name);
-      out.push({ pmid, source, molecule, range, country, basis:c.basis, folder:by === "country" ? source + "/" + country + "/" + molecule : source + "/" + molecule + "/" + range });
+      out.push({ pmid, source, client, molecule, range, country, basis:c.basis, folder:by === "country" ? source + "/" + country + "/" + molecule : by === "client" ? client + "/" + molecule + "/" + range : source + "/" + molecule + "/" + range });
     }
   }
   // Numbers are stable: a folder's membership is fixed when its pull imports, and articles are numbered by PMID within it.
@@ -3124,7 +3125,7 @@ async function exportFullTexts(env, state, viewer, manager, body) {
   let total = 0;
   // With layout, files go into Molecule/DateRange/ subfolders (an article in two molecules appears in both).
   const folders = new Map();
-  if (body.layout === true || body.layout === "country") for (const e of libraryLayout(state, body.layout === "country" ? "country" : "range")) (folders.get(e.pmid) || folders.set(e.pmid, []).get(e.pmid)).push({ prefix:e.folder + "/", tag:libTag(e) + "_" });
+  if (body.layout === true || body.layout === "country" || body.layout === "client") for (const e of libraryLayout(state, body.layout === "country" ? "country" : body.layout === "client" ? "client" : "range")) (folders.get(e.pmid) || folders.set(e.pmid, []).get(e.pmid)).push({ prefix:e.folder + "/", tag:libTag(e) + "_" });
   for (const id of ids) {
     const article = state.articles[id];
     if (!article || !state.assignments.some(a => a.pmid === id && mayAccess(state, viewer, a))) continue;
@@ -5656,8 +5657,8 @@ async function loadAudit(){
   try{auditData=await api("audit",{month:auditMonth});}catch(e){message(e.message,true);auditData={month:auditMonth,total:0,verified:true,entries:[]};}
   drawAudit();
 }
-let libMode="range";
-const libKeys=()=>libMode==="country"?["source","country","molecule"]:["source","molecule","range"];
+let libMode="", libModeSet=false;
+const libKeys=()=>libMode==="country"?["source","country","molecule"]:libMode==="client"?["client","molecule","range"]:["source","molecule","range"];
 const libIds=path=>{const parts=path==="/"?[]:path.split("/"),keys=libKeys();return [...new Set((data.library||[]).filter(e=>parts.every((p,i)=>e[keys[i]]===p)).map(e=>e.pmid))];};
 function drawProgress(){
   const box=$("progress");if(!box)return;
@@ -5957,6 +5958,7 @@ function render() {
       "Every sign-in, review decision, assignment, pull, export, download, account change and setting is recorded with the user and time. Entries are chained by hash, so edits or deletions show up as a broken chain.");
   }
   if(tab==="Library"){
+    if(!libModeSet||!libMode){libMode=(data.clients||[]).length?"client":"range";}
     const lib=data.library||[], keys=libKeys(), tree={};
     lib.forEach(e=>{(((tree[e[keys[0]]]||={})[e[keys[1]]]||={})[e[keys[2]]]||=new Set()).add(e.pmid);});
     const stat=ids=>{const arts=[...ids].map(id=>data.articles[id]).filter(Boolean);return{n:arts.length,ft:arts.filter(a=>a.fullTextKey).length,shot:arts.filter(a=>a.screenshotKey).length};};
@@ -5965,7 +5967,7 @@ function render() {
     else if(p1&&!tree[p0][p1]){libPath=p0;p1=p2=undefined;}
     else if(p2&&!tree[p0][p1][p2]){libPath=p0+"/"+p1;p2=undefined;}
     const byCountry=libMode==="country", lvl1=byCountry?"country":"molecule";
-    const modeBar='<div class="sub" style="margin-bottom:10px">Browse by <button class="btn sm'+(byCountry?" outline":"")+'" data-libmode="range">Date range</button> <button class="btn sm'+(byCountry?"":" outline")+'" data-libmode="country">Country</button> '+(byCountry?"Country is the patient's (from case reports), otherwise the first author's, otherwise the journal's. It decides the regulator and marketing authorisation.":"")+'</div>';
+    const modeBar='<div class="sub" style="margin-bottom:10px">Browse by <button class="btn sm'+(libMode==="client"?"":" outline")+'" data-libmode="client">Client</button> <button class="btn sm'+(libMode==="range"?"":" outline")+'" data-libmode="range">Date range</button> <button class="btn sm'+(byCountry?"":" outline")+'" data-libmode="country">Country</button> '+(libMode==="client"?"Client, then molecule, then date range. Assign molecules to clients on the Clients tab; new clients and molecules appear here automatically. ":"")+(byCountry?"Country is the patient's (from case reports), otherwise the first author's, otherwise the journal's. It decides the regulator and marketing authorisation.":"")+'</div>';
     const crumbs='<div class="sub" style="margin-bottom:12px"><button class="btn outline sm" data-libopen="/">Library</button>'+(p0?' / <button class="btn outline sm" data-libopen="'+esc(p0)+'">'+esc(p0)+'</button>':"")+(p1?' / <button class="btn outline sm" data-libopen="'+esc(p0+"/"+p1)+'">'+esc(p1)+'</button>':"")+(p2?' / <b>'+esc(p2)+'</b>':"")+'</div>';
     const actions=path=>'<button class="btn outline sm" data-libzip="'+esc(path)+'">ZIP</button> <button class="btn outline sm" data-libpdf="'+esc(path)+'">PDF</button> <button class="btn outline sm" data-libris="'+esc(path)+'">RIS</button>'+(data.viewer.role==="manager"?' <button class="btn outline sm" data-libdel="'+esc(path)+'" style="color:var(--red)">Delete</button>':"");
     const idsOf=obj=>new Set(Object.values(obj).flatMap(x=>x instanceof Set?[...x]:[...idsOf(x)]));
@@ -5974,7 +5976,7 @@ function render() {
     if(!lib.length) html=panel("Library",'<div class="empty">Nothing here yet. Pull articles for a molecule on Search &amp; Pull and its folder appears here.</div>');
     else if(!p0) html=modeBar+crumbs+'<div class="cards">'+Object.entries(tree).sort().map(([k,groups])=>{const st=stat(idsOf(groups));
       return '<div class="card"><div class="lbl"><b style="font-size:16px;color:var(--fg)">📁 '+esc(reg(k).label)+'</b></div><div class="sub" style="margin:6px 0 10px">'+Object.keys(groups).length+" "+lvl1+(Object.keys(groups).length===1?"":"s")+" · "+st.n+" articles · "+st.ft+' full texts</div><button class="btn sm" data-libopen="'+esc(k)+'">Open</button> <button class="btn outline sm" data-libzip="'+esc(k)+'">ZIP</button></div>';}).join("")+'</div>'+
-      panel("Whole library",'<button class="btn outline" data-libzip="/">Download everything (ZIP)</button>',"Full texts arranged as "+(byCountry?"Source / Country / Molecule":"Source / Molecule / Date range")+" / files, with a manifest.csv. PubMed articles and each government agency's material are kept in separate top-level folders.");
+      panel("Whole library",'<button class="btn outline" data-libzip="/">Download everything (ZIP)</button>',"Full texts arranged as "+(byCountry?"Source / Country / Molecule":libMode==="client"?"Client / Molecule / Date range":"Source / Molecule / Date range")+" / files, with a manifest.csv. PubMed articles and each government agency's material are kept in separate top-level folders.");
     else if(!p1) html=modeBar+crumbs+'<div class="cards">'+Object.entries(tree[p0]).sort().map(([k,groups])=>{const st=stat(idsOf(groups));
       const maSummary=byCountry&&(data.config.ma||[]).length?Object.keys(groups).map(m=>maChip([m],k)).join(" "):"";
       return '<div class="card"><div class="lbl"><b style="font-size:16px;color:var(--fg)">📁 '+esc(k)+'</b></div><div class="sub" style="margin:6px 0 6px">'+Object.keys(groups).length+" "+(byCountry?"molecule":"date range")+(Object.keys(groups).length===1?"":"s")+" · "+st.n+" articles · "+st.ft+' full texts</div>'+(maSummary?'<div class="chips" style="margin-bottom:8px">'+maSummary+'</div>':"")+'<button class="btn sm" data-libopen="'+esc(p0+"/"+k)+'">Open</button> <button class="btn outline sm" data-libzip="'+esc(p0+"/"+k)+'">ZIP</button></div>';}).join("")+'</div>'+panel("Whole source folder",actions(p0),reg(p0).note);
@@ -6170,7 +6172,7 @@ document.addEventListener("click",event=>{
     if(curCase.data.events.length===1&&!(curCase.data.events[0].verbatim||{}).value)curCase.data.events[0]=ev;else curCase.data.events.push(ev);
     renderCase();return;
   }
-  if(target.dataset.libmode){libMode=target.dataset.libmode;libPath="/";libSortFor="";render();return;}
+  if(target.dataset.libmode){libMode=target.dataset.libmode;libModeSet=true;libPath="/";libSortFor="";render();return;}
   if(target.dataset.imeup){
     const file=$("imefile").files[0];if(!file){message("Choose the IME file first.",true);return;}
     if(file.size>5000000){message("That file is too large for an IME list.",true);return;}
@@ -6366,7 +6368,7 @@ document.addEventListener("click",event=>{
     const kind=target.dataset.libzip?"zip":target.dataset.libpdf?"pdf":"ris", path=target.dataset[kind==="zip"?"libzip":kind==="pdf"?"libpdf":"libris"];
     const ids=libIds(path), name=path==="/"?"LiteraSift library":path.replace("/"," ").replace(/_to_/g," to ");
     target.disabled=true;
-    (kind==="zip"?exportFile("export-fulltext","zip",ids,name,"","ZIP",{layout:libMode==="country"?"country":true}):kind==="pdf"?exportFile("export","pdf",ids,name,"Library folder "+path,"PDF",{layout:libMode==="country"?"country":true}):exportFile("export-citations","ris",ids,name+" citations","","citations",{format:"ris"}))
+    (kind==="zip"?exportFile("export-fulltext","zip",ids,name,"","ZIP",{layout:libMode==="country"?"country":libMode==="client"?"client":true}):kind==="pdf"?exportFile("export","pdf",ids,name,"Library folder "+path,"PDF",{layout:libMode==="country"?"country":libMode==="client"?"client":true}):exportFile("export-citations","ris",ids,name+" citations","","citations",{format:"ris"}))
       .catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
     return;
   }

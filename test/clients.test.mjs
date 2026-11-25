@@ -57,3 +57,14 @@ test("clients: a user can manage clients only after a manager allows it, and rev
   assert.equal((await t.raw(SCREENER, "/api/client-save", { name:"Delta" })).status, 403);
   st = await (await t.get(SCREENER, "/api/state")).json(); assert.equal(st.clientAdmin, false); assert.deepEqual(st.watches, []);
 });
+
+import worker from "../worker/index.js";
+test("library: client layout groups Client / Molecule / range, and picks up clients added later", () => {
+  const state = { watches:[{ portfolio:"CNS", molecule:"aripiprazole", client:"c1" }, { portfolio:"CNS", molecule:"metformin" }], clients:[{ id:"c1", name:"Acme Pharma" }],
+    runs:[{ status:"Imported", source:"PubMed", portfolio:"CNS", molecule:"aripiprazole", from:"2026-01-01", to:"2026-01-31", ids:["1", "2"] }, { status:"Imported", source:"PubMed", portfolio:"CNS", molecule:"metformin", from:"2026-01-01", to:"2026-01-31", ids:["3"] }], articles:{} };
+  const out = worker.libraryLayout(state, "client");
+  assert.deepEqual([...new Set(out.map(e => e.folder))].sort(), ["Acme Pharma/aripiprazole/2026-01-01_to_2026-01-31", "No client/metformin/2026-01-01_to_2026-01-31"]);
+  state.clients.push({ id:"c2", name:"Beta" }); state.watches[1].client = "c2";
+  assert.ok(worker.libraryLayout(state, "client").some(e => e.folder.startsWith("Beta/metformin/")));
+  assert.ok(worker.libraryLayout(state).every(e => e.folder.startsWith("PubMed/")), "the default layout is unchanged");
+});
