@@ -170,3 +170,9 @@ Synchrony is LiteraSift's case workbench (the **Synchrony** tab, linked both way
 - **Event IME matching:** upload the EMA IME list as .xlsx, .csv or .json in Settings. The .xlsx workbook is read directly (no extra software). Matches fill the PT, PT code and SOC in the event picker.
 - **Case series summary:** counts by event, product, country, age and sex with the cases behind every figure, and a monthly trend flag (median + MAD).
 - **Tile screenshot:** on Search & Pull, "Tile screenshot" renders a PNG of the article tiles for a pull, headed with its search query and date range (needs `deploy/enable-screenshots.sh`).
+
+## Closed-access (paywalled) articles
+
+LiteraSift retrieves every legal open copy (PMC, Europe PMC, Unpaywall, Semantic Scholar). For articles that remain closed it does not try to bypass paywalls. Instead, in the article's Review dialog:
+**Open with your institution** (set your library's proxy address in Settings), then **Upload PDF or XML** or **paste the text**. The text is read for events and patient details, the file is stored and marked as supplied by you, and the article flows into Synchrony.
+Uploads up to 40 MB need `deploy/enable-uploads.sh` on an existing server (new installs already allow it). Check your licence before sharing exported packages: they carry a notice for restricted files.

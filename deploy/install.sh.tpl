@@ -83,7 +83,7 @@ www.$DOMAIN {
 $DOMAIN {
 	encode zstd gzip
 	request_body {
-		max_size 3MB
+		max_size 40MB
 	}
 	reverse_proxy 127.0.0.1:8787
 }

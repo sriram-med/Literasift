@@ -394,3 +394,21 @@ test("OCR helper: scanned PDFs (no text layer) are recognised; the reader is opt
   const ocr = await makeOcrFn();
   assert.ok(ocr === null || typeof ocr === "function");
 });
+
+test("closed-access articles: the user can supply the full text (pasted or PDF) and it flows into event detection", async () => {
+  const t = await setup();
+  const none = await t.call(REVIEWER, "/api/fulltext-upload", { pmid: "1", text: "too short" });
+  assert.equal(none.status, 400);
+  assert.equal((await t.call(REVIEWER, "/api/fulltext-upload", { pmid: "999", text: FULL_TEXT })).status, 404);
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8")); bench.articles["1"].entities = { diseases: ["hepatic failure"] }; await t.BUCKET.put("bench.json", JSON.stringify(bench));
+  const pasted = await t.call(REVIEWER, "/api/fulltext-upload", { pmid: "1", text: FULL_TEXT.repeat(2) });
+  assert.equal(pasted.status, 200, JSON.stringify(pasted.body)); assert.equal(pasted.body.textRead, true); assert.ok(pasted.body.events >= 1);
+  let article = JSON.parse(await readFile(benchFile(t.dir), "utf8")).articles["1"];
+  assert.equal(article.fullTextStatus, "Captured"); assert.equal(article.fullTextOrigin, "Uploaded"); assert.equal(article.fullTextRestricted, true); assert.equal(article.fullTextUploadedBy, REVIEWER);
+  assert.equal(article.events[0].verbatim.section, "Case presentation");
+  const pdf = await t.call(REVIEWER, "/api/fulltext-upload", { pmid: "1", base64: Buffer.from(tinyPdf(["Case presentation", "A 54-year-old man developed Hepatic Failure after aciclovir."])).toString("base64") });
+  assert.equal(pdf.status, 200); article = JSON.parse(await readFile(benchFile(t.dir), "utf8")).articles["1"]; assert.match(article.fullTextKey, /uploaded\.pdf$/);
+  assert.equal((await t.call(REVIEWER, "/api/fulltext-upload", { pmid: "1", base64: Buffer.from("not a pdf at all").toString("base64") })).status, 400);
+  const log = (await readFile(monthFile(t.dir), "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(log.some(e => e.action === "upload.fulltext"));
+});

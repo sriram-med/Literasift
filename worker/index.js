@@ -1959,7 +1959,7 @@ async function apiCore(request, env, path) {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
       cases:await Promise.all((state.cases || []).filter(c => manager || c.createdBy === email || c.assignee === email).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
-      series:seriesSummary((state.cases || []).filter(c => manager || c.createdBy === email || c.assignee === email)), config:{ autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      series:seriesSummary((state.cases || []).filter(c => manager || c.createdBy === email || c.assignee === email)), config:{ proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -2008,6 +2008,34 @@ async function apiCore(request, env, path) {
     });
     await audit(env, { by:email, action:"review", target:"PMID " + reviewed.pmid, detail:reviewed.before + " → " + body.status + (body.note ? " (note saved)" : "") });
     return json({ ok:true });
+  }
+  if (path === "/api/fulltext-upload" && viewer) {
+    // For articles behind a paywall: the user supplies the full text from their own licensed access (library, publisher site, author), as a PDF, an XML file, or pasted text.
+    const id = String(body.pmid || ""), item = state.assignments.find(a => a.pmid === id && (manager || a.reviewer === email)), article = item && state.articles[id];
+    if (!article) return json({ error:"Article not found in your queue." }, 404);
+    let bytes = null, text = "", ext = "txt", type = "text/plain; charset=utf-8";
+    if (body.base64) {
+      try { bytes = Uint8Array.from(atob(String(body.base64)), ch => ch.charCodeAt(0)); } catch { return json({ error:"That file could not be read." }, 400); }
+      if (bytes.length > 25_000_000) return json({ error:"That file is larger than 25 MB." }, 413);
+      const head = new TextDecoder().decode(bytes.slice(0, 600));
+      if (head.startsWith("%PDF-")) { ext = "pdf"; type = "application/pdf"; try { text = await pdfToText(env, bytes.buffer); } catch { /* the PDF is kept even if its text cannot be read */ } }
+      else if (/<article\b|<\?xml/.test(head)) { ext = "xml"; type = "application/xml"; text = xmlToText(new TextDecoder().decode(bytes)); }
+      else return json({ error:"Upload a PDF or an XML file, or paste the text instead." }, 400);
+    } else if (String(body.text || "").trim().length >= 200) { text = String(body.text).slice(0, 2_000_000); bytes = new TextEncoder().encode(text); }
+    else return json({ error:"Choose a PDF or XML file, or paste at least a few paragraphs of the article." }, 400);
+    const key = "evidence/" + id + "/uploaded." + ext;
+    await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:type } });
+    const molecules = [...new Set(state.assignments.filter(a => a.pmid === id).flatMap(a => a.molecules || []))], ime = await loadIme(env);
+    const status = { fullTextStatus:"Captured", fullTextKey:key, fullTextOrigin:"Uploaded", fullTextUploadedBy:email, fullTextLicense:"Supplied by the user: check your licence before sharing", fullTextSource:"", fullTextRestricted:true, fullTextTier:fullTextTier };
+    if (text) {
+      const textKey = "evidence/" + id + "/fulltext.txt";
+      await env.BUCKET.put(textKey, text.slice(0, 2_000_000), { httpMetadata:{ contentType:"text/plain; charset=utf-8" } });
+      Object.assign(status, { fullTextTextKey:textKey, keyPassages:keyPassages(text, molecules) });
+    }
+    Object.assign(status, applyDetection({ ...article, ...status }, molecules, ime, state.settings?.imePromotions || [], text));
+    await write(env, data => Object.assign(data.articles[id], status));
+    await audit(env, { by:email, action:"upload.fulltext", target:"PMID " + id, detail:{ type:ext, bytes:bytes.length, text_read:Boolean(text) } });
+    return json({ ok:true, textRead:Boolean(text), events:(status.events || []).length });
   }
   if (path === "/api/icsr-intake" && viewer) {
     const result = await write(env, data => icsrIntake(data, email, a => manager || a.reviewer === email, 1000, manager ? "" : email));
@@ -2210,6 +2238,7 @@ async function apiCore(request, env, path) {
       if ("unpaywallEmail" in body) settings.unpaywallEmail = email;
       if ("ncbiEmail" in body) settings.ncbiEmail = String(body.ncbiEmail || "").trim();
       if (body.esignApprovers === "manager" || body.esignApprovers === "any") settings.esignApprovers = body.esignApprovers;
+      if ("proxyPrefix" in body) settings.proxyPrefix = /^https:\/\/\S+$/.test(String(body.proxyPrefix || "").trim()) ? String(body.proxyPrefix).trim().slice(0, 300) : "";
       if ("autoAssignCases" in body) settings.autoAssignCases = body.autoAssignCases !== "off" && body.autoAssignCases !== false;
       if ("senderId" in body) settings.senderId = String(body.senderId || "").trim().slice(0, 60);
       if ("receiverId" in body) settings.receiverId = String(body.receiverId || "").trim().slice(0, 60);
@@ -2619,6 +2648,15 @@ function renderCase(){
   $("casesign").dataset.id=curCase.id;$("casesign").textContent=(curCase.signatures||[]).some(x=>!x.superseded)?(curCase.signature_intact===false?"Signature: changed after signing":"Signed · view signature"):"Signature…";
 }
 let signCtx=null, codeSug={};
+// For an article without a stored full text: a link through the user's library, and a way to supply the full text themselves.
+function closedAccessHtml(art){
+  const link=art.doi?"https://doi.org/"+art.doi:art.url||"", prefix=data.config.proxyPrefix||"";
+  return '<div class="card" style="margin-top:12px;padding:12px"><div class="sub" style="margin-bottom:6px">'+(art.fullTextKey?"Replace the full text":"Closed access? Add the full text from your own access")+'</div><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'+
+    (prefix&&link?'<a class="btn outline sm" href="'+esc(prefix+link)+'" target="_blank" rel="noopener">Open with your institution</a>':"")+
+    '<input type="file" id="ftfile" accept=".pdf,.xml,application/pdf" style="max-width:230px"><button type="button" class="btn sm" data-ftupload="'+esc(art.id)+'">Upload PDF or XML</button></div>'+
+    '<details style="margin-top:8px"><summary class="sub" style="cursor:pointer">Or paste the text</summary><textarea id="ftpaste" rows="5" style="width:100%;margin-top:6px" placeholder="Paste the article text, including the case description"></textarea><button type="button" class="btn outline sm" data-ftpaste="'+esc(art.id)+'" style="margin-top:6px">Use pasted text</button></details>'+
+    '<p class="sub" style="margin:8px 0 0">Use only text you are licensed to use. It is stored on your server, read for events and patient details, and added to Synchrony.</p></div>';
+}
 async function openSign(kind,id){
   $("signerr").textContent="";
   try{
@@ -2975,6 +3013,7 @@ function render() {
       "There is no open worldwide source for marketing-authorisation status, so this table is yours to maintain. The country decides the regulator, whether the product is authorised there, and the reporting clock shown on ICSR cases (default 15 days for serious and 90 for non-serious cases unless a row says otherwise; confirm with local regulations). Statuses are read as Authorised, Not authorised, Withdrawn or Under review.")+
     panel("PV Nexus (ICSR processing)",'<form class="grid" data-route="settings"><label>PV Nexus API address (optional)<input name="pvNexusUrl" value="'+esc((data.config.pvNexus||{}).url||"")+'" placeholder="https://your-pv-nexus-backend"'+((data.config.pvNexus||{}).urlFromEnv?" disabled":"")+'></label><label>API token (optional)<input type="password" name="pvNexusToken" autocomplete="off" placeholder="'+((data.config.pvNexus||{}).tokenSet?"Token is set; leave blank to keep it":"Sent as a Bearer token if your gateway needs one")+'"></label><div><button class="btn">Save</button>'+((data.config.pvNexus||{}).tokenSet?' <button type="button" class="btn outline" data-pvremove="1">Remove token</button>':"")+'</div></form>',
       "ICSR cases are assessed here with a port of PV Nexus's deterministic rules (validity, QC, causality suggestion, follow-up questions), checked to give identical results. If you enter the address of a PV Nexus backend, the same checks are run by it instead, and LiteraSift falls back to the local rules if it is unreachable.")+
+    panel("Closed-access articles",'<form class="grid" data-route="settings"><label class="wide">Library proxy address (optional)<input name="proxyPrefix" value="'+esc(data.config.proxyPrefix||"")+'" placeholder="https://ezproxy.your-library.edu/login?url="></label><div><button class="btn">Save</button></div></form>',"For articles behind a paywall. With your library's proxy address, every closed article gets an Open with your institution link that signs in through your library. You can then download the PDF and upload it on the article, or paste the text; it flows into event detection and Synchrony like any other full text. LiteraSift does not bypass paywalls.")+
     panel("Synchrony (ICSR workbench)",'<form class="grid" data-route="settings"><label>Add full-text articles automatically<select name="autoIcsr"><option value="on"'+(data.config.autoIcsr?" selected":"")+'>On: draft a case for each article with stored full text and detected events</option><option value="off"'+(data.config.autoIcsr?"":" selected")+'>Off: add them with the button on the Synchrony tab</option></select></label><label>Assign new cases automatically<select name="autoAssignCases"><option value="on"'+(data.config.autoAssignCases?" selected":"")+'>On: molecule owner, else the reviewer with the fewest open cases</option><option value="off"'+(data.config.autoAssignCases?"":" selected")+'>Off: managers assign by hand</option></select></label><label>E2B sender identifier<input name="senderId" value="'+esc((data.config.e2b||{}).sender||"")+'" placeholder="Your organisation ID (N.2.r.2)"></label><label>E2B receiver identifier<input name="receiverId" value="'+esc((data.config.e2b||{}).receiver||"")+'" placeholder="Regulator or partner ID (N.2.r.3)"></label><div><button class="btn">Save</button></div></form>',"E2B(R3) files carry these identifiers in the message header.")+
     panel("NCBI / PubMed access",'<form class="grid" data-route="settings"><label>Contact email for NCBI<input type="email" name="ncbiEmail" value="'+esc((data.config.ncbi||{}).email||"")+'" placeholder="you@example.com"'+((data.config.ncbi||{}).emailFromEnv?" disabled":"")+'></label><label>NCBI API key (optional)<input type="password" name="ncbiApiKey" autocomplete="off" placeholder="'+((data.config.ncbi||{}).keySet?"Key is set; leave blank to keep it":"Paste a free key to allow 10 requests a second")+'"'+((data.config.ncbi||{}).keyFromEnv?" disabled":"")+'></label><div><button class="btn">Save</button>'+(((data.config.ncbi||{}).keySet&&!(data.config.ncbi||{}).keyFromEnv)?' <button type="button" class="btn outline" data-ncbiremove="1">Remove key</button>':"")+'</div></form>',
       "PubMed is read through NCBI's E-utilities only; its web pages are never scraped, which NCBI forbids. NCBI asks automated tools to identify themselves with a contact email, and allows 3 requests a second, or 10 with a free API key (create one in your NCBI account settings). The key is stored with the app data; for a server install it is safer in /etc/literasift.env as NCBI_API_KEY.")+
@@ -3069,7 +3108,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -3112,6 +3151,14 @@ document.addEventListener("click",event=>{
     api("case-assess",{id:c.id}).then(r=>{if($("dialog").open)$("dialog").close();openCaseData(c,r.assessment);}).catch(e=>message(e.message,true));return;
   }
   if(target.dataset.backtolit){const item=(data.assignments||[]).find(x=>x.pmid===curCase.pmid);if(!item){message("That article is not in your queue.",true);return;}$("casedlg").close();const open=document.querySelector('[data-review="'+item.id+'"]');if(open)open.click();else{tab=data.viewer.role==="manager"?"All Assignments":"My Queue";render();}return;}
+  if(target.dataset.ftupload||target.dataset.ftpaste){
+    const id=target.dataset.ftupload||target.dataset.ftpaste, done=r=>{message("Full text added"+(r.textRead?"; "+r.events+" event"+(r.events===1?"":"s")+" detected.":". Its text could not be read, so events come from the abstract."));return refresh().then(()=>{const open=document.querySelector('[data-review="'+active.id+'"]');if(open){$("dialog").close();open.click();}});};
+    if(target.dataset.ftpaste){target.disabled=true;api("fulltext-upload",{pmid:id,text:$("ftpaste").value}).then(done).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}
+    const file=$("ftfile").files[0];if(!file){message("Choose a PDF or XML file first.",true);return;}
+    if(file.size>20000000){message("That file is larger than 20 MB.",true);return;}
+    target.disabled=true;file.arrayBuffer().then(buf=>{let bin="";const u=new Uint8Array(buf);for(let i=0;i<u.length;i+=8192)bin+=String.fromCharCode.apply(null,u.subarray(i,i+8192));return api("fulltext-upload",{pmid:id,base64:btoa(bin)});}).then(done).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    return;
+  }
   if(target.dataset.synfilter){synFilter=target.dataset.synfilter;render();return;}
   if(target.dataset.autoassign){target.disabled=true;api("cases-autoassign",{}).then(async r=>{await refresh();message(r.moved+" case"+(r.moved===1?"":"s")+" assigned.");}).catch(e=>{message(e.message,true);target.disabled=false;});return;}
   if(target.dataset.synexport){
@@ -3312,7 +3359,8 @@ document.addEventListener("click",event=>{
       (artCountry(art)?'<div class="sub" style="margin:10px 0 4px">Country</div><div class="chips"><span class="badge">'+esc(artCountry(art))+' · '+esc(artCountryBasis(art))+'</span>'+(art.patientCountry?'<span class="badge">Patient: '+esc(art.patientCountry.name)+'</span>':'')+(art.affiliationCountry?'<span class="badge">Author affiliation: '+esc(art.affiliationCountry)+'</span>':'')+(art.journalCountry?'<span class="badge">Journal: '+esc(art.journalCountry)+'</span>':'')+maChip(active.molecules,artCountry(art))+'</div>':'')+
       ((art.linkOut||[]).length?'<div class="sub" style="margin:10px 0 4px">PubMed LinkOut'+(art.pubmedCitedBy!==undefined?" · cited by "+art.pubmedCitedBy+" in PubMed":"")+'</div><div class="chips">'+art.linkOut.map(l=>'<a class="badge '+(l.free?"green":"blue")+'" target="_blank" rel="noopener" href="'+esc(l.url)+'">'+esc((l.free?"Free: ":"")+l.provider)+'</a>').join("")+'</div>':"")+
       '<div style="margin-top:10px"><button type="button" class="btn outline sm" data-newcase="'+esc(active.pmid)+'">Send to Synchrony</button> '+(data.cases||[]).filter(c=>c.pmid===active.pmid).map(c=>'<a href="#" data-opencase="'+esc(c.id)+'">'+esc(c.number)+'</a>').join(" · ")+'</div>'+
-      (art.fullTextKey?'<div style="margin-top:8px"><a href="/api/full-text/'+esc(active.pmid)+'">Download full text</a></div>':"");
+      (art.fullTextKey?'<div style="margin-top:8px"><a href="/api/full-text/'+esc(active.pmid)+'">Download full text</a>'+(art.fullTextOrigin==="Uploaded"?' <span class="sub">(uploaded by '+esc(art.fullTextUploadedBy||"")+')</span>':"")+'</div>':"")+
+      closedAccessHtml(art);
     $("review").elements.status.value=active.status;
     $("review").elements.note.value=active.note||"";
     $("dialog").showModal();
