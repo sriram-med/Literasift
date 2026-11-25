@@ -95,7 +95,7 @@ async function handler(req, res) {
     return send(res, 303, "", { Location: "/", "Set-Cookie": cookieFor(email, users[email].v) });
   }
   if (path === "/logout" && req.method === "POST") { const who = readSession(req)?.email; if (who) await record(who, "logout"); }
-  if (path === "/logout" && req.method === "POST") return send(res, 303, "", { Location: "/login", "Set-Cookie": "ls=; HttpOnly; Path=/; Max-Age=0" });
+  if (path === "/logout" && req.method === "POST") return send(res, 303, "", { Location: "/login", "Set-Cookie": "ls=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0" + (secureCookie ? "; Secure" : "") });
 
   // Password recovery: always answers the same way so it cannot be used to discover which emails have accounts.
   if (path === "/forgot" && req.method === "GET") return send(res, 200, forgotPage(), html);
@@ -212,7 +212,10 @@ async function handler(req, res) {
   const response = await worker.fetch(new Request(new URL(req.url, "http://localhost"), { method: req.method, headers, body }), env);
   const out = {}; response.headers.forEach((v, k) => { out[k] = v; });
   if (out["content-type"]?.startsWith("text/html")) {
-    const doc = (await response.text()).replace('<div class="spacer"></div>', '<div class="spacer"></div><form method="post" action="/logout" style="margin:0 10px 10px"><button class="btn outline sm" style="width:100%">Sign out</button></form>');
+    // Sign out is offered twice: at the bottom of the sidebar, and in the top bar, which stays visible when the sidebar is long or collapsed on a phone.
+    const signOut = '<form method="post" action="/logout" style="margin:0"><button class="btn outline sm" type="submit">Sign out</button></form>';
+    const doc = (await response.text()).replace('<div class="spacer"></div>', '<div class="spacer"></div><form method="post" action="/logout" style="margin:0 10px 10px"><button class="btn outline sm" style="width:100%" type="submit">Sign out</button></form>')
+      .replace('<button class="btn outline icon-btn" id="theme"', '<div style="display:flex;gap:8px;align-items:center">' + signOut + '<button class="btn outline icon-btn" id="theme"').replace('title="Toggle dark mode"></button>', 'title="Toggle dark mode"></button></div>');
     delete out["content-length"];
     return send(res, response.status, doc, out);
   }

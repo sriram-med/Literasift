@@ -153,8 +153,9 @@ test("case approvals follow the signer policy, four-eyes rule and readiness chec
   assert.equal((await sign(t, MANAGER, "case", created.id, { meaning: "case_invalid" })).status, 409);
   await t.call(MANAGER, "/api/case-save", { id: created.id, status: "Draft", data: created.data, notes: "No identifiable patient." });
   // Reviewers cannot sign approvals by default.
-  const asReviewer = (await t.call(REVIEWER, "/api/sign-preview", { kind: "case", id: created.id, meaning: "case_invalid" })).status;
-  assert.equal(asReviewer, 404, "reviewers cannot see another person's case");
+  const asReviewer = await t.call(REVIEWER, "/api/sign-preview", { kind: "case", id: created.id, meaning: "case_invalid" });
+  assert.equal(asReviewer.status, 200, "the reviewer the case was assigned to can open it");
+  assert.ok(asReviewer.body.problems.some(p => /Only managers may sign approvals/.test(p)), "but cannot sign an approval");
   const ok = await sign(t, MANAGER, "case", created.id, { meaning: "case_invalid" });
   assert.equal(ok.status, 200, JSON.stringify(ok.body));
   assert.equal(ok.body.record.locked, true);
@@ -317,4 +318,72 @@ test("PDF full texts are read with pdf.js when it is installed, and the events c
   assert.match(text, /Case presentation/); assert.match(text, /Hepatic failure developed after aciclovir\./);
   const r = worker.applyDetection({ id: "5", title: "Aciclovir", abstract: "", entities: { diseases: ["hepatic failure"] }, pubTypes: [] }, ["aciclovir"], null, [], text);
   assert.ok(r.events.some(e => /hepatic failure/i.test(e.term)));
+});
+
+import { existsSync } from "node:fs";
+const IME_XLSX = process.env.IME_XLSX || "/root/.claude/uploads/c16e0d7d-3406-5934-b74c-eb48327a969d/1ea6802d-meddra-important-medical-event-terms-list-ime-version-291_en.xlsx";
+test("the EMA IME workbook (.xlsx) is read: terms, SOC, version, reference, demoted terms", async (t) => {
+  if (!existsSync(IME_XLSX)) return t.skip("IME workbook not available here (licensed content is not stored in the repository)");
+  const parsed = worker.parseImeWorkbook(await worker.readXlsx((await readFile(IME_XLSX)).buffer));
+  assert.equal(parsed.version, "29.1"); assert.equal(parsed.reference, "EMA/211097/2026");
+  assert.ok(parsed.terms.length > 7000);
+  assert.deepEqual(parsed.terms.find(x => x[1] === "Double aortic arch"), ["10093479", "Double aortic arch", "Congenital, familial and genetic disorders", 1]);
+  assert.ok(parsed.demoted.some(d => d[1] === "Iridocyclitis" && d[3] === "Anterior uveitis"));
+});
+
+import { spawnSync } from "node:child_process";
+async function seedWithEvents(t) {
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
+  Object.assign(bench.articles["1"], { fullTextStatus: "Captured", fullTextKey: "k", journal: "J", ...worker.applyDetection({ ...bench.articles["1"], entities: { diseases: ["hepatic failure"] } }, ["aciclovir"], null, [], FULL_TEXT) });
+  bench.profiles.push({ email: "ravi@example.org", name: "Ravi", role: "reviewer", active: true, capacity: 9 });
+  await t.BUCKET.put("bench.json", JSON.stringify(bench));
+}
+test("Synchrony assigns cases automatically to the least-loaded reviewer and managers can reassign", async () => {
+  const t = await setup(); await seedWithEvents(t);
+  const first = (await t.call(MANAGER, "/api/case-create", { pmid: "1" })).body.case;
+  assert.ok([REVIEWER, "ravi@example.org"].includes(first.assignee));
+  assert.ok(first.dueAt, "a reporting due date is set"); assert.match(first.history.at(-1).action, /assigned to .* \(automatic\)/);
+  const other = first.assignee === REVIEWER ? "ravi@example.org" : REVIEWER;
+  assert.equal((await t.call(REVIEWER, "/api/case-assign", { ids: [first.id], assignee: other })).status, 403);
+  assert.equal((await t.call(MANAGER, "/api/case-assign", { ids: [first.id], assignee: "nobody@example.org" })).status, 400);
+  assert.equal((await t.call(MANAGER, "/api/case-assign", { ids: [first.id], assignee: other })).body.moved, 1);
+  const state = await (await worker.fetch(new Request("http://localhost/api/state", { headers: { "oai-authenticated-user-email": other } }), t.env)).json();
+  assert.ok(state.cases.some(c => c.id === first.id), "the new assignee can see the case");
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8")); bench.cases[0].assignee = undefined; await t.BUCKET.put("bench.json", JSON.stringify(bench));
+  assert.equal((await t.call(MANAGER, "/api/cases-autoassign")).body.moved, 1);
+});
+
+test("exports: narrative, CIOMS I PDF, FHIR bundle, line listing, E2B(R3) XML", async () => {
+  const t = await setup(); await seedWithEvents(t);
+  const made = (await t.call(MANAGER, "/api/case-create", { pmid: "1" })).body.case;
+  const get = async format => { const r = await worker.fetch(new Request("http://localhost/api/case-export", { method: "POST", headers: { "oai-authenticated-user-email": MANAGER, "Content-Type": "application/json" }, body: JSON.stringify({ id: made.id, format }) }), t.env); assert.equal(r.status, 200, format); return r; };
+  assert.equal(new TextDecoder().decode((await (await get("cioms")).arrayBuffer()).slice(0, 5)), "%PDF-");
+  const fhir = await (await get("fhir")).json(); assert.equal(fhir.resourceType, "Bundle"); assert.ok(fhir.entry.some(e => e.resource.resourceType === "AdverseEvent"));
+  const csv = await (await get("csv")).text(); assert.match(csv, /^"Case","PMID"/); assert.match(csv, /LS-/);
+  const xml = await (await get("e2b")).text(); assert.match(xml, /<MCCI_IN200100UV01/); assert.match(xml, /<PORR_IN049016UV>/); assert.match(xml, /literatureReference/);
+  const batch = await worker.fetch(new Request("http://localhost/api/cases-export", { method: "POST", headers: { "oai-authenticated-user-email": MANAGER, "Content-Type": "application/json" }, body: JSON.stringify({ format: "e2b" }) }), t.env);
+  assert.equal(batch.status, 200);
+  assert.match(worker.caseNarrativeText(worker.normalizeCase(made.data), "ref"), /^This case was reported in the published literature \(ref\)\./);
+});
+
+const ICH_DIR = process.env.ICH_SCHEMA_DIR || "/home/user/oss-clones/icsrmaker/schemas/multicacheschemas";
+test("E2B(R3) XML validates against the ICH ICSR schema when it is available", async (t) => {
+  if (!existsSync(ICH_DIR + "/MCCI_IN200100UV01.xsd") || spawnSync("xmllint", ["--version"]).error) return t.skip("ICH schema files or xmllint not available");
+  const tmp = await mkdtemp(join(tmpdir(), "e2b-"));
+  const rec = { id: "x", number: "LS-2026-0001", pmid: "1", createdAt: "2026-11-25T00:00:00Z", data: worker.normalizeCase({ receipt_date: "2026-11-25", patient: { identifier: { value: "54-year-old male" }, age: { value: "54" }, sex: { value: "Male" }, weight: { value: "70" }, medical_history: [{ value: "CKD" }] },
+    products: [{ role: "suspect", name: { value: "aciclovir" }, start_date: { value: "2021-03-03" }, action_taken: { value: "Drug withdrawn" } }, { role: "concomitant", name: { value: "metformin" } }],
+    events: [{ verbatim: { value: "confusion" }, pt: { value: "Confusional state" }, pt_code: { value: "10010305" }, onset_date: { value: "2021-03-09" }, outcome: { value: "Recovered/resolved" }, seriousness: { serious: true, hospitalization: true } }], source_summary: "A B. Case. J. 2021." }) };
+  await writeFile(tmp + "/case.xml", worker.e2bBatch([rec], {}));
+  const r = spawnSync("xmllint", ["--noout", "--schema", ICH_DIR + "/MCCI_IN200100UV01.xsd", tmp + "/case.xml"], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test("case series summary counts from the case fields and flags months above the median + MAD limit", () => {
+  assert.deepEqual(worker.robustHikes([10, 12, 11, 13, 50].map((count, i) => ({ month: "m" + i, count }))).hikes.map(h => h.count), [50]);   // the case that breaks mean +/- 2 SD
+  assert.deepEqual(worker.robustHikes([3, 3, 3, 3, 4].map((count, i) => ({ month: "m" + i, count }))).hikes, []);                              // flat series: one more case is not a hike
+  const mk = (n, pt, country, date, serious) => ({ number: n, status: "Draft", createdAt: date, data: worker.normalizeCase({ receipt_date: date, patient: { country: { value: country }, age: { value: "70" }, sex: { value: "Female" } }, products: [{ role: "suspect", name: { value: "aciclovir" } }], events: [{ verbatim: { value: pt }, seriousness: { serious, hospitalization: serious } }] }) });
+  const s = worker.seriesSummary([mk("A", "Confusion", "India", "2026-01-05", true), mk("B", "Confusion", "India", "2026-02-05", false), mk("C", "Rash", "Spain", "2026-02-09", false)]);
+  assert.equal(s.total, 3); assert.deepEqual(s.serious, ["A"]);
+  assert.deepEqual(s.events[0], { key: "Confusion", count: 2, cases: ["A", "B"] });
+  assert.equal(s.countries[0].key, "India"); assert.equal(s.ages[0].key, "65 and over");
 });

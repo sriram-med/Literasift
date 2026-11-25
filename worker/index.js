@@ -743,6 +743,80 @@ function parseImeUpload(text) {
   if (!terms.length) throw new Error("No preferred terms found. Use one term per line, or a CSV with a \"PT Name\" column.");
   return { terms, version, reference, demoted:[] };
 }
+// ---- Spreadsheet (.xlsx) reading with no dependencies: a workbook is a zip of XML files, inflated with the platform's DecompressionStream. ----
+async function inflateRaw(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+async function unzipEntries(buffer) {
+  const bytes = new Uint8Array(buffer), view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let end = -1;
+  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 70000); i--) if (view.getUint32(i, true) === 0x06054b50) { end = i; break; }
+  if (end < 0) throw new Error("This is not a zip or xlsx file.");
+  const count = view.getUint16(end + 10, true), decoder = new TextDecoder(), entries = new Map();
+  let pos = view.getUint32(end + 16, true);
+  for (let n = 0; n < count && n < 500; n++) {
+    if (view.getUint32(pos, true) !== 0x02014b50) break;
+    const method = view.getUint16(pos + 10, true), size = view.getUint32(pos + 20, true), nameLength = view.getUint16(pos + 28, true), extraLength = view.getUint16(pos + 30, true), commentLength = view.getUint16(pos + 32, true), local = view.getUint32(pos + 42, true);
+    const name = decoder.decode(bytes.subarray(pos + 46, pos + 46 + nameLength));
+    pos += 46 + nameLength + extraLength + commentLength;
+    if (!/^xl\/(workbook\.xml|sharedStrings\.xml|worksheets\/sheet\d+\.xml|_rels\/workbook\.xml\.rels)$/.test(name)) continue;
+    const start = local + 30 + view.getUint16(local + 26, true) + view.getUint16(local + 28, true), data = bytes.subarray(start, start + size);
+    entries.set(name, decoder.decode(method === 0 ? data : await inflateRaw(data)));
+  }
+  return entries;
+}
+const colIndex = letters => [...letters].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;
+// Returns [{ name, rows: [[cell, ...], ...] }] with every cell as text.
+async function readXlsx(buffer) {
+  const files = await unzipEntries(buffer);
+  const shared = [...(files.get("xl/sharedStrings.xml") || "").matchAll(/<si>([\s\S]*?)<\/si>/g)].map(m => decodeXml([...m[1].matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map(t => t[1]).join("")));
+  const rels = new Map([...(files.get("xl/_rels/workbook.xml.rels") || "").matchAll(/<Relationship\b[^>]*>/g)].map(m => [/Id="([^"]+)"/.exec(m[0])?.[1], /Target="([^"]+)"/.exec(m[0])?.[1]]));
+  const sheets = [];
+  for (const m of (files.get("xl/workbook.xml") || "").matchAll(/<sheet\b[^>]*>/g)) {
+    const name = decodeXml(/name="([^"]*)"/.exec(m[0])?.[1] || ""), target = String(rels.get(/r:id="([^"]+)"/.exec(m[0])?.[1]) || "").replace(/^\/?(xl\/)?/, "xl/"), xml = files.get(target);
+    if (!xml) continue;
+    const rows = [];
+    for (const row of xml.matchAll(/<row\b[^>]*?(?:\/>|>([\s\S]*?)<\/row>)/g)) {
+      const cells = [];
+      for (const c of (row[1] || "").matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+        const ref = /r="([A-Z]+)\d+"/.exec(c[1]);
+        if (!ref) continue;
+        const inner = c[2] || "", v = /<v>([\s\S]*?)<\/v>/.exec(inner), inline = /<is>([\s\S]*?)<\/is>/.exec(inner);
+        cells[colIndex(ref[1])] = /t="s"/.test(c[1]) && v ? shared[Number(v[1])] ?? "" : inline ? decodeXml([...inline[1].matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map(t => t[1]).join("")) : v ? decodeXml(v[1]) : "";
+      }
+      rows.push(Array.from(cells, c => c ?? ""));
+    }
+    sheets.push({ name, rows });
+  }
+  return sheets;
+}
+// The EMA IME workbook: a list sheet (MedDRA Code, PT Name, SOC Name, Comment, "Added in x", "Primary SOC Change") and a "Deleted PTs" sheet of demoted terms.
+function parseImeWorkbook(sheets) {
+  const norm = v => String(v ?? "").trim();
+  const list = sheets.find(s => s.rows.some(r => r.some(c => /^pt name$/i.test(norm(c))))) || sheets[0];
+  if (!list) throw new Error("The workbook has no sheets.");
+  const head = list.rows.findIndex(r => r.some(c => /^pt name$/i.test(norm(c))));
+  if (head < 0) throw new Error("No \"PT Name\" column found in the first sheet.");
+  const col = re => list.rows[head].findIndex(c => re.test(norm(c))), cCode = col(/^meddra code$/i), cName = col(/^pt name$/i), cSoc = col(/^soc name$/i), cAdded = col(/^added in/i);
+  const top = list.rows.slice(0, head).flat().map(norm).filter(Boolean), serial = Number(top.find(c => /^\d{5}$/.test(c)));
+  const terms = [], seen = new Set();
+  for (const r of list.rows.slice(head + 1)) {
+    const name = norm(r[cName]);
+    if (name.length < 3 || name.length > 160 || seen.has(name.toLowerCase())) continue;
+    seen.add(name.toLowerCase());
+    terms.push([/^\d{6,9}$/.test(norm(r[cCode])) ? norm(r[cCode]) : "", name, norm(r[cSoc]), cAdded >= 0 && norm(r[cAdded]) ? 1 : 0]);
+  }
+  const deleted = sheets.find(s => s !== list && /deleted|demoted/i.test(s.name)), demoted = [];
+  if (deleted) {
+    const h = deleted.rows.findIndex(r => r.some(c => /^term$/i.test(norm(c)))), d = deleted.rows[h] || [];
+    for (const r of deleted.rows.slice(h + 1)) { const name = norm(r[d.findIndex(c => /^term$/i.test(norm(c)))]); if (name) demoted.push([norm(r[0]), name, norm(r[2]), /Demoted under PT (.+?),/.exec(norm(r[3]))?.[1] || ""]); }
+  }
+  if (!terms.length) throw new Error("No preferred terms found in the workbook.");
+  const title = top.find(c => /important medical event/i.test(c)) || "";
+  return { terms:terms.slice(0, 30000), demoted, title, version:/version\s+([\d.]+)/i.exec(title)?.[1] || null, reference:top.find(c => /^EMA\//.test(c)) || null,
+    released:serial ? new Date(Date.UTC(1899, 11, 30) + serial * 86400000).toISOString().slice(0, 10) : null };
+}
 let imeCache = { at:0, value:null };
 async function loadIme(env) {
   if (Date.now() - imeCache.at < 30000) return imeCache.value;
@@ -1186,7 +1260,21 @@ function caseFromArticle(article, assignment) {
       "Patients are not named in published articles, so the patient is identified by age and sex. Therapy start and event onset dates are rarely given: if the article does not give them, tick \"not reported in the article\" once you have checked, and use the time to onset if it states one.",
       ...(facts?.series ? ["The article reports more than one patient. Each patient may need its own ICSR."] : [])] });
 }
-function makeCase(data, article, item, by, intake) {
+const caseClosed = c => c.status === "Sent to PV Nexus" || c.status === "Closed: not a valid ICSR";
+// Who should take a new case: the molecule's owner, else the active reviewer (matching the portfolio) with the fewest open cases and room left, else a manager.
+function pickCaseAssignee(data, rec) {
+  const owned = data.watches.find(w => w.owner && w.portfolio === rec.portfolio && (!w.molecule || w.molecule === rec.molecule));
+  if (owned && data.profiles.some(p => p.email === owned.owner && p.active)) return owned.owner;
+  const open = p => (data.cases || []).filter(c => c.assignee === p.email && !caseClosed(c)).length;
+  const fits = p => p.active && (!p.portfolio || p.portfolio.toLowerCase() === String(rec.portfolio || "").toLowerCase());
+  let pool = data.profiles.filter(p => p.role === "reviewer" && fits(p));
+  if (!data.profiles.some(p => p.role === "reviewer" && p.active)) pool = data.profiles.filter(p => p.role === "manager" && p.active).map(p => ({ ...p, capacity:Infinity }));
+  const best = pool.map(p => ({ p, n:open(p) })).filter(x => x.n < (x.p.capacity ?? Infinity)).sort((a, b) => a.n - b.n || a.p.email.localeCompare(b.p.email))[0];
+  return best?.p.email || "";
+}
+// Reporting due date from the case's country, seriousness and marketing-authorisation record (15 days serious / 90 days non-serious by default).
+function refreshDue(data, rec) { rec.dueAt = regulatoryContext(data.settings?.marketAuth || [], rec.data, rec.molecule).due || ""; }
+function makeCase(data, article, item, by, intake, assignTo = "") {
   const year = new Date().getFullYear(), at = new Date().toISOString(), counters = data.caseSeq ||= {};
   const seq = (counters[year] ?? Math.max(0, ...(data.cases || []).filter(c => c.number.startsWith("LS-" + year)).map(c => Number(c.number.split("-")[2]) || 0))) + 1;
   counters[year] = seq;
@@ -1195,10 +1283,13 @@ function makeCase(data, article, item, by, intake) {
     history:[{ at, by, action:(intake === "automatic" ? "added automatically from the full text of PMID " : "created from PMID ") + article.id }] };
   created.data.case_id = created.number;
   (data.cases ||= []).push(created);
+  const assignee = assignTo || (data.settings?.autoAssignCases === false ? "" : pickCaseAssignee(data, created));
+  if (assignee) { created.assignee = assignee; created.assignedAt = at; created.history.push({ at, by:"system", action:"assigned to " + assignee + (assignTo ? "" : " (automatic)") }); }
+  refreshDue(data, created);
   return created;
 }
 // Adds a draft case for every article whose full text is stored and that has detected events (one case per article).
-function icsrIntake(data, by, scope, limit = 1000) {
+function icsrIntake(data, by, scope, limit = 1000, assignTo = "") {
   const out = { created:[], existing:0, noEvents:0 }, have = new Set((data.cases || []).map(c => c.pmid));
   for (const article of Object.values(data.articles)) {
     if (article.fullTextStatus !== "Captured" || !article.fullTextKey) continue;
@@ -1207,10 +1298,198 @@ function icsrIntake(data, by, scope, limit = 1000) {
     if (have.has(article.id)) { out.existing++; continue; }
     if (!(article.events || []).length) { out.noEvents++; continue; }
     if (out.created.length >= limit) break;
-    out.created.push(makeCase(data, article, item, by, by === "system" ? "automatic" : "manual").number);
+    out.created.push(makeCase(data, article, item, by, by === "system" ? "automatic" : "manual", assignTo).number);
     have.add(article.id);
   }
   return out;
+}
+// ---- Synchrony exports: narrative, E2B(R3) XML (ICH ICSR, HL7 v3), CIOMS I, FHIR R4, line listing ----
+const v = f => (f && f.value != null ? String(f.value).trim() : "");
+const ageText = p => v(p.age) ? v(p.age) + " " + (v(p.age_unit) || "years") : "";
+// A case narrative written only from the case fields, so every statement can be traced to a value the reviewer confirmed.
+function caseNarrativeText(c, citation) {
+  const p = c.patient, suspect = firstSuspect(c), events = c.events.filter(e => hasVal(e.verbatim)), out = [];
+  const who = [v(p.age) ? v(p.age) + "-" + (v(p.age_unit) || "years").replace(/s$/, "") + "-old" : "", v(p.sex).toLowerCase()].filter(Boolean).join(" ") || "patient of unspecified age and sex";
+  out.push("This case was reported in the published literature" + (citation ? " (" + citation + ")" : "") + ". It concerns a " + who + (v(p.country) ? " from " + v(p.country) : "") + (v(p.weight) ? ", weight " + v(p.weight) + " kg" : "") + ".");
+  if (c.patient.medical_history.length) out.push("Relevant medical history: " + c.patient.medical_history.map(h => v(h)).filter(Boolean).join("; ") + ".");
+  if (suspect && hasVal(suspect.name)) out.push("The patient received " + v(suspect.name) + (v(suspect.dose) ? " " + v(suspect.dose) : "") + (v(suspect.route) ? " by the " + v(suspect.route) + " route" : "") + (v(suspect.frequency) ? ", " + v(suspect.frequency) : "") + (v(suspect.indication) ? " for " + v(suspect.indication) : "") + (v(suspect.start_date) ? ", started on " + v(suspect.start_date) : suspect.start_not_reported ? "; the start date was not reported in the article" : "") + ".");
+  const others = c.products.filter(x => x.role !== "suspect" && hasVal(x.name)).map(x => v(x.name));
+  if (others.length) out.push("Other medicines mentioned: " + others.join(", ") + ".");
+  events.forEach((e, i) => {
+    const flags = Object.entries(e.seriousness || {}).filter(([k, on]) => on && k !== "serious").map(([k]) => k.replace(/_/g, " "));
+    out.push((i === 0 ? "The patient experienced " : "The patient also experienced ") + v(e.verbatim) + (hasVal(e.pt) && v(e.pt).toLowerCase() !== v(e.verbatim).toLowerCase() ? " (coded as " + v(e.pt) + ")" : "") +
+      (v(e.onset_date) ? ", with onset on " + v(e.onset_date) : v(e.time_to_onset) ? ", with onset " + v(e.time_to_onset) : e.onset_not_reported ? "; the onset date was not reported in the article" : "") +
+      (e.seriousness?.serious ? ". The event was considered serious" + (flags.length ? " (" + flags.join(", ") + ")" : "") : "") + (v(e.outcome) ? ". Outcome: " + v(e.outcome) : "") + ".");
+  });
+  if (suspect) {
+    if (hasVal(suspect.action_taken)) out.push("Action taken with " + (v(suspect.name) || "the suspect product") + ": " + v(suspect.action_taken) + ".");
+    if (hasVal(suspect.dechallenge)) out.push("Dechallenge: " + v(suspect.dechallenge) + ".");
+    if (hasVal(suspect.rechallenge)) out.push("Rechallenge: " + v(suspect.rechallenge) + ".");
+  }
+  if (c.treatment_given.length) out.push("Treatment given for the event: " + c.treatment_given.join(", ") + ".");
+  if (c.confounders.length) out.push("Potential confounders: " + c.confounders.map(x => x.type + ": " + x.text).join("; ") + ".");
+  return out.join(" ");
+}
+const xmlEsc = value => String(value ?? "").replace(/[&<>"]/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[ch]));
+const hl7Date = value => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value || "")); return m ? m[1] + m[2] + m[3] : ""; };
+const hl7Now = () => new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+const UCUM_AGE = { years:"a", year:"a", months:"mo", month:"mo", weeks:"wk", week:"wk", days:"d", day:"d", hours:"h", hour:"h" };
+// E2B(R3) code lists used below (ICH E2B(R3) Implementation Guide): outcome E.i.7, action taken G.k.8, seriousness criteria E.i.3.2.
+const E2B_OUTCOME = [[/fatal/i, "5"], [/not recovered|unresolved|ongoing/i, "2"], [/sequel/i, "4"], [/recovering|improv|resolving/i, "3"], [/recovered|resolved/i, "1"]];
+const E2B_ACTION = [[/withdrawn|stopped|discontinu/i, "1"], [/reduc/i, "2"], [/increas/i, "3"], [/not changed|continued/i, "4"], [/not applicable/i, "9"]];
+const E2B_SERIOUS = { death:["34", "results in death"], life_threatening:["21", "life threatening"], hospitalization:["33", "caused / prolonged hospitalisation"], disability:["35", "disabling / incapacitating"], congenital_anomaly:["12", "congenital anomaly / birth defect"], other_medically_important:["26", "other medically important condition"] };
+const codeFrom = (table, text) => (table.find(([re]) => re.test(String(text || ""))) || [])[1] || "";
+const OID = { c11:"2.16.840.1.113883.3.989.2.1.3.1", c181:"2.16.840.1.113883.3.989.2.1.3.2", obs:"2.16.840.1.113883.3.989.2.1.1.19", meddra:"2.16.840.1.113883.6.163", batch:"2.16.840.1.113883.3.989.2.1.3.22",
+  msgSender:"2.16.840.1.113883.3.989.2.1.3.11", msgReceiver:"2.16.840.1.113883.3.989.2.1.3.12", sender:"2.16.840.1.113883.3.989.2.1.3.13", receiver:"2.16.840.1.113883.3.989.2.1.3.14", patient:"2.16.840.1.113883.3.989.2.1.3.7" };
+function e2bCase(rec, article, opts = {}) {
+  const c = normalizeCase(rec.data), p = c.patient, suspect = firstSuspect(c), narrative = caseNarrativeText(c, rec.data.source_summary ? String(rec.data.source_summary).split("\n")[0] : "");
+  const uid = () => crypto.randomUUID(), obs = (code, name, valueXml, extra = "") => `<observation classCode="OBS" moodCode="EVN"><code code="${code}" codeSystem="${OID.obs}" displayName="${xmlEsc(name)}"/>${extra}${valueXml}</observation>`;
+  const sexCode = /^male$/i.test(v(p.sex)) ? "1" : /^female$/i.test(v(p.sex)) ? "2" : "";
+  const reactions = c.events.filter(e => hasVal(e.verbatim)).map(e => {
+    const crit = Object.entries(E2B_SERIOUS).filter(([k]) => e.seriousness?.[k]).map(([k, [code, name]]) => obs(code, name, '<value xsi:type="BL" value="true"/>')).join("");
+    const outcome = codeFrom(E2B_OUTCOME, v(e.outcome));
+    const start = hl7Date(v(e.onset_date)), stop = hl7Date(v(e.stop_date));
+    return `<subjectOf2 typeCode="SBJ"><observation classCode="OBS" moodCode="EVN"><id root="${uid()}"/><code code="29" codeSystem="${OID.obs}" displayName="reaction"/>` +
+      (start || stop ? `<effectiveTime xsi:type="IVL_TS">${start ? `<low value="${start}"/>` : ""}${stop ? `<high value="${stop}"/>` : ""}</effectiveTime>` : "") +
+      `<value xsi:type="CE"${hasVal(e.pt_code) ? ` code="${xmlEsc(v(e.pt_code))}" codeSystem="${OID.meddra}"${hasVal(e.meddra_version) ? ` codeSystemVersion="${xmlEsc(v(e.meddra_version))}"` : ""}` : ""}><originalText>${xmlEsc(v(e.verbatim))}</originalText></value>` +
+      (crit || outcome ? `<outboundRelationship2 typeCode="PERT">${outcome ? obs("27", "outcome", `<value xsi:type="CE" code="${outcome}" codeSystem="2.16.840.1.113883.3.989.2.1.1.11"/>`) : ""}</outboundRelationship2>` : "") + `</observation></subjectOf2>` + (crit ? crit.split("</observation>").filter(Boolean).map(o => `<subjectOf2 typeCode="SBJ">${o}</observation></subjectOf2>`).join("") : "");
+  }).join("");
+  const drugs = c.products.filter(x => hasVal(x.name)).map(x => {
+    const role = x.role === "suspect" ? "1" : x.role === "interacting" ? "3" : "2", action = codeFrom(E2B_ACTION, v(x.action_taken)), start = hl7Date(v(x.start_date)), stop = hl7Date(v(x.stop_date));
+    return `<component typeCode="COMP"><substanceAdministration classCode="SBADM" moodCode="EVN"><id root="${uid()}"/>` +
+      (start || stop ? `<effectiveTime xsi:type="IVL_TS">${start ? `<low value="${start}"/>` : ""}${stop ? `<high value="${stop}"/>` : ""}</effectiveTime>` : "") +
+      `<consumable typeCode="CSM"><instanceOfKind classCode="INST"><kindOfProduct classCode="MMAT" determinerCode="KIND"><name>${xmlEsc(v(x.name))}</name></kindOfProduct></instanceOfKind></consumable>` +
+      `<outboundRelationship2 typeCode="COMP">${obs("24", "drugCharacterization", `<value xsi:type="CE" code="${role}" codeSystem="2.16.840.1.113883.3.989.2.1.1.13"/>`)}</outboundRelationship2>` +
+      (action ? `<outboundRelationship2 typeCode="PERT">${obs("9", "actionTaken", `<value xsi:type="CE" code="${action}" codeSystem="2.16.840.1.113883.3.989.2.1.1.15"/>`)}</outboundRelationship2>` : "") + `</substanceAdministration></component>`;
+  }).join("");
+  const history = p.medical_history.map(h => v(h)).filter(Boolean).map(h => `<component typeCode="COMP"><observation classCode="OBS" moodCode="EVN"><code code="1" codeSystem="${OID.obs}" displayName="relevantMedicalHistoryAndConcurrentConditions"/><value xsi:type="ED">${xmlEsc(h)}</value></observation></component>`).join("");
+  const age = v(p.age) ? `<subjectOf2 typeCode="SBJ">${obs("3", "age", `<value xsi:type="PQ" value="${xmlEsc(v(p.age))}" unit="${UCUM_AGE[(v(p.age_unit) || "years").toLowerCase()] || "a"}"/>`)}</subjectOf2>` : "";
+  const weight = v(p.weight) ? `<subjectOf2 typeCode="SBJ">${obs("7", "bodyWeight", `<value xsi:type="PQ" value="${xmlEsc(v(p.weight))}" unit="kg"/>`)}</subjectOf2>` : "";
+  const received = hl7Date(rec.data.receipt_date) || hl7Date(rec.createdAt);
+  const message = `<PORR_IN049016UV><id root="${OID.msgSender}" extension="${xmlEsc(rec.number)}"/><creationTime value="${hl7Now()}"/><interactionId root="2.16.840.1.113883.1.6" extension="PORR_IN049016UV"/><processingCode code="P"/><processingModeCode code="T"/><acceptAckCode code="AL"/>` +
+    `<receiver typeCode="RCV"><device classCode="DEV" determinerCode="INSTANCE"><id root="${OID.msgReceiver}" extension="${xmlEsc(opts.receiver || "RECEIVER")}"/></device></receiver><sender typeCode="SND"><device classCode="DEV" determinerCode="INSTANCE"><id root="${OID.msgSender}" extension="${xmlEsc(opts.sender || "LITERASIFT")}"/></device></sender>` +
+    `<controlActProcess classCode="CACT" moodCode="EVN"><code code="PORR_TE049016UV" codeSystem="2.16.840.1.113883.1.18"/><subject typeCode="SUBJ"><investigationEvent classCode="INVSTG" moodCode="EVN">` +
+    `<id root="${OID.c11}" extension="${xmlEsc(rec.number)}"/><id root="${OID.c181}" extension="${xmlEsc(rec.number)}"/><code code="PAT_ADV_EVNT" codeSystem="2.16.840.1.113883.5.4"/><text>${xmlEsc(narrative)}</text><statusCode code="active"/>` +
+    (received ? `<effectiveTime><low value="${received}"/></effectiveTime><availabilityTime value="${received}"/>` : "") +
+    (rec.data.source_summary ? `<reference typeCode="REFR"><document classCode="DOC" moodCode="EVN"><code code="2" codeSystem="2.16.840.1.113883.3.989.2.1.1.4" displayName="literatureReference"/><bibliographicDesignationText>${xmlEsc(String(rec.data.source_summary).split("\n")[0].slice(0, 500))}</bibliographicDesignationText></document></reference>` : "") +
+    `<component typeCode="COMP"><adverseEventAssessment classCode="INVSTG" moodCode="EVN"><subject1 typeCode="SBJ"><primaryRole classCode="INVSBJ"><id root="${OID.patient}" extension="${xmlEsc(rec.number)}-P"/>` +
+    `<player1 classCode="PSN" determinerCode="INSTANCE">${v(p.identifier) ? `<name>${xmlEsc(v(p.identifier))}</name>` : ""}${sexCode ? `<administrativeGenderCode code="${sexCode}" codeSystem="1.0.5218"/>` : ""}</player1>` +
+    age + weight + reactions + (drugs ? `<subjectOf2 typeCode="SBJ"><organizer classCode="CATEGORY" moodCode="EVN"><code code="4" codeSystem="${OID.obs}" displayName="drugInformation"/>${drugs}</organizer></subjectOf2>` : "") +
+    (history ? `<subjectOf2 typeCode="SBJ"><organizer classCode="CATEGORY" moodCode="EVN"><code code="1" codeSystem="${OID.obs}" displayName="relevantMedicalHistoryAndConcurrentConditions"/>${history}</organizer></subjectOf2>` : "") +
+    `</primaryRole></subject1></adverseEventAssessment></component></investigationEvent></subject></controlActProcess></PORR_IN049016UV>`;
+  return message;
+}
+function e2bBatch(records, articles, opts = {}) {
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<MCCI_IN200100UV01 ITSVersion="XML_1.0" xmlns="urn:hl7-org:v3" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><id root="${OID.batch}" extension="${xmlEsc(opts.batchId || "LS-" + hl7Now())}"/><creationTime value="${hl7Now()}"/><responseModeCode code="D"/><interactionId root="2.16.840.1.113883.1.6" extension="MCCI_IN200100UV01"/>` +
+    `<name code="1" codeSystem="2.16.840.1.113883.3.989.2.1.1.1"/>` + records.map(r => e2bCase(r, articles[r.pmid], opts)).join("") +
+    `<receiver typeCode="RCV"><device classCode="DEV" determinerCode="INSTANCE"><id root="${OID.receiver}" extension="${xmlEsc(opts.receiver || "RECEIVER")}"/></device></receiver><sender typeCode="SND"><device classCode="DEV" determinerCode="INSTANCE"><id root="${OID.sender}" extension="${xmlEsc(opts.sender || "LITERASIFT")}"/></device></sender></MCCI_IN200100UV01>\n`;
+}
+// CIOMS I suspect adverse reaction report form (the CIOMS numbering: 1-13 reaction, 14-21 suspect drug, 22-23 concomitant and history, 24-25 reporter / manufacturer).
+function ciomsPdf(rec, article) {
+  const c = normalizeCase(rec.data), p = c.patient, suspect = firstSuspect(c) || {}, events = c.events.filter(e => hasVal(e.verbatim)), first = events[0] || {};
+  const [pw, ph] = pdfPage, ops = [], left = 30, width = pw - 60;
+  const text = (x, y, value, size = 8, bold = false, gray = 0.1) => ops.push(`BT ${gray} ${gray} ${gray} rg /F${bold ? 2 : 1} ${size} Tf ${x.toFixed(2)} ${y.toFixed(2)} Td (${pdfEscape(value)}) Tj ET`);
+  const box = (x, y, w, h) => ops.push(`0.5 w 0.35 G ${x.toFixed(2)} ${y.toFixed(2)} ${w.toFixed(2)} ${h.toFixed(2)} re S`);
+  // A labelled cell: small caption on top, the value wrapped inside the box (clipped to its height).
+  const cell = (x, top, w, h, label, value, size = 8) => {
+    box(x, top - h, w, h); text(x + 3, top - 8, label, 5.5, true, 0.4);
+    let y = top - 18;
+    for (const line of wrap(String(value || ""), size, false, w - 8)) { if (y < top - h + 4) break; text(x + 3, y, line, size); y -= size + 2.5; }
+  };
+  const band = (top, label) => { ops.push(`0.9 0.9 0.9 rg ${left} ${top - 12} ${width} 12 re f`); text(left + 4, top - 9, label, 7.5, true); return top - 12; };
+  text(left, ph - 36, "SUSPECT ADVERSE REACTION REPORT (CIOMS I)", 13, true);
+  text(left, ph - 50, "Case " + rec.number + " · generated by LiteraSift Synchrony · " + new Date().toISOString().slice(0, 10) + " · draft for medical review", 7.5, false, 0.4);
+  let top = band(ph - 60, "I. REACTION INFORMATION");
+  const h = 34, third = width / 4;
+  const dob = "", age = ageText(p);
+  cell(left, top, third, h, "1. PATIENT INITIALS / IDENTIFIER", v(p.identifier).slice(0, 60)); cell(left + third, top, third * 0.7, h, "1a. COUNTRY", v(p.country));
+  cell(left + third * 1.7, top, third * 0.9, h, "2. DATE OF BIRTH", dob); cell(left + third * 2.6, top, third * 0.7, h, "2a. AGE", age); cell(left + third * 3.3, top, third * 0.7, h, "3. SEX", v(p.sex));
+  top -= h;
+  cell(left, top, width * 0.3, h, "4-6. REACTION ONSET (date)", v(first.onset_date) || v(first.time_to_onset) || (first.onset_not_reported ? "Not reported in the article" : "")); 
+  const flags = Object.entries(first.seriousness || {}).filter(([k, on]) => on && k !== "serious").map(([k]) => ({ death:"Patient died", life_threatening:"Life-threatening", hospitalization:"Hospitalisation (involved or prolonged)", disability:"Persistent or significant disability", congenital_anomaly:"Congenital anomaly", other_medically_important:"Other medically important" }[k]));
+  cell(left + width * 0.3, top, width * 0.7, h, "8-12. CHECK ALL APPROPRIATE TO ADVERSE REACTION", flags.length ? flags.map(f => "[X] " + f).join("   ") : "[ ] none recorded");
+  top -= h;
+  const reactionText = events.map(e => v(e.verbatim) + (hasVal(e.pt) ? " (" + v(e.pt) + (hasVal(e.pt_code) ? " " + v(e.pt_code) : "") + ")" : "") + (hasVal(e.outcome) ? " - " + v(e.outcome) : "")).join("; ");
+  cell(left, top, width, 74, "7 + 13. DESCRIBE REACTION(S) (including relevant tests / laboratory data) - CASE NARRATIVE", reactionText + ". " + caseNarrativeText(c, ""), 7.5);
+  top -= 74;
+  top = band(top - 4, "II. SUSPECT DRUG(S) INFORMATION");
+  cell(left, top, width * 0.5, h, "14. SUSPECT DRUG(S) (include generic name)", v(suspect.name)); cell(left + width * 0.5, top, width * 0.25, h, "15. DAILY DOSE(S)", [v(suspect.dose), v(suspect.frequency)].filter(Boolean).join(", ")); cell(left + width * 0.75, top, width * 0.25, h, "16. ROUTE(S) OF ADMINISTRATION", v(suspect.route));
+  top -= h;
+  cell(left, top, width * 0.5, h, "17. INDICATION(S) FOR USE", v(suspect.indication)); cell(left + width * 0.5, top, width * 0.3, h, "18. THERAPY DATES (from/to)", [v(suspect.start_date) || (suspect.start_not_reported ? "start not reported" : ""), v(suspect.stop_date)].filter(Boolean).join(" to ")); cell(left + width * 0.8, top, width * 0.2, h, "19. THERAPY DURATION", "");
+  top -= h;
+  cell(left, top, width / 2, h, "20. DID REACTION ABATE AFTER STOPPING DRUG?", v(suspect.dechallenge) || "Not stated"); cell(left + width / 2, top, width / 2, h, "21. DID REACTION REAPPEAR AFTER REINTRODUCTION?", v(suspect.rechallenge) || "Not stated");
+  top -= h;
+  top = band(top - 4, "III. CONCOMITANT DRUG(S) AND HISTORY");
+  cell(left, top, width, h, "22. CONCOMITANT DRUG(S) AND DATES OF ADMINISTRATION (exclude those used to treat reaction)", c.products.filter(x => x.role !== "suspect" && hasVal(x.name)).map(x => v(x.name) + (v(x.start_date) ? " (" + v(x.start_date) + ")" : "")).join("; "));
+  top -= h;
+  cell(left, top, width, h + 10, "23. OTHER RELEVANT HISTORY (e.g. diagnostics, allergies, pregnancy with last month of period, etc.)", [c.patient.medical_history.map(x => v(x)).filter(Boolean).join("; "), c.treatment_given.length ? "Treatment given: " + c.treatment_given.join(", ") : ""].filter(Boolean).join(". "));
+  top -= h + 10;
+  top = band(top - 4, "IV. MANUFACTURER / REPORTER INFORMATION");
+  cell(left, top, width * 0.5, h + 8, "24a. NAME AND ADDRESS OF REPORTER / SENDER", [v(c.reporter.identifier), v(c.reporter.qualification), v(c.reporter.country)].filter(Boolean).join(", "));
+  cell(left + width * 0.5, top, width * 0.25, h + 8, "24b. CONTROL NO.", rec.number); cell(left + width * 0.75, top, width * 0.25, h + 8, "24c. DATE RECEIVED", v({ value:rec.data.receipt_date }));
+  top -= h + 8;
+  cell(left, top, width * 0.5, h, "24d. REPORT SOURCE", "[X] Literature   [ ] Study   [ ] Health professional"); cell(left + width * 0.5, top, width * 0.25, h, "DATE OF THIS REPORT", new Date().toISOString().slice(0, 10)); cell(left + width * 0.75, top, width * 0.25, h, "25a. REPORT TYPE", "[X] Initial   [ ] Follow-up");
+  top -= h;
+  cell(left, top, width, h + 10, "LITERATURE REFERENCE", String(rec.data.source_summary || "").split("\n")[0] + (article?.doi ? "  DOI " + article.doi : "") + (article?.id ? "  PMID " + article.id : ""));
+  if ((rec.signatures || []).some(sg => !sg.superseded)) { const sg = activeSignature(rec); text(left, 24, "Signed by " + sg.signer_name + " (" + sg.signer_id + ") " + sg.signed_at + " UTC · " + sg.meaning_text.slice(0, 70) + " · SHA-256 " + sg.content_sha256.slice(0, 16), 6, false, 0.4); }
+  const objects = [["<< /Type /Catalog /Pages 2 0 R >>"], ["<< /Type /Pages /Kids [3 0 R] /Count 1 >>"],
+    [`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pw} ${ph}] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>`],
+    ["<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"], ["<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>"]];
+  const content = textBytes(ops.join("\n")); objects.push([`<< /Length ${content.length} >>\nstream\n`, content, "\nendstream"]);
+  const chunks = [], offsets = []; let length = 0;
+  const push = piece => { const bytes = typeof piece === "string" ? textBytes(piece) : piece; chunks.push(bytes); length += bytes.length; };
+  push("%PDF-1.4\n");
+  objects.forEach((parts, i) => { offsets.push(length); push(`${i + 1} 0 obj\n`); parts.forEach(push); push("\nendobj\n"); });
+  const xref = length;
+  push(`xref\n0 ${objects.length + 1}\n0000000000 65535 f \n` + offsets.map(o => String(o).padStart(10, "0") + " 00000 n \n").join("") + `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+  const out = new Uint8Array(length); let at = 0;
+  for (const chunk of chunks) { out.set(chunk, at); at += chunk.length; }
+  return out;
+}
+// HL7 FHIR R4 Bundle: Patient, Medication (contained) and AdverseEvent resources.
+function fhirBundle(rec, article) {
+  const c = normalizeCase(rec.data), p = c.patient, suspect = firstSuspect(c), events = c.events.filter(e => hasVal(e.verbatim));
+  const patientId = "patient-" + rec.number, entries = [{ fullUrl:"urn:uuid:" + patientId, resource:{ resourceType:"Patient", id:patientId, gender:/^male$/i.test(v(p.sex)) ? "male" : /^female$/i.test(v(p.sex)) ? "female" : "unknown",
+    ...(v(p.identifier) ? { name:[{ text:v(p.identifier) }] } : {}), extension:[...(v(p.age) ? [{ url:"http://literasift.tech/fhir/age", valueQuantity:{ value:Number(v(p.age)), unit:v(p.age_unit) || "years" } }] : []), ...(v(p.country) ? [{ url:"http://literasift.tech/fhir/country", valueString:v(p.country) }] : [])] } }];
+  events.forEach((e, i) => entries.push({ fullUrl:"urn:uuid:ae-" + rec.number + "-" + (i + 1), resource:{ resourceType:"AdverseEvent", id:"ae-" + rec.number + "-" + (i + 1), actuality:"actual", event:{ text:v(e.verbatim), ...(hasVal(e.pt_code) ? { coding:[{ system:"http://terminology.hl7.org/CodeSystem/mdr", code:v(e.pt_code), display:v(e.pt) }] } : {}) },
+    subject:{ reference:"urn:uuid:" + patientId }, ...(v(e.onset_date) ? { date:v(e.onset_date) } : {}), seriousness:{ text:e.seriousness?.serious ? "Serious" : "Non-serious" }, ...(hasVal(e.outcome) ? { outcome:{ text:v(e.outcome) } } : {}),
+    ...(suspect && hasVal(suspect.name) ? { suspectEntity:[{ instance:{ display:v(suspect.name) } }] } : {}), note:[{ text:caseNarrativeText(c, "") }] } }));
+  return { resourceType:"Bundle", type:"collection", identifier:{ system:"http://literasift.tech/case", value:rec.number }, timestamp:new Date().toISOString(), entry:entries };
+}
+// Line listing: one row per case and event (the layout used for periodic reports and spreadsheets).
+function lineListing(records, articles) {
+  const head = ["Case", "PMID", "Status", "Assignee", "Due", "Country", "Age", "Sex", "Suspect product", "Event (verbatim)", "PT", "PT code", "SOC", "Serious", "Onset", "Outcome", "Action taken", "Reference"];
+  const rows = [];
+  for (const r of records) {
+    const c = normalizeCase(r.data), s = firstSuspect(c) || {}, events = c.events.filter(e => hasVal(e.verbatim));
+    for (const e of events.length ? events : [{}]) rows.push([r.number, r.pmid, r.status, r.assignee || "", r.dueAt || "", v(c.patient.country), ageText(c.patient), v(c.patient.sex), v(s.name), v(e.verbatim), v(e.pt), v(e.pt_code), v(e.soc), e.seriousness?.serious ? "Yes" : "No", v(e.onset_date), v(e.outcome), v(s.action_taken), String(r.data.source_summary || "").split("\n")[0]]);
+  }
+  return [head, ...rows].map(row => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
+}
+// ---- Case series summary and trend check. Every figure is counted from the case fields, and each one lists the cases it counts, so nothing is estimated or
+// written by a model. The median + MAD hike rule follows pharmacovigilance-verified-safety-report-agent (MIT, Copyright (c) 2026 NiharNandala): a mean and standard
+// deviation can be pulled up by the very spike they should find, while the median and MAD cannot. ----
+const medianOf = list => { const a = [...list].sort((x, y) => x - y), m = a.length >> 1; return a.length ? (a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2) : 0; };
+function robustHikes(rows) {
+  const counts = rows.map(r => r.count), median = medianOf(counts), mad = medianOf(counts.map(x => Math.abs(x - median))), scaled = mad * 1.4826;
+  // A perfectly flat series has no spread, so a floor of 1 stops every one-case rise being called a hike.
+  const upper = median + 2 * Math.max(scaled, 1);
+  return { median, mad:Number(scaled.toFixed(2)), upper:Number(upper.toFixed(2)), hikes:rows.filter(r => r.count > upper) };
+}
+function seriesSummary(cases) {
+  const list = cases.filter(c => c.status !== "Closed: not a valid ICSR"), tally = (keyOf, limit = 8) => {
+    const map = new Map();
+    for (const c of list) for (const key of new Set([].concat(keyOf(c)).filter(Boolean))) (map.get(key) || map.set(key, []).get(key)).push(c.number);
+    return [...map].map(([key, nums]) => ({ key, count:nums.length, cases:nums })).sort((a, b) => b.count - a.count || a.key.localeCompare(b.key)).slice(0, limit);
+  };
+  const norm = c => normalizeCase(c.data), serious = c => norm(c).events.some(e => Object.values(e.seriousness || {}).some(Boolean)), fatal = c => norm(c).events.some(e => e.seriousness?.death);
+  const band = c => { const p = norm(c).patient, n = Number(v(p.age)); if (!v(p.age)) return "Unknown"; const years = /month/i.test(v(p.age_unit)) ? n / 12 : /week/i.test(v(p.age_unit)) ? n / 52 : /day|hour/i.test(v(p.age_unit)) ? n / 365 : n; return years < 18 ? "Under 18" : years < 65 ? "18 to 64" : "65 and over"; };
+  const month = c => String(c.data.receipt_date || c.createdAt || "").slice(0, 7);
+  const monthly = tally(month, 1000).sort((a, b) => a.key.localeCompare(b.key)).map(r => ({ month:r.key, count:r.count, cases:r.cases }));
+  const trend = robustHikes(monthly);
+  return { total:list.length, serious:list.filter(serious).map(c => c.number), fatal:list.filter(fatal).map(c => c.number),
+    events:tally(c => norm(c).events.map(e => v(e.pt) || v(e.verbatim)).filter(Boolean)), products:tally(c => v(firstSuspect(norm(c))?.name)), countries:tally(c => v(norm(c).patient.country)), sex:tally(c => v(norm(c).patient.sex) || "Unknown"), ages:tally(band),
+    monthly, trend:{ ...trend, hikes:trend.hikes.map(h => h.month), basis:monthly.length < 4 ? "Too few months to judge a trend (needs at least 4)." : "Months above the upper limit are flagged." } };
 }
 const caseStatuses = ["Draft", "Ready for medical review", "Sent to PV Nexus", "Closed: not a valid ICSR"];
 // ---- Electronic signatures (21 CFR Part 11 pattern, design from argus-auditable-rag, MIT): signer, meaning, time, and a hash that binds the
@@ -1679,8 +1958,8 @@ async function apiCore(request, env, path) {
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
-      cases:await Promise.all((state.cases || []).filter(c => manager || c.createdBy === email).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
-      config:{ autoIcsr:state.settings?.autoIcsr !== false, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      cases:await Promise.all((state.cases || []).filter(c => manager || c.createdBy === email || c.assignee === email).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
+      series:seriesSummary((state.cases || []).filter(c => manager || c.createdBy === email || c.assignee === email)), config:{ autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -1731,13 +2010,13 @@ async function apiCore(request, env, path) {
     return json({ ok:true });
   }
   if (path === "/api/icsr-intake" && viewer) {
-    const result = await write(env, data => icsrIntake(data, email, a => manager || a.reviewer === email));
+    const result = await write(env, data => icsrIntake(data, email, a => manager || a.reviewer === email, 1000, manager ? "" : email));
     if (result.created.length) await audit(env, { by:email, action:"case.intake", target:result.created.length + " cases", detail:{ cases:result.created.slice(0, 50).join(", "), source:"articles with stored full text" } });
     return json(result);
   }
   if ((path === "/api/sign-preview" || path === "/api/sign" || path === "/api/supersede") && viewer) {
     const kind = body.kind === "screening" ? "screening" : "case";
-    const record = kind === "case" ? (state.cases || []).find(c => c.id === body.id && (manager || c.createdBy === email)) : state.assignments.find(a => a.id === body.id && (manager || a.reviewer === email));
+    const record = kind === "case" ? (state.cases || []).find(c => c.id === body.id && (manager || c.createdBy === email || c.assignee === email)) : state.assignments.find(a => a.id === body.id && (manager || a.reviewer === email));
     if (!record) return json({ error:"Record not found." }, 404);
     const article = state.articles[record.pmid] || {};
     if (path === "/api/supersede") {
@@ -1777,12 +2056,39 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"sign.signed", entityType:kind === "case" ? "Case" : "Assignment", entityId:kind === "case" ? record.number : record.id, detail:{ meaning:meaningCode, content_sha256, evidence_sha256, auth:reauth, pmid:record.pmid } });
     return json({ signature, record:saved });
   }
+  if (path === "/api/cases-export" && viewer) {
+    const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null, list = (state.cases || []).filter(c => (manager || c.createdBy === email || c.assignee === email) && (!wanted || wanted.has(c.id)));
+    if (!list.length) return json({ error:"No cases to export." }, 404);
+    const format = body.format === "e2b" ? "e2b" : "csv", stamp = new Date().toISOString().slice(0, 10);
+    await audit(env, { by:email, action:"case.export", target:list.length + " cases", detail:"batch " + format });
+    if (format === "e2b") return new Response(e2bBatch(list, state.articles, { sender:state.settings?.senderId, receiver:state.settings?.receiverId }), { headers:{ "Content-Type":"application/xml", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-E2B-R3-' + stamp + '.xml"' } });
+    return new Response(lineListing(list, state.articles), { headers:{ "Content-Type":"text/csv; charset=utf-8", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-line-listing-' + stamp + '.csv"' } });
+  }
+  if ((path === "/api/case-assign" || path === "/api/cases-autoassign") && viewer) {
+    if (!manager) return json({ error:"Manager access required." }, 403);
+    const target = String(body.assignee || "").trim().toLowerCase(), at = new Date().toISOString();
+    if (path === "/api/case-assign" && target && !state.profiles.some(p => p.email === target && p.active)) return json({ error:"Choose an active team member." }, 400);
+    const ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), moved = [];
+    await write(env, data => {
+      for (const c of data.cases || []) {
+        if (path === "/api/case-assign" ? !ids.has(c.id) || c.assignee === target : c.assignee || caseClosed(c)) continue;
+        if (c.locked) continue;
+        const next = path === "/api/case-assign" ? target : pickCaseAssignee(data, c);
+        if (!next && path === "/api/cases-autoassign") continue;
+        c.assignee = next || undefined; c.assignedAt = next ? at : undefined; refreshDue(data, c);
+        (c.history ||= []).push({ at, by:email, action:next ? "assigned to " + next : "unassigned" });
+        moved.push(c.number + " -> " + (next || "nobody"));
+      }
+    });
+    if (moved.length) await audit(env, { by:email, action:"case.assign", target:moved.length + " cases", detail:{ changes:moved.slice(0, 50).join("; ") } });
+    return json({ ok:true, moved:moved.length });
+  }
   if (path.startsWith("/api/case-") && viewer) {
-    const cfg = withSettings(env, state), canSee = c => manager || c.createdBy === email, find = id => (state.cases || []).find(c => c.id === id && canSee(c));
+    const cfg = withSettings(env, state), canSee = c => manager || c.createdBy === email || c.assignee === email, find = id => (state.cases || []).find(c => c.id === id && canSee(c));
     if (path === "/api/case-create") {
       const item = state.assignments.find(a => a.pmid === String(body.pmid) && (manager || a.reviewer === email)), article = item && state.articles[item.pmid];
       if (!article) return json({ error:"Article not found in your queue." }, 404);
-      const record = await write(env, data => makeCase(data, article, item, email, "manual"));
+      const record = await write(env, data => makeCase(data, article, item, email, "manual", manager ? "" : email));
       await audit(env, { by:email, action:"case.create", target:record.number, detail:"from PMID " + record.pmid });
       return json({ case:record, assessment:withRegulatory(await assessCase(cfg, record.data), state, record) });
     }
@@ -1816,7 +2122,7 @@ async function apiCore(request, env, path) {
       const saved = await write(env, d => {
         const c = d.cases.find(x => x.id === current.id), at = new Date().toISOString();
         const changed = c.status !== status;
-        c.data = data; c.notes = notes; c.updatedAt = at;
+        c.data = data; c.notes = notes; c.updatedAt = at; refreshDue(d, c);
         (c.history ||= []).push({ at, by:email, action:changed ? "status " + c.status + " → " + status : "saved" });
         c.status = status;
         return c;
@@ -1825,11 +2131,20 @@ async function apiCore(request, env, path) {
       return json({ case:saved, assessment:withRegulatory(await assessCase(cfg, saved.data), state, saved) });
     }
     if (path === "/api/case-export") {
-      const data = { ...current.data, case_id:current.number };
-      await audit(env, { by:email, action:"case.export", target:current.number, detail:body.format === "package" ? "package" : "json" });
-      if (body.format !== "package") return new Response(JSON.stringify(data, null, 2), { headers:{ "Content-Type":"application/json", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="' + current.number + '.json"' } });
+      const data = { ...current.data, case_id:current.number }, format = ["package", "e2b", "cioms", "fhir", "csv"].includes(body.format) ? body.format : "json", article0 = state.articles[current.pmid] || {};
+      await audit(env, { by:email, action:"case.export", target:current.number, detail:format });
+      const send = (bytes, type, ext) => new Response(bytes, { headers:{ "Content-Type":type, "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="' + current.number + ext + '"' } });
+      if (format === "e2b") return send(e2bBatch([current], state.articles, { sender:state.settings?.senderId, receiver:state.settings?.receiverId }), "application/xml", "-E2B-R3.xml");
+      if (format === "cioms") return send(ciomsPdf(current, article0), "application/pdf", "-CIOMS-I.pdf");
+      if (format === "fhir") return send(JSON.stringify(fhirBundle(current, article0), null, 2), "application/fhir+json", "-FHIR.json");
+      if (format === "csv") return send(lineListing([current], state.articles), "text/csv; charset=utf-8", "-line-listing.csv");
+      if (format !== "package") return new Response(JSON.stringify(data, null, 2), { headers:{ "Content-Type":"application/json", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="' + current.number + '.json"' } });
       const encoder = new TextEncoder(), article = state.articles[current.pmid] || {}, files = [{ name:"icsr.json", data:encoder.encode(JSON.stringify(data, null, 2)) },
         { name:"assessment.json", data:encoder.encode(JSON.stringify(withRegulatory(await assessCase(cfg, current.data), state, current), null, 2)) },
+        { name:"E2B-R3.xml", data:encoder.encode(e2bBatch([current], state.articles, { sender:state.settings?.senderId, receiver:state.settings?.receiverId })) },
+        { name:"CIOMS-I.pdf", data:ciomsPdf(current, article) },
+        { name:"FHIR-AdverseEvent.json", data:encoder.encode(JSON.stringify(fhirBundle(current, article), null, 2)) },
+        { name:"narrative.txt", data:encoder.encode(caseNarrativeText(normalizeCase(current.data), "") + "\r\n") },
         { name:"signatures.json", data:encoder.encode(JSON.stringify(current.signatures || [], null, 2)) },
         { name:"SIGNATURES.txt", data:encoder.encode((current.signatures || []).length ? (current.signatures || []).map(signatureText).join("\r\n") : "Not signed.\r\n") },
         { name:"citation.txt", data:encoder.encode(current.data.source_summary + "\r\n\r\nCase " + current.number + " · status " + current.status + "\r\nNotes: " + (current.notes || "") + "\r\n") }];
@@ -1895,6 +2210,9 @@ async function apiCore(request, env, path) {
       if ("unpaywallEmail" in body) settings.unpaywallEmail = email;
       if ("ncbiEmail" in body) settings.ncbiEmail = String(body.ncbiEmail || "").trim();
       if (body.esignApprovers === "manager" || body.esignApprovers === "any") settings.esignApprovers = body.esignApprovers;
+      if ("autoAssignCases" in body) settings.autoAssignCases = body.autoAssignCases !== "off" && body.autoAssignCases !== false;
+      if ("senderId" in body) settings.senderId = String(body.senderId || "").trim().slice(0, 60);
+      if ("receiverId" in body) settings.receiverId = String(body.receiverId || "").trim().slice(0, 60);
       if ("autoIcsr" in body) settings.autoIcsr = body.autoIcsr !== "off" && body.autoIcsr !== false;
       if ("esignFourEyes" in body) settings.esignFourEyes = body.esignFourEyes === true;
       if ("pvNexusUrl" in body) settings.pvNexusUrl = String(body.pvNexusUrl || "").trim();
@@ -1913,7 +2231,7 @@ async function apiCore(request, env, path) {
   }
   if (path === "/api/ime-upload") {
     let parsed;
-    try { parsed = parseImeUpload(body.text); buildIme(parsed); } catch (error) { return json({ error:"Could not read that list: " + error.message }, 400); }
+    try { parsed = body.base64 ? parseImeWorkbook(await readXlsx(Uint8Array.from(atob(String(body.base64)), c => c.charCodeAt(0)).buffer)) : parseImeUpload(body.text); buildIme(parsed); } catch (error) { return json({ error:"Could not read that list: " + error.message }, 400); }
     const stored = { title:parsed.title || "Important medical event terms (uploaded)", version:parsed.version || "", reference:parsed.reference || "", released:parsed.released || null, source:"uploaded " + String(body.filename || "").slice(0, 80), terms:parsed.terms, demoted:parsed.demoted || [] };
     await env.BUCKET.put("ime/current.json", JSON.stringify(stored), { httpMetadata:{ contentType:"application/json" } });
     imeInvalidate();
@@ -2106,7 +2424,7 @@ const html = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="v
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
 button,input,select,textarea{font:inherit;color:inherit}a{color:var(--brand);text-decoration:none}a:hover{text-decoration:underline}
 .shell{display:grid;grid-template-columns:240px 1fr;min-height:100vh}
-aside{border-right:1px solid var(--border);background:var(--card);padding:18px 12px;display:flex;flex-direction:column;gap:6px;position:sticky;top:0;height:100vh}
+aside{border-right:1px solid var(--border);background:var(--card);padding:18px 12px;display:flex;flex-direction:column;gap:6px;position:sticky;top:0;height:100vh;overflow-y:auto}
 .brand{display:flex;align-items:center;gap:10px;padding:4px 10px 18px;font-weight:700;font-size:17px;letter-spacing:-.02em}
 .logo{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#0f766e,#14b8a6);display:grid;place-items:center;color:#fff}
 .ic{width:16px;height:16px;flex:none}
@@ -2166,7 +2484,7 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 <dialog id="casedlg" style="width:min(1180px,96vw);max-height:92vh;overflow:auto"><div id="casehead" style="display:flex;justify-content:space-between;gap:12px;align-items:flex-end;margin-bottom:14px"></div>
 <div style="display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));align-items:start"><div id="casebody"></div><div><div id="caseassess"></div></div></div>
 <p id="caseerr" class="msg" style="color:var(--red)" role="alert"></p>
-<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"><button type="button" class="btn" data-caseact="save">Save</button><button type="button" class="btn outline" data-caseact="assess">Assess</button><button type="button" class="btn outline" data-caseact="json">Download ICSR JSON</button><button type="button" class="btn outline" data-caseact="package">Download package (ZIP)</button><button type="button" class="btn outline" data-signopen="case" id="casesign">Signature…</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"><button type="button" class="btn" data-caseact="save">Save</button><button type="button" class="btn outline" data-caseact="assess">Assess</button><button type="button" class="btn outline" data-caseact="json">Download ICSR JSON</button><button type="button" class="btn outline" data-caseact="package">Download package (ZIP)</button><button type="button" class="btn outline" data-caseact="e2b">E2B(R3) XML</button><button type="button" class="btn outline" data-caseact="cioms">CIOMS I (PDF)</button><button type="button" class="btn outline" data-caseact="fhir">FHIR JSON</button><button type="button" class="btn outline" data-caseact="csv">Line listing (CSV)</button><button type="button" class="btn outline" data-signopen="case" id="casesign">Signature…</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div>
 <p class="sub" style="margin-top:10px">Human-in-the-loop: values pre-filled from the article are only proposals. Causality and QC are aids; a qualified reviewer decides.</p></dialog>
 <dialog id="signdlg" style="width:min(640px,94vw)"><h2 id="signtitle">Electronic signature</h2><div id="signbody"></div><p id="signerr" class="msg" style="color:var(--red)" role="alert"></p></dialog>
 <dialog id="linkdlg"><h2 id="linktitle"></h2><p id="linknote" class="sub"></p><div style="display:grid;gap:12px"><input id="linkvalue" readonly aria-label="Link"><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" id="linkcopy">Copy link</button><button type="button" class="btn outline" id="linkshare">Share…</button><button type="button" class="btn outline" id="linkclose">Done</button></div></div></dialog>
@@ -2182,7 +2500,7 @@ const paths = {
   Batches:'<path d="m12 3 9 5-9 5-9-5 9-5z"/><path d="m3 13 9 5 9-5"/>',
   Watchlists:'<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   Settings:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
-  "ICSR Cases":'<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>',
+  "Synchrony":'<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>',
   Audit:'<path d="M9 12l2 2 4-4M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
   Library:'<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   Account:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
@@ -2191,7 +2509,7 @@ const paths = {
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.","ICSR Cases":"Individual case safety reports started from published articles."};
+const subtitles = {Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -2293,7 +2611,7 @@ function caseForm(){
 function renderCase(){
   curCase.data.events.forEach(e=>{const b=blankEvent();Object.keys(b).forEach(k=>{if(!(k in e))e[k]=b[k];});});
   const art=data.articles[curCase.pmid]||{};
-  $("casehead").innerHTML='<div><b style="font-size:18px">'+esc(curCase.number)+'</b> <span class="sub">from PMID '+esc(curCase.pmid)+'</span><div class="sub">'+esc(art.title||"")+'</div></div><label style="min-width:240px">Status<select id="casestatus">'+data.config.caseStatuses.map(s=>'<option'+(s===curCase.status?" selected":"")+'>'+esc(s)+'</option>').join("")+'</select></label>';
+  $("casehead").innerHTML='<div><b style="font-size:18px">'+esc(curCase.number)+'</b> <span class="sub">from PMID '+esc(curCase.pmid)+'</span><div class="sub">'+esc(art.title||"")+'</div></div><button type="button" class="btn outline sm" data-backtolit="1" title="Open the article in LiteraSift">Open article in LiteraSift</button><label style="min-width:240px">Status<select id="casestatus">'+data.config.caseStatuses.map(s=>'<option'+(s===curCase.status?" selected":"")+'>'+esc(s)+'</option>').join("")+'</select></label>';
   $("casebody").innerHTML=caseForm();
   $("caseassess").innerHTML=assessmentHtml(curAssess);
   $("caseerr").textContent="";
@@ -2327,9 +2645,9 @@ async function downloadCase(format){
   collectCase();
   const res=await fetch("/api/case-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:curCase.id,format})});
   if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||"Export failed.");}
-  const link=document.createElement("a");link.href=URL.createObjectURL(await res.blob());link.download=curCase.number+(format==="package"?"-package.zip":".json");link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
+  const link=document.createElement("a");link.href=URL.createObjectURL(await res.blob());link.download=((/filename="([^"]+)"/.exec(res.headers.get("Content-Disposition")||"")||[])[1])||(curCase.number+(format==="package"?"-package.zip":".json"));link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
 }
-let libNumbers=null, libSortFor="";
+let libNumbers=null, libSortFor="", synFilter="all";
 let extracting=null, pullRun="", libPath="/", auditData=null, auditMonth=new Date().toISOString().slice(0,7), auditQ="", auditAction="";
 function drawAudit(){
   const box=$("auditbody");if(!box)return;
@@ -2526,7 +2844,7 @@ function applyFilter(items){
 function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","ICSR Cases","Batches","Watchlists","Team","Audit","Settings"]:["My Queue","ICSR Cases"]).concat(data.config.accounts?["Account"]:[]);
+  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Synchrony","Batches","Watchlists","Team","Audit","Settings"]:["My Queue","Synchrony"]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   libNumbers=null;
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
@@ -2561,14 +2879,34 @@ function render() {
     html=panel("Pull articles from PubMed",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div class="wide" style="display:flex;gap:16px;flex-wrap:wrap;grid-column:1/-1"><span class="sub">Narrow with PubMed filters:</span><label class="check"><input type="checkbox" name="humans">&nbsp;Humans only</label><label class="check"><input type="checkbox" name="caseReports">&nbsp;Case reports only</label><label class="check"><input type="checkbox" name="english">&nbsp;English only</label><label class="check"><input type="checkbox" name="noReviews">&nbsp;Exclude reviews</label></div><div><button class="btn">Pull articles</button> <button type="button" class="btn outline" data-suggest="1">Suggest synonyms &amp; brands</button></div></form><div id="suggest"></div>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+'<div id="progress"></div>'+
       panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>':""]),"No pulls yet."),"",true);
   }
-  if(tab==="ICSR Cases"){
-    const cs=(data.cases||[]).slice().sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt));
-    const stColor={"Ready for medical review":"blue","Sent to PV Nexus":"green"};
+  if(tab==="Synchrony"){
+    const me=data.viewer.email, all=(data.cases||[]).slice().sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)), today=new Date().toISOString().slice(0,10);
+    const closed=c=>c.status==="Sent to PV Nexus"||c.status==="Closed: not a valid ICSR", openCases=all.filter(c=>!closed(c));
+    const left=c=>c.dueAt?Math.round((Date.parse(c.dueAt)-Date.parse(today))/864e5):null;
+    const signed=c=>(c.signatures||[]).some(x=>!x.superseded);
+    const filters={all:["Open",openCases],mine:["Mine",openCases.filter(c=>c.assignee===me)],unassigned:["Unassigned",openCases.filter(c=>!c.assignee)],overdue:["Overdue",openCases.filter(c=>left(c)!==null&&left(c)<0)],soon:["Due in 3 days",openCases.filter(c=>left(c)!==null&&left(c)>=0&&left(c)<=3)],review:["Ready for review",openCases.filter(c=>c.status==="Ready for medical review")],signed:["Signed",all.filter(signed)],done:["Closed or sent",all.filter(closed)]};
+    if(!filters[synFilter])synFilter="all";
+    const shown=filters[synFilter][1], stColor={"Ready for medical review":"blue","Sent to PV Nexus":"green"}, manager=data.viewer.role==="manager";
+    const people=(data.profiles||[]).filter(p=>p.active);
+    const tiles='<div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin-bottom:14px">'+Object.entries(filters).map(([k,f])=>'<button type="button" class="card" data-synfilter="'+k+'" style="text-align:left;cursor:pointer;padding:10px 12px;'+(k===synFilter?"border-color:var(--ring);box-shadow:0 0 0 2px #0f766e33":"")+(k==="overdue"&&f[1].length?";border-color:var(--red)":"")+'"><div class="sub">'+esc(f[0])+'</div><div style="font-size:22px;font-weight:600">'+f[1].length+'</div></button>').join("")+'</div>';
     const ready=Object.values(data.articles).filter(a=>a.fullTextStatus==="Captured"&&a.fullTextKey&&(a.events||[]).length&&!(data.cases||[]).some(c=>c.pmid===a.id)).length;
-    html=panel("Full-text intake",'<div class="row"><span>'+ready+' article'+(ready===1?"":"s")+' with stored full text and detected events '+(ready===1?"is":"are")+' not in the workbench yet.'+(data.config.autoIcsr?' New ones are added automatically.':' Automatic adding is off (Settings).')+'</span><button class="btn" data-icsrintake="1"'+(ready?"":" disabled")+'>Add to ICSR workbench</button></div>','Each article becomes a draft case. Events, drug actions and patient details are read from the abstract and the case section of the full text, and each value keeps the exact sentence it came from.')+panel("ICSR cases",table(["Case","Article","Product · event","Status","Minimum criteria","QC",""],cs.map(c=>{const a=c.assessment||{},d=c.data,sp=(d.products.find(p=>p.role==="suspect")||{name:{}}).name.value||"—",ev=((d.events[0]||{}).verbatim||{}).value||"—",art=data.articles[c.pmid]||{};
-      return ['<b>'+esc(c.number)+'</b>','<a href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,90))+'</a><div class="sub">PMID '+esc(c.pmid)+'</div>',esc(sp)+" · "+esc(ev),badge(c.status,stColor[c.status]||""),a.valid?badge("Valid ICSR","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"),(a.score??"")+" / 100",'<button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>'];}),
-      "No cases yet. Open an article's Review dialog and choose Create ICSR case when it reports a patient with an adverse event."),"",true)+
-      panel("How it works",'<div class="row"><span>Start</span><span class="sub">Create a case from a screened article; it is pre-filled with the citation, first author as reporter, the molecule as suspect product, and likely special situations.</span></div><div class="row"><span>Complete</span><span class="sub">Add patient, product and event details from the article or its full text. The four minimum criteria, QC findings, causality suggestion and follow-up questions update as you assess.</span></div><div class="row"><span>Hand over</span><span class="sub">Download the case as PV Nexus ICSR JSON, or a package with the citation, assessment and source full text.</span></div>'+(data.config.pvNexus.configured?'<div class="row"><span>PV Nexus API</span>'+badge("Connected","green")+'</div>':""));
+    const intake='<div class="row"><span>'+ready+' article'+(ready===1?"":"s")+' with stored full text and detected events '+(ready===1?"is":"are")+' not in Synchrony yet.'+(data.config.autoIcsr?' New ones are added automatically.':' Automatic adding is off (Settings).')+'</span><button class="btn" data-icsrintake="1"'+(ready?"":" disabled")+'>Add to Synchrony</button></div>'+
+      '<div class="row"><span>'+openCases.filter(c=>!c.assignee).length+' open case'+(openCases.filter(c=>!c.assignee).length===1?"":"s")+' without an assignee.'+(data.config.autoAssignCases?' New cases are assigned automatically to the reviewer with the fewest open cases.':' Automatic assignment is off (Settings).')+'</span>'+(manager?'<button class="btn outline" data-autoassign="1">Assign unassigned now</button>':"")+'</div>'+
+      '<div class="row"><span>Export the cases shown in this list.</span><span style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn outline sm" data-synexport="csv">Line listing (CSV)</button><button class="btn outline sm" data-synexport="e2b">E2B(R3) batch (XML)</button></span></div>';
+    const rows=shown.map(c=>{
+      const a=c.assessment||{},d=c.data,sp=(d.products.find(p=>p.role==="suspect")||{name:{}}).name.value||"—",ev=((d.events[0]||{}).verbatim||{}).value||"—",art=data.articles[c.pmid]||{},dl=left(c);
+      const who=manager?'<select data-assignsel="'+esc(c.id)+'" aria-label="Assignee"><option value="">Unassigned</option>'+people.map(p=>'<option value="'+esc(p.email)+'"'+(p.email===c.assignee?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select>':esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||"Unassigned");
+      const due=c.dueAt?badge((dl<0?Math.abs(dl)+" d overdue":dl===0?"due today":dl+" d left")+" · "+c.dueAt,closed(c)?"":dl<0?"red":dl<=3?"amber":"green"):'<span class="sub">no date</span>';
+      return ['<b>'+esc(c.number)+'</b>'+(signed(c)?' <span class="badge green" title="Signed">signed</span>':""),'<a href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,80))+'</a><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.molecule||"")+'</div>',esc(sp)+" · "+esc(ev),who,due,badge(c.status,stColor[c.status]||""),(a.valid?badge("Valid","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"))+'<div class="sub">QC '+(a.score??"")+' / 100</div>','<button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>'];});
+    const S=data.series||{total:0,events:[],products:[],countries:[],sex:[],ages:[],monthly:[],serious:[],fatal:[],trend:{hikes:[]}};
+    const bars=(list)=>list.length?list.map(x=>'<div class="row" title="'+esc(x.cases.join(", "))+'"><span>'+esc(x.key)+'</span><span class="sub">'+x.count+' case'+(x.count===1?"":"s")+' · '+esc(x.cases.slice(0,4).join(", "))+(x.cases.length>4?"…":"")+'</span></div>').join(""):'<div class="empty">No data yet.</div>';
+    const months=S.monthly.map(m=>'<span class="badge'+((S.trend.hikes||[]).includes(m.month)?" red":"")+'" title="'+esc(m.cases.join(", "))+'">'+esc(m.month)+': '+m.count+'</span>').join(" ");
+    html=tiles+panel("Case tracker",table(["Case","Article","Product · event","Assignee","Reporting due","Status","Validity",""],rows,"No cases in this view."),"",true)+
+      panel("Intake and assignment",intake)+
+      panel("Case series summary",'<div class="row"><span><b>'+S.total+'</b> cases · <b>'+S.serious.length+'</b> serious · <b>'+S.fatal.length+'</b> fatal</span><span class="sub">Counted from the case fields. Hover a line to see which cases it counts.</span></div>'+
+        '<div style="display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))"><div><h3 style="margin:8px 0">Events</h3>'+bars(S.events)+'</div><div><h3 style="margin:8px 0">Suspect products</h3>'+bars(S.products)+'</div><div><h3 style="margin:8px 0">Countries</h3>'+bars(S.countries)+'</div><div><h3 style="margin:8px 0">Age and sex</h3>'+bars(S.ages)+bars(S.sex)+'</div></div>'+
+        '<h3 style="margin:14px 0 6px">Cases received per month</h3><div class="chips">'+(months||'<span class="sub">No cases yet.</span>')+'</div><p class="sub" style="margin-top:8px">'+esc(S.trend.basis||"")+(S.monthly.length?" Median "+S.trend.median+", spread "+S.trend.mad+", upper limit "+S.trend.upper+" cases per month (median + 2 x scaled MAD).":"")+(S.trend.hikes&&S.trend.hikes.length&&S.monthly.length>=4?' <b style="color:var(--red)">Above the limit: '+esc(S.trend.hikes.join(", "))+'.</b>':"")+'</p>',"Deterministic: no model writes these figures.")+
+      panel("How Synchrony works",'<div class="row"><span>Intake</span><span class="sub">Articles from LiteraSift with stored full text and detected events become draft cases, pre-filled with the exact sentences they came from. Cases can also be started from the Review dialog.</span></div><div class="row"><span>Assign</span><span class="sub">Each case goes to the molecule owner, or the reviewer with the fewest open cases. Managers can reassign from the tracker.</span></div><div class="row"><span>Track</span><span class="sub">The reporting due date comes from the country, seriousness and marketing-authorisation record. Overdue and due-soon cases are flagged.</span></div><div class="row"><span>Review and sign</span><span class="sub">Complete the case, code the events, resolve QC findings, then sign. Signed cases are locked.</span></div><div class="row"><span>Export</span><span class="sub">E2B(R3) XML, CIOMS I (PDF), FHIR JSON, line listing (CSV), PV Nexus JSON, or a full package.</span></div>'+(data.config.pvNexus&&data.config.pvNexus.url?'<div class="row"><span>PV Nexus</span><span class="sub">Checks also run on your PV Nexus backend.</span></div>':""));
   }
   if(tab==="Audit"){
     const months=[...Array(12)].map((_,i)=>{const d=new Date();d.setDate(1);d.setMonth(d.getMonth()-i);return d.toISOString().slice(0,7);});
@@ -2629,7 +2967,7 @@ function render() {
       "Unpaywall requires a contact email on each request; it is sent to Unpaywall only. Every article with a DOI gets an open-access status (gold, hybrid, green, bronze or closed). Permissively licensed PDFs are stored, other open copies are linked. Closed articles are re-checked every 30 days."+(data.config.unpaywallFromEnv?" The email is set by the server environment (UNPAYWALL_EMAIL).":""))+
     panel("Important medical events (IME list)",'<div class="row"><span>Status</span>'+(data.config.ime&&data.config.ime.loaded?badge("Loaded: MedDRA "+data.config.ime.version,"green"):badge("Not loaded","amber"))+'</div>'+
       (data.config.ime&&data.config.ime.loaded?'<div class="sub" style="margin:6px 0">'+esc(data.config.ime.reference||"")+(data.config.ime.released?" · released "+esc(data.config.ime.released):"")+' · '+data.config.ime.count+' terms ('+data.config.ime.added+' added in this version, '+data.config.ime.demoted+' demoted terms)</div>':"")+
-      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0"><input type="file" id="imefile" accept=".json,.csv,.txt"><button type="button" class="btn" data-imeup="1">Upload list</button>'+(data.config.ime&&data.config.ime.loaded?'<button type="button" class="btn outline" data-imeclear="1">Remove list</button>':"")+'</div>'+
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0"><input type="file" id="imefile" accept=".json,.csv,.txt,.xlsx"><button type="button" class="btn" data-imeup="1">Upload list</button>'+(data.config.ime&&data.config.ime.loaded?'<button type="button" class="btn outline" data-imeclear="1">Remove list</button>':"")+'</div>'+
       '<div class="sub" style="margin-top:6px">Promote a term (reviewer-added important medical event)</div><div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0"><input id="imept" placeholder="MedDRA preferred term"><input id="imenote" placeholder="Note (optional)"><button type="button" class="btn outline" data-imepromo="1">Promote</button></div>'+
       (data.config.imePromotions||[]).map(p=>'<div class="row"><span>'+esc(p.pt_name)+'<div class="sub">'+esc(p.note||"")+' '+esc((p.promoted_at||"").slice(0,10))+'</div></span><button type="button" class="btn outline sm" data-imeunpromo="'+esc(p.pt_name)+'">Remove</button></div>').join(""),
       "Events found in articles are matched against the EMA list of important medical events (ICH E2A criterion 6, other medically important condition). Upload PV Nexus's ime-meddra.json (it holds MedDRA 29.1, EMA/211097/2026) or a CSV/TXT with one preferred term per line. The list is stored with your data, not in the source code, because MedDRA content is licensed. Matching uses preferred-term wording, so lay phrases may need MeSH or PubTator hints or a promoted term.")+
@@ -2637,7 +2975,7 @@ function render() {
       "There is no open worldwide source for marketing-authorisation status, so this table is yours to maintain. The country decides the regulator, whether the product is authorised there, and the reporting clock shown on ICSR cases (default 15 days for serious and 90 for non-serious cases unless a row says otherwise; confirm with local regulations). Statuses are read as Authorised, Not authorised, Withdrawn or Under review.")+
     panel("PV Nexus (ICSR processing)",'<form class="grid" data-route="settings"><label>PV Nexus API address (optional)<input name="pvNexusUrl" value="'+esc((data.config.pvNexus||{}).url||"")+'" placeholder="https://your-pv-nexus-backend"'+((data.config.pvNexus||{}).urlFromEnv?" disabled":"")+'></label><label>API token (optional)<input type="password" name="pvNexusToken" autocomplete="off" placeholder="'+((data.config.pvNexus||{}).tokenSet?"Token is set; leave blank to keep it":"Sent as a Bearer token if your gateway needs one")+'"></label><div><button class="btn">Save</button>'+((data.config.pvNexus||{}).tokenSet?' <button type="button" class="btn outline" data-pvremove="1">Remove token</button>':"")+'</div></form>',
       "ICSR cases are assessed here with a port of PV Nexus's deterministic rules (validity, QC, causality suggestion, follow-up questions), checked to give identical results. If you enter the address of a PV Nexus backend, the same checks are run by it instead, and LiteraSift falls back to the local rules if it is unreachable.")+
-    panel("ICSR workbench intake",'<form class="grid" data-route="settings"><label>Add full-text articles automatically<select name="autoIcsr"><option value="on"'+(data.config.autoIcsr?" selected":"")+'>On: draft a case for each article with stored full text and detected events</option><option value="off"'+(data.config.autoIcsr?"":" selected")+'>Off: add them with the button on the ICSR tab</option></select></label><div><button class="btn">Save</button></div></form>')+
+    panel("Synchrony (ICSR workbench)",'<form class="grid" data-route="settings"><label>Add full-text articles automatically<select name="autoIcsr"><option value="on"'+(data.config.autoIcsr?" selected":"")+'>On: draft a case for each article with stored full text and detected events</option><option value="off"'+(data.config.autoIcsr?"":" selected")+'>Off: add them with the button on the Synchrony tab</option></select></label><label>Assign new cases automatically<select name="autoAssignCases"><option value="on"'+(data.config.autoAssignCases?" selected":"")+'>On: molecule owner, else the reviewer with the fewest open cases</option><option value="off"'+(data.config.autoAssignCases?"":" selected")+'>Off: managers assign by hand</option></select></label><label>E2B sender identifier<input name="senderId" value="'+esc((data.config.e2b||{}).sender||"")+'" placeholder="Your organisation ID (N.2.r.2)"></label><label>E2B receiver identifier<input name="receiverId" value="'+esc((data.config.e2b||{}).receiver||"")+'" placeholder="Regulator or partner ID (N.2.r.3)"></label><div><button class="btn">Save</button></div></form>',"E2B(R3) files carry these identifiers in the message header.")+
     panel("NCBI / PubMed access",'<form class="grid" data-route="settings"><label>Contact email for NCBI<input type="email" name="ncbiEmail" value="'+esc((data.config.ncbi||{}).email||"")+'" placeholder="you@example.com"'+((data.config.ncbi||{}).emailFromEnv?" disabled":"")+'></label><label>NCBI API key (optional)<input type="password" name="ncbiApiKey" autocomplete="off" placeholder="'+((data.config.ncbi||{}).keySet?"Key is set; leave blank to keep it":"Paste a free key to allow 10 requests a second")+'"'+((data.config.ncbi||{}).keyFromEnv?" disabled":"")+'></label><div><button class="btn">Save</button>'+(((data.config.ncbi||{}).keySet&&!(data.config.ncbi||{}).keyFromEnv)?' <button type="button" class="btn outline" data-ncbiremove="1">Remove key</button>':"")+'</div></form>',
       "PubMed is read through NCBI's E-utilities only; its web pages are never scraped, which NCBI forbids. NCBI asks automated tools to identify themselves with a contact email, and allows 3 requests a second, or 10 with a free API key (create one in your NCBI account settings). The key is stored with the app data; for a server install it is safer in /etc/literasift.env as NCBI_API_KEY.")+
     panel("Sources",(data.config.sources||[]).map(x=>'<div class="row"><span><b>'+esc(x.label)+'</b><div class="sub">'+esc(x.note)+'</div></span>'+(x.active?badge("Active","green"):badge("Not enabled","amber"))+'</div>').join(""),
@@ -2674,6 +3012,9 @@ function render() {
   animate();
   drawProgress();
   if(tab==="Watchlists"&&$("rkrows")){rkAddRow(1,20);rkAddRow(21,30);}
+  if(tab==="Synchrony"){
+    document.querySelectorAll("[data-assignsel]").forEach(el=>{el.onchange=()=>api("case-assign",{ids:[el.dataset.assignsel],assignee:el.value}).then(()=>{message(el.value?"Case assigned.":"Case unassigned.");return refresh();}).catch(e=>message(e.message,true));});
+  }
   if(tab==="Audit"){
     $("auditmonth").onchange=e=>{auditMonth=e.target.value;loadAudit();};
     $("auditq").oninput=e=>{auditQ=e.target.value;drawAudit();};
@@ -2728,7 +3069,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -2759,7 +3100,7 @@ document.addEventListener("click",event=>{
   if(target.dataset.imeup){
     const file=$("imefile").files[0];if(!file){message("Choose the IME file first.",true);return;}
     if(file.size>5000000){message("That file is too large for an IME list.",true);return;}
-    target.disabled=true;file.text().then(text=>api("ime-upload",{text,filename:file.name})).then(r=>{message("IME list loaded: "+r.info.label+", "+r.info.count+" terms. Events are re-detected in the background.");return refresh();}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;
+    target.disabled=true;(/\.xlsx$/i.test(file.name)?file.arrayBuffer().then(buf=>{let bin="";const u=new Uint8Array(buf);for(let i=0;i<u.length;i+=8192)bin+=String.fromCharCode.apply(null,u.subarray(i,i+8192));return api("ime-upload",{base64:btoa(bin),filename:file.name});}):file.text().then(text=>api("ime-upload",{text,filename:file.name}))).then(r=>{message("IME list loaded: "+r.info.label+", "+r.info.count+" terms. Events are re-detected in the background.");return refresh();}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;
   }
   if(target.dataset.imeclear){if(!confirm("Remove the stored IME list? Important-medical-event flags will disappear until a list is loaded."))return;api("ime-clear",{}).then(()=>{message("IME list removed.");return refresh();}).catch(e=>message(e.message,true));return;}
   if(target.dataset.imepromo){const pt=$("imept").value.trim();if(!pt){message("Enter the MedDRA preferred term.",true);return;}api("ime-promote",{pt_name:pt,note:$("imenote").value}).then(()=>{message("Term promoted.");return refresh();}).catch(e=>message(e.message,true));return;}
@@ -2769,6 +3110,15 @@ document.addEventListener("click",event=>{
   if(target.dataset.opencase){
     event.preventDefault();const c=(data.cases||[]).find(x=>x.id===target.dataset.opencase);if(!c)return;
     api("case-assess",{id:c.id}).then(r=>{if($("dialog").open)$("dialog").close();openCaseData(c,r.assessment);}).catch(e=>message(e.message,true));return;
+  }
+  if(target.dataset.backtolit){const item=(data.assignments||[]).find(x=>x.pmid===curCase.pmid);if(!item){message("That article is not in your queue.",true);return;}$("casedlg").close();const open=document.querySelector('[data-review="'+item.id+'"]');if(open)open.click();else{tab=data.viewer.role==="manager"?"All Assignments":"My Queue";render();}return;}
+  if(target.dataset.synfilter){synFilter=target.dataset.synfilter;render();return;}
+  if(target.dataset.autoassign){target.disabled=true;api("cases-autoassign",{}).then(async r=>{await refresh();message(r.moved+" case"+(r.moved===1?"":"s")+" assigned.");}).catch(e=>{message(e.message,true);target.disabled=false;});return;}
+  if(target.dataset.synexport){
+    const ids=(data.cases||[]).filter(c=>{const s=synFilter;return s==="all"?!["Sent to PV Nexus","Closed: not a valid ICSR"].includes(c.status):s==="mine"?c.assignee===data.viewer.email:s==="unassigned"?!c.assignee:true;}).map(c=>c.id);
+    target.disabled=true;
+    fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:target.dataset.synexport,ids:ids.length?ids:undefined})}).then(async res=>{if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||"Export failed.");}const name=(/filename="([^"]+)"/.exec(res.headers.get("Content-Disposition")||"")||[])[1]||"export";const link=document.createElement("a");link.href=URL.createObjectURL(await res.blob());link.download=name;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    return;
   }
   if(target.dataset.icsrintake){
     target.disabled=true;
@@ -2787,7 +3137,7 @@ document.addEventListener("click",event=>{
     target.disabled=true;
     (async()=>{
       try{
-        if(act==="json"||act==="package"){await downloadCase(act);}
+        if(["json","package","e2b","cioms","fhir","csv"].includes(act)){await downloadCase(act);}
         else if(act==="delete"){if(!confirm("Delete "+curCase.number+"? This cannot be undone (the audit trail keeps a record)."))return;await api("case-delete",{id:curCase.id});$("casedlg").close();await refresh();message("Case deleted.");}
         else{
           collectCase();
@@ -2961,7 +3311,7 @@ document.addEventListener("click",event=>{
       (((art.events||[]).length)?'<div class="sub" style="margin:10px 0 4px">Detected events'+(data.config.ime&&data.config.ime.loaded?" (IME list: MedDRA "+esc(data.config.ime.version)+")":" (load the IME list in Settings to flag important medical events)")+'</div>'+art.events.map(e=>'<div class="row" style="align-items:flex-start"><span>'+(e.ime?badge("IME","red")+" ":"")+'<b>'+esc(e.term)+'</b>'+(e.withDrug?" "+badge("with "+(active.molecules[0]||"drug"),"blue"):"")+'<div class="sub">'+esc((e.kinds||[]).join(" · "))+(e.evidence?" · “"+esc(e.evidence)+"”":"")+'</div></span></div>').join(""):"")+
       (artCountry(art)?'<div class="sub" style="margin:10px 0 4px">Country</div><div class="chips"><span class="badge">'+esc(artCountry(art))+' · '+esc(artCountryBasis(art))+'</span>'+(art.patientCountry?'<span class="badge">Patient: '+esc(art.patientCountry.name)+'</span>':'')+(art.affiliationCountry?'<span class="badge">Author affiliation: '+esc(art.affiliationCountry)+'</span>':'')+(art.journalCountry?'<span class="badge">Journal: '+esc(art.journalCountry)+'</span>':'')+maChip(active.molecules,artCountry(art))+'</div>':'')+
       ((art.linkOut||[]).length?'<div class="sub" style="margin:10px 0 4px">PubMed LinkOut'+(art.pubmedCitedBy!==undefined?" · cited by "+art.pubmedCitedBy+" in PubMed":"")+'</div><div class="chips">'+art.linkOut.map(l=>'<a class="badge '+(l.free?"green":"blue")+'" target="_blank" rel="noopener" href="'+esc(l.url)+'">'+esc((l.free?"Free: ":"")+l.provider)+'</a>').join("")+'</div>':"")+
-      '<div style="margin-top:10px"><button type="button" class="btn outline sm" data-newcase="'+esc(active.pmid)+'">Create ICSR case</button> '+(data.cases||[]).filter(c=>c.pmid===active.pmid).map(c=>'<a href="#" data-opencase="'+esc(c.id)+'">'+esc(c.number)+'</a>').join(" · ")+'</div>'+
+      '<div style="margin-top:10px"><button type="button" class="btn outline sm" data-newcase="'+esc(active.pmid)+'">Send to Synchrony</button> '+(data.cases||[]).filter(c=>c.pmid===active.pmid).map(c=>'<a href="#" data-opencase="'+esc(c.id)+'">'+esc(c.number)+'</a>').join(" · ")+'</div>'+
       (art.fullTextKey?'<div style="margin-top:8px"><a href="/api/full-text/'+esc(active.pmid)+'">Download full text</a></div>':"");
     $("review").elements.status.value=active.status;
     $("review").elements.note.value=active.note||"";
@@ -2973,6 +3323,7 @@ $("linkclose").onclick=()=>$("linkdlg").close();
 $("linkcopy").onclick=async()=>{try{await navigator.clipboard.writeText($("linkvalue").value);message("Link copied.");}catch{$("linkvalue").select();message("Press and hold the link to copy it.");}};
 $("linkshare").onclick=()=>navigator.share({title:"LiteraSift",url:$("linkvalue").value}).catch(()=>{});
 document.addEventListener("submit",async event=>{
+  if(event.target.getAttribute("action")==="/logout")return;   // a normal form post (host sign-out); the app must not intercept it
   event.preventDefault();
   const form=event.target, button=form.querySelector("button");
   const body=Object.fromEntries(new FormData(form));
@@ -3025,7 +3376,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  libraryLayout, applyDetection, audit, verifyAuditChain, auditAnchor,
+  libraryLayout, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);
