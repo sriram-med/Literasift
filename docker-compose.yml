@@ -1,0 +1,15 @@
+# Hostinger Docker deployment: the app plus Caddy for HTTPS. Copy .env.example to .env and fill it in first.
+services:
+  literasift:
+    build: { context: ., args: { WITH_OCR: "${WITH_OCR:-0}" } }
+    restart: unless-stopped
+    env_file: .env
+    environment: { DATA_DIR: /data, HOST: 0.0.0.0, PORT: "8787" }
+    volumes: [ "literasift-data:/data" ]
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: [ "80:80", "443:443" ]
+    depends_on: [ literasift ]
+    volumes: [ "./Caddyfile:/etc/caddy/Caddyfile:ro", "caddy-data:/data" ]
+volumes: { literasift-data: {}, caddy-data: {} }

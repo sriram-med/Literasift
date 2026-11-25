@@ -18,7 +18,13 @@ const secret = e.SESSION_SECRET || "", runToken = e.RUN_TOKEN || "";
 if (secret.length < 32 || runToken.length < 32) { console.error("SESSION_SECRET and RUN_TOKEN must each be at least 32 characters."); process.exit(1); }
 const secureCookie = e.COOKIE_SECURE !== "false";
 const publicUrl = String(e.PUBLIC_URL || "").replace(/\/+$/, "");
-const env = { BUCKET: new FileBucket(dataDir + "/objects"), RUN_TOKEN: runToken, UNPAYWALL_EMAIL: e.UNPAYWALL_EMAIL, CROSSREF_EMAIL: e.CROSSREF_EMAIL,
+// The operational store is SQLite once `node server/store-admin.mjs migrate` has been run; before that the file store is used as before. Article files always stay in the file store.
+import { existsSync } from "node:fs";
+import { SqliteBucket } from "./sqlitestore.mjs";
+const useSqlite = existsSync(dataDir + "/state.db") && e.STORE !== "file";
+const bucket = useSqlite ? new SqliteBucket(dataDir + "/state.db", dataDir + "/objects") : new FileBucket(dataDir + "/objects");
+console.log("Operational store: " + (useSqlite ? "SQLite (transactional, versioned)" : "file store (run server/store-admin.mjs migrate to move to SQLite)"));
+const env = { BUCKET: bucket, RUN_TOKEN: runToken, UNPAYWALL_EMAIL: e.UNPAYWALL_EMAIL, CROSSREF_EMAIL: e.CROSSREF_EMAIL,
   SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN, HOST_ACCOUNTS: true, AUDIT_ANCHOR_KEY: e.AUDIT_ANCHOR_KEY || createHmac("sha256", secret).update("literasift-audit-anchor").digest("hex"), LIBRARY_PATH: dataDir + "/library" };
 
 const pdfTextFn = await makePdfTextFn(), ocrFn = await makeOcrFn();
@@ -259,6 +265,19 @@ async function runScheduled() {
   }
   console.log(JSON.stringify({ time: new Date().toISOString(), batches: results.length, failed: results.filter(r => r.error).length, remaining: last?.remaining || 0, evidence: last?.evidence }));
 }
+// Daily consistent backup of the SQLite store with an integrity check; the newest 14 are kept.
+async function backupDaily() {
+  if (!useSqlite) return;
+  const { readdirSync, unlinkSync } = await import("node:fs");
+  const check = bucket.check();
+  if (!check.ok) { console.error("SQLITE INTEGRITY CHECK FAILED"); return; }
+  const done = bucket.backup(dataDir + "/backups/state-" + new Date().toISOString().slice(0, 10) + ".db");
+  const old = readdirSync(dataDir + "/backups").filter(n => /^state-.*\.db$/.test(n)).sort().slice(0, -14);
+  for (const name of old) for (const f of [name, name + ".sha256"]) try { unlinkSync(dataDir + "/backups/" + f); } catch { /* already gone */ }
+  console.log("Backup written: " + done.destination + " (" + done.bytes + " bytes, " + check.objects + " objects)");
+}
+setTimeout(() => backupDaily().catch(err => console.error("Backup:", err.message)), 90000);
+setInterval(() => backupDaily().catch(err => console.error("Backup:", err.message)), 24 * 3600000);
 // Verify the whole audit chain every day and record the result, so tampering is noticed without anyone having to look.
 async function verifyChainDaily() {
   const chain = await worker.verifyAuditChain(env);
