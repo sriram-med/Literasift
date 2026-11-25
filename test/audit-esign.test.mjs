@@ -514,3 +514,29 @@ test("retrieval keys are saved only by managers, validated, hidden from the page
   await t.call(MANAGER, "/api/settings", { coreApiKey: null });
   assert.equal(JSON.parse(await readFile(benchFile(t.dir), "utf8")).settings.coreApiKey, undefined);
 });
+
+test("PMID list parsing: one per line with optional names, comma lists, comments, duplicates", () => {
+  const list = worker.parsePmidList("# my list\n123456  Smith_2020\n789012\tJones 2021\n345678,901234, 555555\n123456\nnot a pmid\n");
+  assert.deepEqual(list.map(x => x.pmid), ["123456", "789012", "345678", "901234", "555555"]);
+  assert.equal(list[0].name, "Smith_2020"); assert.equal(list[1].name, "Jones 2021"); assert.equal(list[2].name, "");
+});
+
+test("batch by PMID list adds the articles to a portfolio, assigns them, reports PMIDs PubMed does not know, and is manager-only", async () => {
+  const t = await setup(), realFetch = globalThis.fetch;
+  globalThis.fetch = async url => {
+    const u = String(url);
+    if (u.includes("esummary")) return new Response(JSON.stringify({ result: { 111: { title: "Aciclovir case A", fulljournalname: "J A", pubdate: "2021", articleids: [{ idtype: "doi", value: "10.1234/a" }], pubtype: [] }, 222: { title: "Aciclovir case B", fulljournalname: "J B", pubdate: "2022", articleids: [], pubtype: [] }, uids: ["111", "222"] } }), { status: 200 });
+    if (u.includes("efetch")) return new Response("<PubmedArticleSet></PubmedArticleSet>", { status: 200 });
+    return new Response("", { status: 404 });
+  };
+  try {
+    assert.equal((await t.call(REVIEWER, "/api/pmid-batch", { text: "111", portfolio: "Antivirals" })).status, 403);
+    assert.equal((await t.call(MANAGER, "/api/pmid-batch", { text: "", portfolio: "Antivirals" })).status, 400);
+    const r = await t.call(MANAGER, "/api/pmid-batch", { text: "111 First_paper\n222\n999", portfolio: "Antivirals", molecule: "aciclovir" });
+    assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal(r.body.requested, 3); assert.deepEqual(r.body.missing, ["999"]); assert.equal(r.body.run.count, 2);
+    const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
+    assert.equal(bench.articles["111"].batchName, "First_paper"); assert.equal(bench.articles["111"].doi, "10.1234/a");
+    const item = bench.assignments.find(a => a.pmid === "111" && a.portfolio === "Antivirals"); assert.ok(item.reviewer); assert.deepEqual(item.molecules, ["aciclovir"]);
+    assert.equal(bench.runs[0].query, "PMID list (3 requested)");
+  } finally { globalThis.fetch = realFetch; }
+});

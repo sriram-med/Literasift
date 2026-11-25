@@ -111,6 +111,52 @@ async function importWatch(env, watch, from, to) {
     return run;
   });
 }
+// ---- Batch by PMID list (after Pubmed-Batch-Download, MIT, Copyright 2023 Bill Young Greenwald): a list of PMIDs, optionally with a name for each, goes through the whole
+// pipeline instead of being downloaded as loose files. One PMID per line (PMID, then an optional name), or a comma-separated list. ----
+function parsePmidList(text) {
+  const seen = new Set(), out = [];
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const tokens = line.trim().split(/[\t, ;]+/).filter(Boolean);
+    if (!tokens.length || tokens[0].startsWith("#")) continue;
+    const ids = tokens.every(t => /^\d{1,9}$/.test(t)) ? tokens : /^\d{1,9}$/.test(tokens[0]) ? [tokens[0]] : [];
+    const name = ids.length === 1 && tokens.length > 1 ? tokens.slice(1).join(" ").replace(/[^\w .()\-]+/g, "").trim().slice(0, 80) : "";
+    for (const pmid of ids) if (!seen.has(pmid) && out.length < 1000) { seen.add(pmid); out.push({ pmid, name }); }
+  }
+  return out;
+}
+async function importPmidList(env, list, portfolio, molecule) {
+  env = withSettings(env, (await load(env)).state);
+  const articles = {}, missing = [];
+  for (let offset = 0; offset < list.length; offset += 100) {
+    const chunk = list.slice(offset, offset + 100), ids = chunk.map(x => x.pmid);
+    const { result: summary } = await pubmed(env, "esummary", { id:ids.join(","), retmode:"json" });
+    const found = [];
+    for (const { pmid, name } of chunk) {
+      const citation = summary?.[pmid];
+      if (!citation?.title) { missing.push(pmid); continue; }
+      found.push(pmid);
+      articles[pmid] = { id:pmid, source:"PubMed", title:citation.title, journal:citation.fulljournalname, date:citation.pubdate, doi:citation.articleids?.find(a => a.idtype === "doi")?.value || "",
+        pmcid:citation.articleids?.find(a => a.idtype === "pmc")?.value || "", pubmedRetracted:(citation.pubtype || []).includes("Retracted Publication"), url:"https://pubmed.ncbi.nlm.nih.gov/" + pmid + "/", ...(name ? { batchName:name } : {}) };
+    }
+    const details = found.length ? await fetchPubmedDetails(env, found).catch(() => ({})) : {};
+    for (const id of found) if (details[id]) Object.assign(articles[id], details[id], { abstractSource:details[id].abstract ? "PubMed" : "", abstractCheckedAt:new Date().toISOString() });
+  }
+  const today = day(), ids = Object.keys(articles);
+  const run = await write(env, state => {
+    for (const [id, article] of Object.entries(articles)) state.articles[id] = { ...state.articles[id], ...article, pullQuery:"PMID list (" + list.length + ")", pullRange:today };
+    const made = { id:crypto.randomUUID(), source:"PubMed", portfolio, molecule, from:today, to:today, count:ids.length, ids, time:new Date().toISOString(), query:"PMID list (" + list.length + " requested)", status:"Imported" };
+    state.runs.unshift(made);
+    for (const id of ids) {
+      const existing = state.assignments.find(a => a.pmid === id && a.portfolio === portfolio);
+      if (existing) { if (molecule && !(existing.molecules || []).includes(molecule) && (existing.molecules || []).length < 20) (existing.molecules ||= []).push(molecule); continue; }
+      const item = { id:crypto.randomUUID(), pmid:id, portfolio, molecules:molecule ? [molecule] : [], reviewer:"", status:"Pending" };
+      allocate(state, item);
+      state.assignments.push(item);
+    }
+    return made;
+  });
+  return { run, missing };
+}
 async function execute(env, watch, from, to) {
   try { return await importWatch(env, watch, from, to); }
   catch (error) {
@@ -2685,6 +2731,13 @@ async function apiCore(request, env, path) {
     const run = await execute(env, watch, body.from, body.to);
     await collectEvidence(env, run.ids);
     return json(run);
+  } else if (path === "/api/pmid-batch") {
+    const list = parsePmidList(body.text), portfolio = String(body.portfolio || "").trim().slice(0, 80), molecule = String(body.molecule || "").trim().slice(0, 100);
+    if (!list.length) return json({ error:"Paste at least one PMID (digits), one per line, or comma separated." }, 400);
+    if (!portfolio) return json({ error:"Choose or type a portfolio for these articles." }, 400);
+    const { run, missing } = await importPmidList(env, list, portfolio, molecule);
+    await audit(env, { by:email, action:"import.pmids", target:portfolio + (molecule ? " · " + molecule : ""), detail:{ requested:list.length, found:run.count, not_found:missing.length } });
+    return json({ run, requested:list.length, missing });
   } else if (path === "/api/import") {
     const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
     const watch = state.watches.find(w => w.portfolio === portfolio && (w.molecule || "") === molecule);
@@ -3172,7 +3225,8 @@ function render() {
   if(tab==="Search & Pull"){
     const today=new Date().toISOString().slice(0,10), start=new Date(Date.now()-30*864e5).toISOString().slice(0,10);
     html=panel("Pull articles from PubMed",'<form class="grid" data-route="pull"><label>Molecule<input name="molecule" required placeholder="e.g. aciclovir"></label><label>Synonyms, brands (optional)<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio (optional)<input name="portfolio" placeholder="Defaults to the molecule name"></label><label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div class="wide" style="display:flex;gap:16px;flex-wrap:wrap;grid-column:1/-1"><span class="sub">Narrow with PubMed filters:</span><label class="check"><input type="checkbox" name="humans">&nbsp;Humans only</label><label class="check"><input type="checkbox" name="caseReports">&nbsp;Case reports only</label><label class="check"><input type="checkbox" name="english">&nbsp;English only</label><label class="check"><input type="checkbox" name="noReviews">&nbsp;Exclude reviews</label></div><div><button class="btn">Pull articles</button> <button type="button" class="btn outline" data-suggest="1">Suggest synonyms &amp; brands</button></div></form><div id="suggest"></div>',"Searches PubMed by the date each article was added, saves the molecule as a watchlist so new articles keep arriving daily, and assigns the results to reviewers.")+'<div id="progress"></div>'+
-      panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>'+(data.config.accounts?' <a class="btn outline sm" href="/host/run-tiles?run='+encodeURIComponent(r.id)+'" target="_blank" rel="noopener">Tile screenshot</a>':""):""]),"No pulls yet."),"",true);
+      panel("Batch by PMID list",'<form class="grid" data-route="pmid-batch"><label class="wide">PMIDs (one per line, optionally followed by a name; or comma separated)<textarea name="text" rows="5" required placeholder="123456  Smith_2020&#10;789012  Jones_2021&#10;345678,901234"></textarea></label><label>Portfolio<input name="portfolio" required list="pfopts" placeholder="Type or choose"><datalist id="pfopts">'+[...new Set((data.watches||[]).map(w=>w.portfolio))].map(p=>'<option value="'+esc(p)+'">').join("")+'</datalist></label><label>Molecule (optional)<input name="molecule"></label><div><button class="btn">Add and fetch full texts</button></div></form>',"For lists of articles you already have: each PMID is read from PubMed, enters the screening queue and Synchrony like any other article, and its full text is looked up in every open source. Afterwards, Recent pulls offers a list of the PMIDs that could not be fetched, in the same format, to try again once you have the files.")+
+      panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>'+(String(r.query||"").startsWith("PMID list")?' <button class="btn outline sm" data-unfetched="'+esc(r.id)+'">Unfetched list (TSV)</button>':"")+(data.config.accounts?' <a class="btn outline sm" href="/host/run-tiles?run='+encodeURIComponent(r.id)+'" target="_blank" rel="noopener">Tile screenshot</a>':""):""]),"No pulls yet."),"",true);
   }
   if(tab==="Synchrony"){
     const me=data.viewer.email, all=(data.cases||[]).slice().sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)), today=new Date().toISOString().slice(0,10);
@@ -3373,7 +3427,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -3416,6 +3470,13 @@ document.addEventListener("click",event=>{
     api("case-assess",{id:c.id}).then(r=>{if($("dialog").open)$("dialog").close();openCaseData(c,r.assessment);}).catch(e=>message(e.message,true));return;
   }
   if(target.dataset.backtolit){const item=(data.assignments||[]).find(x=>x.pmid===curCase.pmid);if(!item){message("That article is not in your queue.",true);return;}$("casedlg").close();const open=document.querySelector('[data-review="'+item.id+'"]');if(open)open.click();else{tab=data.viewer.role==="manager"?"All Assignments":"My Queue";render();}return;}
+  if(target.dataset.unfetched){
+    const run=data.runs.find(r=>r.id===target.dataset.unfetched);if(!run)return;
+    const rows=run.ids.filter(id=>!(data.articles[id]||{}).fullTextKey).map(id=>id+((data.articles[id]||{}).batchName?String.fromCharCode(9)+data.articles[id].batchName:""));
+    if(!rows.length){message("Every article in this list has a full text.");return;}
+    const link=document.createElement("a");link.href=URL.createObjectURL(new Blob([rows.join(NL)+NL],{type:"text/tab-separated-values"}));link.download="unfetched_pmids.tsv";link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
+    message(rows.length+" PMID"+(rows.length===1?"":"s")+" still without a full text.");return;
+  }
   if(target.dataset.authornote){
     const a=data.articles[target.dataset.authornote]||{},first=(a.authors||[])[0]||"author",note="Dear "+first+",\\n\\nI am writing to ask whether you could share a copy of your article \\""+(a.title||"")+"\\" ("+[a.journal,a.date].filter(Boolean).join(", ")+(a.doi?", DOI "+a.doi:"")+"). We review the safety literature for medicines and cannot access this article through our subscriptions. A PDF of the accepted or published version would be very helpful.\\n\\nThank you,\\n"+data.viewer.name;
     (navigator.clipboard?navigator.clipboard.writeText(note):Promise.reject()).then(()=>message("Request note copied. Paste it into an email to the corresponding author.")).catch(()=>{prompt("Copy this request note:",note);});return;
@@ -3669,9 +3730,10 @@ document.addEventListener("submit",async event=>{
     if(body.next!==body.confirm){message("The new passwords don't match.",true);return;}
     delete body.confirm;
   }
-  button.disabled=true;message(route==="import"||route==="pull"?"Retrieving PubMed citations…":"Saving…");
+  button.disabled=true;message(route==="import"||route==="pull"||route==="pmid-batch"?"Retrieving PubMed citations…":"Saving…");
   try {const result=await api(route,body);if(route==="review")$("dialog").close();await refresh();
     if(route==="pull"){pullRun=result.id;drawProgress();extractRun(result.id);}
+    if(route==="pmid-batch"){pullRun=result.run.id;drawProgress();extractRun(result.run.id);form.reset();message(result.run.count+" of "+result.requested+" article"+(result.requested===1?"":"s")+" added; looking for full texts."+(result.missing.length?" Not found in PubMed: "+result.missing.slice(0,10).join(", ")+(result.missing.length>10?"…":"")+".":""),result.missing.length>0);return;}
     if(route==="/host/invite"&&result.link)showLink("Invite link for "+body.email,(result.mailError?result.mailError+" ":"Email isn't configured. ")+"Send this link to them yourself. It works once and expires in 7 days.",result.link);
     if(route==="/host/change-password")form.reset();
     message(route==="assign-molecule"?result.moved+" article"+(result.moved===1?"":"s")+" assigned.":route==="/host/invite"?(result.existing?"Profile updated.":result.emailed?"Invite emailed to "+body.email+".":"Profile saved."):route==="/host/change-password"?"Password changed.":route==="recheck-access"?"Open-access check queued for all articles.":route==="import"?"Batch imported.":route==="pull"?result.count+" articles pulled for "+(result.molecule||result.portfolio)+".":route==="watches"?result.created+" molecule watchlists saved."+(result.skipped.length?" Skipped (invalid or too long): "+result.skipped.join(", "):""):"Saved.");}
@@ -3704,7 +3766,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  libraryLayout, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  libraryLayout, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);

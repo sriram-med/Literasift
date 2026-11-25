@@ -194,3 +194,7 @@ What stays closed appears on **Batches > Closed articles waiting for a full text
 ## More full-text sources (optional, with your own keys)
 
 Settings > **Publisher and aggregator access** takes a free **CORE** API key (open repository copies), a **Wiley** text-mining token and an **Elsevier** API key (plus optional institution token). Wiley and Elsevier return only what your institution is licensed to read; if your licence is tied to your campus network they may refuse requests from this server, and the article then shows "Not covered by your ... access". bioRxiv and medRxiv DOIs are read through their own API. Texts from licensed publishers are stored as restricted. Design after paperscraper (MIT); see `THIRD_PARTY_NOTICES.md`.
+
+## Batch by PMID list
+
+Search & Pull > **Batch by PMID list**: paste PMIDs (one per line, optionally followed by a name, or comma separated), choose a portfolio, and every article is read from PubMed, queued, assigned, and looked up for a full text. **Unfetched list (TSV)** on the pull gives the PMIDs still without a full text in the same format. Based on Pubmed-Batch-Download (MIT).

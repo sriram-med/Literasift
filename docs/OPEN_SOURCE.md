@@ -100,3 +100,9 @@ Shadow libraries (Sci-Hub and similar), browser extensions that fetch pirated co
 
 The official-interface fallbacks of paperscraper's PDF module are integrated as optional retrieval tiers, re-implemented in JavaScript: **Wiley text-mining API** and **Elsevier text-mining API** (each only with a token or key the user holds; they return only what the user's institution is licensed to read), and the **bioRxiv/medRxiv** details API (preprint full-text XML under its stated licence). **CORE** (free API key) was added alongside. Keys are set under Settings > Publisher and aggregator access and are never sent to the page.
 Not integrated: paperscraper's search over local dumps (bulk downloads), and its generic publisher page fetching, which does not respect paywalls and is the part that raises terms-of-use concerns.
+
+## Pubmed-Batch-Download (billgreenwald/Pubmed-Batch-Download, MIT, commit `11514cf`): integrated and extended
+
+The batch-by-PMID idea (a file or list of PMIDs with an optional name for each, a list of what could not be fetched in the same format, retries) is integrated as **Search & Pull > Batch by PMID list**.
+What it adds over the original script: the articles enter the screening queue, assignment, event detection and Synchrony; full texts are looked up in every open and keyed source LiteraSift has (PMC, Europe PMC, Unpaywall, Semantic Scholar, CORE, preprints, optional Wiley/Elsevier text-mining with your keys) with pacing, retries and progress; duplicates are skipped; PMIDs PubMed does not know are reported; the **Unfetched list (TSV)** can be fed back in later.
+Not integrated: the original's per-publisher page scraping (it reads each publisher's HTML to find a PDF link, which depends on the caller's campus IP address and is against many publishers' terms). Its author notes that the project is no longer maintained.
