@@ -2265,7 +2265,63 @@ function caseFromArticle(article, assignment, settings = {}) {
   });
   return built;
 }
-const caseClosed = c => c.status === "Sent to PV Nexus" || c.status === "Closed: not a valid ICSR";
+const caseClosed = c => c.status === "Sent to PV Nexus" || c.status === "Closed: not a valid ICSR" || Boolean(c.archived);
+// ---- Case classification, tags, folders, archive and universal search. Tags are labels people add; the formal seriousness and listedness fields stay in the case data. ----
+const STANDARD_TAGS = ["serious", "non-serious", "serious:death", "serious:life-threatening", "serious:hospitalization", "serious:disability", "serious:congenital-anomaly", "serious:other-medically-important", "listed", "unlisted", "listedness:unknown"];
+const normTag = t => String(t || "").toLowerCase().replace(/\s+/g, " ").trim();
+const TAG_CRITERIA = { "serious:death":"death", "serious:life-threatening":"life_threatening", "serious:hospitalization":"hospitalization", "serious:disability":"disability", "serious:congenital-anomaly":"congenital_anomaly", "serious:other-medically-important":"other_medically_important" };
+function caseClass(c) {
+  const events = c.data?.events || [], criteria = new Set(), tags = (c.tags || []).map(t => t.tag);
+  for (const e of events) for (const k of SERIOUS_FLAGS) if (e.seriousness?.[k]) criteria.add(k);
+  for (const t of tags) if (TAG_CRITERIA[t]) criteria.add(TAG_CRITERIA[t]);
+  const serious = criteria.size > 0 || tags.includes("serious") || tags.includes("serious:other");
+  const values = events.map(e => v(e.listedness) || v(e.expectedness)).filter(Boolean).map(x => x.toLowerCase());
+  let listedness = !values.length ? "unknown" : values.includes("unlisted") ? "unlisted" : values.every(x => x === "listed") ? "listed" : "unknown";
+  if (listedness === "unknown") listedness = tags.includes("unlisted") ? "unlisted" : tags.includes("listed") ? "listed" : "unknown";
+  return { serious, criteria:[...criteria], listedness };
+}
+function parseSearch(q) {
+  const terms = [], re = /(-?)(?:(\w+):)?(?:"([^"]+)"|(\S+))/g; let m;
+  while ((m = re.exec(String(q || "").slice(0, 300)))) { const field = m[2] && ["pmid", "case", "drug", "event", "tag", "status", "portfolio", "author", "journal", "doi", "patient", "assignee", "title", "text"].includes(m[2].toLowerCase()) ? m[2].toLowerCase() : "", text = (m[3] || m[4] || "").toLowerCase(); const word = field || !m[2] ? text : (m[2] + ":" + text).toLowerCase(); if (word) terms.push({ neg:m[1] === "-", field, text:word }); }
+  return terms.slice(0, 12);
+}
+function searchFields(state, c, a) {
+  const d = c.data || {}, evs = d.events || [], prods = d.products || [], folder = (state.caseFolders || []).find(f => f.id === c.folderId);
+  return { case:[c.number], pmid:[c.pmid], drug:[...prods.map(p => v(p.name)), c.molecule], event:evs.flatMap(e => [v(e.verbatim), v(e.pt)]), tag:(c.tags || []).map(t => t.tag), status:[c.status, c.archived ? "archived" : ""], portfolio:[c.portfolio], assignee:[c.assignee, ((state.profiles || []).find(p => p.email === c.assignee) || {}).name],
+    patient:[v(d.patient?.identifier), v(d.patient?.age), v(d.patient?.sex), ...(d.patient?.medical_history || []).map(h => h.value)], author:a?.authors || [], journal:[a?.journal], doi:[a?.doi], title:[a?.title], text:[a?.abstract, d.narrative?.text, c.notes, d.general_comments, folder?.name] };
+}
+function runSearch(state, viewer, body) {
+  const terms = parseSearch(body.q), f = body.filters && typeof body.filters === "object" ? body.filters : {}, scope = ["all", "articles", "cases"].includes(body.scope) ? body.scope : "all";
+  const caseOnly = Boolean(f.serious || f.listed || f.tag || f.folder || f.archived === "yes" || f.status || f.assignee), lower = x => String(x ?? "").toLowerCase();
+  const hit = (fields, all) => { let score = 0; for (const t of terms) { const pool = t.field ? (fields[t.field] || []) : all; const found = pool.some(x => lower(x).includes(t.text)); const exact = pool.some(x => lower(x) === t.text); if (t.neg ? found : !found) return 0; if (!t.neg) score += (exact ? 6 : 2) + (t.field ? 2 : 0); } return score || (terms.length ? 0 : 1); };
+  const isManager = viewer?.role === "manager", myItems = state.assignments.filter(a => mayAccess(state, viewer, a)), results = { articles:[], cases:[], counts:{} };
+  if (scope !== "cases" && !caseOnly) {
+    const ids = isManager ? Object.keys(state.articles) : [...new Set(myItems.map(a => a.pmid))];
+    for (const id of ids) { const a = state.articles[id]; if (!a) continue; const items = myItems.filter(x => x.pmid === id), all = [a.id, a.title, a.abstract, a.journal, a.doi, ...(a.authors || []), ...items.flatMap(x => [x.portfolio, ...(x.molecules || [])])];
+      if (f.portfolio && !items.some(x => x.portfolio === f.portfolio)) continue;
+      const score = hit({ pmid:[a.id], title:[a.title], author:a.authors || [], journal:[a.journal], doi:[a.doi], drug:items.flatMap(x => x.molecules || []), portfolio:items.map(x => x.portfolio), text:[a.abstract], status:items.map(x => x.status), assignee:items.map(x => x.reviewer), case:[], event:[], tag:[], patient:[] }, all);
+      if (score) results.articles.push({ kind:"article", pmid:id, title:a.title || "", journal:a.journal || "", date:a.date || "", authors:(a.authors || []).slice(0, 3), score, assignments:items.map(x => ({ id:x.id, portfolio:x.portfolio, reviewer:x.reviewer || "", status:x.status, disposition:x.disposition?.value || "" })), hasCase:(state.cases || []).some(c => c.pmid === id) }); }
+  }
+  if (scope !== "articles") {
+    for (const c of state.cases || []) {
+      if (!caseVisible(state, viewer, c)) continue;
+      const arch = Boolean(c.archived); if (f.archived === "yes" ? !arch : f.archived === "any" ? false : arch) continue;
+      const cls = caseClass(c);
+      if (f.serious === "serious" && !cls.serious) continue; if (f.serious === "nonserious" && cls.serious) continue;
+      if (f.listed && cls.listedness !== f.listed) continue;
+      if (f.status && c.status !== f.status) continue; if (f.portfolio && c.portfolio !== f.portfolio) continue; if (f.assignee && (c.assignee || "") !== (f.assignee === "__none" ? "" : f.assignee)) continue;
+      if (f.tag && !(c.tags || []).some(t => t.tag === normTag(f.tag))) continue; if (f.folder && (f.folder === "__none" ? c.folderId : c.folderId !== f.folder)) continue;
+      const art = state.articles[c.pmid], fields = searchFields(state, c, art), all = Object.values(fields).flat(), score = hit(fields, all); if (!score) continue;
+      const matched = terms.filter(t => !t.neg).map(t => Object.entries(fields).find(([k, vals]) => (t.field ? k === t.field : true) && vals.some(x => lower(x).includes(t.text)))?.[0]).filter(Boolean);
+      results.cases.push({ kind:"case", id:c.id, number:c.number, pmid:c.pmid, title:art?.title || "", portfolio:c.portfolio || "", status:c.status, assignee:c.assignee || "", product:v((c.data?.products || [])[0]?.name) || c.molecule || "", event:v((c.data?.events || [])[0]?.verbatim), serious:cls.serious, criteria:cls.criteria, listedness:cls.listedness, tags:(c.tags || []).map(t => t.tag), folderId:c.folderId || "", archived:Boolean(c.archived), matched:[...new Set(matched)], score });
+    }
+  }
+  results.articles.sort((x, y) => y.score - x.score); results.cases.sort((x, y) => y.score - x.score);
+  results.counts = { articles:results.articles.length, cases:results.cases.length };
+  results.articles = results.articles.slice(0, 100); results.cases = results.cases.slice(0, 200);
+  return results;
+}
+
 // Who should take a new case: the molecule's owner, else the active reviewer (matching the portfolio) with the fewest open cases and room left, else a manager.
 function pickCaseAssignee(data, rec) {
   const owned = data.watches.find(w => w.owner && w.portfolio === rec.portfolio && (!w.molecule || w.molecule === rec.molecule));
@@ -3101,9 +3157,9 @@ async function apiCore(request, env, path) {
     const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
       cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
-      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [],
+      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
       monitoring:monitoringCounts(state, viewer),
-      series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c))), config:{ retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
@@ -3182,6 +3238,65 @@ async function apiCore(request, env, path) {
     await write(env, data => { Object.assign(data.articles[id], status); if (evidencePatch) data.articles[id].evidence = { ...(data.articles[id].evidence || {}), ...evidencePatch }; });
     await audit(env, { by:email, action:"upload.fulltext", target:"PMID " + id, detail:{ type:ext, bytes:bytes.length, text_read:Boolean(text) } });
     return json({ ok:true, textRead:Boolean(text), events:(status.events || []).length });
+  }
+  if (["/api/search", "/api/case-tag", "/api/folder-save", "/api/folder-delete", "/api/case-folder", "/api/case-archive", "/api/case-restore", "/api/case-delete"].includes(path) && viewer) {
+    const at = new Date().toISOString(), ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), medical = c => isPortfolioManager(state, viewer, c.portfolio) || rolesIn(state, email, c.portfolio).has("medical_reviewer");
+    const editable = c => caseVisible(state, viewer, c) && (medical(c) || c.assignee === email || c.createdBy === email), chosen = pred => (state.cases || []).filter(c => ids.has(c.id) && pred(c));
+    if (path === "/api/search") {
+      const results = runSearch(state, viewer, body);
+      await audit(env, { by:email, action:"search.run", target:String(body.q || "").slice(0, 120), detail:{ scope:body.scope || "all", filters:Object.entries(body.filters || {}).filter(([, x]) => x).map(([k, x]) => k + "=" + String(x).slice(0, 40)).join(", "), articles:results.counts.articles, cases:results.counts.cases } });
+      return json({ ...results, standardTags:STANDARD_TAGS, folders:(state.caseFolders || []) });
+    }
+    if (path === "/api/case-tag") {
+      const tag = normTag(body.tag);
+      if (!/^[a-z0-9][a-z0-9 :_\/-]{1,39}$/.test(tag)) return json({ error:"A tag is 2-40 characters: letters, numbers, spaces, : _ - /." }, 400);
+      const targets = chosen(editable); if (!targets.length) return json({ error:"Choose cases you are allowed to tag." }, 403);
+      const remove = body.remove === true, changed = [];
+      await write(env, data => { for (const t of targets) { const c = data.cases.find(x => x.id === t.id); const has = (c.tags ||= []).some(x => x.tag === tag);
+        if (remove && has) { c.tags = c.tags.filter(x => x.tag !== tag); (c.history ||= []).push({ at, by:email, action:"tag removed: " + tag }); changed.push(c.number); }
+        if (!remove && !has) { c.tags.push({ tag, by:email, at }); (c.history ||= []).push({ at, by:email, action:"tag added: " + tag }); changed.push(c.number); } } });
+      if (changed.length) await audit(env, { by:email, action:remove ? "case.tag_removed" : "case.tag_added", target:changed.length + " case" + (changed.length === 1 ? "" : "s"), detail:{ tag, cases:changed.slice(0, 50).join(", ") } });
+      return json({ ok:true, changed:changed.length });
+    }
+    if (path === "/api/folder-save" || path === "/api/folder-delete") {
+      if (path === "/api/folder-save") {
+        const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 60); if (name.length < 2) return json({ error:"Give the folder a name (2-60 characters)." }, 400);
+        if (!(manager || (state.memberships || []).some(m => m.email === email && m.role === "medical_reviewer"))) return json({ error:"Only a manager or medical reviewer can create folders." }, 403);
+        if ((state.caseFolders || []).some(f => f.name.toLowerCase() === name.toLowerCase())) return json({ error:"A folder with this name exists." }, 409);
+        const id = crypto.randomUUID(); await write(env, data => { (data.caseFolders ||= []).push({ id, name, by:email, at }); });
+        await audit(env, { by:email, action:"folder.created", target:name, detail:{} }); return json({ ok:true, id });
+      }
+      if (!manager) return json({ error:"Manager access required." }, 403);
+      const folder = (state.caseFolders || []).find(f => f.id === body.id); if (!folder) return json({ error:"Folder not found." }, 404);
+      let moved = 0; await write(env, data => { data.caseFolders = data.caseFolders.filter(f => f.id !== folder.id); for (const c of data.cases || []) if (c.folderId === folder.id) { delete c.folderId; moved++; } });
+      await audit(env, { by:email, action:"folder.deleted", target:folder.name, detail:{ cases_unfiled:moved } }); return json({ ok:true, unfiled:moved });
+    }
+    if (path === "/api/case-folder") {
+      const folderId = String(body.folderId || ""); if (folderId && !(state.caseFolders || []).some(f => f.id === folderId)) return json({ error:"Folder not found." }, 404);
+      const targets = chosen(editable); if (!targets.length) return json({ error:"Choose cases you are allowed to move." }, 403);
+      const name = (state.caseFolders || []).find(f => f.id === folderId)?.name || "no folder";
+      await write(env, data => { for (const t of targets) { const c = data.cases.find(x => x.id === t.id); if (folderId) c.folderId = folderId; else delete c.folderId; (c.history ||= []).push({ at, by:email, action:"moved to folder: " + name }); } });
+      await audit(env, { by:email, action:"case.folder_set", target:targets.length + " case" + (targets.length === 1 ? "" : "s"), detail:{ folder:name, cases:targets.map(c => c.number).slice(0, 50).join(", ") } }); return json({ ok:true, moved:targets.length });
+    }
+    const reason = String(body.reason || "").trim();
+    if (path === "/api/case-archive" || path === "/api/case-restore") {
+      const archive = path === "/api/case-archive"; if (archive && reason.length < 5) return json({ error:"Give a reason of at least 5 characters." }, 400);
+      const targets = chosen(c => medical(c) && Boolean(c.archived) !== archive); if (!targets.length) return json({ error:archive ? "Choose open cases you may archive (manager or medical reviewer)." : "Choose archived cases you may restore." }, 403);
+      await write(env, data => { for (const t of targets) { const c = data.cases.find(x => x.id === t.id); if (archive) c.archived = { at, by:email, reason:reason.slice(0, 300), status:c.status }; else delete c.archived; c.updatedAt = at; (c.history ||= []).push({ at, by:email, action:archive ? "archived: " + reason.slice(0, 200) : "restored from archive" }); } });
+      await audit(env, { by:email, action:archive ? "case.archived" : "case.restored", target:targets.length + " case" + (targets.length === 1 ? "" : "s"), detail:{ cases:targets.map(c => c.number).slice(0, 50).join(", "), reason:reason.slice(0, 300) } });
+      return json({ ok:true, changed:targets.length });
+    }
+    // Permanent deletion of pulled cases: manager only, with a reason and the case number typed in. A tombstone and the audit entry keep a record that the case existed.
+    if (!manager) return json({ error:"Manager access required." }, 403);
+    if (reason.length < 5) return json({ error:"Give a reason of at least 5 characters. It is recorded in the audit trail." }, 400);
+    const doomed = (state.cases || []).filter(c => ids.has(c.id)); if (!doomed.length) return json({ error:"Choose at least one case." }, 400);
+    const typed = String(body.confirm || "").trim(); if (doomed.length === 1 ? typed !== doomed[0].number : typed !== "DELETE " + doomed.length) return json({ error:doomed.length === 1 ? "Type the case number to confirm." : "Type DELETE " + doomed.length + " to confirm." }, 400);
+    const protectedCase = doomed.find(c => (c.signatures || []).some(x => !x.superseded) || c.approval || c.data?.approval || (c.versions || []).some(x => x.action === "exported" || x.action === "approved"));
+    if (protectedCase && !doomed.every(c => c.archived)) return json({ error:protectedCase.number + " was approved, signed or exported. Archive it first, then delete it from the archive." }, 409);
+    const tombs = []; for (const c of doomed) tombs.push({ number:c.number, pmid:c.pmid, portfolio:c.portfolio || "", status:c.status, hash:(c.versions || []).at(-1)?.hash || "", createdAt:c.createdAt, deletedAt:at, deletedBy:email, reason:reason.slice(0, 300) });
+    await write(env, data => { const gone = new Set(doomed.map(c => c.id)); data.cases = data.cases.filter(c => !gone.has(c.id)); (data.deletedCases ||= []).push(...tombs); });
+    await audit(env, { by:email, action:"case.deleted", target:doomed.length + " case" + (doomed.length === 1 ? "" : "s"), detail:{ cases:doomed.map(c => c.number + " (PMID " + c.pmid + ")").slice(0, 50).join(", "), reason:reason.slice(0, 300) } });
+    return json({ ok:true, deleted:doomed.length, pmids:[...new Set(doomed.map(c => c.pmid))] });
   }
   if (["/api/users-bulk", "/api/user-update", "/api/route-back", "/api/case-route"].includes(path) && viewer) {
     const at = new Date().toISOString(), roleOf = r => ROLES.includes(r) ? r : "screener";
@@ -3706,6 +3821,7 @@ async function apiCore(request, env, path) {
     }
     if (path === "/api/case-assess") return json({ assessment:withRegulatory(await assessCase(cfg, body.data || current.data), state, { data:normalizeCase(body.data || current.data), molecule:current.molecule }) });
     if (path === "/api/case-save") {
+      if (current.archived) return json({ error:"This case is archived. Restore it before editing." }, 409);
       if (current.locked) return json({ error:"This case is signed and locked. A manager must supersede the signature before it can be edited." }, 409);
       const data = normalizeCase(body.data || current.data), status = caseStatuses.includes(body.status) ? body.status : current.status, notes = String(body.notes ?? current.notes).slice(0, 4000);
       const local = localAssessment(data);
@@ -4174,7 +4290,7 @@ const paths = {
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
+const subtitles = {Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -4381,6 +4497,7 @@ async function loadReview(){
     (c.link?"":'<div style="display:flex;gap:6px;margin-top:4px"><button type="button" class="btn outline sm" data-p3="dup|'+esc(c.caseId)+'|follow_up">This is a follow-up</button><button type="button" class="btn outline sm" data-p3="dup|'+esc(c.caseId)+'|duplicate">Duplicate</button><button type="button" class="btn outline sm" data-p3="dup|'+esc(c.caseId)+'|not_duplicate">Not a duplicate</button></div>')+'</div>').join(""):'<div class="sub">No potential duplicates found. Nothing is linked without a reviewer confirming it.</div>')+'</div>';
   h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Listedness against reference safety information</b>'+(rsi.length?'<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap"><select id="rsisel" aria-label="Reference safety information">'+rsi.map(x=>'<option value="'+esc(x.id)+'">'+esc(x.product+" v"+x.version+(x.market?" ("+x.market+")":""))+'</option>').join("")+'</select><select id="rsievent" aria-label="Event">'+d.events.map((e,i)=>'<option value="'+i+'">'+esc(e.verbatim&&e.verbatim.value||"event "+(i+1))+'</option>').join("")+'</select><button type="button" class="btn outline sm" data-p3="lsug">Find label passages</button></div><div id="lresult" class="sub"></div>':'<div class="sub">No reference safety information is loaded. A manager can add authorised RSI text below; listedness stays unknown until a reviewer decides against it.</div>')+
     '<details style="margin-top:6px"><summary class="sub">Add reference safety information (manager)</summary><input id="rsiprod" placeholder="Product" style="width:100%;margin-top:4px"><input id="rsiver" placeholder="Version" style="width:48%"><input id="rsimarket" placeholder="Market" style="width:48%"><textarea id="rsitext" rows="4" placeholder="Authorised text (e.g. SmPC section 4.8)" style="width:100%"></textarea><button type="button" class="btn sm" data-p3="rsisave">Save RSI version</button></details></div>';
+  h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Tags</b> <span class="sub">Labels for seriousness criteria and listedness. They also drive the Serious, Non-serious, Listed and Unlisted filters. Each change is recorded with your name.</span><div style="margin:6px 0">'+((curCase.tags||[]).length?curCase.tags.map(t=>'<span class="badge" title="added by '+esc(t.by)+'">'+esc(t.tag)+' <a href="#" data-p5="cuntag|'+esc(t.tag)+'" aria-label="Remove tag" style="text-decoration:none">x</a></span>').join(" "):'<span class="sub">No tags yet.</span>')+'</div><div style="display:flex;gap:6px;flex-wrap:wrap"><select id="ct_tag" aria-label="Tag">'+(data.standardTags||[]).map(t=>'<option>'+esc(t)+'</option>').join("")+'</select><input id="ct_custom" placeholder="or your own tag" style="width:140px"><button type="button" class="btn outline sm" data-p5="ctag">Add tag</button></div></div>';
   if(data.viewer.role==="manager"||(data.memberships||[]).some(m=>m.email===data.viewer.email&&m.role==="medical_reviewer"))h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Route this case</b><div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px"><button type="button" class="btn outline sm" data-p4="caseroute|draft">Send back to Draft (clears approval)</button><select id="routeto" aria-label="Person">'+(data.profiles||[]).filter(p=>p.active).map(p=>'<option value="'+esc(p.email)+'"'+(p.email===curCase.assignee?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select><button type="button" class="btn outline sm" data-p4="caseroute|person">Reassign case</button></div></div>';
   h+='<div class="card" style="padding:10px"><b>Version history</b>'+versions.map(v=>'<div class="sub">v'+v.n+" · "+esc(v.action)+" · "+esc(v.by||"")+" · "+esc(String(v.at||"").slice(0,16).replace("T"," "))+(v.note?" · "+esc(v.note):"")+'</div>').join("")+'</div>';
   box.innerHTML=h;
@@ -4413,7 +4530,7 @@ async function refreshCase(){await refresh();const c=(data.cases||[]).find(x=>x.
 function adminHtml(){
   const today=new Date().toISOString().slice(0,10), people=(data.profiles||[]), act=people.filter(p=>p.active), mem=data.memberships||[];
   const openA=(data.assignments||[]).filter(a=>!["Complete","Full text needed"].includes(a.status)), unassigned=openA.filter(a=>!a.reviewer);
-  const closedC=c=>c.status==="Sent to PV Nexus"||c.status==="Closed: not a valid ICSR", openC=(data.cases||[]).filter(c=>!closedC(c));
+  const closedC=c=>c.status==="Sent to PV Nexus"||c.status==="Closed: not a valid ICSR"||Boolean(c.archived), openC=(data.cases||[]).filter(c=>!closedC(c));
   const stat=(label,n,tone)=>'<div class="card" style="padding:10px 12px"><div class="sub">'+label+'</div><b style="font-size:20px;color:'+(tone&&n?"var(--red)":"inherit")+'">'+n+'</b></div>';
   const tiles='<div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:14px">'+stat("Active people",act.length)+stat("Unassigned citations",unassigned.length,1)+stat("Overdue citations",openA.filter(a=>a.dueAt&&a.dueAt<today).length,1)+stat("Open cases",openC.length)+stat("Cases without owner",openC.filter(c=>!c.assignee).length,1)+stat("Ready for medical review",openC.filter(c=>c.status==="Ready for medical review").length)+'</div>';
   const personOpts=sel=>'<option value="">Nobody</option>'+act.map(p=>'<option value="'+esc(p.email)+'"'+(p.email===sel?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("");
@@ -4458,6 +4575,81 @@ function serToggle(el){
   document.querySelectorAll('[data-kind="flag"]').forEach(x=>{const m=(x.dataset.path||"").split(".");if(m[0]!=="events"||m[2]!=="seriousness")return;const e=curCase.data.events[Number(m[1])];if(e&&m[3] in e.seriousness)x.checked=Boolean(e.seriousness[m[3]]);});
 }
 document.addEventListener("change",e=>{if(e.target.dataset&&e.target.dataset.serall)serToggle(e.target);});
+
+const TAGMAP={"serious:death":"death","serious:life-threatening":"life_threatening","serious:hospitalization":"hospitalization","serious:disability":"disability","serious:congenital-anomaly":"congenital_anomaly","serious:other-medically-important":"other_medically_important"};
+function caseCls(c){
+  const ev=(c.data&&c.data.events)||[],tags=(c.tags||[]).map(t=>t.tag),crit=new Set();
+  ev.forEach(e=>Object.keys(e.seriousness||{}).forEach(k=>{if(e.seriousness[k])crit.add(k);}));
+  tags.forEach(t=>{if(TAGMAP[t])crit.add(TAGMAP[t]);});
+  const vals=ev.map(e=>((e.listedness&&e.listedness.value)||(e.expectedness&&e.expectedness.value)||"").toLowerCase()).filter(Boolean);
+  let l=!vals.length?"unknown":vals.includes("unlisted")?"unlisted":vals.every(x=>x==="listed")?"listed":"unknown";
+  if(l==="unknown")l=tags.includes("unlisted")?"unlisted":tags.includes("listed")?"listed":"unknown";
+  return{serious:crit.size>0||tags.includes("serious"),crit:[...crit],listed:l};
+}
+const canMedical=()=>data.viewer.role==="manager"||(data.viewerRoles||[]).includes("medical_reviewer");
+const tagChips=c=>(c.tags||[]).map(t=>'<span class="badge" title="added by '+esc(t.by)+'">'+esc(t.tag)+'</span>').join(" ");
+function bulkBar(cls,opts){
+  opts=opts||{};const mgr=data.viewer.role==="manager",fl=data.caseFolders||[];
+  return '<div class="card" style="padding:10px;margin-bottom:10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center"><button type="button" class="btn outline sm" data-p5="selall|'+cls+'">Select all shown</button>'+
+    '<select id="bk_tag" aria-label="Tag">'+(data.standardTags||[]).map(t=>'<option>'+esc(t)+'</option>').join("")+'</select><input id="bk_custom" placeholder="or your own tag" style="width:130px"><button type="button" class="btn outline sm" data-p5="tag|'+cls+'">Add tag</button><button type="button" class="btn outline sm" data-p5="untag|'+cls+'">Remove tag</button>'+
+    '<select id="bk_folder" aria-label="Folder"><option value="">No folder</option>'+fl.map(f=>'<option value="'+esc(f.id)+'">'+esc(f.name)+'</option>').join("")+'</select><button type="button" class="btn outline sm" data-p5="folder|'+cls+'">Move to folder</button>'+
+    (canMedical()&&!opts.archive?'<button type="button" class="btn outline sm" data-p5="archive|'+cls+'">Archive</button>':"")+(opts.archive&&canMedical()?'<button type="button" class="btn outline sm" data-p5="restore|'+cls+'">Restore</button>':"")+
+    (mgr?'<button type="button" class="btn outline sm" style="color:var(--red)" data-p5="delcase|'+cls+'">Delete…</button>':"")+'</div>';
+}
+function caseRowCells(c){
+  const cl=caseCls(c),f=(data.caseFolders||[]).find(x=>x.id===c.folderId),art=data.articles[c.pmid]||{};
+  return ['<input type="checkbox" class="'+(tab==="Search"?"srch_c":tab==="Archive"?"arc_c":"syn_c")+'" value="'+esc(c.id)+'" aria-label="Select case">','<a href="#" data-opencase="'+esc(c.id)+'"><b>'+esc(c.number)+'</b></a>',esc((art.title||"PMID "+c.pmid).slice(0,70))+'<div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.portfolio||"")+(f?" · folder: "+esc(f.name):"")+'</div>',
+    (cl.serious?badge("Serious","red"):badge("Non-serious",""))+" "+(cl.listed==="listed"?badge("Listed","green"):cl.listed==="unlisted"?badge("Unlisted","amber"):badge("Listedness unknown",""))+(cl.crit.length?'<div class="sub">'+esc(cl.crit.map(x=>x.replace(/_/g," ")).join(", "))+'</div>':""),tagChips(c),badge(c.status,""),esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||"")];
+}
+let srch={q:"",scope:"all",f:{},res:null};
+function searchHtml(){
+  const pf=[...new Set((data.assignments||[]).map(a=>a.portfolio))].sort(),f=srch.f,sel=(id,label,opts)=>'<label>'+label+'<select id="'+id+'">'+opts.map(o=>'<option value="'+esc(o[0])+'"'+(String(f[id.slice(3)]||"")===o[0]?" selected":"")+'>'+esc(o[1])+'</option>').join("")+'</select></label>';
+  return panel("Search everything",'<div class="sub" style="margin-bottom:6px">Searches citations (title, abstract, authors, journal, PMID, DOI) and cases (number, product, event, patient, narrative, notes, tags). Use quotes for phrases, <b>-word</b> to exclude, and <b>pmid:</b> <b>case:</b> <b>drug:</b> <b>event:</b> <b>tag:</b> <b>author:</b> <b>status:</b> <b>portfolio:</b> to search one field.</div>'+
+    '<div style="display:flex;gap:8px"><input id="sq" value="'+esc(srch.q)+'" placeholder="Search, e.g. event:&quot;status epilepticus&quot; drug:aciclovir" style="flex:1" aria-label="Search"><button type="button" class="btn" data-p5="search">Search</button></div>'+
+    '<div style="display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-top:10px">'+
+    sel("sf_scope","Look in",[["all","Citations and cases"],["articles","Citations only"],["cases","Cases only"]])+
+    sel("sf_serious","Seriousness",[["","Any"],["serious","Serious"],["nonserious","Non-serious"]])+sel("sf_listed","Listedness",[["","Any"],["listed","Listed"],["unlisted","Unlisted"],["unknown","Unknown"]])+
+    sel("sf_status","Case status",[["","Any"]].concat((data.config.caseStatuses||[]).map(s=>[s,s])))+sel("sf_portfolio","Portfolio",[["","Any"]].concat(pf.map(x=>[x,x])))+
+    sel("sf_folder","Folder",[["","Any"],["__none","Not in a folder"]].concat((data.caseFolders||[]).map(x=>[x.id,x.name])))+sel("sf_archived","Archive",[["","Working cases"],["yes","Archived only"],["any","Both"]])+
+    '<label>Tag<input id="sf_tag" value="'+esc(f.tag||"")+'" placeholder="e.g. serious:death"></label></div>')+'<div id="sres">'+(srch.res?searchResults():"")+'</div>';
+}
+function searchResults(){
+  const r=srch.res,mgr=data.viewer.role==="manager";let h="";
+  h+=panel("Cases ("+r.counts.cases+")",(r.cases.length?bulkBar("srch_c",{archive:srch.f.archived==="yes"})+table(["","Case","Article","Classification","Tags","Status","Owner"],r.cases.map(x=>{const c=(data.cases||[]).find(y=>y.id===x.id);return c?caseRowCells(c):[];}).filter(x=>x.length),"No cases."):'<div class="empty">No cases match.</div>'),"",true);
+  if(r.articles.length||srch.scope!=="cases")h+=panel("Citations ("+r.counts.articles+")",(mgr&&r.articles.length?'<div style="margin-bottom:8px"><button type="button" class="btn outline sm" data-p5="selall|srch_a">Select all shown</button> <button type="button" class="btn outline sm" style="color:var(--red)" data-p5="delpulled">Delete selected pulled citations…</button> <span class="sub">Citations that still have a case are kept; delete or archive the case first.</span></div>':"")+
+    table(mgr?["","Citation","Journal","Assignments"]:["Citation","Journal","Assignments"],r.articles.map(a=>{const cells=['<a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(a.pmid)+'/" target="_blank" rel="noopener"><b>'+esc(a.title||"PMID "+a.pmid)+'</b></a><div class="sub">PMID '+esc(a.pmid)+' · '+esc((a.authors||[]).join(", "))+(a.hasCase?' · '+badge("has a case",""):"")+'</div>',esc(a.journal)+'<div class="sub">'+esc(a.date)+'</div>',a.assignments.map(x=>esc(x.portfolio)+" · "+esc(x.status)+(x.disposition?" · "+esc(x.disposition.replace(/_/g," ")):"")).join("<br>")];return mgr?['<input type="checkbox" class="srch_a" value="'+esc(a.pmid)+'" aria-label="Select citation">'].concat(cells):cells;}),"No citations match."),"",true);
+  return h;
+}
+function archiveHtml(){
+  const arc=(data.cases||[]).filter(c=>c.archived).sort((a,b)=>(b.archived.at||"").localeCompare(a.archived.at||""));
+  return panel("Archived cases",'<div class="sub" style="margin-bottom:8px">Archived cases are out of working lists and case series counts and cannot be edited. They stay searchable (Search, Archive: archived only) and can be restored by a manager or medical reviewer. A manager may delete a case permanently from here; approved or exported cases must be archived first.</div>'+(arc.length?bulkBar("arc_c",{archive:true})+table(["","Case","Article","Classification","Tags","Status","Owner","Archived"],arc.map(c=>caseRowCells(c).concat([esc(c.archived.by||"")+'<div class="sub">'+esc(String(c.archived.at||"").slice(0,10))+" · "+esc(c.archived.reason||"")+'</div>'])),"No archived cases."):'<div class="empty">Nothing archived yet.</div>'),"",true)+
+    (data.viewer.role==="manager"?panel("Deleted cases (record kept)",table(["Case","PMID","Deleted","By","Reason"],(data.deletedCases||[]).slice().reverse().map(d=>[esc(d.number),esc(d.pmid),esc(String(d.deletedAt).slice(0,10)),esc(d.deletedBy),esc(d.reason)]),"No cases have been deleted."),"Deleting a case leaves this record and an audit trail entry.",true):"");
+}
+async function p5action(target){
+  const [act,a1]=target.dataset.p5.split("|"),ids=cls=>[...document.querySelectorAll("."+cls+":checked")].map(x=>x.value),again=async m=>{await refresh();if(tab==="Search"&&srch.res)await runSearchUi(true);else render();message(m);};
+  try{
+    if(act==="search"){await runSearchUi(false);return;}
+    if(act==="selall"){document.querySelectorAll("."+a1).forEach(x=>{x.checked=true;});return;}
+    if(act==="tag"||act==="untag"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const tag=($("bk_custom").value||"").trim()||$("bk_tag").value;const r=await api("case-tag",{ids:list,tag,remove:act==="untag"});await again(r.changed+" case"+(r.changed===1?"":"s")+(act==="tag"?" tagged ":" untagged ")+tag+".");return;}
+    if(act==="folder"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const r=await api("case-folder",{ids:list,folderId:$("bk_folder").value});await again(r.moved+" moved.");return;}
+    if(act==="archive"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const why=prompt("Why are these cases being archived? (recorded)","");if(!why)return;const r=await api("case-archive",{ids:list,reason:why});await again(r.changed+" archived.");return;}
+    if(act==="restore"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const r=await api("case-restore",{ids:list});await again(r.changed+" restored.");return;}
+    if(act==="delcase"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const cs=list.map(i=>(data.cases||[]).find(c=>c.id===i)).filter(Boolean);
+      const why=prompt("Why are you permanently deleting "+cs.length+" case"+(cs.length===1?"":"s")+"? (recorded in the audit trail)","");if(!why)return;
+      const typed=prompt(cs.length===1?"Type the case number "+cs[0].number+" to confirm:":"Type DELETE "+cs.length+" to confirm:","");if(!typed)return;
+      const r=await api("case-delete",{ids:list,reason:why,confirm:typed});
+      if(confirm(r.deleted+" deleted. Also delete the pulled citation"+(r.pmids.length===1?"":"s")+" (PMID "+r.pmids.join(", ")+") from the library?")){try{await api("library-delete",{pmids:r.pmids,reason:why});}catch(e){message(e.message,true);}}
+      await again("Deleted.");return;}
+    if(act==="delpulled"){const list=ids("srch_a");if(!list.length)return message("Tick the citations first.",true);if(!confirm("Delete "+list.length+" pulled citation"+(list.length===1?"":"s")+" with their stored files? Citations with a case are kept. This cannot be undone."))return;const why=prompt("Reason (recorded in the audit trail):","");if(!why)return;const r=await api("library-delete",{pmids:list,reason:why});await again(r.deleted+" deleted"+((r.kept||[]).length?", "+r.kept.length+" kept because they have a case":"")+".");return;}
+    if(act==="newfolder"){const name=prompt("Folder name:","");if(!name)return;await api("folder-save",{name});await again("Folder created.");return;}
+    if(act==="delfolder"){if(!confirm("Delete this folder? Its cases are kept and become unfiled."))return;const r=await api("folder-delete",{id:a1});if(synFolder===a1)synFolder="";await again("Folder deleted; "+r.unfiled+" case"+(r.unfiled===1?"":"s")+" unfiled.");return;}
+    if(act==="ctag"||act==="cuntag"){const tag=act==="ctag"?(($("ct_custom").value||"").trim()||$("ct_tag").value):a1;await api("case-tag",{ids:[curCase.id],tag,remove:act==="cuntag"});await refresh();const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c)curCase.tags=c.tags;loadReview();return;}
+  }catch(e){message(e.message,true);}
+}
+async function runSearchUi(keep){
+  if(!keep){srch.q=$("sq").value;srch.scope=$("sf_scope").value;srch.f={serious:$("sf_serious").value,listed:$("sf_listed").value,status:$("sf_status").value,portfolio:$("sf_portfolio").value,folder:$("sf_folder").value,archived:$("sf_archived").value,tag:$("sf_tag").value.trim()};}
+  srch.res=await api("search",{q:srch.q,scope:srch.scope,filters:srch.f});$("sres").innerHTML=searchResults();
+}
 const covBadge=c=>({reconciled:badge("Reconciled","green"),zero_results:badge("Zero results",""),partial:badge("Partially imported","amber"),failed:badge("Failed","red"),running:badge("Running","blue"),legacy:badge("Imported (earlier)","")}[c]||badge(c||"legacy",""));
 async function loadBatches(){
   const box=$("batchcov");if(!box)return;
@@ -4521,7 +4713,7 @@ async function downloadCase(format){
   if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||"Export failed.");}
   const link=document.createElement("a");link.href=URL.createObjectURL(await res.blob());link.download=((/filename="([^"]+)"/.exec(res.headers.get("Content-Disposition")||"")||[])[1])||(curCase.number+(format==="package"?"-package.zip":".json"));link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
 }
-let libNumbers=null, libSortFor="", synFilter="all";
+let libNumbers=null, libSortFor="", synFilter="all", synFolder="";
 let extracting=null, pullRun="", libPath="/", auditData=null, auditMonth=new Date().toISOString().slice(0,7), auditQ="", auditAction="";
 function drawAudit(){
   const box=$("auditbody");if(!box)return;
@@ -4722,7 +4914,7 @@ function applyFilter(items){
 function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Synchrony","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Queue","Synchrony"]).concat(data.config.accounts?["Account"]:[]);
+  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Synchrony","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Queue","Synchrony"]).concat(["Search"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   libNumbers=null;
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
@@ -4762,13 +4954,13 @@ function render() {
       panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>'+(String(r.query||"").startsWith("PMID list")?' <button class="btn outline sm" data-unfetched="'+esc(r.id)+'">Unfetched list (TSV)</button>':"")+(data.config.accounts?' <a class="btn outline sm" href="/host/run-tiles?run='+encodeURIComponent(r.id)+'" target="_blank" rel="noopener">Tile screenshot</a>':""):""]),"No pulls yet."),"",true);
   }
   if(tab==="Synchrony"){
-    const me=data.viewer.email, all=(data.cases||[]).slice().sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)), today=new Date().toISOString().slice(0,10);
+    const me=data.viewer.email, all=(data.cases||[]).filter(c=>!c.archived).slice().sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)), today=new Date().toISOString().slice(0,10);
     const closed=c=>c.status==="Sent to PV Nexus"||c.status==="Closed: not a valid ICSR", openCases=all.filter(c=>!closed(c));
     const left=c=>c.dueAt?Math.round((Date.parse(c.dueAt)-Date.parse(today))/864e5):null;
     const signed=c=>(c.signatures||[]).some(x=>!x.superseded);
-    const filters={all:["Open",openCases],mine:["Mine",openCases.filter(c=>c.assignee===me)],unassigned:["Unassigned",openCases.filter(c=>!c.assignee)],serious:["Serious",openCases.filter(c=>(c.data.events||[]).some(e=>Object.values(e.seriousness||{}).some(Boolean)))],overdue:["Overdue",openCases.filter(c=>left(c)!==null&&left(c)<0)],soon:["Due in 3 days",openCases.filter(c=>left(c)!==null&&left(c)>=0&&left(c)<=3)],review:["Ready for review",openCases.filter(c=>c.status==="Ready for medical review")],signed:["Signed",all.filter(signed)],done:["Closed or sent",all.filter(closed)]};
+    const filters={all:["Open",openCases],mine:["Mine",openCases.filter(c=>c.assignee===me)],unassigned:["Unassigned",openCases.filter(c=>!c.assignee)],serious:["Serious",openCases.filter(c=>caseCls(c).serious)],nonserious:["Non-serious",openCases.filter(c=>!caseCls(c).serious)],listed:["Listed",openCases.filter(c=>caseCls(c).listed==="listed")],unlisted:["Unlisted",openCases.filter(c=>caseCls(c).listed==="unlisted")],overdue:["Overdue",openCases.filter(c=>left(c)!==null&&left(c)<0)],soon:["Due in 3 days",openCases.filter(c=>left(c)!==null&&left(c)>=0&&left(c)<=3)],review:["Ready for review",openCases.filter(c=>c.status==="Ready for medical review")],signed:["Signed",all.filter(signed)],done:["Closed or sent",all.filter(closed)]};
     if(!filters[synFilter])synFilter="all";
-    const shown=filters[synFilter][1], stColor={"Ready for medical review":"blue","Sent to PV Nexus":"green"}, manager=data.viewer.role==="manager";
+    const shown=filters[synFilter][1].filter(c=>!synFolder||(synFolder==="__none"?!c.folderId:c.folderId===synFolder)), stColor={"Ready for medical review":"blue","Sent to PV Nexus":"green"}, manager=data.viewer.role==="manager";
     const people=(data.profiles||[]).filter(p=>p.active);
     const tiles='<div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin-bottom:14px">'+Object.entries(filters).map(([k,f])=>'<button type="button" class="card" data-synfilter="'+k+'" style="text-align:left;cursor:pointer;padding:10px 12px;'+(k===synFilter?"border-color:var(--ring);box-shadow:0 0 0 2px #0f766e33":"")+(k==="overdue"&&f[1].length?";border-color:var(--red)":"")+'"><div class="sub">'+esc(f[0])+'</div><div style="font-size:22px;font-weight:600">'+f[1].length+'</div></button>').join("")+'</div>';
     const ready=Object.values(data.articles).filter(a=>a.fullTextStatus==="Captured"&&a.fullTextKey&&(a.events||[]).length&&!(data.cases||[]).some(c=>c.pmid===a.id)).length;
@@ -4779,11 +4971,12 @@ function render() {
       const a=c.assessment||{},d=c.data,sp=(d.products.find(p=>p.role==="suspect")||{name:{}}).name.value||"—",ev=((d.events[0]||{}).verbatim||{}).value||"—",art=data.articles[c.pmid]||{},dl=left(c);
       const who=manager?'<select data-assignsel="'+esc(c.id)+'" aria-label="Assignee"><option value="">Unassigned</option>'+people.map(p=>'<option value="'+esc(p.email)+'"'+(p.email===c.assignee?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select>':esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||"Unassigned");
       const due=c.dueAt?badge((dl<0?Math.abs(dl)+" d overdue":dl===0?"due today":dl+" d left")+" · "+c.dueAt,closed(c)?"":dl<0?"red":dl<=3?"amber":"green"):'<span class="sub">no date</span>';
-      return ['<b>'+esc(c.number)+'</b>'+(signed(c)?' <span class="badge green" title="Signed">signed</span>':"")+((c.data.events||[]).some(e=>Object.values(e.seriousness||{}).some(Boolean))?' <span class="badge red">serious</span>':""),'<a href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,80))+'</a><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.molecule||"")+'</div>',esc(sp)+" · "+esc(ev),who,due,badge(c.status,stColor[c.status]||""),(a.valid?badge("Valid","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"))+'<div class="sub">QC '+(a.score??"")+' / 100</div>','<button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>'];});
+      return ['<input type="checkbox" class="syn_c" value="'+esc(c.id)+'" aria-label="Select case">','<b>'+esc(c.number)+'</b>'+(signed(c)?' <span class="badge green" title="Signed">signed</span>':"")+(caseCls(c).serious?' <span class="badge red">serious</span>':' <span class="badge">non-serious</span>')+(caseCls(c).listed==="unlisted"?' <span class="badge amber">unlisted</span>':caseCls(c).listed==="listed"?' <span class="badge green">listed</span>':"")+(tagChips(c)?'<div style="margin-top:3px">'+tagChips(c)+'</div>':""),'<a href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,80))+'</a><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.molecule||"")+'</div>',esc(sp)+" · "+esc(ev),who,due,badge(c.status,stColor[c.status]||""),(a.valid?badge("Valid","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"))+'<div class="sub">QC '+(a.score??"")+' / 100</div>','<button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>'];});
     const S=data.series||{total:0,events:[],products:[],countries:[],sex:[],ages:[],monthly:[],serious:[],fatal:[],trend:{hikes:[]}};
     const bars=(list)=>list.length?list.map(x=>'<div class="row" title="'+esc(x.cases.join(", "))+'"><span>'+esc(x.key)+'</span><span class="sub">'+x.count+' case'+(x.count===1?"":"s")+' · '+esc(x.cases.slice(0,4).join(", "))+(x.cases.length>4?"…":"")+'</span></div>').join(""):'<div class="empty">No data yet.</div>';
     const months=S.monthly.map(m=>'<span class="badge'+((S.trend.hikes||[]).includes(m.month)?" red":"")+'" title="'+esc(m.cases.join(", "))+'">'+esc(m.month)+': '+m.count+'</span>').join(" ");
-    html=tiles+panel("Case tracker",table(["Case","Article","Product · event","Assignee","Reporting due","Status","Validity",""],rows,"No cases in this view."),"",true)+
+    const fl=data.caseFolders||[],folderBar=panel("Folders",'<div class="chips"><button type="button" class="btn sm '+(synFolder?"outline":"")+'" data-synfolder="">All cases</button><button type="button" class="btn sm '+(synFolder==="__none"?"":"outline")+'" data-synfolder="__none">Not in a folder</button>'+fl.map(f=>'<span style="display:inline-flex;gap:2px"><button type="button" class="btn sm '+(synFolder===f.id?"":"outline")+'" data-synfolder="'+esc(f.id)+'">'+esc(f.name)+' ('+openCases.filter(c=>c.folderId===f.id).length+')</button>'+(manager?'<button type="button" class="btn outline sm" data-p5="delfolder|'+esc(f.id)+'" title="Delete folder" aria-label="Delete folder">x</button>':"")+'</span>').join("")+(canMedical()?'<button type="button" class="btn outline sm" data-p5="newfolder">+ New folder</button>':"")+'</div>');
+    html=tiles+folderBar+bulkBar("syn_c")+panel("Case tracker",table(["","Case","Article","Product · event","Assignee","Reporting due","Status","Validity",""],rows,"No cases in this view."),"",true)+
       panel("Intake and assignment",intake)+
       panel("Case series summary",'<div class="row"><span><b>'+S.total+'</b> case'+(S.total===1?'':'s')+' · <b>'+S.serious.length+'</b> serious · <b>'+S.fatal.length+'</b> fatal</span><span class="sub">Counted from the case fields. Hover a line to see which cases it counts.</span></div>'+
         '<div style="display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))"><div><h3 style="margin:8px 0">Events</h3>'+bars(S.events)+'</div><div><h3 style="margin:8px 0">Suspect products</h3>'+bars(S.products)+'</div><div><h3 style="margin:8px 0">Countries</h3>'+bars(S.countries)+'</div><div><h3 style="margin:8px 0">Age and sex</h3>'+bars(S.ages)+bars(S.sex)+'</div></div>'+
@@ -4877,6 +5070,8 @@ function render() {
   if(tab==="Account") html=panel("Change password",'<form class="grid" data-route="/host/change-password"><label>Current password<input type="password" name="current" autocomplete="current-password" required></label><label>New password<input type="password" name="next" autocomplete="new-password" minlength="12" required></label><label>Confirm new password<input type="password" name="confirm" autocomplete="new-password" minlength="12" required></label><div><button class="btn">Change password</button></div></form>',"At least 12 characters. Changing it signs you out everywhere else.")+
     panel("Your account",'<div class="row"><span>Name</span><b>'+esc(data.viewer.name)+'</b></div><div class="row"><span>Email</span><b>'+esc(data.viewer.email)+'</b></div><div class="row"><span>Role</span>'+badge(data.viewer.role,data.viewer.role==="manager"?"blue":"")+'</div>');
   if(tab==="Admin")html=adminHtml();
+  if(tab==="Search")html=searchHtml();
+  if(tab==="Archive")html=archiveHtml();
   if(tab==="Team"){
     const hosted=data.config.accounts, accts=data.accounts.users;
     const pfList=[...new Set([...data.watches.map(w=>w.portfolio),...data.assignments.map(a=>a.portfolio)])].sort(), mem=data.memberships||[];
@@ -4971,7 +5166,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -5161,6 +5356,8 @@ document.addEventListener("click",event=>{
   if(target.dataset.reassign){api("reassign",{ids:[active.id],to:$("reassignto").value,reason:$("reassignreason").value}).then(async()=>{await refresh();message("Reassigned.");$("dialog").close();}).catch(e=>message(e.message,true));return;}
   if(target.dataset.p3){p3action(target);return;}
   if(target.dataset.p4){p4action(target);return;}
+  if(target.dataset.p5){p5action(target);return;}
+  if(target.dataset.synfolder!==undefined){synFolder=target.dataset.synfolder;render();return;}
   if(target.dataset.exdec){const [action,eid]=target.dataset.exdec.split("|");let reason="";if(action==="exclude"){reason=prompt("Why is this not captured? (recorded)","");if(!reason)return;}api("extraction-decide",{id:active.id,eventId:eid,action,reason}).then(()=>loadExtraction()).catch(e=>message(e.message,true));return;}
   if(target.dataset.resume){target.disabled=true;message("Resuming the import…");api("import-resume",{runId:target.dataset.resume,retryFailed:true}).then(async r=>{await refresh();message("Import is now "+r.coverage.replace("_"," ")+(r.gaps.length?" with "+r.gaps.length+" gap"+(r.gaps.length===1?"":"s"):"")+".",r.coverage!=="reconciled"&&r.coverage!=="zero_results");}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}
   if(target.dataset.evretry){target.disabled=true;message("Retrying only what is missing…");api("evidence-retry",{runId:target.dataset.evretry}).then(async r=>{await refresh();message(r.retried+" PMID"+(r.retried===1?"":"s")+" retried; "+r.readiness.pending+" still pending.");}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}

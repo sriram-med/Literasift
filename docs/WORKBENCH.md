@@ -36,3 +36,11 @@ MedDRA and IME lists (`*ime-meddra*.json`, `ime/`) and RSI text are loaded by th
 
 ## Tests
 `npm test` (84 tests) covers: failed import resume, ZIP completeness, two portfolios reviewing one citation, two-patient articles, the aciclovir chronology, ambiguous reporters, aggregate-only articles, duplicate follow-ups, restricted full text, valid and invalid E2B, approval gating, store migration/rollback and the audit chain.
+
+## Search, tags, folders, archive and deletion
+- **Search** tab (everyone, scoped to what the person may see): citations and cases, with `pmid: case: drug: event: tag: author: status: portfolio:` operators, quoted phrases and `-exclude`. Filters: serious / non-serious, listed / unlisted / unknown, status, portfolio, folder, tag, archive.
+- **Tags** are user labels (for example `serious:hospitalization`, `listed`) added on a case or in bulk; they feed the filters and record who added them. The formal seriousness and listedness fields stay in the case data.
+- **Folders** group cases (created by a manager or medical reviewer, deleted by a manager; cases are never deleted with a folder).
+- **Archive** tab: archived cases leave working lists and series counts, cannot be edited, stay searchable and can be restored.
+- **Deletion** is manager-only, needs a reason and the typed case number, and leaves a tombstone plus an audit entry. Approved, signed or exported cases must be archived first. After deleting, the pulled citation can be removed from the library too.
+- Every search, tag, folder, archive, restore and delete is written to the audit trail.
