@@ -797,10 +797,13 @@ function assessMinimumCriteria(ex, patient, decisions = {}) {
 }
 const eventSeriousness = (e, drugs) => {
   const text = e.mentions.map(m => m.sentence).join(" "), flags = {}, basis = [];
-  const test = (key, re, label) => { const m = re.exec(text); if (m) { flags[key] = true; basis.push(label + ": \"" + m[0] + "\""); } };
-  test("death", /\b(died|death|fatal)\b/i, "death"); test("life_threatening", /\blife[- ]threatening|intensive care|\bicu\b|cardiac arrest|intubat\w+|mechanical ventilation/i, "life-threatening"); test("hospitalization", /\b(hospitali[sz]\w*|admitted|admission|prolonged (?:stay|hospital))\b/i, "hospitalisation");
+  // Negation-aware (a mention that is negated, such as "was not admitted", is not a criterion); an emergency department visit without admission is not hospitalisation.
+  const test = (key, re, label) => { const m = firstAffirmed(text, re); if (m) { flags[key] = true; basis.push(label + ": \"" + m[0] + "\""); } };
+  test("death", /\b(died|death|fatal)\b/i, "death"); test("life_threatening", /\blife[- ]threatening|intensive care|\bicu\b|cardiac arrest|intubat\w+|mechanical ventilation/i, "life-threatening"); test("hospitalization", /\b(hospitali[sz]\w*|admitted|admission|inpatient|prolonged (?:stay|hospital))\b/i, "hospitalisation");
   test("disability", /\b(permanent|persistent|disabil\w+|sequel\w+|incapacit\w+)\b/i, "disability"); test("congenital_anomaly", /\b(congenital|birth defect|malformation)\b/i, "congenital anomaly");
+  if (!flags.hospitalization && firstAffirmed(text, /\b(emergency (?:department|room)|\bER\b|\bA&E\b|casualty)\b/i)) basis.push("note: an emergency department visit without admission is not hospitalisation");
   if (e.ime) { flags.other_medically_important = true; basis.push("other medically important: on the EMA IME list"); }
+  if (!e.ime && IMPORTANT_EVENT_RE.test(e.term || "")) { flags.other_medically_important = true; basis.push("other medically important: " + e.term); }
   if (/status epilepticus|haemodialysis|hemodialysis|dialysis/i.test(text + " " + e.term)) { flags.other_medically_important = true; basis.push("other medically important: " + (/dialysis/i.test(text) ? "intervention such as dialysis was needed" : "status epilepticus")); }
   flags.serious = Object.values(flags).some(Boolean);
   return { flags, basis };
@@ -2151,7 +2154,7 @@ function normalizeCase(input) {
     general_comments:String(data.general_comments || "").slice(0, 4000), sender_comments:String(data.sender_comments || "").slice(0, 4000),
     products:(data.products || []).slice(0, 30).map(p => ({ ...group(p, FIELDS.product), role:["suspect", "concomitant", "interacting"].includes(p?.role) ? p.role : "suspect", start_not_reported:p?.start_not_reported === true,
       dechallenge_basis:["reported", "unknown", "unreported", "not_applicable"].includes(p?.dechallenge_basis) ? p.dechallenge_basis : "", rechallenge_basis:["reported", "unknown", "unreported", "not_applicable"].includes(p?.rechallenge_basis) ? p.rechallenge_basis : "", start_day:Number.isFinite(p?.start_day) ? p.start_day : null, stop_day:Number.isFinite(p?.stop_day) ? p.stop_day : null })),
-    events:(data.events || []).slice(0, 30).map(e => ({ ...group(e, FIELDS.event), onset_not_reported:e?.onset_not_reported === true, ime_flag:e?.ime_flag === true, onset_day:Number.isFinite(e?.onset_day) ? e.onset_day : null, needs_medical_judgment:(e?.needs_medical_judgment || []).map(String).slice(0, 10), manifestations:(e?.manifestations || []).slice(0, 20), extraction_ref:String(e?.extraction_ref || ""), listedness_assessment:e?.listedness_assessment || null, seriousness:Object.fromEntries(SERIOUS_FLAGS.map(k => [k, Boolean(e?.seriousness?.[k])])) })).map(syncListedness),
+    events:(data.events || []).slice(0, 30).map(e => ({ ...group(e, FIELDS.event), onset_not_reported:e?.onset_not_reported === true, ime_flag:e?.ime_flag === true, onset_day:Number.isFinite(e?.onset_day) ? e.onset_day : null, needs_medical_judgment:(e?.needs_medical_judgment || []).map(String).slice(0, 10), manifestations:(e?.manifestations || []).slice(0, 20), extraction_ref:String(e?.extraction_ref || ""), listedness_assessment:e?.listedness_assessment || null, naranjo:e?.naranjo || null, who_umc_calc:e?.who_umc_calc || null, causality_suggestions:(e?.causality_suggestions || []).slice(0, 10), seriousness:Object.fromEntries(SERIOUS_FLAGS.map(k => [k, Boolean(e?.seriousness?.[k])])) })).map(syncListedness),
     labs:Array.isArray(data.labs) ? data.labs.slice(0, 100) : [], source_documents:(data.source_documents || []).slice(0, 20).map(d => ({ filename:String(d?.filename || "").slice(0, 200), media_type:d?.media_type || null, size_bytes:Number(d?.size_bytes) || 0, source_type:d?.source_type || "unknown" })),
     source_summary:String(data.source_summary || "").slice(0, 20000), warnings:(data.warnings || []).map(String).slice(0, 20), special_situations:(data.special_situations || []).map(String).slice(0, 30),
     // LiteraSift extensions (PV Nexus ignores unknown keys): care given for the event, and factors that confound the assessment.
@@ -2437,6 +2440,132 @@ function kbTargets(state) {
   for (const w of state.watches || []) if (w.molecule) names.add(w.molecule);
   for (const c of state.cases || []) for (const p of c.data?.products || []) if (v(p.name)) names.add(v(p.name));
   return [...names].filter(n => n.length > 1);
+}
+
+// ---- Integrations ported from open-source projects (see THIRD_PARTY_NOTICES.md) ----
+// Lixplore (MIT, pryndor/Lixplore_cli): multi-source search (PubMed, Europe PMC, Crossref, DOAJ), de-duplication, BibTeX/RIS/CSV export, Unpaywall open-access links.
+// Open-access copies are only ever linked or retrieved through Unpaywall and the other legitimate sources the app already uses. Shadow libraries are not supported.
+const DISCOVER_SOURCES = ["pubmed", "europepmc", "crossref", "doaj"];
+const doiOf = x => String(x || "").trim().toLowerCase().replace(/^https?:\/\/(?:dx\.)?doi\.org\//, "").replace(/^doi:/, "");
+const stripTags = x => String(x || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+async function srcJson(env, url) {
+  return withRetry(env, async () => { const r = await fetch(url, { signal:AbortSignal.timeout(12000), headers:{ Accept:"application/json", "User-Agent":"LiteraSift/0.01" } }); if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }, { tries:2 });
+}
+const DISCOVER_FETCH = {
+  async pubmed(env, q, n) {
+    const found = await withRetry(env, () => pubmed(env, "esearch", { term:q, retmode:"json", retmax:String(n) }), { tries:2 }), ids = found?.esearchresult?.idlist || [];
+    if (!ids.length) return [];
+    const sum = await withRetry(env, () => pubmed(env, "esummary", { id:ids.join(","), retmode:"json" }), { tries:2 });
+    return ids.map(id => { const c = sum?.result?.[id]; if (!c) return null; const ids2 = c.articleids || [];
+      return { title:String(c.title || "").replace(/\.$/, ""), authors:(c.authors || []).map(a => a.name).slice(0, 12), journal:c.fulljournalname || c.source || "", year:String(c.pubdate || "").slice(0, 4), doi:doiOf(ids2.find(a => a.idtype === "doi")?.value), pmid:id, pmcid:ids2.find(a => a.idtype === "pmc")?.value || "", abstract:"", url:"https://pubmed.ncbi.nlm.nih.gov/" + id + "/", source:"pubmed" }; }).filter(Boolean);
+  },
+  async europepmc(env, q, n) {
+    const j = await srcJson(env, "https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + new URLSearchParams({ query:q, pageSize:String(n), format:"json", resultType:"core" }));
+    return (j?.resultList?.result || []).map(r => ({ title:stripTags(r.title).replace(/\.$/, ""), authors:String(r.authorString || "").split(",").map(a => a.trim()).filter(Boolean).slice(0, 12), journal:r.journalTitle || "", year:String(r.pubYear || ""), doi:doiOf(r.doi), pmid:r.pmid || "", pmcid:r.pmcid || "", abstract:stripTags(r.abstractText || r.abstract), url:r.pmcid ? "https://europepmc.org/article/PMC/" + r.pmcid : r.pmid ? "https://europepmc.org/article/MED/" + r.pmid : r.doi ? "https://doi.org/" + r.doi : "", source:"europepmc" }));
+  },
+  async crossref(env, q, n) {
+    const params = new URLSearchParams({ query:q, rows:String(n), select:"DOI,title,author,abstract,container-title,published,URL" }), mail = env.CROSSREF_EMAIL || env.UNPAYWALL_EMAIL; if (mail) params.set("mailto", mail);
+    const j = await srcJson(env, "https://api.crossref.org/works?" + params);
+    return (j?.message?.items || []).map(r => ({ title:stripTags([].concat(r.title || [])[0]), authors:(r.author || []).map(a => [a.given, a.family].filter(Boolean).join(" ")).filter(Boolean).slice(0, 12), journal:[].concat(r["container-title"] || [])[0] || "", year:String(r.published?.["date-parts"]?.[0]?.[0] || ""), doi:doiOf(r.DOI), pmid:"", pmcid:"", abstract:stripTags(r.abstract), url:r.URL || (r.DOI ? "https://doi.org/" + r.DOI : ""), source:"crossref" }));
+  },
+  async doaj(env, q, n) {
+    const j = await srcJson(env, "https://doaj.org/api/v3/search/articles/" + encodeURIComponent(q) + "?" + new URLSearchParams({ pageSize:String(n), page:"1" }));
+    return (j?.results || []).map(r => { const b = r.bibjson || {}; return { title:stripTags(b.title), authors:(b.author || []).map(a => a.name).filter(Boolean).slice(0, 12), journal:b.journal?.title || "", year:String(b.year || ""), doi:doiOf((b.identifier || []).find(i => i.type === "doi")?.id), pmid:"", pmcid:"", abstract:stripTags(b.abstract), url:(b.link || []).find(l => l.type === "fulltext")?.url || (b.link || [])[0]?.url || "", source:"doaj" }; });
+  },
+};
+const dedupTitle = t => String(t || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 90);
+// De-duplication as in Lixplore: DOI first, then PMID, then the normalised title; fields are merged and every source is kept.
+function mergeDiscovered(lists) {
+  const byKey = new Map(), order = [];
+  for (const list of lists) for (const r of list) {
+    const keys = [r.doi && "doi:" + r.doi, r.pmid && "pmid:" + r.pmid, r.title && "t:" + dedupTitle(r.title)].filter(Boolean), hit = keys.map(k => byKey.get(k)).find(Boolean);
+    if (hit) { for (const f of ["title", "journal", "year", "doi", "pmid", "pmcid", "abstract", "url"]) if (!hit[f] && r[f]) hit[f] = r[f]; if ((r.authors || []).length > (hit.authors || []).length) hit.authors = r.authors; if (!hit.sources.includes(r.source)) hit.sources.push(r.source); keys.forEach(k => byKey.set(k, hit)); }
+    else { const item = { ...r, sources:[r.source] }; delete item.source; keys.forEach(k => byKey.set(k, item)); order.push(item); }
+  }
+  return order.sort((a, b) => b.sources.length - a.sources.length || String(b.year).localeCompare(String(a.year)));
+}
+function unpaywallSummary(result) {
+  if (result.state === "unconfigured") return { state:"unconfigured", note:"Add a contact email under Settings to check open access through Unpaywall." };
+  if (result.state === "nodoi") return { state:"nodoi" };
+  if (result.state === "notfound") return { state:"notfound" };
+  if (result.state !== "ok") return { state:"unavailable" };
+  const d = result.data, best = d.best_oa_location || {}, https = u => /^https:\/\//.test(u || "") ? u : "";
+  return { state:"ok", isOa:Boolean(d.is_oa), status:d.oa_status || (d.is_oa ? "open" : "closed"), journalIsOa:Boolean(d.journal_is_oa), license:best.license || "", version:best.version || "", host:best.host_type || "", pdfUrl:https(best.url_for_pdf), landingUrl:https(best.url_for_landing_page || best.url), locations:(d.oa_locations || []).length };
+}
+const bibKey = (r, i) => { const t = String((r.authors || [])[0] || "item").split(/[ ,]+/).filter(Boolean), surname = t.length > 1 && /^[A-Z]{1,3}$/.test(t[t.length - 1]) ? t[0] : t[t.length - 1] || "item"; return (surname.replace(/[^A-Za-z]/g, "") || "item") + (r.year || "nd") + String.fromCharCode(97 + i % 26); };
+const bibEsc = x => String(x || "").replace(/[{}\\]/g, "");
+function discoverExport(items, format) {
+  if (format === "ris") return items.map(r => ["TY  - JOUR", "TI  - " + r.title, ...(r.authors || []).map(a => "AU  - " + a), r.journal && "JO  - " + r.journal, r.year && "PY  - " + r.year, r.doi && "DO  - " + r.doi, r.pmid && "ID  - PMID " + r.pmid, r.abstract && "AB  - " + r.abstract, r.url && "UR  - " + r.url, "ER  - "].filter(Boolean).join("\r\n")).join("\r\n") + "\r\n";
+  if (format === "bibtex") return items.map((r, i) => "@article{" + bibKey(r, i) + ",\n  title = {" + bibEsc(r.title) + "},\n  author = {" + (r.authors || []).map(bibEsc).join(" and ") + "},\n  journal = {" + bibEsc(r.journal) + "},\n  year = {" + bibEsc(r.year) + "}" + (r.doi ? ",\n  doi = {" + bibEsc(r.doi) + "}" : "") + (r.pmid ? ",\n  note = {PMID " + bibEsc(r.pmid) + "}" : "") + "\n}").join("\n\n") + "\n";
+  const head = ["Title", "Authors", "Journal", "Year", "DOI", "PMID", "PMCID", "Sources", "URL"];
+  return [head, ...items.map(r => [r.title, (r.authors || []).join("; "), r.journal, r.year, r.doi, r.pmid, r.pmcid, (r.sources || []).join("; "), r.url])].map(row => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
+}
+// pv-case-triage-agents (MIT, gopipamulapati): rule-based PHI redaction, run before any text goes to a model, and a leak check on what comes back.
+const PHI_PATTERNS = [["EMAIL", /\b[\w.+-]+@[\w-]+\.[\w.]+\b/g], ["SSN", /\b\d{3}-\d{2}-\d{4}\b/g], ["PHONE", /(?:\+1[\s.-]?)?\(?\b\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g], ["MRN", /\b(?:MRN|medical record(?: number)?)[:#\s]*[A-Z0-9-]{5,}\b/gi], ["DOB", /\b(?:DOB|date of birth)[:\s]*\d{1,2}\/\d{1,2}\/\d{2,4}\b/gi],
+  ["ADDRESS", /\b\d{1,5}[ \t]+(?:[A-Z][a-z]+[ \t]){1,3}(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln)\b/g], ["NAME", /^(?:patient|reporter)(?: name)?:[ \t]*([A-Z][a-z]+(?:[ \t][A-Z][a-z.]+)+)/gim], ["NAME", /\bDr\.?[ \t]+[A-Z][a-z]+(?:[ \t][A-Z][a-z]+)?/g]];
+function redactPhi(text) {
+  const counts = {}, removed = []; let out = String(text || "");
+  for (const [label, re] of PHI_PATTERNS) out = out.replace(re, (m, value) => { counts[label] = (counts[label] || 0) + 1; if (typeof value === "string" && value) { removed.push(value); return m.replace(value, "[" + label + "]"); } removed.push(m.replace(/^(?:MRN|medical record(?: number)?|DOB|date of birth)[:#\s]*/i, "")); return "[" + label + "]"; });
+  return { text:out, counts, removed };
+}
+const phiLeaks = (text, removed) => removed.filter(v => v && String(text).toLowerCase().includes(String(v).toLowerCase()));
+// Negation-aware seriousness evidence (same rule as pv-case-triage-agents): "denies", "not admitted" and "without" do not create a criterion.
+const NEG_RE = /(?:^|[\s(])(?:no|not|denies|denied|without|never|negative for)\s/;
+function negatedBefore(text, start) { const seg = text.slice(Math.max(0, start - 40), start).toLowerCase().split(/[.;!?]/).pop(); return NEG_RE.test(" " + seg); }
+function firstAffirmed(text, re) { const g = new RegExp(re.source, re.flags.replace("g", "") + "g"); for (const m of text.matchAll(g)) if (!negatedBefore(text, m.index)) return m; return null; }
+const IMPORTANT_EVENT_RE = /anaphyla|stevens[- ]johnson|hepatic failure|liver failure|seizure|convulsion|acute kidney injury|renal failure|lactic acidosis|qt prolong/i;
+// Triage priority (pv-case-triage-agents): an internal ordering for reviewers; the regulatory clock is the reporting timeline, which stays separate.
+function triageFor(state, c) {
+  const cls = caseClass(c), a = localAssessment(c.data || {}).validity;
+  if (!a.valid_icsr) return { priority:"follow_up_required", rank:0, label:"Follow-up required", reason:"Missing: " + (a.missing || []).join(", ") };
+  if (cls.serious && cls.listedness !== "listed") return { priority:"expedited", rank:1, label:"Expedited", reason:"Serious and " + (cls.listedness === "unlisted" ? "unlisted" : "listedness not confirmed (treated as unlisted)") + (cls.criteria.length ? " · " + cls.criteria.join(", ").replace(/_/g, " ") : "") };
+  if (cls.serious) return { priority:"priority", rank:2, label:"Priority", reason:"Serious, all events listed" };
+  return { priority:"routine", rank:3, label:"Routine", reason:"Non-serious" };
+}
+// drug-adverse-event-explorer (MIT, rajnomani): proportional reporting ratio from the openFDA adverse-event reports (FAERS). A screening aid only: it does not show that the drug causes the event.
+function prrStats(a, b, c, d) {
+  if (!(a > 0) || !(c > 0) || a + b <= 0 || c + d <= 0) return null;
+  const N = a + b + c + d, prr = (a / (a + b)) / (c / (c + d)), chi2 = N * (a * d - b * c) ** 2 / ((a + b) * (c + d) * (a + c) * (b + d)), se = Math.sqrt(1 / a - 1 / (a + b) + 1 / c - 1 / (c + d));
+  return { prr, lcl:Math.exp(Math.log(prr) - 1.96 * se), ucl:Math.exp(Math.log(prr) + 1.96 * se), chi2, signal:a >= 3 && prr >= 2 && chi2 >= 4 };
+}
+async function openfdaTotal(env, search) {
+  const params = new URLSearchParams({ limit:"1" }); if (search) params.set("search", search); if (env.OPENFDA_API_KEY) params.set("api_key", env.OPENFDA_API_KEY);
+  await sleep(Number(env.FAERS_GAP_MS ?? 280));
+  return withRetry(env, async () => { const r = await fetch("https://api.fda.gov/drug/event.json?" + params, { signal:AbortSignal.timeout(15000) }); if (r.status === 404) return 0; if (!r.ok) throw new Error("openFDA HTTP " + r.status); return Number((await r.json())?.meta?.results?.total ?? 0); }, { tries:3 });
+}
+async function openfdaTop(env, search, n) {
+  const params = new URLSearchParams({ search, count:"patient.reaction.reactionmeddrapt.exact", limit:String(n) }); if (env.OPENFDA_API_KEY) params.set("api_key", env.OPENFDA_API_KEY);
+  await sleep(Number(env.FAERS_GAP_MS ?? 280));
+  return withRetry(env, async () => { const r = await fetch("https://api.fda.gov/drug/event.json?" + params, { signal:AbortSignal.timeout(15000) }); if (r.status === 404) return []; if (!r.ok) throw new Error("openFDA HTTP " + r.status); return (await r.json())?.results || []; }, { tries:3 });
+}
+const fdaTerm = x => String(x || "").replace(/["\\]/g, " ").trim();
+// drug-causality-bert-v2 (Apache-2.0, PrashantRGore): Naranjo scale and WHO-UMC rules. Scores are suggestions until a reviewer saves and applies them.
+const NARANJO_Q = [["q1", "Are there previous conclusive reports on this reaction?", 1, 0, 0], ["q2", "Did the adverse event appear after the suspected drug was administered?", 2, -1, 0], ["q3", "Did the reaction improve when the drug was discontinued or a specific antagonist was given?", 1, 0, 0], ["q4", "Did the reaction reappear when the drug was re-administered?", 2, -1, 0],
+  ["q5", "Are there alternative causes that could on their own have caused the reaction?", -1, 2, 0], ["q6", "Did the reaction reappear when a placebo was given?", -1, 1, 0], ["q7", "Was the drug detected in blood or other fluids in toxic concentrations?", 1, 0, 0], ["q8", "Was the reaction more severe with a higher dose, or less severe with a lower dose?", 1, 0, 0],
+  ["q9", "Did the patient have a similar reaction to the same or similar drugs before?", 1, 0, 0], ["q10", "Was the event confirmed by objective evidence?", 1, 0, 0]].map(([id, text, yes, no, unknown]) => ({ id, text, yes, no, unknown }));
+function naranjoScore(answers = {}) {
+  let score = 0, answered = 0; for (const q of NARANJO_Q) { const a = answers[q.id]; if (a === "yes" || a === "no") { score += a === "yes" ? q.yes : q.no; answered++; } }
+  return { score, answered, category:score >= 9 ? "Definite" : score >= 5 ? "Probable" : score >= 1 ? "Possible" : "Doubtful" };
+}
+const NARANJO_TO_WHO = { Definite:"Certain", Probable:"Probable/Likely", Possible:"Possible", Doubtful:"Unlikely" };
+function whoUmcCategory({ temporal, dechallengePositive, rechallengePositive, alternativeUnlikely, plausible }) {
+  if (temporal === null || temporal === undefined) return "Unassessable/Unclassifiable";
+  if (temporal && dechallengePositive && rechallengePositive && alternativeUnlikely && plausible) return "Certain";
+  if (temporal && dechallengePositive && alternativeUnlikely) return "Probable/Likely";
+  if (temporal && plausible) return "Possible";
+  if (!temporal) return "Unlikely";
+  return "Conditional/Unclassified";
+}
+function causalityPrefill(c, event) {
+  const prod = (c.data?.products || []).find(p => p.role === "suspect") || (c.data?.products || [])[0] || {}, dc = v(prod.dechallenge).toLowerCase(), rc = v(prod.rechallenge).toLowerCase(), basis = {}, a = {};
+  const onset = event.onset_day, start = prod.start_day;
+  if (Number.isFinite(onset) && Number.isFinite(start)) { a.q2 = onset >= start ? "yes" : "no"; basis.q2 = "Onset day " + onset + " vs start day " + start; } else if (hasVal(event.time_to_onset)) { a.q2 = "yes"; basis.q2 = "Time to onset reported: " + v(event.time_to_onset); }
+  if (/positive/.test(dc)) { a.q3 = "yes"; basis.q3 = "Dechallenge: " + v(prod.dechallenge); } else if (/negative/.test(dc)) { a.q3 = "no"; basis.q3 = "Dechallenge: " + v(prod.dechallenge); }
+  if (/positive/.test(rc)) { a.q4 = "yes"; basis.q4 = "Rechallenge: " + v(prod.rechallenge); } else if (/negative/.test(rc)) { a.q4 = "no"; basis.q4 = "Rechallenge: " + v(prod.rechallenge); }
+  if (hasVal(event.alternative_causes)) { a.q5 = "yes"; basis.q5 = "Alternative causes recorded: " + v(event.alternative_causes); }
+  if (hasVal(event.objective_evidence)) { a.q10 = "yes"; basis.q10 = "Objective evidence recorded: " + v(event.objective_evidence); }
+  const who = { temporal:a.q2 === "yes" ? true : a.q2 === "no" ? false : null, dechallengePositive:a.q3 === "yes", rechallengePositive:a.q4 === "yes", alternativeUnlikely:hasVal(event.alternative_causes) ? false : null, plausible:null };
+  return { answers:a, basis, who };
 }
 function parseSearch(q) {
   const terms = [], re = /(-?)(?:(\w+):)?(?:"([^"]+)"|(\S+))/g; let m;
@@ -3317,7 +3446,7 @@ async function apiCore(request, env, path) {
     const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules) }));
     return json({ viewer, library:manager ? libraryLayout(state) : [],
       cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
-      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c) }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
+      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c), triage:triageFor(state, c) }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
       monitoring:monitoringCounts(state, viewer),
       series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
@@ -3438,6 +3567,49 @@ async function apiCore(request, env, path) {
     kb.sync = { ...kb.sync, lastMode:mode, lastRunAt:at, by:email }; await saveKb(env, kb);
     await audit(env, { by:email, action:"drugkb.sync", target:mode, detail:{ pulled:done.length, remaining:Math.max(0, todo.length - done.length), failed:failed.slice(0, 5).join("; ") } });
     return json({ ok:true, mode, pulled:done.length, remaining:Math.max(0, todo.length - done.length), failed });
+  }
+  if (["/api/discover", "/api/discover-export", "/api/faers-context"].includes(path) && viewer) {
+    const cfg = withSettings(env, state);
+    if (path === "/api/discover-export") {
+      const items = (Array.isArray(body.items) ? body.items : []).slice(0, 200).map(r => ({ title:String(r?.title || "").slice(0, 500), authors:(Array.isArray(r?.authors) ? r.authors : []).map(a => String(a).slice(0, 80)).slice(0, 30), journal:String(r?.journal || "").slice(0, 200), year:String(r?.year || "").slice(0, 8), doi:doiOf(r?.doi).slice(0, 200), pmid:String(r?.pmid || "").replace(/\D/g, "").slice(0, 12), pmcid:String(r?.pmcid || "").slice(0, 20), abstract:String(r?.abstract || "").slice(0, 4000), url:/^https?:\/\//.test(r?.url || "") ? String(r.url).slice(0, 500) : "", sources:(Array.isArray(r?.sources) ? r.sources : []).map(x => String(x).slice(0, 20)).slice(0, 5) })).filter(r => r.title);
+      const format = ["bibtex", "ris", "csv"].includes(body.format) ? body.format : "csv";
+      if (!items.length) return json({ error:"Choose at least one result to export." }, 400);
+      await audit(env, { by:email, action:"discover.export", target:items.length + " result" + (items.length === 1 ? "" : "s"), detail:{ format } });
+      const ext = { bibtex:"bib", ris:"ris", csv:"csv" }[format];
+      return new Response(discoverExport(items, format), { headers:{ "Content-Type":format === "csv" ? "text/csv; charset=utf-8" : "text/plain; charset=utf-8", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-discover.' + ext + '"' } });
+    }
+    if (path === "/api/discover") {
+      const q = String(body.q || "").trim().slice(0, 300); if (q.length < 2) return json({ error:"Enter a search." }, 400);
+      const sources = (Array.isArray(body.sources) && body.sources.length ? body.sources : DISCOVER_SOURCES).filter(x => DISCOVER_SOURCES.includes(x)), limit = Math.min(Math.max(Number(body.limit) || 20, 5), 50);
+      const settled = await Promise.allSettled(sources.map(src => DISCOVER_FETCH[src](cfg, q, limit)));
+      const status = sources.map((src, i) => ({ source:src, ok:settled[i].status === "fulfilled", count:settled[i].status === "fulfilled" ? settled[i].value.length : 0, error:settled[i].status === "rejected" ? String(settled[i].reason?.message || "failed").slice(0, 160) : "" }));
+      const merged = mergeDiscovered(settled.filter(x => x.status === "fulfilled").map(x => x.value)).slice(0, 100);
+      // Open access through Unpaywall for the first results that have a DOI, a few at a time.
+      const withDoi = merged.filter(r => validDoi(r.doi)).slice(0, 40), queue = [...withDoi], uw = new Map();
+      await Promise.all(Array.from({ length:4 }, async () => { while (queue.length) { const r = queue.shift(); try { uw.set(r.doi, unpaywallSummary(await unpaywallLookup(cfg, { doi:r.doi }))); } catch { uw.set(r.doi, { state:"unavailable" }); } } }));
+      const mine = state.assignments.filter(a => mayAccess(state, viewer, a)), byDoi = new Map(Object.values(state.articles).filter(a => a.doi).map(a => [doiOf(a.doi), a.id]));
+      const results = merged.map(r => { const pmid = r.pmid && state.articles[r.pmid] ? r.pmid : byDoi.get(r.doi) || "", visible = pmid && mine.some(a => a.pmid === pmid);
+        return { ...r, unpaywall:uw.get(r.doi) || (r.doi ? { state:"skipped" } : { state:"nodoi" }),
+          library:visible ? { pmid, assignments:mine.filter(a => a.pmid === pmid).map(a => ({ id:a.id, portfolio:a.portfolio, status:a.status })), cases:(state.cases || []).filter(c => c.pmid === pmid && caseVisible(state, viewer, c)).map(c => ({ id:c.id, number:c.number })) } : null,
+          links:{ pubmed:r.pmid ? "https://pubmed.ncbi.nlm.nih.gov/" + r.pmid + "/" : "", europepmc:r.pmcid ? "https://europepmc.org/article/PMC/" + r.pmcid : r.pmid ? "https://europepmc.org/article/MED/" + r.pmid : "", doi:r.doi ? "https://doi.org/" + r.doi : "", unpaywall:r.doi ? "https://unpaywall.org/" + r.doi : "", crossref:r.doi ? "https://api.crossref.org/works/" + encodeURIComponent(r.doi) : "", doaj:r.doi ? "https://doaj.org/search/articles?source=" + encodeURIComponent(JSON.stringify({ query:{ query_string:{ query:'doi:"' + r.doi + '"' } } })) : "" } }; });
+      await audit(env, { by:email, action:"discover.search", target:q.slice(0, 120), detail:{ sources:sources.join(","), results:results.length, failed:status.filter(x => !x.ok).map(x => x.source).join(",") } });
+      return json({ q, sources:status, results, unpaywallConfigured:Boolean(cfg.UNPAYWALL_EMAIL) });
+    }
+    // FAERS context (openFDA)
+    const drug = String(body.drug || "").trim().slice(0, 100), event = String(body.event || "").trim().slice(0, 120);
+    if (drug.length < 2) return json({ error:"Enter a drug name." }, 400);
+    const kb = await loadKb(env), names = [...new Set(kbExpand(kb, drug).map(fdaTerm).filter(Boolean))].slice(0, 6), drugExpr = names.map(n => 'patient.drug.openfda.generic_name:"' + n + '" OR patient.drug.medicinalproduct:"' + n + '"').join(" OR ");
+    const cacheKey = "faers/" + (await sha256Hex(drugExpr + "|" + event + "|" + (body.top ? "top" : ""))).slice(0, 24) + ".json", cached = await env.BUCKET.get(cacheKey);
+    if (cached && body.refresh !== true) { try { const c = JSON.parse(await cached.text()); if (Date.now() - Date.parse(c.fetchedAt) < 86400000) return json({ ...c, cached:true }); } catch { /* refetch */ } }
+    const N = await openfdaTotal(cfg, ""), nDrug = await openfdaTotal(cfg, "(" + drugExpr + ")"), rows = [];
+    if (!nDrug) return json({ drug, names, found:false, note:"No FAERS reports mention this drug name." });
+    const stat = async (reaction, a) => { const nEvent = await openfdaTotal(cfg, 'patient.reaction.reactionmeddrapt:"' + fdaTerm(reaction) + '"'), b = nDrug - a, c = nEvent - a, d = N - nDrug - c, st = prrStats(a, b, c, d); return { reaction, a, b, c, d, ...(st || { prr:null, lcl:null, ucl:null, chi2:null, signal:false }) }; };
+    if (event) { const a = await openfdaTotal(cfg, "(" + drugExpr + ') AND patient.reaction.reactionmeddrapt:"' + fdaTerm(event) + '"'); rows.push(await stat(event, a)); }
+    else for (const r of await openfdaTop(cfg, "(" + drugExpr + ")", Math.min(Number(body.top) || 15, 25))) rows.push(await stat(r.term, r.count));
+    const out = { drug, names, found:true, event, asOf:new Date().toISOString().slice(0, 10), fetchedAt:new Date().toISOString(), reportsAll:N, reportsDrug:nDrug, rows:rows.sort((x, y) => (y.prr ?? -1) - (x.prr ?? -1)), rule:"Possible signal when reports ≥ 3, PRR ≥ 2 and chi-square ≥ 4.", caveat:"FAERS holds spontaneous reports. A high PRR is a reason to look closer, not evidence that the drug causes the event. It is context for the reviewer and changes nothing in the case." };
+    await env.BUCKET.put(cacheKey, JSON.stringify(out), { httpMetadata:{ contentType:"application/json" } });
+    await audit(env, { by:email, action:"faers.context", target:drug + (event ? " / " + event : ""), detail:{ rows:rows.length, signals:rows.filter(r => r.signal).length } });
+    return json(out);
   }
   if (path === "/api/route" && viewer) {
     const stage = String(body.stage || ""), to = String(body.to || "").trim().toLowerCase(), reason = String(body.reason || "").trim(), ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), at = new Date().toISOString();
@@ -3800,7 +3972,7 @@ async function apiCore(request, env, path) {
       }
     }
   }
-  if (["/api/narrative-generate", "/api/narrative-save", "/api/e2b-validate", "/api/case-review", "/api/case-approve", "/api/rsi-save", "/api/rsi-list", "/api/listedness-suggest", "/api/listedness-decide"].includes(path) && viewer) {
+  if (["/api/narrative-generate", "/api/narrative-save", "/api/e2b-validate", "/api/case-review", "/api/case-approve", "/api/rsi-save", "/api/rsi-list", "/api/listedness-suggest", "/api/listedness-decide", "/api/causality-assess", "/api/bert-causality", "/api/phi-scan"].includes(path) && viewer) {
     const at = new Date().toISOString();
     if (path === "/api/rsi-save" || path === "/api/rsi-list") {
       if (path === "/api/rsi-list") return json({ rsi:(state.rsi || []).map(({ id, product, market, version, effectiveDate, source, hash, at, by }) => ({ id, product, market, version, effectiveDate, source, hash, at, by })) });
@@ -3816,8 +3988,48 @@ async function apiCore(request, env, path) {
     const rec = (state.cases || []).find(c => c.id === body.caseId);
     if (!rec || !caseVisible(state, viewer, rec)) return json({ error:"Case not found." }, 404);
     const pm = isPortfolioManager(state, viewer, rec.portfolio), roles = rolesIn(state, email, rec.portfolio), medical = pm || roles.has("medical_reviewer"), mayEdit = medical || rec.assignee === email || rec.createdBy === email;
-    if (rec.locked && path !== "/api/e2b-validate" && path !== "/api/listedness-suggest") return json({ error:"This case is signed and locked." }, 409);
+    if (rec.locked && path !== "/api/e2b-validate" && path !== "/api/listedness-suggest" && path !== "/api/phi-scan") return json({ error:"This case is signed and locked." }, 409);
     const profileName = ["ICH", "EU", "FDA"].includes(body.profile) ? body.profile : "ICH";
+    if (path === "/api/phi-scan") {
+      // Looks for patient-identifying data in the narrative and free text before anything is shared or sent to a model. Reporter contact details have their own fields and are not scanned.
+      const narrative = rec.data.narrative?.text || buildNarrative(rec).text, fields = { narrative, "general comments":rec.data.general_comments || "", "source summary":rec.data.source_summary || "", "patient identifier":v(rec.data.patient?.identifier) };
+      const findings = [], redacted = {};
+      for (const [name, text] of Object.entries(fields)) { if (!text) continue; const r = redactPhi(text); if (r.removed.length) { findings.push({ field:name, types:r.counts, samples:r.removed.slice(0, 5).map(x => x.slice(0, 40)) }); redacted[name] = r.text; } }
+      await audit(env, { by:email, action:"case.phi_scan", entityType:"Case", entityId:rec.number, detail:{ fields_with_findings:findings.length } });
+      return json({ clean:!findings.length, findings, redactedNarrative:redacted.narrative || narrative, note:"Rule-based check (names after labels, Dr names, e-mails, phone numbers, MRN, dates of birth, street addresses, SSN). It does not replace a privacy review." });
+    }
+    if (path === "/api/causality-assess" || path === "/api/bert-causality") {
+      const index = Number(body.eventIndex), event = rec.data.events?.[index]; if (!event) return json({ error:"Choose an event." }, 404);
+      if (path === "/api/bert-causality") {
+        const cfg = withSettings(env, state); if (!cfg.CAUSALITY_ENDPOINT || !cfg.CAUSALITY_TOKEN) return json({ error:"The BERT causality service is not configured (CAUSALITY_ENDPOINT and CAUSALITY_TOKEN)." }, 501);
+        if (new URL(cfg.CAUSALITY_ENDPOINT).protocol !== "https:" && !/^http:\/\/(127\.0\.0\.1|localhost)/.test(cfg.CAUSALITY_ENDPOINT)) return json({ error:"The causality endpoint must use HTTPS." }, 400);
+        if (!mayEdit) return json({ error:"Not permitted." }, 403);
+        const prod = (rec.data.products || []).find(x => x.role === "suspect") || (rec.data.products || [])[0] || {}, sentences = (event.verbatim?.evidence || []).map(x => x.excerpt).filter(Boolean).slice(0, 4);
+        const raw = [v(prod.name) + " and " + v(event.verbatim) + ".", ...sentences].join(" "), red = redactPhi(raw), payload = { text:red.text, drug:v(prod.name), event:v(event.verbatim) };
+        const response = await fetch(cfg.CAUSALITY_ENDPOINT, { method:"POST", headers:{ "Content-Type":"application/json", Authorization:"Bearer " + cfg.CAUSALITY_TOKEN }, body:JSON.stringify(payload), signal:AbortSignal.timeout(30000) }).catch(e => ({ ok:false, status:0, error:e }));
+        if (!response.ok) return json({ error:"The causality service answered HTTP " + (response.status || "error") + "." }, 502);
+        const out = await response.json().catch(() => null), prob = Number(out?.probability);
+        if (!out || !["causal", "non-causal"].includes(String(out.label)) || !(prob >= 0 && prob <= 1)) return json({ error:"The causality service returned an unexpected answer." }, 502);
+        const suggestion = { method:"BioBERT classifier", source:"drug-causality-bert-v2", model:String(out.model || "").slice(0, 80), label:out.label, probability:Math.round(prob * 1000) / 1000, state:"machine_suggestion", inputSha256:await sha256Hex(red.text), phiRedacted:red.counts, by:email, at, note:"Binary text classifier (causal / non-causal). A suggestion only: it is not a WHO-UMC or Naranjo category and is not a reviewer decision." };
+        await write(env, data => { const c = data.cases.find(x => x.id === rec.id); (c.data.events[index].causality_suggestions ||= []).unshift(suggestion); c.data.events[index].causality_suggestions = c.data.events[index].causality_suggestions.slice(0, 10); });
+        await audit(env, { by:email, action:"case.causality_suggested", entityType:"Case", entityId:rec.number, detail:{ method:suggestion.method, label:suggestion.label, probability:suggestion.probability, model:suggestion.model } });
+        return json({ suggestion });
+      }
+      const prefill = causalityPrefill(rec, event);
+      if (body.mode !== "save") return json({ questions:NARANJO_Q, prefill, naranjo:naranjoScore(prefill.answers), who:{ inputs:prefill.who, category:whoUmcCategory(prefill.who) }, saved:{ naranjo:event.naranjo, who:event.who_umc_calc }, suggestions:event.causality_suggestions || [] });
+      if (!mayEdit) return json({ error:"Only the case's reviewer, a medical reviewer or a manager can record a causality assessment." }, 403);
+      const answers = {}; for (const q of NARANJO_Q) { const a = String(body.answers?.[q.id] || "unknown"); if (!["yes", "no", "unknown"].includes(a)) return json({ error:"Answer each question yes, no or unknown." }, 400); answers[q.id] = a; }
+      const tri = x => x === true ? true : x === false ? false : null, w = body.who || {}, who = { temporal:tri(w.temporal), dechallengePositive:w.dechallengePositive === true, rechallengePositive:w.rechallengePositive === true, alternativeUnlikely:tri(w.alternativeUnlikely), plausible:tri(w.plausible) };
+      const score = naranjoScore(answers), whoCat = whoUmcCategory({ ...who, alternativeUnlikely:who.alternativeUnlikely === true, plausible:who.plausible === true, temporal:who.temporal });
+      const naranjo = { answers, ...score, basis:prefill.basis, by:email, at, state:"reviewer_calculated" }, who_umc_calc = { inputs:who, category:whoCat, by:email, at, state:"reviewer_calculated" };
+      const apply = ["naranjo", "who"].includes(body.apply) ? body.apply : "", applied = apply === "naranjo" ? NARANJO_TO_WHO[score.category] : apply === "who" ? whoCat : "";
+      const data2 = JSON.parse(JSON.stringify(rec.data)); const ev2 = data2.events[index]; ev2.naranjo = naranjo; ev2.who_umc_calc = who_umc_calc; (ev2.causality_suggestions ||= []).unshift({ method:"Naranjo", category:score.category, score:score.score, state:"reviewer_calculated", by:email, at }, { method:"WHO-UMC rules", category:whoCat, state:"reviewer_calculated", by:email, at });
+      if (applied) { ev2.causality_reviewer = icsrField(applied, "edited"); ev2.causality_method = icsrField(apply === "naranjo" ? "Naranjo" : "WHO-UMC", "edited"); }
+      const entry = await recordVersion(env, { ...rec, data:data2 }, "edited", email, "Causality assessment (Naranjo " + score.score + ", WHO-UMC " + whoCat + (applied ? ", applied " + applied : "") + ")");
+      await write(env, data => { const c = data.cases.find(x => x.id === rec.id); c.data = data2; c.updatedAt = at; (c.history ||= []).push({ at, by:email, action:"causality assessed: Naranjo " + score.score + " (" + score.category + "), WHO-UMC " + whoCat + (applied ? "; applied " + applied : "") }); pushVersion(c, entry); });
+      await audit(env, { by:email, action:"case.causality", entityType:"Case", entityId:rec.number, detail:{ event:v(event.verbatim), naranjo:score.score + " " + score.category, who:whoCat, applied:applied || "not applied" } });
+      return json({ ok:true, naranjo, who:who_umc_calc, applied });
+    }
     if (path === "/api/narrative-generate" || path === "/api/narrative-save") {
       if (!mayEdit) return json({ error:"Only the case's reviewer, a medical reviewer or a manager can change the narrative." }, 403);
       let narrative;
@@ -4564,7 +4776,7 @@ const paths = {
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
+const subtitles = {Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -4774,6 +4986,8 @@ async function loadReview(){
     '<details style="margin-top:6px"><summary class="sub">Add reference safety information (manager)</summary><input id="rsiprod" placeholder="Product" style="width:100%;margin-top:4px"><input id="rsiver" placeholder="Version" style="width:48%"><input id="rsimarket" placeholder="Market" style="width:48%"><textarea id="rsitext" rows="4" placeholder="Authorised text (e.g. SmPC section 4.8)" style="width:100%"></textarea><button type="button" class="btn sm" data-p3="rsisave">Save RSI version</button></details></div>';
   const meta=(data.caseMeta||{})[curCase.id]||{};
   h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Where it is</b> '+stageBadge(caseStage(curCase))+' <span class="sub">'+esc(((data.profiles||[]).find(p=>p.email===curCase.assignee)||{}).name||curCase.assignee||"nobody")+'</span><div style="margin-top:6px">'+(meta.timeline?'<b>'+esc(meta.timeline.category)+'</b><div style="margin-top:4px">'+clockHtml(curCase)+'</div>':"")+'</div><div style="margin-top:8px">'+clinHtml(curCase)+'</div>'+(kbCard?'<div style="margin-top:8px">'+kbCard+'</div>':"")+'</div>';
+  h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Triage, causality, signal context and privacy</b><div style="margin:6px 0">'+triageBadge(curCase)+'</div>'+crossLinks(data.articles[curCase.pmid]||{id:curCase.pmid})+
+    '<div class="sub">Per event: Naranjo and WHO-UMC calculators (nothing changes until you apply a result), and FAERS reporting context from openFDA (a screening aid, not causality).</div>'+d.events.map((e,i)=>'<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px"><b>'+esc((e.verbatim&&e.verbatim.value)||"event "+(i+1))+'</b><button type="button" class="btn outline sm" data-p8="cause|'+i+'">Causality…</button><button type="button" class="btn outline sm" data-p8="faers|'+i+'">FAERS context</button>'+((e.causality_suggestions||[]).some(x=>x.state==="machine_suggestion")?badge("machine suggestion on file","amber"):"")+(e.naranjo?badge("Naranjo "+e.naranjo.score+" "+e.naranjo.category,"blue"):"")+'</div>').join("")+'<div id="faersres" style="margin-top:8px"></div><div style="margin-top:10px"><button type="button" class="btn outline sm" data-p8="phi">Scan for patient-identifying data</button></div><div id="phires" style="margin-top:6px"></div></div>';
   h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Tags</b> <span class="sub">Labels for seriousness criteria and listedness. They also drive the Serious, Non-serious, Listed and Unlisted filters. Each change is recorded with your name.</span><div style="margin:6px 0">'+((curCase.tags||[]).length?curCase.tags.map(t=>'<span class="badge" title="added by '+esc(t.by)+'">'+esc(t.tag)+' <a href="#" data-p5="cuntag|'+esc(t.tag)+'" aria-label="Remove tag" style="text-decoration:none">x</a></span>').join(" "):'<span class="sub">No tags yet.</span>')+'</div><div style="display:flex;gap:6px;flex-wrap:wrap"><select id="ct_tag" aria-label="Tag">'+(data.standardTags||[]).map(t=>'<option>'+esc(t)+'</option>').join("")+'</select><input id="ct_custom" placeholder="or your own tag" style="width:140px"><button type="button" class="btn outline sm" data-p5="ctag">Add tag</button></div></div>';
   if(data.viewer.role==="manager"||(data.memberships||[]).some(m=>m.email===data.viewer.email&&m.role==="medical_reviewer"))h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Route this case</b><div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px"><button type="button" class="btn outline sm" data-p4="caseroute|draft">Send back to Draft (clears approval)</button><select id="routeto" aria-label="Person">'+(data.profiles||[]).filter(p=>p.active).map(p=>'<option value="'+esc(p.email)+'"'+(p.email===curCase.assignee?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select><button type="button" class="btn outline sm" data-p4="caseroute|person">Reassign case</button><button type="button" class="btn outline sm" data-p4="routecase">Route to a stage or person…</button></div></div>';
   h+='<div class="card" style="padding:10px"><b>Version history</b>'+versions.map(v=>'<div class="sub">v'+v.n+" · "+esc(v.action)+" · "+esc(v.by||"")+" · "+esc(String(v.at||"").slice(0,16).replace("T"," "))+(v.note?" · "+esc(v.note):"")+'</div>').join("")+'</div>';
@@ -4893,9 +5107,10 @@ function caseRowCells(c){
   return ['<input type="checkbox" class="'+(tab==="Search"?"srch_c":tab==="Archive"?"arc_c":"syn_c")+'" value="'+esc(c.id)+'" aria-label="Select case">','<a href="#" data-opencase="'+esc(c.id)+'"><b>'+esc(c.number)+'</b></a>',esc((art.title||"PMID "+c.pmid).slice(0,70))+'<div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.portfolio||"")+'</div>',x.ser+x.crit,x.lis,x.fold,tagChips(c),stageBadge(caseStage(c))+" "+badge(c.status,""),esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||""),clockHtml(c),clinHtml(c),x.act];
 }
 const CASEHEAD=["","Case","Article","Seriousness","Listedness","Folder","Tags","Stage · status","Owner","Reporting timeline","Indication · action · DC · RC","Actions"];
-const GROUPS={sercat:"Seriousness × listedness",clock:"Reporting status",stage:"Stage",none:"No grouping",status:"Status",seriousness:"Seriousness",listedness:"Listedness",folder:"Folder",portfolio:"Portfolio",owner:"Owner",category:"Archive category"};
+const GROUPS={triage:"Triage priority",sercat:"Seriousness × listedness",clock:"Reporting status",stage:"Stage",none:"No grouping",status:"Status",seriousness:"Seriousness",listedness:"Listedness",folder:"Folder",portfolio:"Portfolio",owner:"Owner",category:"Archive category"};
 function groupKey(c,by){
   const cl=caseCls(c);
+  if(by==="triage"){const t=((data.caseMeta||{})[c.id]||{}).triage;return t?t.label:"Unknown";}
   if(by==="sercat")return((data.caseMeta||{})[c.id]||{}).timeline?data.caseMeta[c.id].timeline.category:"Unclassified";if(by==="clock"){const t=((data.caseMeta||{})[c.id]||{}).timeline;return t?t.status.charAt(0).toUpperCase()+t.status.slice(1):"No date";}if(by==="stage")return(data.stages||{})[caseStage(c)]||caseStage(c);
   if(by==="status")return c.status;if(by==="seriousness")return cl.serious?"Serious":"Non-serious";if(by==="listedness")return cl.listed==="listed"?"Listed":cl.listed==="unlisted"?"Unlisted":"Listedness unknown";
   if(by==="folder")return((data.caseFolders||[]).find(f=>f.id===c.folderId)||{}).name||"Not in a folder";if(by==="portfolio")return c.portfolio||"No portfolio";
@@ -5083,6 +5298,86 @@ async function loadScheduler(){
 async function p7action(target){
   const [act,pf,mol,from,to]=target.dataset.p7.split("|");
   if(act==="retry"){target.disabled=true;try{await api("missed-retry",{portfolio:pf,molecule:mol,from,to});await refresh();message("Retried "+from+(to!==from?" to "+to:"")+".");}catch(e){message(e.message,true);}render();}
+}
+
+let dsc={q:"",sources:["pubmed","europepmc","crossref","doaj"],limit:20,res:null};
+const SRC_NAME={pubmed:"PubMed",europepmc:"Europe PMC",crossref:"Crossref",doaj:"DOAJ"};
+function oaCell(u){
+  if(!u)return "";
+  if(u.state==="ok")return (u.isOa?badge("Open access · "+u.status,"green"):badge("Closed access",""))+(u.license?' <span class="sub">'+esc(u.license)+(u.version?" · "+esc(u.version):"")+'</span>':"")+'<div style="margin-top:3px">'+(u.pdfUrl?'<a href="'+esc(u.pdfUrl)+'" target="_blank" rel="noopener">PDF</a> ':"")+(u.landingUrl?'<a href="'+esc(u.landingUrl)+'" target="_blank" rel="noopener">Landing page</a>':"")+'</div>';
+  if(u.state==="notfound")return '<span class="sub">Not in Unpaywall</span>';
+  if(u.state==="unconfigured")return '<span class="sub" title="'+esc(u.note||"")+'">Add a contact email in Settings</span>';
+  if(u.state==="nodoi")return '<span class="sub">No DOI</span>';
+  return '<span class="sub">Unpaywall unavailable</span>';
+}
+function discoverResults(){
+  const r=dsc.res,mgr=data.viewer.role==="manager";
+  const status=r.sources.map(s=>badge(SRC_NAME[s.source]+": "+(s.ok?s.count:"failed"),s.ok?"green":"red")).join(" ");
+  const rows=r.results.map((x,i)=>{
+    const lib=x.library?badge("In LiteraSift","green")+' <a href="#" data-p8="openlib|'+esc(x.library.pmid)+'">Open</a>'+(x.library.cases.length?'<div class="sub">'+x.library.cases.map(c=>'<a href="#" data-opencase="'+esc(c.id)+'">'+esc(c.number)+'</a>').join(", ")+'</div>':""):(x.pmid&&mgr?'<button type="button" class="btn outline sm" data-p8="addlib|'+i+'">Add to library</button>':'<span class="sub">'+(x.pmid?"Not in your library":"No PMID")+'</span>');
+    const links=Object.entries({PubMed:x.links.pubmed,"Europe PMC":x.links.europepmc,DOI:x.links.doi,Unpaywall:x.links.unpaywall,Crossref:x.links.crossref}).filter(e=>e[1]).map(e=>'<a href="'+esc(e[1])+'" target="_blank" rel="noopener">'+esc(e[0])+'</a>').join(" · ");
+    return ['<input type="checkbox" class="dsel" value="'+i+'" aria-label="Select result">','<b>'+esc(x.title)+'</b><div class="sub">'+esc((x.authors||[]).slice(0,4).join(", "))+((x.authors||[]).length>4?" et al":"")+' · '+esc(x.journal)+' '+esc(x.year)+'</div><div class="sub" style="margin-top:3px">'+links+'</div>'+(x.abstract?'<details><summary class="sub">Abstract</summary><div class="sub">'+esc(x.abstract.slice(0,900))+'</div></details>':""),(x.sources||[]).map(s=>badge(SRC_NAME[s]||s,"")).join(" "),oaCell(x.unpaywall),lib];
+  });
+  return '<div style="margin:10px 0">'+status+'</div><div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px"><button type="button" class="btn outline sm" data-p8="dselall">Select all</button><button type="button" class="btn outline sm" data-p8="dexport|bibtex">BibTeX</button><button type="button" class="btn outline sm" data-p8="dexport|ris">RIS</button><button type="button" class="btn outline sm" data-p8="dexport|csv">CSV</button>'+(mgr?'<input id="dpf" list="pfopts" placeholder="Portfolio for new records" style="width:200px"><button type="button" class="btn outline sm" data-p8="daddsel">Add selected PMIDs to library</button>':"")+'</div>'+table(["","Result","Found in","Open access (Unpaywall)","LiteraSift"],rows,"No results.");
+}
+function discoverHtml(){
+  return panel("Discover literature",'<div class="sub" style="margin-bottom:6px">Searches PubMed, Europe PMC, Crossref and DOAJ together, removes duplicates by DOI, PMID and title, and checks open access through Unpaywall. Results link to records already in LiteraSift, and records link back here. Open-access copies are only linked from Unpaywall and the publisher.</div><div style="display:flex;gap:8px"><input id="dq" value="'+esc(dsc.q)+'" placeholder="e.g. aripiprazole akathisia case report" style="flex:1" aria-label="Discover search"><select id="dlimit" aria-label="Results per source">'+[10,20,30,50].map(n=>'<option'+(n===dsc.limit?" selected":"")+'>'+n+'</option>').join("")+'</select><button type="button" class="btn" data-p8="dsearch">Search</button></div><div class="chips" style="margin-top:8px">'+Object.keys(SRC_NAME).map(k=>'<label class="check"><input type="checkbox" class="dsrc" value="'+k+'"'+(dsc.sources.includes(k)?" checked":"")+'>&nbsp;'+SRC_NAME[k]+'</label>').join("")+'</div><div id="dres">'+(dsc.res?discoverResults():"")+'</div>');
+}
+async function runDiscover(){
+  dsc.q=$("dq").value.trim();dsc.limit=Number($("dlimit").value);dsc.sources=[...document.querySelectorAll(".dsrc:checked")].map(x=>x.value);
+  if(dsc.q.length<2)return message("Enter a search.",true);if(!dsc.sources.length)return message("Choose at least one source.",true);
+  $("dres").innerHTML='<div class="sub" style="margin-top:10px">Searching '+dsc.sources.map(s=>SRC_NAME[s]).join(", ")+'…</div>';
+  dsc.res=await api("discover",{q:dsc.q,sources:dsc.sources,limit:dsc.limit});$("dres").innerHTML=discoverResults();
+}
+function crossLinks(art){
+  if(!art)return "";
+  const L=[];if(art.id)L.push(['PubMed','https://pubmed.ncbi.nlm.nih.gov/'+art.id+'/']);if(art.pmcid)L.push(['Europe PMC','https://europepmc.org/article/PMC/'+art.pmcid]);else if(art.id)L.push(['Europe PMC','https://europepmc.org/article/MED/'+art.id]);
+  if(art.doi){L.push(['DOI','https://doi.org/'+art.doi]);L.push(['Unpaywall','https://unpaywall.org/'+art.doi]);L.push(['Crossref','https://api.crossref.org/works/'+encodeURIComponent(art.doi)]);}
+  return '<div class="chips" style="margin:6px 0">'+L.map(l=>'<a class="badge blue" style="text-decoration:none" href="'+esc(l[1])+'" target="_blank" rel="noopener">'+esc(l[0])+'</a>').join("")+(art.oaStatus?badge("Unpaywall: "+art.oaStatus,art.oaIsOpen?"green":""):"")+'<a class="badge" style="text-decoration:none" href="#" data-p8="similar|'+esc(art.title||"")+'">Find similar in Discover</a></div>';
+}
+function triageBadge(c){const t=((data.caseMeta||{})[c.id]||{}).triage;if(!t)return "";return badge(t.label,t.rank===0?"red":t.rank===1?"amber":t.rank===2?"blue":"")+'<div class="sub">'+esc(t.reason)+'</div>';}
+async function causalityDialog(index){
+  const r=await api("causality-assess",{caseId:curCase.id,eventIndex:index}),old=$("cdlg");if(old)old.remove();
+  const ans=Object.assign({},r.prefill.answers,(r.saved.naranjo&&r.saved.naranjo.answers)||{}),w=Object.assign({},r.prefill.who,(r.saved.who&&r.saved.who.inputs)||{});
+  const tri=(id,v)=>'<select id="'+id+'"><option value="">Unknown</option><option value="1"'+(v===true?" selected":"")+'>Yes</option><option value="0"'+(v===false?" selected":"")+'>No</option></select>';
+  const ev=curCase.data.events[index],evn=(ev.verbatim&&ev.verbatim.value)||"event";
+  const qs=r.questions.map(q=>'<tr><td style="padding:4px 8px">'+esc(q.text)+(r.prefill.basis[q.id]?'<div class="sub">Evidence: '+esc(r.prefill.basis[q.id])+'</div>':"")+'</td><td><select id="nq_'+q.id+'" data-nq="1">'+["yes","no","unknown"].map(o=>'<option value="'+o+'"'+((ans[q.id]||"unknown")===o?" selected":"")+'>'+o+'</option>').join("")+'</select></td></tr>').join("");
+  document.body.insertAdjacentHTML("beforeend",'<dialog id="cdlg" style="width:min(860px,96vw);max-height:92vh;overflow:auto"><h3 style="margin:0 0 6px">Causality for "'+esc(evn)+'"</h3><div class="sub">Naranjo scale and WHO-UMC rules, pre-filled only where the case holds evidence. These are calculations for the reviewer: nothing changes in the case until you apply one.</div><table style="width:100%;margin-top:8px"><tbody>'+qs+'</tbody></table><div id="nres" style="margin:8px 0"></div>'+
+    '<h4 style="margin:10px 0 4px">WHO-UMC inputs</h4><div style="display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr))"><label>Plausible time relationship'+tri("w_t",w.temporal)+'</label><label>Positive dechallenge'+tri("w_d",w.dechallengePositive)+'</label><label>Positive rechallenge'+tri("w_r",w.rechallengePositive)+'</label><label>Other causes unlikely'+tri("w_a",w.alternativeUnlikely)+'</label><label>Pharmacologically plausible'+tri("w_p",w.plausible)+'</label></div><div id="wres" style="margin:8px 0"></div>'+
+    ((r.suggestions||[]).length?'<h4 style="margin:10px 0 4px">Earlier suggestions and calculations</h4>'+r.suggestions.slice(0,6).map(s=>'<div class="sub">'+badge(s.state==="machine_suggestion"?"machine suggestion":"reviewer calculation",s.state==="machine_suggestion"?"amber":"")+" "+esc(s.method)+": "+esc(s.category||s.label)+(s.score!==undefined?" ("+s.score+")":"")+(s.probability!==undefined?" p="+s.probability:"")+" · "+esc(s.by||"")+'</div>').join(""):"")+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;margin-top:12px"><button type="button" class="btn outline" id="c_bert">Ask the BioBERT service</button><button type="button" class="btn outline" id="c_no">Close</button><button type="button" class="btn outline" id="c_save">Save calculation</button><button type="button" class="btn outline" id="c_an">Save and apply Naranjo</button><button type="button" class="btn" id="c_aw">Save and apply WHO-UMC</button></div></dialog>');
+  const d=$("cdlg"),getA=()=>{const a={};r.questions.forEach(q=>{a[q.id]=$("nq_"+q.id).value;});return a;},tv=id=>{const v=$(id).value;return v===""?null:v==="1";},getW=()=>({temporal:tv("w_t"),dechallengePositive:tv("w_d")===true,rechallengePositive:tv("w_r")===true,alternativeUnlikely:tv("w_a"),plausible:tv("w_p")});
+  const sc=a=>{let s=0,n=0;r.questions.forEach(q=>{if(a[q.id]==="yes"){s+=q.yes;n++;}else if(a[q.id]==="no"){s+=q.no;n++;}});return{s,n,c:s>=9?"Definite":s>=5?"Probable":s>=1?"Possible":"Doubtful"};};
+  const who=x=>x.temporal===null?"Unassessable/Unclassifiable":(x.temporal&&x.dechallengePositive&&x.rechallengePositive&&x.alternativeUnlikely===true&&x.plausible===true)?"Certain":(x.temporal&&x.dechallengePositive&&x.alternativeUnlikely===true)?"Probable/Likely":(x.temporal&&x.plausible===true)?"Possible":!x.temporal?"Unlikely":"Conditional/Unclassified";
+  const recalc=()=>{const a=sc(getA());$("nres").innerHTML='<b>Naranjo score '+a.s+'</b> '+badge(a.c,"blue")+' <span class="sub">'+a.n+' of 10 answered; unknown scores 0</span>';$("wres").innerHTML='<b>WHO-UMC rules suggest</b> '+badge(who(getW()),"blue");};
+  d.addEventListener("change",recalc);recalc();d.showModal();
+  const save=async apply=>{try{await api("causality-assess",{caseId:curCase.id,eventIndex:index,mode:"save",answers:getA(),who:getW(),apply});d.close();d.remove();await refreshCase();message(apply?"Saved and applied "+(apply==="naranjo"?"Naranjo":"WHO-UMC")+" to the case.":"Calculation saved. The case's causality was not changed.");}catch(e){message(e.message,true);}};
+  $("c_no").onclick=()=>{d.close();d.remove();};$("c_save").onclick=()=>save("");$("c_an").onclick=()=>save("naranjo");$("c_aw").onclick=()=>save("who");
+  $("c_bert").onclick=async()=>{try{const s=await api("bert-causality",{caseId:curCase.id,eventIndex:index});message("BioBERT: "+s.suggestion.label+" (p="+s.suggestion.probability+"). Recorded as a machine suggestion only.");}catch(e){message(e.message,true);}};
+}
+async function faersPanel(index){
+  const ev=curCase.data.events[index],prod=(curCase.data.products||[]).find(p=>p.role==="suspect")||(curCase.data.products||[])[0]||{},drug=(prod.name&&prod.name.value)||curCase.molecule||"",evn=(ev.verbatim&&ev.verbatim.value)||"";
+  const box=$("faersres");box.innerHTML='<div class="sub">Asking openFDA about '+esc(drug)+' and '+esc(evn)+'…</div>';
+  try{const r=await api("faers-context",{drug,event:(ev.pt&&ev.pt.value)||evn});
+    if(!r.found){box.innerHTML='<div class="sub">'+esc(r.note||"No reports found.")+'</div>';return;}
+    const row=r.rows[0];box.innerHTML='<div><b>'+esc(drug)+' and '+esc(row.reaction)+'</b> '+(row.signal?badge("Possible signal","amber"):badge("No signal by the usual rule",""))+'</div><div class="sub">'+row.a+' reports with both, of '+r.reportsDrug+' for the drug and '+(row.a+row.c)+' for the event, among '+r.reportsAll+' ('+esc(r.asOf)+'). PRR '+(row.prr===null?"n/a":row.prr.toFixed(2)+' (95% CI '+row.lcl.toFixed(2)+' to '+row.ucl.toFixed(2)+')')+', chi-square '+(row.chi2===null?"n/a":row.chi2.toFixed(1))+'.</div><div class="sub">'+esc(r.rule)+' '+esc(r.caveat)+'</div>'+(r.cached?'<div class="sub">Cached answer.</div>':"");
+  }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
+}
+async function p8action(target){
+  const parts=target.dataset.p8.split("|"),act=parts[0],a1=parts.slice(1).join("|");
+  try{
+    if(act==="dsearch"){await runDiscover();return;}
+    if(act==="dselall"){document.querySelectorAll(".dsel").forEach(x=>{x.checked=true;});return;}
+    if(act==="dexport"){const idx=[...document.querySelectorAll(".dsel:checked")].map(x=>Number(x.value)),items=(idx.length?idx.map(i=>dsc.res.results[i]):dsc.res.results);await downloadPost("/api/discover-export",{format:a1,items},"literasift-discover");return;}
+    if(act==="addlib"||act==="daddsel"){const pm=act==="addlib"?[dsc.res.results[Number(a1)].pmid]:[...document.querySelectorAll(".dsel:checked")].map(x=>dsc.res.results[Number(x.value)].pmid).filter(Boolean);
+      const pf=act==="addlib"?(prompt("Portfolio for this record:","")||""):$("dpf").value;if(!pm.length)return message("Tick results that have a PMID.",true);if(!pf)return message("Enter the portfolio.",true);
+      const r=await api("pmid-batch",{text:pm.join(NL),portfolio:pf,molecule:""});await refresh();await runDiscover();message(r.run.count+" record"+(r.run.count===1?"":"s")+" added to "+pf+(r.missing.length?"; not found: "+r.missing.join(", "):"")+".");return;}
+    if(act==="openlib"){const item=(data.assignments||[]).find(x=>x.pmid===a1);if(!item)return message("That article is not in your queue.",true);const b=document.querySelector('[data-review="'+item.id+'"]');if(b){b.click();return;}tab=data.viewer.role==="manager"?"All Assignments":"My Queue";render();setTimeout(()=>{const b2=document.querySelector('[data-review="'+item.id+'"]');if(b2)b2.click();},300);return;}
+    if(act==="similar"){dsc.q=a1;dsc.res=null;tab="Discover";render();await runDiscover();return;}
+    if(act==="cause"){await causalityDialog(Number(a1));return;}
+    if(act==="faers"){await faersPanel(Number(a1));return;}
+    if(act==="phi"){const r=await api("phi-scan",{caseId:curCase.id}),box=$("phires");box.innerHTML=r.clean?badge("No identifying data found","green")+' <span class="sub">'+esc(r.note)+'</span>':badge(r.findings.length+" field"+(r.findings.length===1?"":"s")+" with identifying data","red")+r.findings.map(f=>'<div class="sub"><b>'+esc(f.field)+'</b>: '+Object.entries(f.types).map(e=>esc(e[0])+" ×"+e[1]).join(", ")+'</div>').join("")+'<div class="sub">'+esc(r.note)+'</div>';return;}
+  }catch(e){message(e.message,true);}
 }
 const covBadge=c=>({reconciled:badge("Reconciled","green"),zero_results:badge("Zero results",""),partial:badge("Partially imported","amber"),failed:badge("Failed","red"),running:badge("Running","blue"),legacy:badge("Imported (earlier)","")}[c]||badge(c||"legacy",""));
 async function loadBatches(){
@@ -5348,7 +5643,7 @@ function applyFilter(items){
 function stat(label,value,icon,warn){return '<div class="card'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Synchrony","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Queue","Synchrony"]).concat(["Search"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
+  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Synchrony","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Queue","Synchrony"]).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   libNumbers=null;
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
@@ -5405,12 +5700,12 @@ function render() {
       const a=c.assessment||{},d=c.data,sp=(d.products.find(p=>p.role==="suspect")||{name:{}}).name.value||"—",ev=((d.events[0]||{}).verbatim||{}).value||"—",art=data.articles[c.pmid]||{},dl=left(c);
       const who=manager?'<select data-assignsel="'+esc(c.id)+'" aria-label="Assignee"><option value="">Unassigned</option>'+people.map(p=>'<option value="'+esc(p.email)+'"'+(p.email===c.assignee?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select>':esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||"Unassigned");
       const due=c.dueAt?badge((dl<0?Math.abs(dl)+" d overdue":dl===0?"due today":dl+" d left")+" · "+c.dueAt,closed(c)?"":dl<0?"red":dl<=3?"amber":"green"):'<span class="sub">no date</span>';
-      const x=rowSelects(c);return ['<input type="checkbox" class="syn_c" value="'+esc(c.id)+'" aria-label="Select case">','<b>'+esc(c.number)+'</b> '+stageBadge(caseStage(c))+(signed(c)?' <span class="badge green" title="Signed">signed</span>':"")+(tagChips(c)?'<div style="margin-top:3px">'+tagChips(c)+'</div>':""),'<a href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,80))+'</a><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.molecule||"")+'</div>',esc(sp)+" · "+esc(ev),x.ser+x.crit,x.lis,x.fold,who,clockHtml(c)||due,clinHtml(c),badge(c.status,stColor[c.status]||""),(a.valid?badge("Valid","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"))+'<div class="sub">QC '+(a.score??"")+' / 100</div>',x.act+' <button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>'];};
+      const x=rowSelects(c);return ['<input type="checkbox" class="syn_c" value="'+esc(c.id)+'" aria-label="Select case">','<b>'+esc(c.number)+'</b> '+stageBadge(caseStage(c))+(signed(c)?' <span class="badge green" title="Signed">signed</span>':"")+(tagChips(c)?'<div style="margin-top:3px">'+tagChips(c)+'</div>':""),'<a href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,80))+'</a><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.molecule||"")+'</div>',esc(sp)+" · "+esc(ev),x.ser+x.crit,x.lis,x.fold,who,(clockHtml(c)||due)+triageBadge(c),clinHtml(c),badge(c.status,stColor[c.status]||""),(a.valid?badge("Valid","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"))+'<div class="sub">QC '+(a.score??"")+' / 100</div>',x.act+' <button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>'];};
     const S=data.series||{total:0,events:[],products:[],countries:[],sex:[],ages:[],monthly:[],serious:[],fatal:[],trend:{hikes:[]}};
     const bars=(list)=>list.length?list.map(x=>'<div class="row" title="'+esc(x.cases.join(", "))+'"><span>'+esc(x.key)+'</span><span class="sub">'+x.count+' case'+(x.count===1?"":"s")+' · '+esc(x.cases.slice(0,4).join(", "))+(x.cases.length>4?"…":"")+'</span></div>').join(""):'<div class="empty">No data yet.</div>';
     const months=S.monthly.map(m=>'<span class="badge'+((S.trend.hikes||[]).includes(m.month)?" red":"")+'" title="'+esc(m.cases.join(", "))+'">'+esc(m.month)+': '+m.count+'</span>').join(" ");
     const fl=data.caseFolders||[],folderBar=panel("Folders",'<div class="chips"><button type="button" class="btn sm '+(synFolder?"outline":"")+'" data-synfolder="">All cases</button><button type="button" class="btn sm '+(synFolder==="__none"?"":"outline")+'" data-synfolder="__none">Not in a folder</button>'+fl.map(f=>'<span style="display:inline-flex;gap:2px"><button type="button" class="btn sm '+(synFolder===f.id?"":"outline")+'" data-synfolder="'+esc(f.id)+'">'+esc(f.name)+' ('+openCases.filter(c=>c.folderId===f.id).length+')</button>'+(manager?'<button type="button" class="btn outline sm" data-p5="delfolder|'+esc(f.id)+'" title="Delete folder" aria-label="Delete folder">x</button>':"")+'</span>').join("")+(canMedical()?'<button type="button" class="btn outline sm" data-p5="newfolder">+ New folder</button>':"")+'</div>');
-    html=tiles+categoryMatrix(openCases)+folderBar+bulkBar("syn_c")+panel("Case tracker",'<div style="padding:4px 0">'+groupSelect(synGroup,["none","sercat","clock","stage","status","seriousness","listedness","folder","portfolio","owner"],"syn_group")+' <span class="sub">Seriousness, listedness and folder are dropdowns on each case. "From case data" uses the event fields.</span></div>',"")+groupedTables(shown,synGroup,["","Case","Article","Product · event","Seriousness","Listedness","Folder","Assignee","Reporting timeline","Indication · action · DC · RC","Status","Validity",""],rowOf,"No cases in this view.")+
+    html=tiles+categoryMatrix(openCases)+folderBar+bulkBar("syn_c")+panel("Case tracker",'<div style="padding:4px 0">'+groupSelect(synGroup,["none","triage","sercat","clock","stage","status","seriousness","listedness","folder","portfolio","owner"],"syn_group")+' <span class="sub">Seriousness, listedness and folder are dropdowns on each case. "From case data" uses the event fields.</span></div>',"")+groupedTables(shown,synGroup,["","Case","Article","Product · event","Seriousness","Listedness","Folder","Assignee","Reporting timeline","Indication · action · DC · RC","Status","Validity",""],rowOf,"No cases in this view.")+
       panel("Intake and assignment",intake)+
       panel("Case series summary",'<div class="row"><span><b>'+S.total+'</b> case'+(S.total===1?'':'s')+' · <b>'+S.serious.length+'</b> serious · <b>'+S.fatal.length+'</b> fatal</span><span class="sub">Counted from the case fields. Hover a line to see which cases it counts.</span></div>'+
         '<div style="display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))"><div><h3 style="margin:8px 0">Events</h3>'+bars(S.events)+'</div><div><h3 style="margin:8px 0">Suspect products</h3>'+bars(S.products)+'</div><div><h3 style="margin:8px 0">Countries</h3>'+bars(S.countries)+'</div><div><h3 style="margin:8px 0">Age and sex</h3>'+bars(S.ages)+bars(S.sex)+'</div></div>'+
@@ -5505,6 +5800,7 @@ function render() {
     panel("Your account",'<div class="row"><span>Name</span><b>'+esc(data.viewer.name)+'</b></div><div class="row"><span>Email</span><b>'+esc(data.viewer.email)+'</b></div><div class="row"><span>Role</span>'+badge(data.viewer.role,data.viewer.role==="manager"?"blue":"")+'</div>');
   if(tab==="Admin")html=adminHtml();
   if(tab==="Search")html=searchHtml();
+  if(tab==="Discover")html=discoverHtml();
   if(tab==="Archive")html=archiveHtml();
   if(tab==="Team"){
     const hosted=data.config.accounts, accts=data.accounts.users;
@@ -5603,7 +5899,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueRows(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -5795,6 +6091,7 @@ document.addEventListener("click",event=>{
   if(target.dataset.p4){p4action(target);return;}
   if(target.dataset.p5){p5action(target);return;}
   if(target.dataset.p7){p7action(target);return;}
+  if(target.dataset.p8){event.preventDefault();p8action(target);return;}
   if(target.dataset.p6){event.preventDefault();p6action(target);return;}
   if(target.dataset.syncat!==undefined){synCat=target.dataset.syncat;render();return;}
   if(target.dataset.synfolder!==undefined){synFolder=target.dataset.synfolder;render();return;}
@@ -5907,7 +6204,7 @@ document.addEventListener("click",event=>{
     const art=data.articles[active.pmid];
     $("citation").textContent=art.title;
     $("screensign").dataset.id=active.id;$("screensign").textContent=(active.signatures||[]).some(x=>!x.superseded)?"Signed · view signature":"Sign decision…";
-    $("detail").innerHTML=(art.abstract?'<div class="sub" style="margin-bottom:4px">Abstract'+(art.abstractSource?" ("+esc(art.abstractSource)+")":"")+'</div><div style="font-size:13px;line-height:1.55">'+mark(art.abstract,active.molecules,(art.entities||{}).diseases)+'</div>':'<div class="sub">No abstract available yet.</div>')+
+    $("detail").innerHTML=crossLinks(art)+(art.abstract?'<div class="sub" style="margin-bottom:4px">Abstract'+(art.abstractSource?" ("+esc(art.abstractSource)+")":"")+'</div><div style="font-size:13px;line-height:1.55">'+mark(art.abstract,active.molecules,(art.entities||{}).diseases)+'</div>':'<div class="sub">No abstract available yet.</div>')+
       (((art.entities||{}).diseases||[]).length?'<div class="sub" style="margin:10px 0 4px">Conditions mentioned (PubTator)</div><div class="chips">'+art.entities.diseases.map(t=>badge(t,"amber")).join("")+'</div>':"")+
       (((art.entities||{}).chemicals||[]).length?'<div class="sub" style="margin:10px 0 4px">Chemicals mentioned</div><div class="chips">'+art.entities.chemicals.map(t=>badge(t)).join("")+'</div>':"")+
       ((art.keyPassages||[]).length?'<div class="sub" style="margin:10px 0 4px">Key passages from the full text</div>'+art.keyPassages.map(t=>'<div style="font-size:13px;margin-bottom:6px">“'+mark(t,active.molecules)+'”</div>').join(""):"")+
@@ -5987,7 +6284,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  extractClinical, stageOf, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  extractClinical, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);
