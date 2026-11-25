@@ -176,3 +176,12 @@ Synchrony is LiteraSift's case workbench (the **Synchrony** tab, linked both way
 LiteraSift retrieves every legal open copy (PMC, Europe PMC, Unpaywall, Semantic Scholar). For articles that remain closed it does not try to bypass paywalls. Instead, in the article's Review dialog:
 **Open with your institution** (set your library's proxy address in Settings), then **Upload PDF or XML** or **paste the text**. The text is read for events and patient details, the file is stored and marked as supplied by you, and the article flows into Synchrony.
 Uploads up to 40 MB need `deploy/enable-uploads.sh` on an existing server (new installs already allow it). Check your licence before sharing exported packages: they carry a notice for restricted files.
+
+## Case details added for CIOMS and E2B
+
+- **Age and age group:** age is read from many wordings; the E2B(R3) age group (neonate, infant, child, adolescent, adult, elderly) is derived from the age, or from words such as "elderly" and "paediatric".
+- **Several events per case:** up to 12 events are picked from an article. Each keeps its own source sentence, outcome and onset date when its own sentence gives them.
+- **Causality per event:** a WHO-UMC dropdown (certain, probable/likely, possible, unlikely, conditional/unclassified, unassessable/unclassifiable) with reporter causality, method, temporal relationship, alternative causes, concomitant factors, objective evidence, listedness, reference safety information, rationale and reviewer comment. LiteraSift suggests a value for each event; a medical reviewer confirms it.
+- **Reporter, sender and comments:** reporter organisation, department, address, e-mail and phone; sender type, organisation and contact (defaults in Settings); the reporter's and sender's general comments.
+- **CIOMS I** follows the PV Nexus export layout (sections 0 to X, one row per event, an assessment block per event). **E2B(R3) XML** carries the same data: age group, reporter and sender, comments, and one causality assessment per reaction and suspect drug.
+- **Unpaywall:** up to five open locations are tried, including open landing pages that name their PDF in the standard `citation_pdf_url` tag.

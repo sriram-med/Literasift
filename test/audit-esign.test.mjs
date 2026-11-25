@@ -412,3 +412,44 @@ test("closed-access articles: the user can supply the full text (pasted or PDF) 
   const log = (await readFile(monthFile(t.dir), "utf8")).trim().split("\n").map(JSON.parse);
   assert.ok(log.some(e => e.action === "upload.fulltext"));
 });
+
+test("age group is derived from the age (E2B D.2.3) and from words like 'elderly'", () => {
+  const g = (age, unit) => worker.normalizeCase({ patient: { age: { value: age }, age_unit: { value: unit } } }).patient.age_group.value;
+  assert.equal(g("10", "days"), "Neonate"); assert.equal(g("6", "months"), "Infant"); assert.equal(g("8", "years"), "Child"); assert.equal(g("15", "years"), "Adolescent"); assert.equal(g("54", "years"), "Adult"); assert.equal(g("80", "years"), "Elderly");
+  assert.equal(ageOf("An elderly woman took aciclovir.").age_group, "elderly");
+});
+
+const MULTI = "Case presentation\nA 54-year-old man was admitted. He had started aciclovir on 3 March 2021.\nOn 9 March 2021 he developed confusion and was hospitalised; the confusion resolved after withdrawal.\nHe also had a generalised rash which persisted. Hepatic failure was fatal on 20 March 2021.\n";
+test("several events become several cases rows, each with its own outcome, onset and WHO-UMC suggestion", async () => {
+  const t = await setup();
+  const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
+  const art = { ...bench.articles["1"], abstract: "A case report.", entities: { diseases: ["confusion", "rash", "hepatic failure"] }, fullTextStatus: "Captured", fullTextKey: "k", journal: "J", affiliation: "Dept of Medicine, Test Hospital, Pune, India", affiliationCountry: "India" };
+  bench.articles["1"] = { ...art, ...worker.applyDetection(art, ["aciclovir"], null, [], MULTI) }; await t.BUCKET.put("bench.json", JSON.stringify(bench));
+  const made = (await t.call(MANAGER, "/api/case-create", { pmid: "1" })).body.case, ev = made.data.events;
+  assert.ok(ev.length >= 3, "events: " + ev.map(e => e.verbatim.value));
+  const byName = n => ev.find(e => new RegExp(n, "i").test(e.verbatim.value));
+  assert.equal(byName("hepatic failure").outcome.value, "Fatal"); assert.equal(byName("hepatic failure").onset_date.value, "2021-03-20");
+  assert.equal(byName("confusion").outcome.value, "Recovered/resolved"); assert.equal(byName("confusion").onset_date.value, "2021-03-09");
+  assert.equal(byName("rash").outcome.value, "Not recovered/not resolved");
+  for (const e of ev) { assert.ok(worker.normalizeCase({}).events.length === 0); assert.match(e.causality_reviewer.value, /Probable\/Likely|Possible|Unassessable\/Unclassifiable/); assert.equal(e.causality_method.value, "WHO-UMC"); }
+  assert.equal(made.data.patient.age_group.value, "Adult"); assert.match(made.data.reporter.organisation.value, /Test Hospital/);
+});
+
+test("CIOMS I lists every event with its own causality, and E2B XML carries reporter, sender, comments, age group and causality", async () => {
+  const t = await setup();
+  const f = value => ({ value, state: "edited", evidence: [] });
+  const data = worker.normalizeCase({ patient: { age: f("54"), sex: f("Male") }, reporter: { identifier: f("A B"), qualification: f("Physician"), organisation: f("Test Hospital"), email: f("ab@test.org") }, sender: { organisation: f("Acme Pharma"), name: f("PV Desk") },
+    products: [{ role: "suspect", name: f("aciclovir") }], general_comments: "Authors suspect accumulation.", sender_comments: "Sender note.",
+    events: ["confusion", "rash", "nausea"].map((n, i) => ({ verbatim: f(n), causality_reviewer: f(["Possible", "Probable/Likely", "Unlikely"][i]), causality_reporter: f("Probable/Likely"), causality_method: f("WHO-UMC"), seriousness: { serious: false } })), source_summary: "A B. Case. J. 2021." });
+  const rec = { id: "x", number: "LS-2026-0009", pmid: "1", createdAt: "2026-11-25T00:00:00Z", data, signatures: [] };
+  const pdf = new TextDecoder("latin1").decode(worker.ciomsPdf(rec, {}));
+  for (const text of ["V. MEDICAL ASSESSMENT", "Event 1 of 3", "Event 3 of 3", "Reviewer causality", "Unlikely", "VII. REPORTER AND SENDER INFORMATION", "Acme Pharma", "Authors suspect accumulation", "X. FEATURE COVERAGE"]) assert.ok(pdf.includes(text), text);
+  const xml = worker.e2bBatch([rec], {});
+  assert.equal((xml.match(/<causalityAssessment/g) || []).length, 3);
+  for (const text of ["WHO-UMC", "Acme Pharma", "PV Desk", "ab@test.org", "Authors suspect accumulation", "Sender note.", 'displayName="ageGroup"', "Reviewer: Unlikely"]) assert.ok(xml.includes(text), text);
+  const tmp = await mkdtemp(join(tmpdir(), "e2b2-"));
+  if (existsSync(ICH_DIR + "/MCCI_IN200100UV01.xsd") && !spawnSync("xmllint", ["--version"]).error) {
+    await writeFile(tmp + "/c.xml", xml);
+    const r = spawnSync("xmllint", ["--noout", "--schema", ICH_DIR + "/MCCI_IN200100UV01.xsd", tmp + "/c.xml"], { encoding: "utf8" }); assert.equal(r.status, 0, r.stderr);
+  }
+});
