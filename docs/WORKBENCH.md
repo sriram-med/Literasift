@@ -92,3 +92,14 @@ A manager with a MedDRA licence loads the release in **Settings, MedDRA dictiona
 - **Optional AI event check (OpenAI).** Off by default; a monthly token limit of 0 means nothing is ever sent. When on, it runs only when a person presses the button on one article, sends only tagged sentences with personal data masked, discards any proposed event whose quote is not in the text, applies nothing to a case by itself, and stops before a call that would exceed the monthly limit. Usage is counted and every call is audited.
 - **Line listing.** Built live from the cases a person can see (Line Listing tab), and a copy is saved once a day by the scheduler (`exports/line-listing/YYYY-MM-DD.csv`).
 - **Automatic PubMed pull.** On by default for every molecule; pause it globally or per molecule on the Watchlists tab, or press Pull now.
+
+## Case workspace (redesigned)
+
+The case opens as a full-screen workspace, laid out like PV Nexus's case page: a pipeline strip (Screening, QC, Medical review, Signed, Sent), a section list (Patient, Reporter, Sender, Products, Events, Special situations, Treatment, Authors, Comments, Source), the form in the middle, and a right-hand assist panel.
+
+The assist panel, per event, with no cost and no outside call unless noted:
+- **Seriousness detected** from the case's own sentences (death, life-threatening, hospitalisation, disability, congenital anomaly, other medically important), with the quoted basis; the EMA IME list marks important medical events. One click applies it as a proposal.
+- **MedDRA coding suggestions** (when a licensed release is loaded): exact and similar terms with LLT/PT/SOC and codes; "Auto-code all events" applies exact matches only, as proposals.
+- **Listedness (SmPC)**, online: the product's label is read through openFDA (cached 30 days) and each event is searched in the adverse reactions, warnings, precautions, contraindications and overdosage sections. A hit is "Listed" with the quoted sentence; a miss is "Not found" (never "Unlisted" automatically) and a missing label is "Unknown". The US label is a proxy for the EU SmPC, so EU reporting should check section 4.8: paste it into the panel to check against it, or follow the EMA, UK eMC and DailyMed links. Applying a result sets listedness and the reference safety information as proposals.
+- **Text source**: shows whether the full text came from a structured XML, a PDF text layer, or OCR of a scanned PDF (OCR is on when `deploy/enable-ocr.sh` has been run).
+- The full-article scanner and the optional AI event check open from the "Scan full text" button.

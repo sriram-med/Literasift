@@ -761,6 +761,56 @@ async function scanArticle(env, state, article) {
   const counts = {}; for (const u of units) for (const sp of u.spans) counts[sp.kind] = (counts[sp.kind] || 0) + 1;
   return { pmid:article.id, title:article.title || "", source:article.fullTextKey ? "full text" : "citation and abstract", sentences:units.length, counts, products:productNames, events:suggestions, patients:ex.patients.length, authors:(ex.reporters.authors || []).map(a => ({ name:a.name, affiliation:(a.affiliations || [])[0] || "", email:a.email || "", corresponding:Boolean(a.corresponding) })), meddraLoaded:Boolean(midx), units };
 }
+// ---- Online label lookup and listedness check. The FDA label (SPL) is read through openFDA, cached for 30 days, and each event is searched for in the safety sections. ----
+// This is the US prescribing information, a proxy for the EU SmPC: for EU reporting the SmPC section 4.8 must still be confirmed (paste it to check against it).
+const LABEL_SECTIONS = [["adverse_reactions", "Adverse reactions"], ["warnings_and_cautions", "Warnings and precautions"], ["warnings", "Warnings"], ["precautions", "Precautions"], ["boxed_warning", "Boxed warning"], ["contraindications", "Contraindications"], ["overdosage", "Overdosage"]];
+const slugOf = t => String(t || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
+const labelLinks = name => ({ dailymed:"https://dailymed.nlm.nih.gov/dailymed/search.cfm?labeltype=all&query=" + encodeURIComponent(name), ema:"https://www.ema.europa.eu/en/search?search_api_fulltext=" + encodeURIComponent(name), emc:"https://www.medicines.org.uk/emc/search?q=" + encodeURIComponent(name) });
+async function fetchLabel(env, name) {
+  const key = "smpc/" + slugOf(name) + ".json", now = Date.now();
+  try { const cached = await env.BUCKET.get(key); if (cached) { const c = JSON.parse(await cached.text()); if (now - Date.parse(c.fetchedAt) < (c.label ? 30 : 1) * 86400000) return c; } } catch { /* refetch */ }
+  const q = encodeURIComponent('openfda.generic_name:"' + name + '"') + "+" + encodeURIComponent('openfda.brand_name:"' + name + '"') + "+" + encodeURIComponent('openfda.substance_name:"' + name + '"');
+  let label = null, error = "";
+  try {
+    const res = await fetch("https://api.fda.gov/drug/label.json?search=" + q + "&limit=5" + (env.OPENFDA_API_KEY ? "&api_key=" + encodeURIComponent(env.OPENFDA_API_KEY) : ""), { signal:AbortSignal.timeout(15000) });
+    if (res.ok) {
+      const results = (await res.json()).results || [], size = r => LABEL_SECTIONS.reduce((n, [k]) => n + String((r[k] || []).join(" ")).length, 0), best = results.slice().sort((a, b) => size(b) - size(a))[0];
+      if (best && size(best)) label = { setId:best.set_id || "", version:best.version || "", effective:best.effective_time || "", brand:(best.openfda?.brand_name || [])[0] || "", generic:(best.openfda?.generic_name || [])[0] || name, manufacturer:(best.openfda?.manufacturer_name || [])[0] || "", sections:Object.fromEntries(LABEL_SECTIONS.map(([k]) => [k, String((best[k] || []).join("\n")).slice(0, 120000)]).filter(([, t]) => t)) };
+    } else if (res.status !== 404) error = "openFDA answered HTTP " + res.status;
+  } catch (e) { error = "The label service could not be reached: " + String(e.message).slice(0, 100); }
+  const out = { name, fetchedAt:new Date().toISOString(), label, error };
+  if (!error) { try { await env.BUCKET.put(key, JSON.stringify(out), { httpMetadata:{ contentType:"application/json" } }); } catch { /* cache only */ } }
+  return out;
+}
+function matchEventInLabel(sections, terms) {
+  const order = ["adverse_reactions", "warnings_and_cautions", "warnings", "precautions", "boxed_warning", "contraindications", "overdosage", "pasted"], labels = Object.fromEntries(LABEL_SECTIONS), cleaned = terms.map(t => imeNorm(t)).filter(t => t.length >= 4);
+  let similar = null;
+  for (const key of order) {
+    const text = sections[key]; if (!text) continue;
+    for (const raw of String(text).split(/(?<=[.;:])\s+|\n+/)) {
+      const hay = " " + imeNorm(raw) + " "; if (hay.length < 6) continue;
+      for (const t of cleaned) {
+        if (hay.includes(" " + t + " ")) return { listedness:"listed", section:key, sectionLabel:labels[key] || "Pasted SmPC text", quote:raw.trim().slice(0, 320), matched:t };
+        const toks = t.split(" ").filter(x => x.length > 2);
+        if (!similar && toks.length >= 2 && toks.every(x => hay.includes(" " + x))) similar = { listedness:"similar", section:key, sectionLabel:labels[key] || "Pasted SmPC text", quote:raw.trim().slice(0, 320), matched:t };
+      }
+    }
+  }
+  return similar || { listedness:"not_found", section:"", sectionLabel:"", quote:"", matched:"" };
+}
+// What the dictionary and the IME list say about each event, and what the text supports for seriousness. No network, no cost.
+async function caseAssist(env, state, c) {
+  const midx = await loadMeddra(env), ime = await loadIme(env), data = normalizeCase(c.data), art = state.articles[c.pmid] || {};
+  const events = data.events.map((e, index) => {
+    const verbatim = v(e.verbatim); if (!verbatim) return { index, verbatim:"" };
+    const imeHit = ime ? detectEvents({ title:"", abstract:verbatim }, [], ime, state.settings?.imePromotions || [], []).filter(x => x.ime)[0] || null : null;
+    const text = [verbatim, ...(e.verbatim.evidence || []).map(x => x.excerpt || ""), v(e.outcome), v(e.time_to_onset), v(e.objective_evidence)].join(". ");
+    const ser = eventSeriousness({ mentions:[{ sentence:text }], term:verbatim, ime:imeHit ? imeHit.ime : null }, []);
+    const meddra = midx ? meddraSuggest(midx, verbatim, 4) : [];
+    return { index, verbatim, ime:imeHit ? { term:imeHit.term, code:imeHit.ime.code || "", soc:imeHit.ime.soc || "" } : null, seriousness:{ flags:ser.flags, basis:ser.basis }, meddra, coded:hasVal(e.pt_code) || hasVal(e.llt_code), listedness:v(e.listedness) };
+  });
+  return { events, meddraLoaded:Boolean(midx), imeLoaded:Boolean(ime), textSource:({ ocr:"ocr (scanned PDF read by OCR)", "pdf-text-layer":"PDF text layer", "jats-xml":"structured full text (XML)" })[art.evidence?.fulltext?.extraction?.method] || (art.fullTextKey ? "full text" : "citation and abstract"), suspects:data.products.filter(p => p.role === "suspect").map(p => v(p.name)).filter(Boolean) };
+}
 // ---- Optional AI check of events (OpenAI). Off by default, never automatic, hard monthly token cap (0 = none), and only the sentences the scanner tagged are sent, with personal data masked.
 const aiConfig = (env, state) => { const a = state.settings?.ai || {}, key = env.OPENAI_API_KEY || state.settings?.openaiKey || ""; return { enabled:a.enabled === true, model:a.model || "gpt-4o-mini", monthlyTokens:Number(a.monthlyTokens) || 0, key, hasKey:Boolean(key) }; };
 const aiMonth = () => new Date().toISOString().slice(0, 7);
@@ -3827,6 +3877,25 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"meddra.loaded", target:"MedDRA " + info.version + " " + info.language, detail:{ ...info.counts, filename:info.filename, licence_confirmed:true } });
     return json({ ok:true, info });
   }
+  if ((path === "/api/case-assist" || path === "/api/smpc-check") && viewer) {
+    const c = (state.cases || []).find(x => x.id === String(body.id || body.caseId || ""));
+    if (!c || !caseVisible(state, viewer, c)) return json({ error:"Case not found." }, 404);
+    if (path === "/api/case-assist") return json(await caseAssist(env, state, body.data ? { ...c, data:normalizeCase(body.data) } : c));
+    const product = String(body.product || "").trim().slice(0, 120), pasted = String(body.text || "").trim().slice(0, 150000), midx = await loadMeddra(env);
+    const events = (Array.isArray(body.events) ? body.events : []).slice(0, 25).map(e => ({ index:Number(e.index) || 0, verbatim:String(e.verbatim || "").slice(0, 200), pt:String(e.pt || "").slice(0, 200), llt:String(e.llt || "").slice(0, 200) })).filter(e => e.verbatim);
+    if (!events.length) return json({ error:"Add an event first." }, 400);
+    if (!pasted && !product) return json({ error:"Name the suspect product first." }, 400);
+    let source, sections, label = null, error = "";
+    if (pasted) { sections = { pasted }; source = { name:"SmPC text pasted by " + email, region:"as pasted", url:"" }; }
+    else { const got = await fetchLabel(env, product); label = got.label; error = got.error; sections = got.label?.sections || {}; source = label ? { name:"FDA prescribing information via openFDA" + (label.brand ? " (" + label.brand + ")" : ""), region:"US label, a proxy for the EU SmPC", url:label.setId ? "https://dailymed.nlm.nih.gov/dailymed/lookup.cfm?setid=" + label.setId : "", effective:label.effective, version:label.version, manufacturer:label.manufacturer } : null; }
+    const results = events.map(e => {
+      const terms = uniq([e.verbatim, e.pt, e.llt]).filter(Boolean);
+      if (midx) { const top = meddraSuggest(midx, e.pt || e.verbatim, 3).filter(m => m.match === "exact term"); for (const m of top) { terms.push(m.pt.name, m.llt.name); } const code = (midx.byName.get(imeNorm(e.pt || e.verbatim)) || [])[0], l = code && midx.llt.get(code); if (l) for (const n of midx.names) { if (terms.length > 40) break; if (midx.llt.get(n.code)?.pt === l.pt) terms.push(n.n); } }
+      return { index:e.index, verbatim:e.verbatim, terms:uniq(terms).slice(0, 40).length, ...(Object.keys(sections).length ? matchEventInLabel(sections, uniq(terms).slice(0, 40)) : { listedness:"unknown", section:"", sectionLabel:"", quote:"", matched:"" }) };
+    });
+    await audit(env, { by:email, action:"smpc.check", target:c.number, detail:{ product:product || "(pasted text)", source:source?.name || "none", events:results.length, listed:results.filter(r => r.listedness === "listed").length } });
+    return json({ product, source, found:Boolean(Object.keys(sections).length), error, results, links:labelLinks(product || "") });
+  }
   if ((path === "/api/article-scan" || path === "/api/ai-detect") && viewer) {
     const article = state.articles[String(body.pmid || "")];
     if (!article || !state.assignments.some(a => a.pmid === article.id && mayAccess(state, viewer, a))) return json({ error:"Article not found in your queue." }, 404);
@@ -5018,6 +5087,34 @@ aside{background:var(--side);color:var(--side-fg);padding:18px 14px;display:flex
 .sc{border-radius:4px;padding:0 2px;color:inherit}.sc-product{background:#bfdbfe}.sc-event{background:#fecaca}.sc-dose{background:#e9d5ff}.sc-timing{background:#fde68a}.sc-dechallenge{background:#bbf7d0}.sc-rechallenge{background:#99f6e4}.sc-outcome{background:#fed7aa}.sc-causality{background:#fbcfe8}.sc-lab{background:#e2e8f0}.sc-patient{background:#ddd6fe}
 [data-theme=dark] .sc{color:#fff}[data-theme=dark] .sc-product{background:#1e3a8a}[data-theme=dark] .sc-event{background:#7f1d1d}[data-theme=dark] .sc-dose{background:#581c87}[data-theme=dark] .sc-timing{background:#78350f}[data-theme=dark] .sc-dechallenge{background:#14532d}[data-theme=dark] .sc-rechallenge{background:#134e4a}[data-theme=dark] .sc-outcome{background:#7c2d12}[data-theme=dark] .sc-causality{background:#831843}[data-theme=dark] .sc-lab{background:#334155}[data-theme=dark] .sc-patient{background:#3b0764}
 .sc-chip{border:1px solid var(--border);border-radius:99px;padding:3px 10px;font-size:12px;cursor:pointer;color:inherit}.sc-chip.on{outline:2px solid var(--brand)}.scp{margin:4px 0;line-height:1.6;max-width:90ch}
+dialog.cwin{width:min(1560px,98vw);height:min(960px,96vh);max-height:96vh;padding:0;overflow:hidden;border-radius:16px}
+dialog.cwin[open]{display:grid;grid-template-rows:auto auto minmax(0,1fr)}
+.cw-top{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;flex-wrap:wrap;padding:14px 22px 10px;border-bottom:1px solid var(--border);background:var(--card)}
+.cw-head{display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap;flex:1 1 420px;min-width:0}.cw-title{color:var(--muted);font-size:13px;margin-top:2px;max-width:70ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cw-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.cw-more{position:relative}.cw-more>summary{list-style:none;cursor:pointer}.cw-more>summary::-webkit-details-marker{display:none}.cw-more>summary::after{content:" ▾"}
+.cw-menu{position:absolute;right:0;top:110%;z-index:10;background:var(--card);border:1px solid var(--border);border-radius:12px;box-shadow:0 14px 34px -10px #0d151266;padding:6px;display:flex;flex-direction:column;min-width:190px}
+.cw-menu button{border:0;background:none;text-align:left;padding:8px 10px;border-radius:8px;cursor:pointer;color:var(--fg)}.cw-menu button:hover{background:var(--accent)}
+.cw-steps{display:flex;gap:6px;align-items:center;padding:8px 22px;background:var(--accent);border-bottom:1px solid var(--border);font-size:12.5px;overflow-x:auto}
+.cw-step{display:inline-flex;gap:7px;align-items:center;color:var(--muted);font-weight:500;white-space:nowrap}.cw-step i{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:50%;background:var(--card);border:1px solid var(--border);font-style:normal;font-size:11px}
+.cw-step.done{color:var(--green)}.cw-step.done i{background:var(--green-soft);border-color:transparent;color:var(--green)}.cw-step.now{color:var(--fg);font-weight:600}.cw-step.now i{background:var(--primary);color:var(--primary-fg);border-color:transparent}
+.cw-sep{width:26px;height:1px;background:var(--border)}
+.cw-body{display:grid;grid-template-columns:184px minmax(0,1fr) 410px;min-height:0}
+.cw-nav{overflow:auto;border-right:1px solid var(--border);padding:12px 10px;display:flex;flex-direction:column;gap:2px;background:var(--card)}
+.cn-link{display:flex;justify-content:space-between;align-items:center;border:0;background:none;border-radius:9px;padding:8px 10px;color:var(--muted);cursor:pointer;font-weight:500;text-align:left}.cn-link:hover{background:var(--accent);color:var(--fg)}.cn-link span{font-size:11.5px;background:var(--accent);border-radius:99px;padding:0 7px}
+.cw-main{overflow:auto;padding:18px 22px;background:var(--bg);scroll-behavior:smooth}
+.cw-assist{overflow:auto;border-left:1px solid var(--border);padding:12px 14px;background:var(--card)}
+.csec{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;margin-bottom:16px;box-shadow:var(--shadow);scroll-margin-top:6px}.csec h3{margin:0 0 10px;font-size:15px;display:flex;align-items:center;gap:10px}
+.csec .card{box-shadow:none;background:var(--bg)}.cw-main .card b,.cw-main .card{font-size:inherit}.cw-main .card b{display:inline;line-height:inherit;margin:0;letter-spacing:0;font-weight:600}#casehead label{flex-direction:row;align-items:center;gap:8px;min-width:0!important}#casehead label select{width:auto}
+.cw-tabs{display:flex;gap:4px;margin-bottom:10px;position:sticky;top:-12px;background:var(--card);padding:4px 0 8px;z-index:2}
+.cw-tab{flex:1;border:1px solid var(--border);background:none;border-radius:9px;padding:6px 10px;font-weight:600;cursor:pointer;color:var(--muted)}.cw-tab.on{background:var(--primary);color:var(--primary-fg);border-color:var(--primary)}
+.as-card{border:1px solid var(--border);border-radius:12px;padding:12px;margin-bottom:12px;background:var(--bg)}.as-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:4px}
+.as-btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.as-btns select{max-width:190px;padding:4px 8px;font-size:13px}
+.as-h{font-size:10.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);margin:10px 0 4px}
+.as-basis{margin:6px 0;padding-left:18px;font-size:12.5px;color:var(--muted)}.as-sug{display:flex;justify-content:space-between;gap:8px;align-items:center;padding:6px 0;border-top:1px solid var(--border)}.as-sug:first-of-type{border-top:0}
+.as-lis{display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+@media(max-width:1250px){.cw-body{grid-template-columns:minmax(0,1fr) 360px}.cw-nav{display:none}}
+@media(max-width:900px){dialog.cwin{height:98vh}.cw-body{grid-template-columns:minmax(0,1fr);overflow:auto}.cw-assist{border-left:0;border-top:1px solid var(--border)}.cw-main,.cw-assist{overflow:visible}}
 .roban{background:var(--amber-soft);color:var(--amber);border:1px solid var(--amber);border-radius:9px;padding:8px 12px;margin-bottom:12px;font-weight:500}
 .serieslayout{display:grid;gap:22px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.serieslayout h3{font-size:13px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
 .sbar{margin-bottom:9px}.sbar-h{display:flex;justify-content:space-between;gap:10px;font-size:13px}.sbar-k{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sbar-t{height:6px;border-radius:99px;background:var(--accent);margin-top:3px;overflow:hidden}.sbar-t i{display:block;height:100%;background:var(--brand);border-radius:99px}
@@ -5110,11 +5207,12 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 <div><div class="top"><button type="button" class="btn outline icon-btn" id="sidetoggle" aria-label="Collapse the side panel" title="Collapse or expand the side panel"></button><div style="margin-right:auto"><h1 id="heading">LiteraSift</h1><p id="subhead"></p></div><input id="gsearch" type="search" placeholder="Search drugs, brands, cases, citations…" aria-label="Search everything" style="margin-left:auto;margin-right:8px;width:min(340px,40vw);border-radius:999px;padding:9px 16px"><span class="sub" style="margin-right:8px;white-space:nowrap">v0.01 · Dr Sriram</span><button class="btn outline icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button></div>
 <main id="content"><div class="skel"></div><div class="skel"></div><div class="skel"></div></main><footer class="sub" style="margin:28px 0 12px;text-align:center">LiteraSift v0.01 · Developed by Dr Sriram</footer></div></div>
 <div id="toast" role="status"></div>
-<dialog id="casedlg" style="width:min(1180px,96vw);max-height:92vh;overflow:auto"><div id="casehead" style="display:flex;justify-content:space-between;gap:12px;align-items:flex-end;margin-bottom:14px"></div>
-<div style="display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));align-items:start"><div id="casebody"></div><div><div id="caseassess"></div></div></div><div id="casereview" style="margin-top:12px"></div>
-<p id="caseerr" class="msg" style="color:var(--red)" role="alert"></p>
-<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"><button type="button" class="btn" data-caseact="save" id="casesave">Save</button><button type="button" class="btn outline" data-caseact="routecase" id="caseroutebtn">Route…</button><button type="button" class="btn outline" data-scan="CASEPMID" id="casescanbtn">Scan full text</button><button type="button" class="btn outline" data-caseact="assess">Assess</button><button type="button" class="btn outline" data-caseact="json">Download ICSR JSON</button><button type="button" class="btn outline" data-caseact="package">Download package (ZIP)</button><button type="button" class="btn outline" data-caseact="e2b">E2B(R3) XML</button><button type="button" class="btn outline" data-caseact="cioms">CIOMS I (PDF)</button><button type="button" class="btn outline" data-caseact="fhir">FHIR JSON</button><button type="button" class="btn outline" data-caseact="csv">Line listing (CSV)</button><button type="button" class="btn outline" data-signopen="case" id="casesign">Signature…</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div>
-<p class="sub" style="margin-top:10px">Human-in-the-loop: values pre-filled from the article are only proposals. Causality and QC are aids; a qualified reviewer decides.</p></dialog>
+<dialog id="casedlg" class="cwin"><div class="cw-top"><div id="casehead" class="cw-head"></div><div class="cw-actions"><button type="button" class="btn" data-caseact="save" id="casesave">Save</button><button type="button" class="btn outline" data-caseact="routecase" id="caseroutebtn">Route…</button><button type="button" class="btn outline" data-scan="CASEPMID" id="casescanbtn">Scan full text</button><button type="button" class="btn outline" data-caseact="assess">Assess</button>
+<details class="cw-more"><summary class="btn outline">Export</summary><div class="cw-menu"><button type="button" data-caseact="e2b">E2B(R3) XML</button><button type="button" data-caseact="cioms">CIOMS I (PDF)</button><button type="button" data-caseact="fhir">FHIR JSON</button><button type="button" data-caseact="json">ICSR JSON</button><button type="button" data-caseact="csv">Line listing (CSV)</button><button type="button" data-caseact="package">Full package (ZIP)</button></div></details>
+<button type="button" class="btn outline" data-signopen="case" id="casesign">Signature…</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div></div>
+<div id="casesteps" class="cw-steps"></div>
+<div class="cw-body"><nav id="casenav" class="cw-nav" aria-label="Case sections"></nav><div class="cw-main"><div id="casebody"></div><div id="casereview" style="margin-top:12px"></div><p id="caseerr" class="msg" style="color:var(--red)" role="alert"></p><p class="sub" style="margin:10px 0 30px">Human-in-the-loop: values pre-filled from the article are only proposals. Detection, coding, listedness and causality are aids; a qualified reviewer decides.</p></div>
+<div class="cw-assist"><div class="cw-tabs" id="caseatabs"></div><div id="caseassist"></div><div id="caseassess" style="display:none"></div></div></div></dialog>
 <dialog id="signdlg" style="width:min(640px,94vw)"><h2 id="signtitle">Electronic signature</h2><div id="signbody"></div><p id="signerr" class="msg" style="color:var(--red)" role="alert"></p></dialog>
 <dialog id="linkdlg"><h2 id="linktitle"></h2><p id="linknote" class="sub"></p><div style="display:grid;gap:12px"><input id="linkvalue" readonly aria-label="Link"><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" id="linkcopy">Copy link</button><button type="button" class="btn outline" id="linkshare">Share…</button><button type="button" class="btn outline" id="linkclose">Done</button></div></div></dialog>
 <dialog id="dialog" style="width:min(1180px,96vw);max-height:94vh;overflow:auto"><h2>Screen citation</h2><p id="citation" class="sub"></p><div style="display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));align-items:start"><div><div id="detail" style="max-height:64vh;overflow:auto;margin-bottom:12px"></div><div id="extractbox"></div></div><div><div id="dispo"></div><form id="review"><label>Status<select name="status"><option>Pending</option><option>In review</option><option>Full text needed</option><option>Complete</option></select></label><label>Decision notes<textarea name="note" rows="4"></textarea></label><div style="display:flex;gap:8px"><button class="btn">Save decision</button><button type="button" class="btn outline" id="close">Cancel</button><button type="button" class="btn outline" data-signopen="screening" id="screensign">Signature…</button></div></form></div></div></dialog>
@@ -5235,26 +5333,104 @@ function caseForm(){
     '<div class="sub" style="margin:10px 0 4px">MedDRA coding <button type="button" class="btn outline sm" data-codesuggest="'+i+'">Suggest coding</button>'+(data.meddraInfo?' <button type="button" class="btn outline sm" data-p9="msearch|'+i+'">Search MedDRA…</button>':"")+' <span>Confirm against a licensed MedDRA source.</span></div><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(130px,1fr))">'+caseInput("LLT","events."+i+".llt")+caseInput("LLT code","events."+i+".llt_code")+caseInput("PT","events."+i+".pt")+caseInput("PT code","events."+i+".pt_code")+caseInput("HLT","events."+i+".hlt")+caseInput("HLGT","events."+i+".hlgt")+caseInput("SOC","events."+i+".soc")+caseInput("MedDRA version","events."+i+".meddra_version")+caseSelect("Coding status","events."+i+".coding_status",["","Proposed (IME list)","Proposed (earlier reviewed case)","Reviewed"])+'</div><div id="codesug'+i+'"></div>'+
     '<div class="sub" style="margin:12px 0 4px"><b>Causality assessment</b> for this event (WHO-UMC). The reviewer value is a suggestion until a medical reviewer confirms it.</div><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseSelect("Reporter causality","events."+i+".causality_reporter",[""].concat(data.config.whoUmc||[]).concat(["Not stated"]))+caseSelect("Reviewer causality (WHO-UMC)","events."+i+".causality_reviewer",[""].concat(data.config.whoUmc||[]))+caseSelect("Assessment method","events."+i+".causality_method",["","WHO-UMC","Naranjo","Other"])+caseSelect("Listedness / expectedness","events."+i+".listedness",["","Listed","Unlisted","Unknown"])+caseInput("Temporal relationship","events."+i+".temporal_relationship")+caseInput("Alternative causes","events."+i+".alternative_causes")+caseInput("Concomitant factors","events."+i+".concomitant_factors")+caseInput("Objective evidence","events."+i+".objective_evidence")+caseInput("Assessed reaction term","events."+i+".assessed_term")+caseInput("Reference safety information","events."+i+".rsi")+caseInput("Causality rationale","events."+i+".causality_rationale")+caseInput("Medical reviewer comment","events."+i+".reviewer_comment")+'</div>'+
     '<div class="chips" style="margin-top:8px">'+["serious","death","life_threatening","hospitalization","disability","congenital_anomaly","other_medically_important"].map(k=>'<label class="check"><input type="checkbox" data-kind="flag" data-path="events.'+i+'.seriousness.'+k+'"'+(e.seriousness[k]?" checked":"")+'>&nbsp;'+k.replace(/_/g," ")+'</label>').join("")+'</div></div>').join("");
-  return '<h3 style="margin:0 0 8px">Patient</h3><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseInput("Identifier / initials","patient.identifier")+caseInput("Age","patient.age")+caseSelect("Age unit","patient.age_unit",["years","months","weeks","days","hours"])+caseSelect("Age group","patient.age_group",[""].concat(data.config.ageGroups||[]))+caseSelect("Sex","patient.sex",["","Male","Female","Unknown"])+caseInput("Weight (kg)","patient.weight")+caseSelect("Country where the event occurred","patient.country",[""].concat(data.config.countries||[]).concat(((gp(curCase.data,"patient.country")||{}).value&&!(data.config.countries||[]).includes(gp(curCase.data,"patient.country").value))?[gp(curCase.data,"patient.country").value]:[]))+'</div>'+
+  return '<section class="csec" id="cs-patient"><h3>Patient</h3><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseInput("Identifier / initials","patient.identifier")+caseInput("Age","patient.age")+caseSelect("Age unit","patient.age_unit",["years","months","weeks","days","hours"])+caseSelect("Age group","patient.age_group",[""].concat(data.config.ageGroups||[]))+caseSelect("Sex","patient.sex",["","Male","Female","Unknown"])+caseInput("Weight (kg)","patient.weight")+caseSelect("Country where the event occurred","patient.country",[""].concat(data.config.countries||[]).concat(((gp(curCase.data,"patient.country")||{}).value&&!(data.config.countries||[]).includes(gp(curCase.data,"patient.country").value))?[gp(curCase.data,"patient.country").value]:[]))+'</div>'+
     '<label style="margin-top:10px">Medical history (one per line)<textarea id="casehist" rows="3">'+esc(d.patient.medical_history.map(h=>h.value).join("\\n"))+'</textarea></label>'+
-    '<h3 style="margin:16px 0 8px">Reporter</h3><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseInput("Name / identifier","reporter.identifier")+caseSelect("Qualification","reporter.qualification",QUAL.includes((d.reporter.qualification||{}).value||"")?QUAL:QUAL.concat([d.reporter.qualification.value]))+caseSelect("Reporter country","reporter.country",[""].concat(data.config.countries||[]).concat(((d.reporter.country||{}).value&&!(data.config.countries||[]).includes(d.reporter.country.value))?[d.reporter.country.value]:[]))+caseInput("Contactable (how)","reporter.contactable")+caseInput("Organisation","reporter.organisation")+caseInput("Department","reporter.department")+caseInput("Address","reporter.address")+caseInput("E-mail","reporter.email")+caseInput("Phone","reporter.phone")+'</div>'+
-    '<h3 style="margin:16px 0 8px">Sender</h3><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseSelect("Sender type","sender.type",["","Pharmaceutical company","Regulatory authority","Health professional","Regional pharmacovigilance centre","Patient or consumer","Other"])+caseInput("Organisation","sender.organisation")+caseInput("Contact name","sender.name")+caseInput("E-mail","sender.email")+caseInput("Phone","sender.phone")+caseInput("Country","sender.country")+'</div>'+
-    '<h3 style="margin:16px 0 8px">Products <button type="button" class="btn outline sm" data-caseact="addprod">Add product</button></h3>'+products+
-    '<h3 style="margin:16px 0 8px">Events <button type="button" class="btn outline sm" data-caseact="addevent">Add event</button></h3>'+pickerHtml()+events+
-    '<h3 style="margin:16px 0 8px">Special situations</h3><div class="chips">'+SIT.map(x=>'<label class="check"><input type="checkbox" data-kind="situation" value="'+esc(x)+'"'+(d.special_situations.includes(x)?" checked":"")+'>&nbsp;'+esc(x)+'</label>').join("")+'</div>'+
-    '<h3 style="margin:16px 0 8px">Treatment and confounding</h3><label>Treatment given for the event (one per line)<textarea id="casetreat" rows="2">'+esc((d.treatment_given||[]).join(NL))+'</textarea></label>'+
+    '</section><section class="csec" id="cs-reporter"><h3>Reporter</h3><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseInput("Name / identifier","reporter.identifier")+caseSelect("Qualification","reporter.qualification",QUAL.includes((d.reporter.qualification||{}).value||"")?QUAL:QUAL.concat([d.reporter.qualification.value]))+caseSelect("Reporter country","reporter.country",[""].concat(data.config.countries||[]).concat(((d.reporter.country||{}).value&&!(data.config.countries||[]).includes(d.reporter.country.value))?[d.reporter.country.value]:[]))+caseInput("Contactable (how)","reporter.contactable")+caseInput("Organisation","reporter.organisation")+caseInput("Department","reporter.department")+caseInput("Address","reporter.address")+caseInput("E-mail","reporter.email")+caseInput("Phone","reporter.phone")+'</div>'+
+    '</section><section class="csec" id="cs-sender"><h3>Sender</h3><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseSelect("Sender type","sender.type",["","Pharmaceutical company","Regulatory authority","Health professional","Regional pharmacovigilance centre","Patient or consumer","Other"])+caseInput("Organisation","sender.organisation")+caseInput("Contact name","sender.name")+caseInput("E-mail","sender.email")+caseInput("Phone","sender.phone")+caseInput("Country","sender.country")+'</div>'+
+    '</section><section class="csec" id="cs-products"><h3>Products <button type="button" class="btn outline sm" data-caseact="addprod">Add product</button></h3>'+products+
+    '</section><section class="csec" id="cs-events"><h3>Events <button type="button" class="btn outline sm" data-caseact="addevent">Add event</button></h3>'+pickerHtml()+events+
+    '</section><section class="csec" id="cs-special"><h3>Special situations</h3><div class="chips">'+SIT.map(x=>'<label class="check"><input type="checkbox" data-kind="situation" value="'+esc(x)+'"'+(d.special_situations.includes(x)?" checked":"")+'>&nbsp;'+esc(x)+'</label>').join("")+'</div>'+
+    '</section><section class="csec" id="cs-treat"><h3>Treatment and confounding</h3><label>Treatment given for the event (one per line)<textarea id="casetreat" rows="2">'+esc((d.treatment_given||[]).join(NL))+'</textarea></label>'+
     '<label style="margin-top:10px">Confounders and other causes (one per line, as Type: text)<textarea id="caseconf" rows="3">'+esc((d.confounders||[]).map(c=>c.type+": "+c.text).join(NL))+'</textarea></label>'+
-    '<h3 style="margin:16px 0 8px">Authors (reporters)</h3><div class="sub" style="margin-bottom:6px">The first or corresponding author is the primary reporter above. Every other author is listed here as an additional reporter, one per line: name | organisation | country | e-mail. All are sent as primary sources in the E2B file.</div><textarea id="caseotherrep" rows="4" placeholder="Sita Iyer | Test Hospital | India | sita@example.org">'+esc((d.other_reporters||[]).map(r=>[r.name,r.organisation,r.country,r.email].join(" | ")).join(NL))+'</textarea>'+
-    '<h3 style="margin:16px 0 8px">Comments</h3><label>Reporter comments (the authors’ own conclusions, e.g. their view on causality)<textarea id="casereportercomment" rows="3">'+esc(d.reporter_comments||"")+'</textarea></label><label style="margin-top:10px">General comments (case handling notes)<textarea id="casegeneral" rows="3">'+esc(d.general_comments||"")+'</textarea></label><label style="margin-top:10px">Sender comments (your company assessment)<textarea id="casesendercomment" rows="3">'+esc(d.sender_comments||"")+'</textarea></label>'+
-    '<label style="margin-top:14px">Source and abstract<textarea id="casesummary" rows="5">'+esc(d.source_summary)+'</textarea></label><label style="margin-top:10px">Reviewer notes<textarea id="casenotes" rows="2">'+esc(curCase.notes||"")+'</textarea></label>';
+    '</section><section class="csec" id="cs-authors"><h3>Authors (reporters)</h3><div class="sub" style="margin-bottom:6px">The first or corresponding author is the primary reporter above. Every other author is listed here as an additional reporter, one per line: name | organisation | country | e-mail. All are sent as primary sources in the E2B file.</div><textarea id="caseotherrep" rows="4" placeholder="Sita Iyer | Test Hospital | India | sita@example.org">'+esc((d.other_reporters||[]).map(r=>[r.name,r.organisation,r.country,r.email].join(" | ")).join(NL))+'</textarea>'+
+    '</section><section class="csec" id="cs-comments"><h3>Comments</h3><label>Reporter comments (the authors’ own conclusions, e.g. their view on causality)<textarea id="casereportercomment" rows="3">'+esc(d.reporter_comments||"")+'</textarea></label><label style="margin-top:10px">General comments (case handling notes)<textarea id="casegeneral" rows="3">'+esc(d.general_comments||"")+'</textarea></label><label style="margin-top:10px">Sender comments (your company assessment)<textarea id="casesendercomment" rows="3">'+esc(d.sender_comments||"")+'</textarea></label>'+
+    '</section><section class="csec" id="cs-source"><h3>Source and notes</h3><label>Source and abstract<textarea id="casesummary" rows="5">'+esc(d.source_summary)+'</textarea></label><label style="margin-top:10px">Reviewer notes<textarea id="casenotes" rows="2">'+esc(curCase.notes||"")+'</textarea></label></section>';
 }
+let assistCase="", assistTab="events", assistData=null, smpcRes={}, smpcInfo=null, assistBusy="", smpcPaste="";
+const CASE_SECTIONS=[["cs-patient","Patient"],["cs-reporter","Reporter"],["cs-sender","Sender"],["cs-products","Products"],["cs-events","Events"],["cs-special","Special situations"],["cs-treat","Treatment and confounders"],["cs-authors","Authors"],["cs-comments","Comments"],["cs-source","Source and notes"]];
+function caseNav(){
+  const d=curCase.data, cnt={"cs-products":d.products.length,"cs-events":d.events.length,"cs-authors":(d.other_reporters||[]).length+1};
+  $("casenav").innerHTML=CASE_SECTIONS.map(x=>'<button type="button" class="cn-link" data-casejump="'+x[0]+'">'+esc(x[1])+(cnt[x[0]]?'<span>'+cnt[x[0]]+'</span>':"")+'</button>').join("");
+}
+function caseSteps(){
+  const stage=caseStage(curCase), signed=(curCase.signatures||[]).some(x=>!x.superseded), sent=curCase.status==="Sent to PV Nexus"||curCase.status==="Closed: not a valid ICSR";
+  const steps=[["Screening","screening"],["QC","qc"],["Medical review","medical_review"],["Signed",""],["Sent",""]], idx=sent?4:signed?3:Math.max(0,["screening","qc","medical_review"].indexOf(stage));
+  $("casesteps").innerHTML=steps.map((x,i)=>'<span class="cw-step'+(i<idx?" done":i===idx?" now":"")+'"><i>'+(i<idx?"✓":i+1)+'</i>'+esc(x[0])+'</span>').join('<span class="cw-sep"></span>');
+}
+function assistTabs(){
+  $("caseatabs").innerHTML=[["events","Events"],["checks","Checks"]].map(t=>'<button type="button" class="cw-tab'+(assistTab===t[0]?" on":"")+'" data-assisttab="'+t[0]+'">'+t[1]+'</button>').join("");
+  $("caseassist").style.display=assistTab==="events"?"":"none";$("caseassess").style.display=assistTab==="checks"?"":"none";
+}
+const SERFLAGS=["death","life_threatening","hospitalization","disability","congenital_anomaly","other_medically_important"];
+function assistHtml(){
+  const a=assistData;
+  if(!a)return '<div class="skel"></div><div class="skel"></div>';
+  const ed=curCase.canEdit!==false, suspects=a.suspects||[];
+  const top='<div class="as-card"><div class="as-row"><b>Event assist</b><button type="button" class="btn outline sm" data-assistact="refresh">Refresh</button></div>'+
+    '<div class="sub">Text source: <b>'+esc(a.textSource)+'</b>'+(String(a.textSource).indexOf("ocr")>=0?' '+badge("scanned PDF read by OCR","amber"):"")+' · MedDRA '+(a.meddraLoaded?badge("loaded","green"):badge("not loaded","amber"))+' · IME list '+(a.imeLoaded?badge("loaded","green"):badge("not loaded","amber"))+'</div>'+
+    (ed?'<div class="as-btns"><button type="button" class="btn sm" data-assistact="autocode">Auto-code all events</button><button type="button" class="btn sm" data-assistact="autoser">Apply detected seriousness</button></div>':"")+'</div>';
+  const smpc='<div class="as-card"><div class="as-row"><b>Listedness (SmPC)</b></div><div class="sub">Looks the product up online and searches its adverse-reaction sections for each event.</div>'+
+    (suspects.length?'<div class="as-btns"><select id="smpcprod" aria-label="Suspect product">'+suspects.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select><button type="button" class="btn sm" data-assistact="smpc"'+(assistBusy==="smpc"?" disabled":"")+'>'+(assistBusy==="smpc"?"Checking…":"Check online")+'</button></div>':'<div class="sub">Add a suspect product first.</div>')+
+    '<details style="margin-top:8px"><summary class="sub" style="cursor:pointer">Or paste the SmPC section 4.8 (EU) text</summary><textarea id="smpcpaste" rows="4" placeholder="Paste the undesirable effects section here">'+esc(smpcPaste)+'</textarea><button type="button" class="btn outline sm" data-assistact="smpcpaste" style="margin-top:6px">Check against pasted text</button></details>'+
+    (smpcInfo?'<div class="sub" style="margin-top:8px">'+(smpcInfo.found?'Source: <b>'+esc(smpcInfo.source.name)+'</b>'+(smpcInfo.source.url?' · <a href="'+esc(smpcInfo.source.url)+'" target="_blank" rel="noopener">open label</a>':"")+(smpcInfo.source.effective?' · effective '+esc(smpcInfo.source.effective):"")+'<br><i>'+esc(smpcInfo.source.region)+'. For EU reporting, confirm against the SmPC.</i>':badge("No label found online","amber")+' '+esc(smpcInfo.error||"")+' Check manually: ')+' <a href="'+esc(smpcInfo.links.ema)+'" target="_blank" rel="noopener">EMA</a> · <a href="'+esc(smpcInfo.links.emc)+'" target="_blank" rel="noopener">UK eMC</a> · <a href="'+esc(smpcInfo.links.dailymed)+'" target="_blank" rel="noopener">DailyMed</a></div>':"")+'</div>';
+  const cards=a.events.filter(e=>e.verbatim).map(e=>{
+    const fl=e.seriousness.flags, on=SERFLAGS.filter(k=>fl[k]), cur=curCase.data.events[e.index]||{}, same=SERFLAGS.every(k=>Boolean((cur.seriousness||{})[k])===Boolean(fl[k]));
+    const sug=e.meddra.length?e.meddra.map((m,i)=>'<div class="as-sug"><span><b>'+esc(m.llt.name)+'</b> → '+esc(m.pt.name)+'<div class="sub">LLT '+esc(m.llt.code)+' · PT '+esc(m.pt.code)+' · '+esc(m.soc.name)+' · '+esc(m.match)+'</div></span>'+(ed?'<button type="button" class="btn outline sm" data-assistuse="'+e.index+'|'+i+'">Use</button>':"")+'</div>').join(""):'<div class="sub">'+(a.meddraLoaded?"No close MedDRA match.":"Load a MedDRA release in Settings for code suggestions.")+'</div>';
+    const r=smpcRes[e.index], rb=r?(r.listedness==="listed"?badge("Listed","green"):r.listedness==="similar"?badge("Possibly listed","amber"):r.listedness==="not_found"?badge("Not found","red"):badge("Unknown","")):"";
+    const lis=r?'<div class="as-lis">'+rb+' <span class="sub">'+(r.listedness==="listed"||r.listedness==="similar"?esc(r.sectionLabel)+': “'+esc(r.quote)+'”':r.listedness==="not_found"?"Not in the safety sections searched. Confirm in the EU SmPC before treating it as unlisted.":"No label to compare with.")+'</span>'+(ed&&r.listedness!=="unknown"?'<div><button type="button" class="btn outline sm" data-assistlis="'+e.index+'">Apply '+(r.listedness==="not_found"?"Unlisted":"Listed")+'</button></div>':"")+'</div>':'<div class="sub">Listedness now: <b>'+esc(e.listedness||"not set")+'</b></div>';
+    return '<div class="as-card"><div class="as-row"><b>'+esc(e.verbatim)+'</b><span>'+(e.ime?badge("IME","red"):"")+(e.coded?badge("coded","green"):badge("not coded","amber"))+'</span></div>'+
+      (e.ime?'<div class="sub">On the EMA IME list as “'+esc(e.ime.term)+'”'+(e.ime.code?' · '+esc(e.ime.code):"")+(e.ime.soc?' · '+esc(e.ime.soc):"")+'. An IME term counts as other medically important.</div>':"")+
+      '<div class="as-h">Seriousness detected</div>'+(on.length?'<div class="chips">'+on.map(k=>badge(k.replace(/_/g," "),"red")).join("")+'</div><ul class="as-basis">'+e.seriousness.basis.map(b=>'<li>'+esc(b)+'</li>').join("")+'</ul>':'<div class="sub">No seriousness criterion found in the text.</div>')+
+      (ed&&!same?'<button type="button" class="btn outline sm" data-assistser="'+e.index+'">Apply to this event</button>':(same&&on.length?'<span class="sub">Matches the form.</span>':""))+
+      '<div class="as-h">MedDRA coding suggestions</div>'+sug+'<div class="as-h">Listedness</div>'+lis+'</div>';
+  }).join("")||'<div class="empty">Add an event to see detection and coding suggestions.</div>';
+  return top+smpc+cards;
+}
+async function loadAssist(){
+  if(!curCase||!$("caseassist"))return;
+  try{collectCase();assistData=await api("case-assist",{id:curCase.id,data:curCase.data});}catch(e){assistData={events:[],suspects:[],meddraLoaded:false,imeLoaded:false,textSource:"unavailable"};message(e.message,true);}
+  if($("caseassist"))$("caseassist").innerHTML=assistHtml();
+}
+function putCoding(e,m){
+  const ev=(e.verbatim&&e.verbatim.evidence)||[], put=(k,val)=>{e[k]={value:String(val),normalized_value:null,state:"proposed",evidence:ev};};
+  put("llt",m.llt.name);put("llt_code",m.llt.code);put("pt",m.pt.name);put("pt_code",m.pt.code);put("hlt",m.hlt.name);put("hlgt",m.hlgt.name);put("soc",m.soc.name);put("meddra_version",m.version);put("coding_status","Proposed (MedDRA "+m.version+")");
+}
+function putSeriousness(e,fl){const s=e.seriousness||(e.seriousness={});SERFLAGS.forEach(k=>{if(fl[k])s[k]=true;});s.serious=SERFLAGS.some(k=>s[k])||s.serious;}
+async function assistAction(act){
+  if(act==="refresh"){await loadAssist();return;}
+  collectCase();const evs=curCase.data.events;
+  if(act==="autocode"){let n=0;assistData.events.forEach(a=>{const e=evs[a.index];if(e&&!a.coded&&a.meddra.length&&a.meddra[0].match==="exact term"){putCoding(e,a.meddra[0]);n++;}});renderCase();message(n?n+" event"+(n===1?"":"s")+" coded as proposals. Confirm them before saving.":"No exact MedDRA matches to apply.");return;}
+  if(act==="autoser"){let n=0;assistData.events.forEach(a=>{const e=evs[a.index];if(e&&a.seriousness.flags.serious){putSeriousness(e,a.seriousness.flags);n++;}});renderCase();message(n+" event"+(n===1?"":"s")+" updated from the text. Confirm them before saving.");return;}
+  if(act==="smpc"||act==="smpcpaste"){
+    const body={id:curCase.id,events:evs.map((e,i)=>({index:i,verbatim:e.verbatim&&e.verbatim.value||"",pt:e.pt&&e.pt.value||"",llt:e.llt&&e.llt.value||""})).filter(e=>e.verbatim)};
+    if(act==="smpcpaste"){smpcPaste=$("smpcpaste").value;body.text=smpcPaste;}else body.product=($("smpcprod")||{}).value||"";
+    assistBusy="smpc";$("caseassist").innerHTML=assistHtml();
+    try{const r=await api("smpc-check",body);smpcInfo=r;smpcRes={};r.results.forEach(x=>{smpcRes[x.index]=x;});}catch(e){message(e.message,true);}
+    assistBusy="";$("caseassist").innerHTML=assistHtml();
+  }
+}
+function assistUse(key){
+  collectCase();const [i,j]=key.split("|").map(Number),a=assistData.events.find(x=>x.index===i),e=curCase.data.events[i];if(!a||!e)return;
+  putCoding(e,a.meddra[j]);renderCase();message("Coding applied as a proposal. Confirm it before saving.");
+}
+function assistListed(i){
+  collectCase();const r=smpcRes[i],e=curCase.data.events[i];if(!r||!e)return;
+  const val=r.listedness==="not_found"?"Unlisted":"Listed";
+  e.listedness={value:val,normalized_value:null,state:"proposed",evidence:r.quote?[{excerpt:r.quote,source:(smpcInfo&&smpcInfo.source?smpcInfo.source.name:"SmPC")+", "+r.sectionLabel}]:[]};
+  e.rsi={value:(smpcInfo&&smpcInfo.source?smpcInfo.source.name:"SmPC")+(r.sectionLabel?", "+r.sectionLabel:"")+(smpcInfo&&smpcInfo.source&&smpcInfo.source.effective?", effective "+smpcInfo.source.effective:""),normalized_value:null,state:"proposed",evidence:[]};
+  renderCase();message("Listedness set to "+val+" as a proposal. Confirm it before saving.");
+}
+function assistSer(i){collectCase();const a=assistData.events.find(x=>x.index===i),e=curCase.data.events[i];if(!a||!e)return;putSeriousness(e,a.seriousness.flags);renderCase();message("Seriousness applied as a proposal.");}
 function renderCase(){
   curCase.data.events.forEach(e=>{const b=blankEvent();Object.keys(b).forEach(k=>{if(!(k in e))e[k]=b[k];});});
   {const d=curCase.data;d.sender=d.sender||{};["type","organisation","name","email","phone","address","country"].forEach(k=>{if(!d.sender[k])d.sender[k]=blankField();});["organisation","department","address","email","phone"].forEach(k=>{if(!d.reporter[k])d.reporter[k]=blankField();});if(!d.patient.age_group)d.patient.age_group=blankField();d.general_comments=d.general_comments||"";d.sender_comments=d.sender_comments||"";}
   const art=data.articles[curCase.pmid]||{};
-  $("casehead").innerHTML='<div><b style="font-size:18px">'+esc(curCase.number)+'</b> <span class="sub">from PMID '+esc(curCase.pmid)+'</span><div class="sub">'+esc(art.title||"")+'</div></div><button type="button" class="btn outline sm" data-backtolit="1" title="Open the article in LiteraSift">Open article in LiteraSift</button><label style="min-width:240px">Status<select id="casestatus">'+data.config.caseStatuses.map(s=>'<option'+(s===curCase.status?" selected":"")+'>'+esc(s)+'</option>').join("")+'</select></label>';
+  $("casehead").innerHTML='<div style="min-width:0"><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b style="font-size:20px;letter-spacing:-.02em">'+esc(curCase.number)+'</b>'+stageBadge(caseStage(curCase))+triageBadge(curCase)+'<span class="sub">PMID '+esc(curCase.pmid)+'</span><button type="button" class="btn outline sm" data-backtolit="1" title="Open the article in LiteraSift">Open article</button></div><div class="cw-title">'+esc(art.title||"")+'</div></div><label style="min-width:230px">Status<select id="casestatus">'+data.config.caseStatuses.map(s=>'<option'+(s===curCase.status?" selected":"")+'>'+esc(s)+'</option>').join("")+'</select></label>';
   $("casebody").innerHTML=serBar()+caseForm();
   $("caseassess").innerHTML=assessmentHtml(curAssess);
+  caseNav();caseSteps();assistTabs();
+  if(assistData&&assistCase===curCase.id)$("caseassist").innerHTML=assistHtml();
+  assistCase=curCase.id;loadAssist();
   loadReview();
   $("caseerr").textContent="";
   {const ro=curCase.canEdit===false;
@@ -5891,7 +6067,7 @@ async function openSign(kind,id){
     const sel=$("signmeaning");if(sel)sel.onchange=async()=>{const p2=await api("sign-preview",{kind,id,meaning:sel.value});signCtx.pre=p2;$("signstatement").textContent=p2.statement;};
   }catch(e){message(e.message,true);}
 }
-function openCaseData(c,a){curCase=JSON.parse(JSON.stringify(c));curAssess=a;renderCase();if(!$("casedlg").open)$("casedlg").showModal();}
+function openCaseData(c,a){if(!curCase||curCase.id!==c.id){assistData=null;smpcRes={};smpcInfo=null;assistTab="events";assistCase="";}curCase=JSON.parse(JSON.stringify(c));curAssess=a;renderCase();if(!$("casedlg").open)$("casedlg").showModal();}
 async function downloadCase(format){
   collectCase();
   const res=await fetch("/api/case-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:curCase.id,format})});
@@ -6442,6 +6618,15 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueBody(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
+  const cj=event.target.closest&&event.target.closest("[data-casejump],[data-assisttab],[data-assistact],[data-assistuse],[data-assistlis],[data-assistser]");
+  if(cj){
+    if(cj.dataset.casejump){const el=$(cj.dataset.casejump);if(el)el.scrollIntoView({behavior:"smooth",block:"start"});return;}
+    if(cj.dataset.assisttab){assistTab=cj.dataset.assisttab;assistTabs();return;}
+    if(cj.dataset.assistact){assistAction(cj.dataset.assistact);return;}
+    if(cj.dataset.assistuse){assistUse(cj.dataset.assistuse);return;}
+    if(cj.dataset.assistlis){assistListed(Number(cj.dataset.assistlis));return;}
+    if(cj.dataset.assistser){assistSer(Number(cj.dataset.assistser));return;}
+  }
   const scb=event.target.closest&&event.target.closest("[data-scan],[data-scanfilter],[data-scanai],[data-scanadd]");
   if(scb){
     if(scb.dataset.scan!==undefined){openScan(scb.dataset.scan);return;}
