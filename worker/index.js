@@ -4847,6 +4847,17 @@ aside{background:var(--side);color:var(--side-fg);padding:18px 14px;display:flex
 .fchip b{display:inline-block;min-width:24px;text-align:center;border-radius:99px;background:var(--accent);padding:1px 7px;font-size:12px;font-variant-numeric:tabular-nums}
 .fchip:hover{border-color:var(--ring)}.fchip.on{background:var(--primary);color:var(--primary-fg);border-color:var(--primary)}.fchip.on b{background:#ffffff2e;color:inherit}
 .fchip.hot b{background:var(--red-soft);color:var(--red)}
+.setlayout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:22px;align-items:start}
+.setnav{position:sticky;top:84px;display:flex;flex-direction:column;gap:4px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:8px;box-shadow:var(--shadow)}
+.setlink{display:flex;justify-content:space-between;align-items:center;border:0;background:none;border-radius:9px;padding:9px 12px;font-weight:500;color:var(--muted);cursor:pointer;text-align:left}
+.setlink span{font-size:12px;background:var(--accent);border-radius:99px;padding:0 8px;color:var(--muted)}.setlink:hover{background:var(--accent);color:var(--fg)}
+.setlink.on{background:var(--brand-soft);color:var(--brand)}.setlink.on span{background:var(--brand);color:var(--primary-fg)}
+.setbody{min-width:0;max-width:980px}.setbody>section:first-child{margin-top:0}
+@media(max-width:980px){.setlayout{grid-template-columns:1fr}.setnav{position:static;flex-direction:row;flex-wrap:wrap}}
+.toolbar{display:flex;flex-wrap:wrap;gap:6px 0;align-items:stretch;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:14px;position:sticky;top:72px;z-index:4}
+.tbg{display:flex;flex-direction:column;gap:5px;padding:9px 14px;border-right:1px solid var(--border)}.tbg:last-child{border-right:0}
+.tbl{font-size:10.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}.tbr{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.tbr select,.tbr input{padding:4px 8px;font-size:13px}
+.trkhead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin:6px 2px 10px}.trkhead h2{margin:0;font-size:17px;letter-spacing:-.01em}.trkhead select{padding:4px 8px}.trkhead label{flex-direction:row;align-items:center;gap:8px}.tbg{border-bottom:0}
 .sumrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:18px;align-items:start;margin-bottom:18px}.sumrow>section{margin:0}
 .mx{display:grid;gap:8px;grid-template-columns:70px repeat(3,minmax(0,1fr));align-items:center}.mx>.sub{text-align:center}.mx>.mxl{text-align:left;line-height:1.25}.mx .card{min-width:0}
 section>header p{max-width:80ch}
@@ -5268,12 +5279,13 @@ const canMedical=()=>data.viewer.role==="manager"||(data.viewerRoles||[]).includ
 const tagChips=c=>(c.tags||[]).map(t=>'<span class="badge" title="added by '+esc(t.by)+'">'+esc(t.tag)+'</span>').join(" ");
 function bulkBar(cls,opts){
   opts=opts||{};const mgr=data.viewer.role==="manager",fl=data.caseFolders||[];
-  return '<div class="card" style="padding:10px;margin-bottom:10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center"><button type="button" class="btn outline sm" data-p5="selall|'+cls+'">Select all shown</button>'+
-    '<select id="bk_ser" aria-label="Set seriousness"><option value="__">Set seriousness…</option><option value="serious">Serious</option><option value="nonserious">Non-serious</option><option value="">From case data</option></select><select id="bk_lis" aria-label="Set listedness"><option value="__">Set listedness…</option><option value="listed">Listed</option><option value="unlisted">Unlisted</option><option value="unknown">Unknown</option><option value="">From case data</option></select><button type="button" class="btn outline sm" data-p5="classify|'+cls+'">Apply</button>'+
-    '<select id="bk_tag" aria-label="Tag">'+(data.standardTags||[]).map(t=>'<option>'+esc(t)+'</option>').join("")+'</select><input id="bk_custom" placeholder="or your own tag" style="width:130px"><button type="button" class="btn outline sm" data-p5="tag|'+cls+'">Add tag</button><button type="button" class="btn outline sm" data-p5="untag|'+cls+'">Remove tag</button>'+
-    '<select id="bk_folder" aria-label="Folder"><option value="">No folder</option>'+fl.map(f=>'<option value="'+esc(f.id)+'">'+esc(f.name)+'</option>').join("")+'</select><button type="button" class="btn outline sm" data-p5="folder|'+cls+'">Move to folder</button>'+
-    (canMedical()&&!opts.archive?'<button type="button" class="btn outline sm" data-p5="route|'+cls+'">Route…</button><button type="button" class="btn outline sm" data-p5="archive|'+cls+'">Archive</button>':"")+(opts.archive&&canMedical()?'<button type="button" class="btn outline sm" data-p5="restore|'+cls+'">Restore</button>':"")+
-    (mgr?'<button type="button" class="btn outline sm" style="color:var(--red)" data-p5="delcase|'+cls+'">Delete…</button>':"")+'</div>';
+  const grp=(label,inner)=>'<div class="tbg"><span class="tbl">'+label+'</span><div class="tbr">'+inner+'</div></div>';
+  const b=(act,label,extra)=>'<button type="button" class="btn outline sm"'+(extra||"")+' data-p5="'+act+'|'+cls+'">'+label+'</button>';
+  return '<div class="toolbar"><div class="tbg"><span class="tbl">Selection</span><div class="tbr">'+b("selall","Select all shown")+'</div></div>'+
+    grp("Classify",'<select id="bk_ser" aria-label="Set seriousness"><option value="__">Seriousness…</option><option value="serious">Serious</option><option value="nonserious">Non-serious</option><option value="">From case data</option></select><select id="bk_lis" aria-label="Set listedness"><option value="__">Listedness…</option><option value="listed">Listed</option><option value="unlisted">Unlisted</option><option value="unknown">Unknown</option><option value="">From case data</option></select>'+b("classify","Apply"))+
+    grp("Tags",'<select id="bk_tag" aria-label="Tag">'+(data.standardTags||[]).map(t=>'<option>'+esc(t)+'</option>').join("")+'</select><input id="bk_custom" placeholder="or your own tag" style="width:130px">'+b("tag","Add")+b("untag","Remove"))+
+    grp("Folder",'<select id="bk_folder" aria-label="Folder"><option value="">No folder</option>'+fl.map(f=>'<option value="'+esc(f.id)+'">'+esc(f.name)+'</option>').join("")+'</select>'+b("folder","Move"))+
+    ((canMedical()&&!opts.archive)||(opts.archive&&canMedical())||mgr?grp("More",(canMedical()&&!opts.archive?b("route","Route…")+b("archive","Archive"):"")+(opts.archive&&canMedical()?b("restore","Restore"):"")+(mgr?b("delcase","Delete…",' style="color:var(--red)"'):"")):"")+'</div>';
 }
 const canEditCase=c=>{const me=data.viewer.email;return canMedical()||c.assignee===me||c.createdBy===me;};
 function rowSelects(c){
@@ -5864,6 +5876,23 @@ function applyFilter(items){
   return items.filter(a=>(!filt.client||(filt.client==="none"?!a.client:a.client===filt.client))&&(!filt.status||a.status===filt.status)&&(!filt.portfolio||a.portfolio===filt.portfolio)&&(!filt.oa||oaGroup(data.articles[a.pmid]||{})===filt.oa)&&(!filt.ft||ftGroup(data.articles[a.pmid]||{})===filt.ft)&&(!filt.source||(filt.source==="pubmed")===(sourceOf(data.articles[a.pmid])==="PubMed"))&&(!filt.country||(artCountry(data.articles[a.pmid])||"Unknown")===filt.country)&&(!filt.ime||(filt.ime==="ime"?(data.articles[a.pmid]&&data.articles[a.pmid].imeCount>0):(data.articles[a.pmid]&&data.articles[a.pmid].caseFacts&&data.articles[a.pmid].caseFacts.minimum.verdict==="Valid ICSR candidate")))&&
     (!q||(a.pmid+" "+(data.articles[a.pmid]?.title||"")+" "+(a.molecules||[]).join(" ")).toLowerCase().includes(q))&&specialOk(a)).sort(filt.sort==="likely"?(x,y)=>Number(isLikely(y))-Number(isLikely(x))||(y.score||0)-(x.score||0):order);
 }
+let setSec="Access";
+const SET_GROUPS=[["Access","Access & permissions",["User permissions"]],
+  ["Sources","Sources & retrieval",["Unpaywall (open access)","NCBI / PubMed access","Publisher and aggregator access","Closed-access articles","Restricted-licence full text","Sources","Extraction sources","What Unpaywall adds across the site"]],
+  ["Reference","Safety reference data",["MedDRA dictionary (licensed)","Important medical events (IME list)","Marketing authorisations by country","Coding memory"]],
+  ["Workflow","Case workflow",["Synchrony (ICSR workbench)","PV Nexus (ICSR processing)"]],
+  ["Storage","Storage & capture",["Article screenshots","Library folder on the server"]]];
+function settingsLayout(all){
+  const parts=all.split("<section>").filter(Boolean).map(x=>"<section>"+x), byTitle=new Map(), used=new Set();
+  parts.forEach(x=>{const a=x.indexOf("<h2>"),b=x.indexOf("</h2>");byTitle.set(a>=0&&b>a?x.slice(a+4,b).split("<")[0]:"",x);});
+  const secs=SET_GROUPS.map(([id,label,titles])=>{const items=titles.filter(t=>byTitle.has(t)).map(t=>{used.add(t);return byTitle.get(t);});return {id,label,items};});
+  const rest=[...byTitle.keys()].filter(t=>!used.has(t)).map(t=>byTitle.get(t));
+  if(rest.length)secs.push({id:"More",label:"More",items:rest});
+  const live=secs.filter(x=>x.items.length);
+  if(!live.some(x=>x.id===setSec))setSec=live[0].id;
+  const cur=live.find(x=>x.id===setSec);
+  return '<div class="setlayout"><nav class="setnav" aria-label="Settings sections">'+live.map(x=>'<button type="button" class="setlink'+(x.id===setSec?" on":"")+'" data-setsec="'+x.id+'">'+esc(x.label)+'<span>'+x.items.length+'</span></button>').join("")+'</nav><div class="setbody">'+cur.items.join("")+'</div></div>';
+}
 function userPermsHtml(){
   const people=data.profiles.filter(p=>p.role!=="manager"&&p.active!==false);
   const rows=people.map(p=>'<div class="row"><span><b>'+esc(p.name||p.email)+'</b><div class="sub">'+esc(p.email)+'</div></span><span style="display:flex;gap:10px;align-items:center">'+(p.canManageClients?badge("Can manage clients","green"):badge("Standard","")) +'<form data-route="client-permission" style="margin:0"><input type="hidden" name="email" value="'+esc(p.email)+'"><input type="hidden" name="allowed" value="'+(p.canManageClients?"false":"true")+'"><button class="btn outline sm">'+(p.canManageClients?"Revoke":"Allow")+'</button></form></span></div>').join("");
@@ -5953,7 +5982,7 @@ function render() {
     const bars=(list)=>list.length?list.map(x=>'<div class="row" title="'+esc(x.cases.join(", "))+'"><span>'+esc(x.key)+'</span><span class="sub">'+x.count+' case'+(x.count===1?"":"s")+' · '+esc(x.cases.slice(0,4).join(", "))+(x.cases.length>4?"…":"")+'</span></div>').join(""):'<div class="empty">No data yet.</div>';
     const months=S.monthly.map(m=>'<span class="badge'+((S.trend.hikes||[]).includes(m.month)?" red":"")+'" title="'+esc(m.cases.join(", "))+'">'+esc(m.month)+': '+m.count+'</span>').join(" ");
     const fl=data.caseFolders||[],folderBar=panel("Folders",'<div class="chips"><button type="button" class="btn sm '+(synFolder?"outline":"")+'" data-synfolder="">All cases</button><button type="button" class="btn sm '+(synFolder==="__none"?"":"outline")+'" data-synfolder="__none">Not in a folder</button>'+fl.map(f=>'<span style="display:inline-flex;gap:2px"><button type="button" class="btn sm '+(synFolder===f.id?"":"outline")+'" data-synfolder="'+esc(f.id)+'">'+esc(f.name)+' ('+openCases.filter(c=>c.folderId===f.id).length+')</button>'+(manager?'<button type="button" class="btn outline sm" data-p5="delfolder|'+esc(f.id)+'" title="Delete folder" aria-label="Delete folder">x</button>':"")+'</span>').join("")+(canMedical()?'<button type="button" class="btn outline sm" data-p5="newfolder">+ New folder</button>':"")+'</div>');
-    html=tiles+'<div class="sumrow">'+categoryMatrix(openCases)+folderBar+panel("Intake and assignment",intake)+'</div>'+bulkBar("syn_c")+panel("Case tracker",'<div style="padding:4px 0">'+groupSelect(synGroup,["none","soc","triage","sercat","clock","stage","status","seriousness","listedness","folder","portfolio","owner"],"syn_group")+' <span class="sub">Seriousness, listedness and folder are dropdowns on each case. "From case data" uses the event fields.</span></div>',"")+groupedTables(shown,synGroup,["","Case","Article","Product · event","Seriousness","Listedness","Folder","Assignee","Reporting timeline","Indication · action · DC · RC","Status","Validity",""],rowOf,"No cases in this view.")+
+    html=tiles+'<div class="sumrow">'+categoryMatrix(openCases)+folderBar+panel("Intake and assignment",intake)+'</div>'+'<div class="trkhead"><h2>Case tracker</h2><span class="sub">Seriousness, listedness and folder are dropdowns on each case.</span><span style="margin-left:auto">'+groupSelect(synGroup,["none","soc","triage","sercat","clock","stage","status","seriousness","listedness","folder","portfolio","owner"],"syn_group")+'</span></div>'+bulkBar("syn_c")+groupedTables(shown,synGroup,["","Case","Article","Product · event","Seriousness","Listedness","Folder","Assignee","Reporting timeline","Indication · action · DC · RC","Status","Validity",""],rowOf,"No cases in this view.")+
       panel("Case series summary",'<div class="row"><span><b>'+S.total+'</b> case'+(S.total===1?'':'s')+' · <b>'+S.serious.length+'</b> serious · <b>'+S.fatal.length+'</b> fatal</span><span class="sub">Counted from the case fields. Hover a line to see which cases it counts.</span></div>'+
         '<div style="display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))"><div><h3 style="margin:8px 0">Events</h3>'+bars(S.events)+'</div><div><h3 style="margin:8px 0">Suspect products</h3>'+bars(S.products)+'</div><div><h3 style="margin:8px 0">Countries</h3>'+bars(S.countries)+'</div><div><h3 style="margin:8px 0">Age and sex</h3>'+bars(S.ages)+bars(S.sex)+'</div></div>'+
         '<h3 style="margin:14px 0 6px">Cases received per month</h3><div class="chips">'+(months||'<span class="sub">No cases yet.</span>')+'</div><p class="sub" style="margin-top:8px">'+esc(S.trend.basis||"")+(S.monthly.length?" Median "+S.trend.median+", spread "+S.trend.mad+", upper limit "+S.trend.upper+" cases per month (median + 2 x scaled MAD).":"")+(S.trend.hikes&&S.trend.hikes.length&&S.monthly.length>=4?' <b style="color:var(--red)">Above the limit: '+esc(S.trend.hikes.join(", "))+'.</b>':"")+'</p>',"Deterministic: no model writes these figures.")+
@@ -6081,6 +6110,7 @@ function render() {
       table(["Article","Status","Get it","Ask the author"],closedList.map(a=>{const link=a.doi?"https://doi.org/"+a.doi:a.url||"";return ['<a href="'+esc(a.url||"#")+'" target="_blank" rel="noopener">'+esc(String(a.title).slice(0,90))+'</a><div class="sub">PMID '+esc(a.id)+(a.doi?" · "+esc(a.doi):"")+'</div>',esc(a.fullTextStatus||"Pending"),(prefix&&link?'<a class="btn outline sm" href="'+esc(prefix+link)+'" target="_blank" rel="noopener">Via your library</a>':'<span class="sub">set a proxy in Settings</span>'),'<button type="button" class="btn outline sm" data-authornote="'+esc(a.id)+'">Copy request</button>'];}),"Every article in the queues has a full text."),
       "Open-access sources are tried automatically (PMC, Europe PMC, Unpaywall, Semantic Scholar, preprints). What is left is closed. Only use copies you are licensed to use.");
   }
+  if(tab==="Settings")html=settingsLayout(html);
   $("content").innerHTML=html;
   animate();
   drawProgress();
@@ -6152,6 +6182,7 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueBody(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
+  const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
   const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
