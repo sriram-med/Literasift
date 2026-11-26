@@ -522,7 +522,10 @@ async function buildFullTextEvidence(env, articleId, status, hadText) {
 }
 // ---- Clinical extraction: patients, reporter attribution, and patient-specific product-event views. Every item links back to the exact sentence or table cell it came from,
 // with the reasons it was chosen; the original verbatim is kept apart from the normalised term and the suggested MedDRA coding. Rules, not a model: nothing is invented. ----
-const EXTRACTION_VERSION = "clinical-extraction/1";
+const EXTRACTION_VERSION = "clinical-extraction/2";
+const citationEvidence = article => JSON.stringify([article.title || "", article.abstract || "", article.authors || [], article.authorDetails || []]);
+const extractionCurrent = (ex, article) => ex?.version === EXTRACTION_VERSION && ex.source?.citation === citationEvidence(article) &&
+  ex.source?.fullTextSha256 === (article.evidence?.fulltext?.sha256 || null);
 const DRUG_LEXICON = ["aciclovir", "acyclovir", "valaciclovir", "valacyclovir", "ganciclovir", "oseltamivir", "levetiracetam", "lorazepam", "diazepam", "midazolam", "phenytoin", "phenobarbital", "phenobarbitone", "valproate", "carbamazepine", "lacosamide", "propofol", "furosemide", "frusemide",
   "metformin", "insulin", "amlodipine", "atenolol", "metoprolol", "bisoprolol", "lisinopril", "ramipril", "enalapril", "losartan", "telmisartan", "atorvastatin", "rosuvastatin", "simvastatin", "aspirin", "clopidogrel", "warfarin", "heparin", "enoxaparin", "paracetamol", "acetaminophen", "ibuprofen", "diclofenac", "naproxen",
   "amoxicillin", "ceftriaxone", "cefepime", "meropenem", "vancomycin", "gentamicin", "ciprofloxacin", "levofloxacin", "azithromycin", "doxycycline", "metronidazole", "fluconazole", "amphotericin", "tacrolimus", "cyclosporine", "methotrexate", "prednisolone", "prednisone", "dexamethasone", "hydrocortisone",
@@ -594,6 +597,8 @@ function segmentPatients(units, article) {
       introduced = byKey.get(key) || make({ label:"Patient " + labelNum, labelText:"Patient " + labelNum, unit:unit.id });
       byKey.set(key, introduced);
       if (dInfo && !introduced.descriptor.age) { Object.assign(introduced.descriptor, { age:dInfo.age, ageUnit:dInfo.ageUnit, sex:dInfo.sex }); byKey.set(dInfo.age + dInfo.ageUnit + dInfo.sex, introduced); }
+    } else if (dInfo && /\b(?:different|another|second|third)\s+\d{1,3}/i.test(unit.text)) {
+      introduced = make({ ...dInfo, label:"Patient " + (patients.length + 1), labelText:"Distinct patient described in the article", unit:unit.id });
     } else if (dInfo) {
       const key = dInfo.age + dInfo.ageUnit + dInfo.sex;
       if (!byKey.has(key) && current && !current.descriptor.age && !current.descriptor.sex && current.unitIds.length <= 2) { Object.assign(current.descriptor, { age:dInfo.age, ageUnit:dInfo.ageUnit, sex:dInfo.sex }); byKey.set(key, current); introduced = current; }
@@ -605,7 +610,7 @@ function segmentPatients(units, article) {
       const label = cell("patient") || cell("case"), age = cell("age"), sex = cell("sex") || cell("gender");
       if (label || age) {
         const ageNum = /(\d{1,3})/.exec(age || "")?.[1] || "", sx = sexOf(String(sex || "").replace(/^m$/i, "male").replace(/^f$/i, "female")), key = label ? "label" + (/\d+/.exec(label)?.[0] || label) : ageNum + "years" + sx;
-        introduced = byKey.get(key) || (ageNum && byKey.get(ageNum + "years" + sx)) || make({ age:ageNum, ageUnit:"years", sex:sx, label:label ? String(label) : (ageNum ? ageNum + "-year-old " + (sx ? sx.toLowerCase() : "patient") : "Patient"), labelText:label ? String(label) : "", unit:unit.id });
+        introduced = byKey.get(key) || make({ age:ageNum, ageUnit:"years", sex:sx, label:label ? String(label) : (ageNum ? ageNum + "-year-old " + (sx ? sx.toLowerCase() : "patient") : "Patient"), labelText:label ? String(label) : "", unit:unit.id });
         byKey.set(key, introduced); if (ageNum) byKey.set(ageNum + "years" + sx, introduced);
         if (!introduced.descriptor.age && ageNum) Object.assign(introduced.descriptor, { age:ageNum, ageUnit:"years", sex:sx || introduced.descriptor.sex });
       }
@@ -691,7 +696,6 @@ function extractForPatient(patient, units, ctx) {
         else if (category === "alternative" && !ALTERNATIVE_RE.test(before.slice(-50) + after)) { category = "alternative"; }
         const key = lex.term.replace(/s$/, "") + "|" + category, entry = events.get(key) || { id:null, term:lex.term, normalized:lex.term.replace(/^seizures$/, "seizure"), category, parent:lex.parent, verbatim:m[0], mentions:[], reasons:[], negated:false, hypothetical:false, suggested:{ pt:lex.pt || "", code:"", soc:"", llt:null, source:lex.pt ? "LiteraSift lexicon (unverified)" : "" } };
         entry.mentions.push({ unitId:unit.id, section:unit.section, sentence:text, start, end, verbatim:m[0], cell:unit.cell ? { table:unit.cell.table, row:unit.cell.row } : null, negated, hypothetical });
-        entry.negated = entry.negated || negated; entry.hypothetical = entry.hypothetical || hypothetical;
         for (const r of reasons) if (!entry.reasons.includes(r)) entry.reasons.push(r);
         events.set(key, entry);
         if (["ae", "manifestation", "lab"].includes(category) && !negated && !hypothetical) {
@@ -707,6 +711,11 @@ function extractForPatient(patient, units, ctx) {
   const list = [...events.values()]; let n = 0;
   for (const e of list) {
     e.id = patient.id + ":e" + (++n);
+    const confirmed = e.mentions.find(m => !m.negated && !m.hypothetical);
+    e.negated = !confirmed && e.mentions.some(m => m.negated);
+    e.hypothetical = !confirmed && e.mentions.some(m => m.hypothetical);
+    if (confirmed) e.verbatim = confirmed.verbatim;
+    if (confirmed && e.mentions.some(m => m.negated)) e.reasons.push("Both a reported occurrence and a negative mention are present. Review the dates and wording.");
     const suspectHere = [...drugs.values()].some(d => d.role === "suspect" && d.mentions.some(m => e.mentions.some(x => x.unitId === m.unitId)));
     if (e.category === "manifestation") { const parent = list.find(p => p !== e && p.category === "ae" && (p.term === e.parent || p.normalized === e.parent || (e.parent === "neurotoxicity" && /encephalopathy|neurotox|status epilepticus/.test(p.term)) || (e.parent === "renal toxicity" && /renal|kidney|nephro/.test(p.term)))); if (parent) { e.parentId = parent.id; e.reasons.push("a manifestation of " + parent.term + ", named in this patient's record"); } else { e.category = "ae"; e.reasons.push("named on its own, with no broader diagnosis for this patient"); } }
     if (e.category === "ae") { e.reasons.push(e.negated ? "the text says it did not happen" : e.hypothetical ? "only described as a possibility or as background" : "stated as happening to this patient"); if (suspectHere) e.reasons.push("same passage as the suspect drug"); }
@@ -754,7 +763,7 @@ function annotateText(text, productNames, eventTerms) {
 }
 async function scanArticle(env, state, article) {
   let ex = article.extraction;
-  if (!ex || ex.version !== EXTRACTION_VERSION) ex = await extractClinical(withSettings(env, state), article, state);
+  if (!extractionCurrent(ex, article)) ex = await extractClinical(withSettings(env, state), article, state);
   const productNames = uniq([...(state.assignments.filter(a => a.pmid === article.id).flatMap(a => a.molecules || [])), ...ex.patients.flatMap(p => p.drugs.map(d => d.name))]).filter(Boolean);
   const eventTerms = uniq(ex.patients.flatMap(p => p.events.filter(e => e.category === "ae" || e.category === "manifestation").map(e => e.verbatim))).filter(Boolean);
   const ime = await loadIme(env), midx = await loadMeddra(env);
@@ -877,7 +886,7 @@ function attributeReporters(article, parsed, units) {
   const candidates = authors.filter(a => a.corresponding).concat(authors.filter(a => !a.corresponding)).slice(0, 5);
   return { authors, correspondence:parsed?.correspondence || [], correspondenceEmails:contacts, candidates, quoted:quoted.slice(0, 8), patientVoice, flags, status:!authors.length ? "missing" : flags.length ? "uncertain" : "supported" };
 }
-async function extractClinical(env, article, state) {
+async function extractClinical(env, article, state, correction = null) {
   let parsed = null, plain = "";
   if (article.evidence?.parsed?.key) { const o = await env.BUCKET.get(article.evidence.parsed.key); if (o) parsed = JSON.parse(await o.text()); }
   if (!parsed && article.fullTextTextKey) { const o = await env.BUCKET.get(article.fullTextTextKey); if (o) plain = await o.text(); }
@@ -885,9 +894,30 @@ async function extractClinical(env, article, state) {
   const assignments = state.assignments.filter(a => a.pmid === article.id), molecules = uniq(assignments.flatMap(a => a.molecules || []));
   const dictionaryNames = uniq(assignments.flatMap(a => { const d = state.dictionaries?.[a.portfolio]; return d ? d.products.flatMap(dictNames) : []; }));
   const ime = await loadIme(env);
+  const articleRevision = await sha256Hex(canonicalJson([citationEvidence(article), article.evidence?.fulltext?.sha256 || null, plain, parsed]));
+  if (correction?.revision === articleRevision && !seg.aggregateOnly) {
+    const groups = new Map(seg.patients.map(p => [p.id, p]));
+    for (const [unitId, to] of Object.entries(correction.units || {})) {
+      const unit = units.find(u => u.id === unitId);
+      if (!unit) continue;
+      if (!groups.has(to)) groups.set(to, { id:to, label:"Reviewer-separated patient", descriptor:{ labelText:"" }, introducedBy:unitId, unitIds:[], evidence:[] });
+      const original = seg.patients.find(p => p.unitIds.includes(unitId));
+      for (const group of groups.values()) group.unitIds = group.unitIds.filter(id => id !== unitId);
+      const target = groups.get(to);
+      if (original?.introducedBy === unitId && original !== target) {
+        if (target.id.startsWith("M")) target.descriptor = { ...original.descriptor };
+        target.evidence.push({ unitId, section:unit.section, text:unit.text, why:"Reviewer assigned this passage" });
+        original.evidence = original.evidence.filter(e => e.unitId !== unitId);
+        original.descriptor = { labelText:"" };
+      }
+      target.unitIds.push(unitId);
+    }
+    seg.patients = [...groups.values()].filter(p => p.unitIds.length).map(p => ({ ...p, unitIds:p.unitIds.sort((a,b) => Number(a.slice(1)) - Number(b.slice(1))) }));
+    seg.ambiguous = seg.ambiguous.filter(u => !Object.hasOwn(correction.units, u.unitId));
+  }
   const ctx = { molecules, dictionaryNames, ime }, patients = seg.patients.map(p => extractForPatient(p, units, ctx));
   const reporters = attributeReporters(article, parsed, units);
-  return { version:EXTRACTION_VERSION, createdAt:new Date().toISOString(), pmid:article.id, units:units.length, patients, ambiguous:seg.ambiguous, aggregateOnly:seg.aggregateOnly, aggregateMentions:seg.aggregateMentions, reporters, source:{ parsedJats:Boolean(parsed), plainText:Boolean(plain), fullTextSha256:article.evidence?.fulltext?.sha256 || null },
+  return { version:EXTRACTION_VERSION, createdAt:new Date().toISOString(), pmid:article.id, units:units.length, patients, ambiguous:seg.ambiguous, aggregateOnly:seg.aggregateOnly, aggregateMentions:seg.aggregateMentions, reporters, source:{ articleRevision, citation:citationEvidence(article), parsedJats:Boolean(parsed), plainText:Boolean(plain), fullTextSha256:article.evidence?.fulltext?.sha256 || null },
     unitIndex:Object.fromEntries(units.map(u => [u.id, { section:u.section, text:u.text, cell:u.cell ? { table:u.cell.table, row:u.cell.row } : null }])) };
 }
 // Central monitoring counts for the dashboard, scoped to what the viewer may see.
@@ -947,7 +977,7 @@ function assessMinimumCriteria(ex, patient, decisions = {}) {
   criteria.product = suspect ? { status:"supported", basis:"The patient received " + suspect.name + (suspect.dose ? " " + suspect.dose : "") + ".", evidence:evOf(suspect.mentions.map(m => m.unitId)) }
     : { status:patient.drugs.length ? "uncertain" : "missing", basis:patient.drugs.length ? "Other medicines are mentioned, but none is the product being assessed." : "No drug exposure is described for this patient.", evidence:evOf(patient.drugs.flatMap(x => x.mentions.map(m => m.unitId))) };
   // adverse event, after the reviewer's decisions
-  const counted = patient.events.filter(e => !e.negated && !e.hypothetical && ((e.category === "ae" && decisions[e.id]?.action !== "exclude") || (e.category === "manifestation" && decisions[e.id]?.action === "promote")));
+  const counted = patient.events.filter(e => !e.negated && !e.hypothetical && ((e.category === "ae" && !["exclude","link"].includes(decisions[e.id]?.action)) || (e.category === "manifestation" && decisions[e.id]?.action === "promote")));
   const linked = counted.filter(e => patient.drugs.some(x => x.role === "suspect" && x.mentions.some(m => e.mentions.some(y => y.unitId === m.unitId))) || e.onset || e.timeToOnset);
   criteria.event = linked.length ? { status:"supported", basis:linked.map(e => e.verbatim).join(", ") + (linked[0].timeToOnset ? " (" + linked[0].timeToOnset.text + ")" : "") + ".", evidence:evOf(linked.flatMap(e => e.mentions.map(m => m.unitId))) }
     : counted.length ? { status:"uncertain", basis:"An event is named, but nothing ties it to the suspect product in time or in the text.", evidence:evOf(counted.flatMap(e => e.mentions.map(m => m.unitId))) }
@@ -1005,14 +1035,14 @@ function caseFromPatient(article, patient, ex, assignment, settings, ctx) {
   const evid = (unitIds, confidence = 0.6) => uniq(unitIds).slice(0, 3).map(id => { const u = ex.unitIndex[id] || {}; return { source_file:"PMID " + article.id, unit:id, section:u.section || "", cell:u.cell || null, excerpt:String(u.text || "").slice(0, 300), confidence }; });
   const f = (value, unitIds, state = "proposed") => icsrField(value || "", state, value ? evid(unitIds || []) : []);
   const d = patient.descriptor, suspects = patient.drugs.filter(x => x.role === "suspect"), suspect = suspects[0];
-  const counted = patient.events.filter(e => !e.negated && !e.hypothetical && ((e.category === "ae" && decisions[e.id]?.action !== "exclude") || (e.category === "manifestation" && decisions[e.id]?.action === "promote")));
-  const children = e => patient.events.filter(m => m.parentId === e.id && decisions[m.id]?.action !== "promote" && decisions[m.id]?.action !== "exclude");
+  const counted = patient.events.filter(e => !e.negated && !e.hypothetical && ((e.category === "ae" && !["exclude","link"].includes(decisions[e.id]?.action)) || (e.category === "manifestation" && decisions[e.id]?.action === "promote")));
+  const children = e => patient.events.filter(m => (decisions[m.id]?.parentId || m.parentId) === e.id && !m.negated && !m.hypothetical && !["promote","exclude"].includes(decisions[m.id]?.action));
   const history = patient.events.filter(e => e.category === "history").map(e => f(e.verbatim, e.mentions.map(m => m.unitId)));
   const { dech, rech } = dechallengeFor(suspect, counted, ex, patient);
-  const events = counted.map(e => { const ser = eventSeriousness(e, patient.drugs), judgment = medicalJudgment(e, suspect, ser), ids = e.mentions.map(m => m.unitId);
+  const events = counted.map(e => { const ser = eventSeriousness(e, patient.drugs), judgment = medicalJudgment(e, suspect, ser), ids = e.mentions.filter(m => !m.negated && !m.hypothetical).map(m => m.unitId);
     const onsetDate = e.onset?.date || "", detail = children(e);
     return { verbatim:f(e.verbatim, ids), pt:f(e.suggested.pt, ids), pt_code:f(e.suggested.code, ids), soc:f(e.suggested.soc, ids), meddra_version:f(e.suggested.code ? (ctx.ime?.info.version || "") : "", ids), coding_status:f(e.suggested.pt ? (e.suggested.code ? "Proposed (IME list)" : "Proposed (unverified lexicon)") : "", ids),
-      onset_date:f(onsetDate, ids), onset_day:e.onset?.day ?? null, onset_not_reported:false, time_to_onset:f(e.timeToOnset?.text || (e.onset?.day !== undefined ? "day " + e.onset.day + " of the report" : ""), ids), outcome:f(e.outcome ? e.outcome.text : "", e.outcome ? [e.outcome.unitId] : []),
+      onset_date:f(onsetDate, e.onset ? [e.onset.unitId] : ids), onset_day:e.onset?.day ?? null, onset_not_reported:false, time_to_onset:f(e.timeToOnset?.text || (e.onset?.day !== undefined ? "day " + e.onset.day + " of the report" : ""), ids), outcome:f(e.outcome ? e.outcome.text : "", e.outcome ? [e.outcome.unitId] : []),
       seriousness_basis:f(ser.basis.join("; "), ids), needs_medical_judgment:judgment, ime_flag:Boolean(e.ime), manifestations:detail.map(m => ({ verbatim:m.verbatim, evidence:evid(m.mentions.map(x => x.unitId)) })), extraction_ref:e.id, seriousness:ser.flags };
   });
   const products = [
@@ -1116,9 +1146,10 @@ function buildNarrative(rec) {
     say("Dechallenge: " + (hasVal(suspect.dechallenge) ? v(suspect.dechallenge) : ({ unreported:"not reported in the article", not_applicable:"not applicable (the product was not stopped)", unknown:"unknown" }[suspect.dechallenge_basis] || "not reported in the article")) + ". Rechallenge: " + (hasVal(suspect.rechallenge) ? v(suspect.rechallenge) : ({ unreported:"not reported in the article", not_applicable:"not applicable", unknown:"unknown" }[suspect.rechallenge_basis] || "not reported in the article")) + ".", refs(suspect.dechallenge, suspect.rechallenge), "dechallenge");
   }
   if (c.confounders.length) say("Possible confounders: " + c.confounders.map(x => x.type + ": " + x.text).join("; ") + ".", c.confounders.slice(0, 3).filter(x => x.evidence).map(x => ({ pmid:rec.pmid, unit:"", section:"", excerpt:x.evidence, cell:null })), "confounders");
-  const rep = events.filter(e => hasVal(e.causality_reporter)).map(e => v(e.verbatim) + ": " + v(e.causality_reporter)), comp = events.filter(e => hasVal(e.causality_reviewer)).map(e => v(e.verbatim) + ": " + v(e.causality_reviewer) + (e.causality_reviewer?.state === "proposed" ? " (suggestion, not yet confirmed)" : ""));
-  if (rep.length) say("Reporter's causality assessment: " + rep.join("; ") + ".", [], "causality_reporter");
-  if (comp.length) say("Company causality assessment: " + comp.join("; ") + ".", [], "causality_company");
+  for (const [field, title, kind] of [["causality_reporter","Reporter's causality assessment","causality_reporter"],["causality_reviewer","Company causality assessment","causality_company"]]) {
+    const assessed = events.flatMap(e => suspects.map(product => ({ e, product, pair:causalityForPair(e, product, suspects) }))).filter(x => hasVal(x.pair[field]));
+    if (assessed.length) say(title + ": " + assessed.map(({ e, product, pair }) => v(product.name) + " / " + v(e.verbatim) + ": " + v(pair[field]) + (pair[field].state === "proposed" ? " (suggestion pending confirmation)" : "") + (hasVal(pair.causality_rationale) ? " (" + v(pair.causality_rationale) + ")" : "")).join("; ") + ".", refs(...assessed.flatMap(x => [x.pair[field], x.pair.causality_rationale])), kind);
+  }
   return { text:statements.map(s => s.text).join(" "), statements, generatedAt:new Date().toISOString(), basedOn:null, edited:false };
 }
 // ---- E2B(R3): regional profiles, field-level validation, and the approval gate for final output. Transmission to a regulator is outside this release. ----
@@ -1159,7 +1190,11 @@ function validateE2b(rec, article, profileName = "ICH", dict = null) {
     if (!e.seriousness?.serious && !hasVal(e.seriousness_basis)) add("warning", "E.i.3.2", at + ".seriousness", "Seriousness has not been assessed for \"" + v(e.verbatim) + "\".");
     if (!hasVal(e.onset_date) && !hasVal(e.time_to_onset) && !e.onset_not_reported) add("warning", "E.i.4", at + ".onset_date", "No onset date or time to onset for \"" + v(e.verbatim) + "\".");
     if (hasVal(e.onset_date) && !date(v(e.onset_date))) add("error", "E.i.4", at + ".onset_date", "Dates must be YYYY-MM-DD.");
-    if (!hasVal(e.causality_reviewer) && !hasVal(e.causality_reporter)) add("warning", "G.k.9.i", at + ".causality", "No causality assessment for \"" + v(e.verbatim) + "\".");
+    const suspects = c.products.filter(p => p.role === "suspect" && hasVal(p.name));
+    for (const product of suspects) {
+      const pair = causalityForPair(e, product, suspects);
+      if (!hasVal(pair.causality_reviewer) && !hasVal(pair.causality_reporter)) add("warning", "G.k.9.i", at + ".causality", "No causality assessment for " + v(product.name) + " / " + v(e.verbatim) + ".");
+    }
     for (const j of e.needs_medical_judgment || []) add("warning", "review", at, v(e.verbatim) + ": " + j);
   });
   if (!String(c.narrative?.text || "").trim()) add("error", "H.1", "narrative", "The case narrative is missing. Generate and review it.");
@@ -1170,6 +1205,37 @@ function validateE2b(rec, article, profileName = "ICH", dict = null) {
 async function structuralXsd(env, xml) {
   if (typeof env.XSD_VALIDATE !== "function") return { available:false, errors:[], note:"Schema validation needs the ICH schema files on the server (see deploy/enable-xsd.sh); only the business rules were checked." };
   try { return { available:true, errors:await env.XSD_VALIDATE(xml) }; } catch (error) { return { available:false, errors:[], note:"Schema validation could not run: " + error.message }; }
+}
+function caseEvidenceSnapshot(state, rec) {
+  const a = state.articles[rec.pmid] || {}, rsi = state.rsi || [];
+  const labels = (rec.data.events || []).flatMap(e => {
+    const cited = e.listedness_assessment;
+    if (!cited?.rsiId) return [];
+    const base = rsi.find(doc => doc.id === cited.rsiId);
+    if (!base) return [];
+    const latest = rsi.slice().reverse().find(doc => doc.product.toLowerCase() === base.product.toLowerCase() && (doc.market || "").toLowerCase() === (base.market || "").toLowerCase());
+    return [{ cited:base.id, before:base.version, latest:latest.id, after:latest.version }];
+  });
+  return { citation:citationEvidence(a), fulltext:evidenceRef(a).fulltext, labels };
+}
+function caseEvidenceDelta(state, rec) {
+  const current = caseEvidenceSnapshot(state, rec);
+  const previous = rec.sourceReview?.snapshot || rec.provenance?.sourceSnapshot || null;
+  const originalText = previous ? previous.fulltext : rec.provenance?.evidence?.fulltext;
+  const changes = [];
+  if (previous && previous.citation !== current.citation) {
+    const old = JSON.parse(previous.citation), next = JSON.parse(current.citation);
+    changes.push({ title:"Citation revised", before:old.slice(0,2).join("\n").slice(0,6000), after:next.slice(0,2).join("\n").slice(0,6000) });
+  }
+  if (originalText !== undefined && originalText !== current.fulltext) changes.push({ title:"Full-text evidence changed", before:originalText || "No stored full text", after:current.fulltext || "No stored full text" });
+  for (const label of current.labels) {
+    if (label.cited !== label.latest && !previous?.labels.some(p => p.cited === label.cited && p.latest === label.latest)) changes.push({ title:"Reference safety information revised", before:label.before, after:label.after });
+  }
+  return { current, changes };
+}
+async function caseEvidenceChanges(state, rec) {
+  const delta = caseEvidenceDelta(state, rec);
+  return { ...delta, key:await sha256Hex(canonicalJson(delta.current)) };
 }
 const approvalValid = async rec => Boolean(rec.approval?.status === "approved" && rec.approval.hash === await caseDataHash(rec));
 const safetyFilter = '("adverse effects"[sh] OR "drug-related side effects and adverse reactions"[MeSH Terms] OR safety[tiab] OR toxicity[tiab] OR "adverse event*"[tiab] OR "adverse reaction*"[tiab] OR "adverse drug reaction*"[tiab] OR "side effect*"[tiab])';
@@ -2333,18 +2399,34 @@ function normalizeCase(input) {
     treatment_refs:(data.treatment_refs || []).slice(0, 30), minimum_criteria:data.minimum_criteria || null, narrative:data.narrative || null, market:String(data.market || "").slice(0, 80),
     general_comments:String(data.general_comments || "").slice(0, 4000), sender_comments:String(data.sender_comments || "").slice(0, 4000), reporter_comments:String(data.reporter_comments || "").slice(0, 4000),
     other_reporters:(Array.isArray(data.other_reporters) ? data.other_reporters : []).slice(0, 40).map(r => ({ name:String(r?.name || "").slice(0, 120), organisation:String(r?.organisation || "").slice(0, 200), country:String(r?.country || "").slice(0, 80), email:String(r?.email || "").slice(0, 120), qualification:String(r?.qualification || "").slice(0, 80), corresponding:r?.corresponding === true })).filter(r => r.name),
-    products:(data.products || []).slice(0, 30).map(p => ({ ...group(p, FIELDS.product), role:["suspect", "concomitant", "interacting"].includes(p?.role) ? p.role : "suspect", start_not_reported:p?.start_not_reported === true,
+    products:(data.products || []).slice(0, 30).map(p => ({ ...group(p, FIELDS.product), pair_id:validPairId(p?.pair_id) ? p.pair_id : null, role:["suspect", "concomitant", "interacting"].includes(p?.role) ? p.role : "suspect", start_not_reported:p?.start_not_reported === true,
       dechallenge_basis:["reported", "unknown", "unreported", "not_applicable"].includes(p?.dechallenge_basis) ? p.dechallenge_basis : "", rechallenge_basis:["reported", "unknown", "unreported", "not_applicable"].includes(p?.rechallenge_basis) ? p.rechallenge_basis : "", start_day:Number.isFinite(p?.start_day) ? p.start_day : null, stop_day:Number.isFinite(p?.stop_day) ? p.stop_day : null })),
-    events:(data.events || []).slice(0, 30).map(e => ({ ...group(e, FIELDS.event), onset_not_reported:e?.onset_not_reported === true, ime_flag:e?.ime_flag === true, onset_day:Number.isFinite(e?.onset_day) ? e.onset_day : null, needs_medical_judgment:(e?.needs_medical_judgment || []).map(String).slice(0, 10), manifestations:(e?.manifestations || []).slice(0, 20), extraction_ref:String(e?.extraction_ref || ""), listedness_assessment:e?.listedness_assessment || null, naranjo:e?.naranjo || null, who_umc_calc:e?.who_umc_calc || null, causality_suggestions:(e?.causality_suggestions || []).slice(0, 10), seriousness:Object.fromEntries(SERIOUS_FLAGS.map(k => [k, Boolean(e?.seriousness?.[k])])) })).map(syncListedness),
+    events:(data.events || []).slice(0, 30).map(e => ({ ...group(e, FIELDS.event), product_causality:Object.fromEntries(Object.entries(e?.product_causality || {}).filter(([key]) => validPairId(key)).slice(0, 30).map(([key, pair]) => [key, group(pair, PAIR_FIELDS)])), onset_not_reported:e?.onset_not_reported === true, ime_flag:e?.ime_flag === true, onset_day:Number.isFinite(e?.onset_day) ? e.onset_day : null, needs_medical_judgment:(e?.needs_medical_judgment || []).map(String).slice(0, 10), manifestations:(e?.manifestations || []).slice(0, 20), extraction_ref:String(e?.extraction_ref || ""), listedness_assessment:e?.listedness_assessment || null, naranjo:e?.naranjo || null, who_umc_calc:e?.who_umc_calc || null, causality_suggestions:(e?.causality_suggestions || []).slice(0, 10), seriousness:Object.fromEntries(SERIOUS_FLAGS.map(k => [k, Boolean(e?.seriousness?.[k])])) })).map(syncListedness),
     labs:Array.isArray(data.labs) ? data.labs.slice(0, 100) : [], source_documents:(data.source_documents || []).slice(0, 20).map(d => ({ filename:String(d?.filename || "").slice(0, 200), media_type:d?.media_type || null, size_bytes:Number(d?.size_bytes) || 0, source_type:d?.source_type || "unknown" })),
     source_summary:String(data.source_summary || "").slice(0, 20000), warnings:(data.warnings || []).map(String).slice(0, 20), special_situations:(data.special_situations || []).map(String).slice(0, 30),
     // LiteraSift extensions (PV Nexus ignores unknown keys): care given for the event, and factors that confound the assessment.
     treatment_given:(data.treatment_given || []).map(String).map(t => t.slice(0, 200)).slice(0, 20),
     confounders:(data.confounders || []).map(c => typeof c === "string" ? { type:"Other", text:c.slice(0, 200), evidence:"" } : { type:String(c?.type || "Other").slice(0, 60), text:String(c?.text || "").slice(0, 200), evidence:String(c?.evidence || "").slice(0, 300) }).filter(c => c.text).slice(0, 30) };
   if (!out.patient.age_unit.value) out.patient.age_unit.value = "years";
+  const usedPairIds = new Set(out.products.map(p => p.pair_id).filter(Boolean)), assignedPairIds = new Set();
+  out.products.forEach((p, i) => {
+    if (!p.pair_id || assignedPairIds.has(p.pair_id)) {
+      let id = "legacy-" + (i + 1);
+      while (usedPairIds.has(id)) id += "-p";
+      p.pair_id = id;
+      usedPairIds.add(id);
+    }
+    assignedPairIds.add(p.pair_id);
+  });
   // The age group is derived from the age when the article gives an age but no group.
   if (!out.patient.age_group.value) { const group = ageGroupFrom(out.patient.age.value, out.patient.age_unit.value); if (group) { out.patient.age_group.value = group; out.patient.age_group.state = "proposed"; } }
   return out;
+}
+const validPairId = id => /^(?:legacy-\d+(?:-p)*|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(id || "");
+const PAIR_FIELDS = ["causality_reporter", "causality_reviewer", "causality_method", "causality_rationale"];
+function causalityForPair(event, product, suspects) {
+  if (event.product_causality && Object.hasOwn(event.product_causality, product.pair_id)) return event.product_causality[product.pair_id];
+  return suspects.length === 1 ? event : {};
 }
 const hasVal = f => Boolean(f && f.value != null && String(f.value).trim());
 const firstSuspect = c => c.products.find(p => p.role === "suspect");
@@ -2874,6 +2956,7 @@ function makeCase(data, article, item, by, intake, assignTo = "", stage = "medic
     data:caseFromArticle(article, item, data.settings || {}), createdBy:by, createdAt:at, updatedAt:at, intake, stage, ...(stage === "screening" && assignTo ? { screener:assignTo } : {}),
     history:[{ at, by, action:(intake === "automatic" ? "added automatically from the full text of PMID " : "created from PMID ") + article.id }] };
   created.data.case_id = created.number;
+  created.provenance = { assignmentId:item.id, sourceSnapshot:caseEvidenceSnapshot(data, created) };
   (data.cases ||= []).push(created);
   const assignee = assignTo || (data.settings?.autoAssignCases === false ? "" : pickCaseAssignee(data, created));
   if (assignee) { created.assignee = assignee; created.assignedAt = at; created.history.push({ at, by:"system", action:"assigned to " + assignee + (assignTo ? "" : " (automatic)") }); }
@@ -2922,6 +3005,12 @@ function caseNarrativeText(c, citation) {
   }
   if (c.treatment_given.length) out.push("Treatment given for the event: " + c.treatment_given.join(", ") + ".");
   if (c.confounders.length) out.push("Potential confounders: " + c.confounders.map(x => x.type + ": " + x.text).join("; ") + ".");
+  const suspects = c.products.filter(p => p.role === "suspect" && hasVal(p.name));
+  for (const event of events) for (const product of suspects) {
+    const pair = causalityForPair(event, product, suspects);
+    const parts = [["Reporter",pair.causality_reporter],["Reviewer",pair.causality_reviewer]].filter(([, field]) => hasVal(field)).map(([label, field]) => label + ": " + v(field));
+    if (parts.length) out.push("Causality for " + v(product.name) + " / " + v(event.verbatim) + ". " + parts.join(". ") + (hasVal(pair.causality_rationale) ? ". " + v(pair.causality_rationale) : "") + ".");
+  }
   return out.join(" ");
 }
 const xmlEsc = value => String(value ?? "").replace(/[&<>"]/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[ch]));
@@ -2961,10 +3050,16 @@ function e2bCase(rec, article, opts = {}) {
   const age = v(p.age) ? `<subjectOf2 typeCode="SBJ">${obs("3", "age", `<value xsi:type="PQ" value="${xmlEsc(v(p.age))}" unit="${UCUM_AGE[(v(p.age_unit) || "years").toLowerCase()] || "a"}"/>`)}</subjectOf2>` : "";
   const ageGroup = AGE_GROUPS.indexOf(v(p.age_group)) >= 0 ? `<subjectOf2 typeCode="SBJ">${obs("4", "ageGroup", `<value xsi:type="CE" code="${AGE_GROUPS.indexOf(v(p.age_group))}" codeSystem="2.16.840.1.113883.3.989.2.1.1.9"/>`)}</subjectOf2>` : "";
   // One causality assessment per reaction and suspect drug (E2B(R3) G.k.9.i), with the method and the reviewer's result.
-  const causality = evs.flatMap((e, ei) => drugList.map((x, di) => x.role === "suspect" && (hasVal(e.causality_reviewer) || hasVal(e.causality_reporter)) ? `<component typeCode="COMP"><causalityAssessment classCode="OBS" moodCode="EVN"><code code="39" codeSystem="${OID.obs}" displayName="causality"/>` +
-    `<value xsi:type="ST">${xmlEsc([hasVal(e.causality_reporter) ? "Reporter: " + v(e.causality_reporter) : "", hasVal(e.causality_reviewer) ? "Reviewer: " + v(e.causality_reviewer) : ""].filter(Boolean).join("; "))}</value>` +
-    (hasVal(e.causality_method) ? `<methodCode><originalText>${xmlEsc(v(e.causality_method))}</originalText></methodCode>` : "") +
-    `<subject1 typeCode="SUBJ"><adverseEffectReference classCode="OBS" moodCode="EVN"><id root="${reactionIds[ei]}"/></adverseEffectReference></subject1><subject2 typeCode="SUBJ"><productUseReference classCode="SBADM" moodCode="EVN"><id root="${drugIds[di]}"/></productUseReference></subject2></causalityAssessment></component>` : "").filter(Boolean)).join("");
+  const suspects = drugList.filter(p => p.role === "suspect");
+  const causality = evs.flatMap((e, ei) => drugList.map((x, di) => {
+    if (x.role !== "suspect") return "";
+    const pair = causalityForPair(e, x, suspects);
+    if (!hasVal(pair.causality_reviewer) && !hasVal(pair.causality_reporter)) return "";
+    return `<component typeCode="COMP"><causalityAssessment classCode="OBS" moodCode="EVN"><code code="39" codeSystem="${OID.obs}" displayName="causality"/>` +
+    `<value xsi:type="ST">${xmlEsc([hasVal(pair.causality_reporter) ? "Reporter: " + v(pair.causality_reporter) : "", hasVal(pair.causality_reviewer) ? "Reviewer: " + v(pair.causality_reviewer) : ""].filter(Boolean).join("; "))}</value>` +
+    (hasVal(pair.causality_method) ? `<methodCode><originalText>${xmlEsc(v(pair.causality_method))}</originalText></methodCode>` : "") +
+    `<subject1 typeCode="SUBJ"><adverseEffectReference classCode="OBS" moodCode="EVN"><id root="${reactionIds[ei]}"/></adverseEffectReference></subject1><subject2 typeCode="SUBJ"><productUseReference classCode="SBADM" moodCode="EVN"><id root="${drugIds[di]}"/></productUseReference></subject2></causalityAssessment></component>`;
+  }).filter(Boolean)).join("");
   const qualCode = { physician:"1", pharmacist:"2", lawyer:"4", consumer:"5" }, qualText = v(c.reporter.qualification).toLowerCase(), qual = Object.entries(qualCode).find(([k]) => qualText.includes(k))?.[1] || (qualText ? "3" : "");
   const person = (name, org, email, phone, addr, country, code) => `<assignedEntity classCode="ASSIGNED">${code ? `<code code="${code}" codeSystem="2.16.840.1.113883.3.989.2.1.1.6"/>` : ""}${addr || country ? `<addr>${addr ? `<streetAddressLine>${xmlEsc(addr)}</streetAddressLine>` : ""}${country ? `<country>${xmlEsc(country)}</country>` : ""}</addr>` : ""}${phone ? `<telecom value="tel:${xmlEsc(phone)}"/>` : ""}${email ? `<telecom value="mailto:${xmlEsc(email)}"/>` : ""}${name ? `<assignedPerson classCode="PSN" determinerCode="INSTANCE"><name>${xmlEsc(name)}</name></assignedPerson>` : ""}${org ? `<representedOrganization classCode="ORG" determinerCode="INSTANCE"><name>${xmlEsc(org)}</name></representedOrganization>` : ""}</assignedEntity>`;
   const qualOf = text => { const q = String(text || "").toLowerCase(); return Object.entries(qualCode).find(([k]) => q.includes(k))?.[1] || (q ? "3" : ""); };
@@ -3711,7 +3806,7 @@ async function apiCore(request, env, path) {
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules), client:clientIdFor(state, a) }));
     return json({ viewer, clients:(state.clients || []).map(c => ({ ...c, molecules:state.watches.filter(w => w.client === c.id).map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "" })) })), library:manager ? libraryLayout(state) : [],
-      cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, canEdit:canEditCase(state, viewer, c), signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
+      cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, evidenceReviewPending:caseEvidenceDelta(state, c).changes.length>0, canEdit:canEditCase(state, viewer, c), signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
       dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], meddraInfo:state.meddra || null, stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c), triage:triageFor(state, c) }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
       monitoring:monitoringCounts(state, viewer),
       series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ ai:(() => { const c = aiConfig(env, state); return { available:c.enabled && c.hasKey && c.monthlyTokens > 0, ...(manager ? { enabled:c.enabled, model:c.model, monthlyTokens:c.monthlyTokens, hasKey:c.hasKey, used:aiUsed(state), month:aiMonth() } : {}) }; })(), retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
@@ -3908,6 +4003,37 @@ async function apiCore(request, env, path) {
     await write(env, data => { data.meddra = info; });
     await audit(env, { by:email, action:"meddra.loaded", target:"MedDRA " + info.version + " " + info.language, detail:{ ...info.counts, filename:info.filename, licence_confirmed:true } });
     return json({ ok:true, info });
+  }
+  if (["/api/case-source", "/api/case-work-draft", "/api/case-source-reviewed"].includes(path) && viewer) {
+    const rec = (state.cases || []).find(c => c.id === body.id && caseVisible(state, viewer, c));
+    if (!rec) return json({ error:"Case not found." }, 404);
+    const article = state.articles[rec.pmid];
+    if (path === "/api/case-source") return json({ scan:article ? await scanArticle(env, state, article) : null, changes:await caseEvidenceChanges(state, rec) });
+    const mayWrite = canEditCase(state, viewer, rec) && !rec.locked && !rec.archived;
+    if (path === "/api/case-work-draft") {
+      if (!mayWrite) return json({ error:"This case cannot be edited by this account." }, 403);
+      const key = "work-drafts/" + await sha256Hex(email + "|" + rec.id) + ".json";
+      if (body.action === "get") {
+        const obj = await env.BUCKET.get(key);
+        return json({ draft:obj ? await obj.json() : null });
+      }
+      if (body.action === "clear") { await env.BUCKET.delete(key); return json({ ok:true }); }
+      if (body.action !== "save" || !body.draft || JSON.stringify(body.draft).length > 1_000_000) return json({ error:"Invalid draft." }, 400);
+      await env.BUCKET.put(key, JSON.stringify({ ...body.draft, savedAt:new Date().toISOString() }));
+      return json({ ok:true });
+    }
+    if (!mayWrite) return json({ error:"The assigned editor must review evidence on an open, unsigned case." }, 403);
+    const evidence = await caseEvidenceChanges(state, rec), note = String(body.note || "").trim();
+    if (note.length < 5 || body.key !== evidence.key) return json({ error:"Refresh the evidence and record a review note." }, 409);
+    const saved = await write(env, d => {
+      const c = d.cases.find(x => x.id === rec.id);
+      if (!c || c.locked || c.archived || !canEditCase(d, viewer, c) || canonicalJson(caseEvidenceSnapshot(d, c)) !== canonicalJson(evidence.current)) return false;
+      c.sourceReview = { snapshot:evidence.current, by:email, at:new Date().toISOString(), note:note.slice(0, 1000) };
+      return true;
+    });
+    if (!saved) return json({ error:"The case or evidence changed. Refresh before confirming." }, 409);
+    await audit(env, { by:email, action:"case.source_reviewed", entityType:"Case", entityId:rec.number, detail:{ note:note.slice(0, 1000), changes:evidence.changes } });
+    return json({ ok:true });
   }
   if (["/api/case-submit", "/api/case-qc", "/api/case-ai-fill"].includes(path) && viewer) {
     const c = (state.cases || []).find(x => x.id === String(body.id || ""));
@@ -4153,7 +4279,7 @@ async function apiCore(request, env, path) {
     if (moved.length) await audit(env, { by:email, action:"case.routed", target:moved.length + " cases", detail:{ changes:moved.slice(0, 50).join("; "), reason:reason.slice(0, 300) } });
     return json({ ok:true, moved:moved.length });
   }
-  if (["/api/disposition", "/api/qc-decision", "/api/reassign", "/api/membership-save", "/api/extract", "/api/extraction-decide", "/api/allocate-bulk"].includes(path) && viewer) {
+  if (["/api/disposition", "/api/qc-decision", "/api/reassign", "/api/membership-save", "/api/extract", "/api/extraction-decide", "/api/patient-passage", "/api/allocate-bulk"].includes(path) && viewer) {
     const today = day(), at = new Date().toISOString();
     const EXCLUSION_REASONS = ["No individual patient (aggregate or study data only)", "No adverse event", "No suspect product", "Not a drug safety report (review, background, or editorial)", "Duplicate of another record", "Outside the portfolio scope", "Other (explain in the note)"];
     if (path === "/api/membership-save") {
@@ -4190,20 +4316,50 @@ async function apiCore(request, env, path) {
     if (path === "/api/extract") {
       const article = state.articles[item.pmid]; if (!article) return json({ error:"Article not found." }, 404);
       let extraction = article.extraction;
-      if (!extraction || body.refresh === true || extraction.version !== EXTRACTION_VERSION || extraction.source?.fullTextSha256 !== (article.evidence?.fulltext?.sha256 || null)) {
+      if (body.refresh === true || !extractionCurrent(extraction, article)) {
         extraction = await extractClinical(withSettings(env, state), article, state);
         await write(env, data => { if (data.articles[item.pmid]) data.articles[item.pmid].extraction = extraction; });
       }
+      if (item.patientPassages) extraction = await extractClinical(withSettings(env, state), article, state, item.patientPassages);
       return json({ extraction, decisions:item.extractionDecisions || {}, patientDecisions:item.patientDecisions || {}, possibleDuplicatePublications:publicationDuplicates(state, article), evidence:evidenceRef(article) });
+    }
+    if (path === "/api/patient-passage") {
+      if (!isScreener && !pm && !rolesIn(state, email, item.portfolio).has("medical_reviewer")) return json({ error:"You cannot edit patient attribution for this assignment." }, 403);
+      const article = state.articles[item.pmid];
+      const ex = await extractClinical(withSettings(env, state), article, state, item.patientPassages);
+      const unitId = String(body.unitId || ""), requested = String(body.patientId || "");
+      const target = requested === "new" ? "M" + crypto.randomUUID().slice(0, 16) : requested;
+      if (ex.aggregateOnly || !Object.hasOwn(ex.unitIndex, unitId) || (requested !== "new" && !ex.patients.some(p => p.id === target))) return json({ error:"Choose a passage and a patient from the current individual report." }, 400);
+      if (body.revision !== ex.source.articleRevision) return json({ error:"Article evidence changed. Refresh the extraction first." }, 409);
+      const saved = await write(env, data => {
+        const a = data.assignments.find(x => x.id === item.id);
+        if (!a || !mayAccess(data, viewer, a) || (data.cases || []).some(c => c.provenance?.assignmentId === a.id || (c.pmid === a.pmid && c.portfolio === a.portfolio))) return false;
+        if (a.patientPassages?.revision !== ex.source.articleRevision) a.patientPassages = { revision:ex.source.articleRevision, units:{} };
+        a.patientPassages.units[unitId] = target;
+        a.extractionDecisions = {};
+        a.patientDecisions = {};
+        return true;
+      });
+      if (!saved) return json({ error:"A case already exists for this assignment or access changed. Review corrections with the case owner." }, 409);
+      await audit(env, { by:email, action:"assignment.patient_passage", entityType:"Assignment", entityId:item.id, detail:{ unitId, patientId:target } });
+      return json({ ok:true, patientId:target });
     }
     if (path === "/api/extraction-decide") {
       if (!isScreener && !pm && !rolesIn(state, email, item.portfolio).has("medical_reviewer")) return json({ error:"Only the assigned reviewer, a medical reviewer or a manager can decide this." }, 403);
       const action = String(body.action || ""), reason = String(body.reason || "").trim().slice(0, 300), key = String(body.eventId || body.patientId || "");
-      if (!["promote", "exclude", "reset"].includes(action) || !key) return json({ error:"Choose promote, exclude or reset for an event or patient." }, 400);
+      if (!["promote", "exclude", "reset", "link"].includes(action) || !key) return json({ error:"Choose promote, exclude or reset for an event or patient." }, 400);
       if (action === "exclude" && reason.length < 3) return json({ error:"Give a reason for excluding it." }, 400);
-      const extraction = state.articles[item.pmid]?.extraction, known = new Set([...(extraction?.patients || []).flatMap(p => [p.id, ...p.events.map(e => e.id)])]);
+      const article = state.articles[item.pmid];
+      const extraction = item.patientPassages ? await extractClinical(withSettings(env, state), article, state, item.patientPassages) : article?.extraction;
+      const parentId = String(body.parentId || "");
+      if (action === "link") {
+        const patient = extraction?.patients.find(p => p.events.some(e => e.id === key && !e.negated && !e.hypothetical));
+        const parent = patient?.events.find(e => e.id === parentId && e.category === "ae" && !e.negated && !e.hypothetical);
+        if (!body.eventId || !parent || parentId === key || ["link","exclude"].includes(item.extractionDecisions?.[parentId]?.action) || Object.values(item.extractionDecisions || {}).some(d => d.parentId === key)) return json({ error:"Choose an independent reaction for this patient as the parent." }, 400);
+      }
+      const known = new Set([...(extraction?.patients || []).flatMap(p => [p.id, ...p.events.map(e => e.id)])]);
       if (!known.has(key)) return json({ error:"That event or patient is not in the extraction. Refresh it first." }, 404);
-      await write(env, data => { const a = data.assignments.find(x => x.id === item.id), bucket = body.patientId ? (a.patientDecisions ||= {}) : (a.extractionDecisions ||= {}); if (action === "reset") delete bucket[key]; else bucket[key] = { action, reason, by:email, at, evidence:evidenceRef(data.articles[a.pmid]) }; });
+      await write(env, data => { const a = data.assignments.find(x => x.id === item.id), bucket = body.patientId ? (a.patientDecisions ||= {}) : (a.extractionDecisions ||= {}); if (action === "reset") delete bucket[key]; else bucket[key] = { action, reason, ...(action === "link" ? { parentId } : {}), by:email, at, evidence:evidenceRef(data.articles[a.pmid]) }; });
       await audit(env, { by:email, action:"extraction.decision", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ item:key, action, reason, portfolio:item.portfolio } });
       return json({ ok:true });
     }
@@ -4249,12 +4405,12 @@ async function apiCore(request, env, path) {
   }
   if (["/api/criteria", "/api/drafts-create", "/api/duplicates", "/api/duplicate-decide", "/api/case-versions", "/api/case-diff", "/api/case-dates", "/api/reportability"].includes(path) && viewer) {
     const at = new Date().toISOString(), ownsCase = c => caseVisible(state, viewer, c);
-    const freshExtraction = async article => { let ex = article.extraction; if (!ex || ex.version !== EXTRACTION_VERSION || ex.source?.fullTextSha256 !== (article.evidence?.fulltext?.sha256 || null)) { ex = await extractClinical(withSettings(env, state), article, state); await write(env, data => { if (data.articles[article.id]) data.articles[article.id].extraction = ex; }); } return ex; };
+    const freshExtraction = async article => { let ex = article.extraction; if (!extractionCurrent(ex, article)) { ex = await extractClinical(withSettings(env, state), article, state); await write(env, data => { if (data.articles[article.id]) data.articles[article.id].extraction = ex; }); } return ex; };
     if (path === "/api/criteria" || path === "/api/drafts-create") {
       const item = state.assignments.find(a => a.id === body.id);
       if (!item || !mayAccess(state, viewer, item)) return json({ error:"Assignment not found." }, 404);
       const article = state.articles[item.pmid]; if (!article) return json({ error:"Article not found." }, 404);
-      const ex = await freshExtraction(article), decisions = item.extractionDecisions || {}, pdec = item.patientDecisions || {};
+      const ex = item.patientPassages ? await extractClinical(withSettings(env, state), article, state, item.patientPassages) : await freshExtraction(article), decisions = item.extractionDecisions || {}, pdec = item.patientDecisions || {};
       const assessed = ex.patients.map(p => ({ patient:p, assessment:assessMinimumCriteria(ex, p, decisions), excluded:pdec[p.id]?.action === "exclude" }));
       if (path === "/api/criteria") return json({ possibleDuplicatePublications:publicationDuplicates(state, article), aggregateOnly:ex.aggregateOnly, patients:assessed.map(x => ({ id:x.patient.id, label:x.patient.label, excluded:x.excluded, ...x.assessment })), screening:item.disposition || null, existingDrafts:(state.cases || []).filter(c => c.pmid === item.pmid && c.portfolio === item.portfolio).map(c => ({ number:c.number, patient:c.provenance?.patientId })) });
       const pm = isPortfolioManager(state, viewer, item.portfolio), roles = rolesIn(state, email, item.portfolio);
@@ -4283,6 +4439,7 @@ async function apiCore(request, env, path) {
           const rec = { id:crypto.randomUUID(), number, pmid:item.pmid, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"", data:caseData, createdBy:email, createdAt:at, updatedAt:at, ...(a.qc || a.routedToMedical || data.settings?.qcPotentialIcsr === true ? { assignee:a.medicalReviewer || pickMedical(data, item.portfolio) || item.reviewer || email, stage:"medical_review" } : { assignee:a.reviewer || email, screener:a.reviewer || email, stage:"screening" }), intake:"patient-draft",
             provenance:{ evidence:evidenceRef(data.articles[item.pmid]), idempotencyKey:idem, patientId:p.id, patientLabel:p.label, extractionVersion:ex.version, extractedAt:ex.createdAt, fullTextSha256:ex.source.fullTextSha256, assignmentId:item.id, criteriaOverall:assessment.overall, forced },
             history:[{ at, by:email, action:"draft created for " + (p.label || p.id) + " from PMID " + item.pmid + " (" + item.portfolio + ")" }] };
+          rec.provenance.sourceSnapshot = caseEvidenceSnapshot(data, rec);
           refreshDue(data, rec); (data.cases ||= []).push(rec); done.push({ existing:false, number, patient:p.id, id:rec.id });
         }
         return done;
@@ -4455,6 +4612,7 @@ async function apiCore(request, env, path) {
       return json({ ok:true });
     }
     // approval
+    if ((await caseEvidenceChanges(state, rec)).changes.length) return json({ error:"Review the changed source evidence before approving this case." }, 409);
     const profile = E2B_PROFILES[profileName];
     if (!profile.supportedForFinal) return json({ error:profile.label + ": " + profile.note, profile:profileName }, 409);
     const issues = validateE2b(rec, state.articles[rec.pmid], profileName, await loadMeddra(env)), blocking = issues.filter(i => i.severity === "error");
@@ -4491,6 +4649,7 @@ async function apiCore(request, env, path) {
     }
     const meaningCode = kind === "screening" ? "screening" : body.meaning === "case_invalid" ? "case_invalid" : "case_approve", meaning = SIGN_MEANINGS[meaningCode];
     const { content_sha256, evidence_sha256 } = await signContent(kind, record, article, meaningCode), problems = signPolicyProblems(state, kind, record, meaning, viewer, manager);
+    if (kind === "case" && meaningCode === "case_approve" && caseEvidenceDelta(state, record).changes.length) problems.push("Review the changed source evidence before signing.");
     if (path === "/api/sign-preview") return json({ kind, meaning:meaningCode, meanings:kind === "case" ? ["case_approve", "case_invalid"].map(code => ({ code, label:SIGN_MEANINGS[code].label, statement:SIGN_MEANINGS[code].statement })) : [{ code:"screening", label:meaning.label, statement:meaning.statement }],
       statement:meaning.statement, content_sha256, evidence_sha256, signer:{ id:email, name:viewer.name, role:viewer.role }, reauth:Boolean(env.HOST_ACCOUNTS), problems, signatures:record.signatures || [], intact:await signatureIntact(kind, record, article), manager });
     if (problems.length) return json({ error:problems[0] }, 409);
@@ -4713,12 +4872,19 @@ async function apiCore(request, env, path) {
       if (status === "Closed: not a valid ICSR" && !notes.trim()) return json({ error:"Add a note explaining why this is not a valid ICSR." }, 400);
       const saved = await write(env, d => {
         const c = d.cases.find(x => x.id === current.id), at = new Date().toISOString();
+        if (!c || c.locked || c.archived || !canEditCase(d, viewer, c) ||
+            (body.expectedRevision !== undefined && body.expectedRevision !== (c.editRevision || c.updatedAt || "")) ||
+            (current.editRevision || current.updatedAt || "") !== (c.editRevision || c.updatedAt || "")) return null;
         const changed = c.status !== status;
+        c.editRevision = crypto.randomUUID();
+        c.provenance ||= {};
+        if (!c.provenance.sourceSnapshot && !c.provenance.evidence) c.provenance.sourceSnapshot = caseEvidenceSnapshot(d, c);
         c.data = data; c.notes = notes; c.updatedAt = at; refreshDue(d, c);
         (c.history ||= []).push({ at, by:email, action:changed ? "status " + c.status + " → " + status : "saved" });
         c.status = status;
         return c;
       });
+      if (!saved) return json({ error:"The case changed or was reassigned. Reload the case before saving again.", stale:true }, 409);
       { const entry = await recordVersion(env, saved, "edited", email, "status " + saved.status); await write(env, d => { const c = d.cases.find(x => x.id === saved.id); pushVersion(c, entry); }); }
       await audit(env, { by:email, action:"case.save", target:saved.number, detail:"status " + saved.status });
       return json({ case:saved, assessment:withRegulatory(await assessCase(cfg, saved.data), state, saved) });
@@ -5313,7 +5479,7 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 <button type="button" class="btn outline" data-signopen="case" id="casesign">Signature…</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div></div>
 <div id="casesteps" class="cw-steps"></div>
 <div class="cw-body"><nav id="casenav" class="cw-nav" aria-label="Case sections"></nav><div class="cw-main"><div id="casebody"></div><div id="casereview" style="margin-top:12px"></div><p id="caseerr" class="msg" style="color:var(--red)" role="alert"></p><p class="sub" style="margin:10px 0 30px">Human-in-the-loop: values pre-filled from the article are only proposals. Detection, coding, listedness and causality are aids; a qualified reviewer decides.</p></div>
-<div class="cw-assist"><div class="cw-tabs" id="caseatabs"></div><div id="caseflow"></div><div id="caseassist" style="display:none"></div><div id="caseassess" style="display:none"></div></div></div></dialog>
+<div class="cw-assist"><div class="cw-tabs" id="caseatabs"></div><div id="caseflow"></div><div id="caseassist" style="display:none"></div><div id="caseevidence" style="display:none" aria-live="polite"></div><div id="caseassess" style="display:none"></div></div></div></dialog>
 <dialog id="signdlg" style="width:min(640px,94vw)"><h2 id="signtitle">Electronic signature</h2><div id="signbody"></div><p id="signerr" class="msg" style="color:var(--red)" role="alert"></p></dialog>
 <dialog id="linkdlg"><h2 id="linktitle"></h2><p id="linknote" class="sub"></p><div style="display:grid;gap:12px"><input id="linkvalue" readonly aria-label="Link"><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" id="linkcopy">Copy link</button><button type="button" class="btn outline" id="linkshare">Share…</button><button type="button" class="btn outline" id="linkclose">Done</button></div></div></dialog>
 <dialog id="dialog" style="width:min(1180px,96vw);max-height:94vh;overflow:auto"><h2>Screen citation</h2><p id="citation" class="sub"></p><div style="display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));align-items:start"><div><div id="detail" style="max-height:64vh;overflow:auto;margin-bottom:12px"></div><div id="extractbox"></div></div><div><div id="dispo"></div><form id="review"><label>Status<select name="status"><option>Pending</option><option>In review</option><option>Full text needed</option><option>Complete</option></select></label><label>Decision notes<textarea name="note" rows="4"></textarea></label><div style="display:flex;gap:8px"><button class="btn">Save decision</button><button type="button" class="btn outline" id="close">Cancel</button><button type="button" class="btn outline" data-signopen="screening" id="screensign">Signature…</button></div></form></div></div></dialog>
@@ -5381,7 +5547,64 @@ const runStats=run=>{
   return {n,abstracts:c(a=>a.abstract),oaChecked:c(a=>a.oaCheckedAt),oaOpen:c(a=>a.oaIsOpen),pmc:c(a=>a.fullTextOrigin==="PMC"&&a.fullTextKey),epmc:c(a=>a.fullTextOrigin==="Europe PMC"&&a.fullTextKey),
     unpaywall:c(a=>a.fullTextOrigin==="Unpaywall"&&a.fullTextKey),linkOnly:c(a=>a.fullTextStatus==="Open access link only"),closed:c(a=>a.oaStatus==="closed"),texts:c(a=>a.fullTextTextKey),passages:c(a=>(a.keyPassages||[]).length),retr:c(a=>a.retractionCheckedAt)};
 };
-let curCase=null, curAssess=null;
+let curCase=null, curAssess=null, draftTimer=null, draftWrites=Promise.resolve(), pendingDraft=null;
+function flushCaseDraft(){
+  clearTimeout(draftTimer);
+  if(!pendingDraft)return;
+  const payload=pendingDraft;
+  pendingDraft=null;
+  draftWrites=draftWrites.then(()=>api("case-work-draft",payload)).catch(e=>message("Draft could not be saved: "+e.message,true));
+}
+function queueCaseDraft(){
+  if(!curCase||curCase.canEdit===false||curCase.locked||curCase.archived||!$("casedlg").open)return;
+  collectCase();
+  const id=curCase.id, draft=JSON.parse(JSON.stringify({ revision:curCase.editRevision||curCase.updatedAt||"", data:curCase.data, notes:curCase.notes, status:curCase.status }));
+  clearTimeout(draftTimer);
+  pendingDraft={id,action:"save",draft};
+  draftTimer=setTimeout(flushCaseDraft,650);
+}
+async function clearCaseDraft(id){
+  clearTimeout(draftTimer);
+  pendingDraft=null;
+  await draftWrites;
+  await api("case-work-draft",{id,action:"clear"}).catch(e=>message("Could not clear the saved draft: "+e.message,true));
+}
+async function offerCaseDraft(c){
+  if(c.canEdit===false||c.locked||c.archived)return;
+  try{
+    await draftWrites;
+    const { draft }=await api("case-work-draft",{id:c.id,action:"get"});
+    if(!draft||curCase?.id!==c.id||!$("casedlg").open)return;
+    if(draft.revision!==(curCase.editRevision||curCase.updatedAt||"")) {
+      $("caseerr").textContent="An older draft exists. Current case changes take precedence.";
+      return;
+    }
+    if(confirm("Restore your unsaved draft from "+new Date(draft.savedAt).toLocaleString()+"?")){
+      Object.assign(curCase,{data:draft.data,notes:draft.notes,status:draft.status});
+      renderCase();
+    }
+  }catch(e){message(e.message,true);}
+}
+function usesPairEditor(d){
+  const suspects=d.products.filter(p=>p.role==="suspect");
+  return suspects.length>1||suspects.some(p=>d.events.some(e=>Boolean(e.product_causality?.[p.pair_id])));
+}
+function pairEditor(){
+  const d=curCase.data;
+  const products=d.products.filter(p=>p.role==="suspect");
+  if(!products.length||!usesPairEditor(d))return "";
+  const entries=d.events.map((e,i)=>{
+    e.product_causality ||= {};
+    return '<div class="card"><b>'+esc(e.verbatim?.value||"Reaction "+(i+1))+'</b>'+products.map((product,j)=>{
+      const id=product.pair_id;
+      const path="events."+i+".product_causality."+id+".";
+      const existing=e.product_causality[id];
+      if(!existing)e.product_causality[id]=Object.fromEntries(["causality_reporter","causality_reviewer","causality_method","causality_rationale"].map(key=>[key,products.length===1&&e[key]?structuredClone(e[key]):blankField()]));
+      return '<fieldset style="margin:8px 0"><legend>'+esc(product.name?.value||"Suspect "+(j+1))+'</legend>'+caseInput("Reporter assessment",path+"causality_reporter")+caseSelect("Reviewer assessment",path+"causality_reviewer",["","Certain","Probable/Likely","Possible","Unlikely","Conditional/Unclassified","Unassessable/Unclassifiable"])+caseInput("Method",path+"causality_method")+caseInput("Rationale",path+"causality_rationale")+'</fieldset>';
+    }).join("")+'</div>';
+  });
+  return '<section class="csec" id="cs-pairs"><h3>Drug–event causality</h3>'+entries.join("")+'</section>';
+}
 const SIT=["Pregnancy exposure","Neonatal exposure","Paediatric patient","Elderly patient","Overdose","Misuse / abuse","Lack of effect","Off-label use","Drug interaction","Medication error"];
 const QUAL=["","Physician","Pharmacist","Other health professional","Health professional (published literature)","Lawyer","Consumer or other non-health professional"];
 const gp=(o,p)=>p.split(".").reduce((x,k)=>x==null?x:x[k],o);
@@ -5389,7 +5612,7 @@ const caseTitleTip=f=>((f.evidence||[])[0]||{}).excerpt||"";
 const caseInput=(label,path,type)=>{const f=gp(curCase.data,path)||{};return '<label>'+label+(f.state==="proposed"&&f.value?' <span class="badge amber" title="Proposed from the article: confirm or correct">proposed</span>':"")+'<input data-kind="field" data-path="'+path+'" value="'+esc(f.value||"")+'" title="'+esc(caseTitleTip(f))+'"'+(type?' type="'+type+'"':"")+'></label>';};
 const caseSelect=(label,path,options)=>{const f=gp(curCase.data,path)||{};return '<label>'+label+(f.state==="proposed"&&f.value?' <span class="badge amber">proposed</span>':"")+'<select data-kind="field" data-path="'+path+'">'+options.map(o=>'<option'+(o===(f.value||"")?" selected":"")+'>'+esc(o)+'</option>').join("")+'</select></label>';};
 const blankField=()=>({value:null,normalized_value:null,state:"edited",evidence:[]});
-const blankProduct=()=>({role:"concomitant",start_not_reported:false,name:blankField(),dose:blankField(),frequency:blankField(),route:blankField(),indication:blankField(),start_date:blankField(),stop_date:blankField(),action_taken:blankField(),dechallenge:blankField(),rechallenge:blankField()});
+const blankProduct=()=>({pair_id:crypto.randomUUID(),role:"concomitant",start_not_reported:false,name:blankField(),dose:blankField(),frequency:blankField(),route:blankField(),indication:blankField(),start_date:blankField(),stop_date:blankField(),action_taken:blankField(),dechallenge:blankField(),rechallenge:blankField()});
 const blankEvent=()=>({verbatim:blankField(),llt_code:blankField(),onset_date:blankField(),stop_date:blankField(),outcome:blankField(),expectedness:blankField(),coded_term:blankField(),time_to_onset:blankField(),causality_reporter:blankField(),causality_reviewer:blankField(),causality_method:blankField(),temporal_relationship:blankField(),alternative_causes:blankField(),concomitant_factors:blankField(),objective_evidence:blankField(),listedness:blankField(),assessed_term:blankField(),rsi:blankField(),causality_rationale:blankField(),reviewer_comment:blankField(),llt:blankField(),pt:blankField(),pt_code:blankField(),hlt:blankField(),hlgt:blankField(),soc:blankField(),meddra_version:blankField(),coding_status:blankField(),onset_not_reported:false,seriousness:{serious:false,death:false,life_threatening:false,hospitalization:false,disability:false,congenital_anomaly:false,other_medically_important:false}});
 function setField(o,p,val){const parts=p.split("."),last=parts.pop(),t=parts.reduce((x,k)=>x[k],o),f=t[last];if(f&&(f.value||"")!==val){f.value=val===""?null:val;f.state="edited";}}
 function collectCase(){
@@ -5400,7 +5623,7 @@ function collectCase(){
   const old=d.patient.medical_history, lines=$("casehist").value.split("\\n").map(x=>x.trim()).filter(Boolean);
   d.patient.medical_history=lines.map(t=>old.find(h=>h.value===t)||{value:t,normalized_value:null,state:"edited",evidence:[]});
   d.special_situations=[...box.querySelectorAll("[data-kind=situation]")].filter(x=>x.checked).map(x=>x.value).concat(d.special_situations.filter(x=>!SIT.includes(x)));
-  d.general_comments=$("casegeneral").value;d.reporter_comments=$("casereportercomment").value;d.other_reporters=$("caseotherrep").value.split(NL).map(l=>l.split("|").map(x=>x.trim())).filter(c=>c[0]).map(c=>({name:c[0],organisation:c[1]||"",country:c[2]||"",email:c[3]||"",qualification:"Health professional (published literature)",corresponding:false}));d.sender_comments=$("casesendercomment").value;d.source_summary=$("casesummary").value;curCase.notes=$("casenotes").value;curCase.status=$("casestatus").value;
+  d.general_comments=$("casegeneral").value;d.reporter_comments=$("casereportercomment").value;d.other_reporters=$("caseotherrep").value.split(NL).map(l=>l.split("|").map(x=>x.trim())).filter(c=>c[0]).map(c=>({name:c[0],organisation:c[1]||"",country:c[2]||"",email:c[3]||"",qualification:(d.other_reporters||[]).find(r=>r.name===c[0]&&r.email===(c[3]||""))?.qualification||"Health professional (published literature)",corresponding:(d.other_reporters||[]).some(r=>r.name===c[0]&&r.email===(c[3]||"")&&r.corresponding)}));d.sender_comments=$("casesendercomment").value;d.source_summary=$("casesummary").value;curCase.notes=$("casenotes").value;curCase.status=$("casestatus").value;
   d.treatment_given=$("casetreat").value.split(NL).map(x=>x.trim()).filter(Boolean);
   const oldConf=d.confounders||[];
   d.confounders=$("caseconf").value.split(NL).map(x=>x.trim()).filter(Boolean).map(line=>{const i=line.indexOf(":"),type=i>0?line.slice(0,i).trim():"Other",text=i>0?line.slice(i+1).trim():line;return oldConf.find(c=>c.type===type&&c.text===text)||{type,text,evidence:""};});
@@ -5433,7 +5656,7 @@ function caseForm(){
   const events=d.events.map((e,i)=>'<div class="card" style="margin-bottom:10px;padding:12px"><div class="grid" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+
     caseInput("Event (verbatim)","events."+i+".verbatim")+caseInput("Coded term (MedDRA, if licensed)","events."+i+".coded_term")+caseInput("Onset date","events."+i+".onset_date","date")+'<label class="check" style="align-self:end"><input type="checkbox" data-kind="flag" data-path="events.'+i+'.onset_not_reported"'+(e.onset_not_reported?" checked":"")+'>&nbsp;Onset date not reported (confirmed)</label>'+caseInput("Time to onset (as stated)","events."+i+".time_to_onset")+caseInput("Stop date","events."+i+".stop_date","date")+caseInput("Outcome","events."+i+".outcome")+caseInput("Expectedness","events."+i+".expectedness")+'</div>'+
     '<div class="sub" style="margin:10px 0 4px">MedDRA coding <button type="button" class="btn outline sm" data-codesuggest="'+i+'">Suggest coding</button>'+(data.meddraInfo?' <button type="button" class="btn outline sm" data-p9="msearch|'+i+'">Search MedDRA…</button>':"")+' <span>Confirm against a licensed MedDRA source.</span></div><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(130px,1fr))">'+caseInput("LLT","events."+i+".llt")+caseInput("LLT code","events."+i+".llt_code")+caseInput("PT","events."+i+".pt")+caseInput("PT code","events."+i+".pt_code")+caseInput("HLT","events."+i+".hlt")+caseInput("HLGT","events."+i+".hlgt")+caseInput("SOC","events."+i+".soc")+caseInput("MedDRA version","events."+i+".meddra_version")+caseSelect("Coding status","events."+i+".coding_status",["","Proposed (IME list)","Proposed (earlier reviewed case)","Reviewed"])+'</div><div id="codesug'+i+'"></div>'+
-    '<div class="sub" style="margin:12px 0 4px"><b>Causality assessment</b> for this event (WHO-UMC). The reviewer value is a suggestion until a medical reviewer confirms it.</div><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseSelect("Reporter causality","events."+i+".causality_reporter",[""].concat(data.config.whoUmc||[]).concat(["Not stated"]))+caseSelect("Reviewer causality (WHO-UMC)","events."+i+".causality_reviewer",[""].concat(data.config.whoUmc||[]))+caseSelect("Assessment method","events."+i+".causality_method",["","WHO-UMC","Naranjo","Other"])+caseSelect("Listedness / expectedness","events."+i+".listedness",["","Listed","Unlisted","Unknown"])+caseInput("Temporal relationship","events."+i+".temporal_relationship")+caseInput("Alternative causes","events."+i+".alternative_causes")+caseInput("Concomitant factors","events."+i+".concomitant_factors")+caseInput("Objective evidence","events."+i+".objective_evidence")+caseInput("Assessed reaction term","events."+i+".assessed_term")+caseInput("Reference safety information","events."+i+".rsi")+caseInput("Causality rationale","events."+i+".causality_rationale")+caseInput("Medical reviewer comment","events."+i+".reviewer_comment")+'</div>'+
+    '<div class="sub" style="margin:12px 0 4px"><b>Causality assessment</b> for this event (WHO-UMC). The reviewer value is a suggestion until a medical reviewer confirms it.</div><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+(usesPairEditor(d)?"":caseSelect("Reporter causality","events."+i+".causality_reporter",[""].concat(data.config.whoUmc||[]).concat(["Not stated"]))+caseSelect("Reviewer causality (WHO-UMC)","events."+i+".causality_reviewer",[""].concat(data.config.whoUmc||[]))+caseSelect("Assessment method","events."+i+".causality_method",["","WHO-UMC","Naranjo","Other"]))+caseSelect("Listedness / expectedness","events."+i+".listedness",["","Listed","Unlisted","Unknown"])+caseInput("Temporal relationship","events."+i+".temporal_relationship")+caseInput("Alternative causes","events."+i+".alternative_causes")+caseInput("Concomitant factors","events."+i+".concomitant_factors")+caseInput("Objective evidence","events."+i+".objective_evidence")+caseInput("Assessed reaction term","events."+i+".assessed_term")+caseInput("Reference safety information","events."+i+".rsi")+(usesPairEditor(d)?"":caseInput("Causality rationale","events."+i+".causality_rationale"))+caseInput("Medical reviewer comment","events."+i+".reviewer_comment")+'</div>'+
     '<div class="chips" style="margin-top:8px">'+["serious","death","life_threatening","hospitalization","disability","congenital_anomaly","other_medically_important"].map(k=>'<label class="check"><input type="checkbox" data-kind="flag" data-path="events.'+i+'.seriousness.'+k+'"'+(e.seriousness[k]?" checked":"")+'>&nbsp;'+k.replace(/_/g," ")+'</label>').join("")+'</div></div>').join("");
   return '<section class="csec" id="cs-patient"><h3>Patient</h3><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseInput("Identifier / initials","patient.identifier")+caseInput("Age","patient.age")+caseSelect("Age unit","patient.age_unit",["years","months","weeks","days","hours"])+caseSelect("Age group","patient.age_group",[""].concat(data.config.ageGroups||[]))+caseSelect("Sex","patient.sex",["","Male","Female","Unknown"])+caseInput("Weight (kg)","patient.weight")+caseSelect("Country where the event occurred","patient.country",[""].concat(data.config.countries||[]).concat(((gp(curCase.data,"patient.country")||{}).value&&!(data.config.countries||[]).includes(gp(curCase.data,"patient.country").value))?[gp(curCase.data,"patient.country").value]:[]))+'</div>'+
     '<label style="margin-top:10px">Medical history (one per line)<textarea id="casehist" rows="3">'+esc(d.patient.medical_history.map(h=>h.value).join("\\n"))+'</textarea></label>'+
@@ -5449,7 +5672,7 @@ function caseForm(){
     '</section><section class="csec" id="cs-source"><h3>Source and notes</h3><label>Source and abstract<textarea id="casesummary" rows="5">'+esc(d.source_summary)+'</textarea></label><label style="margin-top:10px">Reviewer notes<textarea id="casenotes" rows="2">'+esc(curCase.notes||"")+'</textarea></label></section>';
 }
 let assistCase="", assistTab="flow", aiFillRes=null, assistTab0="flow", assistData=null, smpcRes={}, smpcInfo=null, assistBusy="", smpcPaste="";
-const CASE_SECTIONS=[["cs-patient","Patient"],["cs-reporter","Reporter"],["cs-sender","Sender"],["cs-products","Products"],["cs-events","Events"],["cs-special","Special situations"],["cs-treat","Treatment and confounders"],["cs-authors","Authors"],["cs-comments","Comments"],["cs-source","Source and notes"]];
+const CASE_SECTIONS=[["cs-patient","Patient"],["cs-reporter","Reporter"],["cs-sender","Sender"],["cs-products","Products"],["cs-events","Events"],["cs-pairs","Drug–event causality"],["cs-special","Special situations"],["cs-treat","Treatment and confounders"],["cs-authors","Authors"],["cs-comments","Comments"],["cs-source","Source and notes"]];
 function caseNav(){
   const d=curCase.data, cnt={"cs-products":d.products.length,"cs-events":d.events.length,"cs-authors":(d.other_reporters||[]).length+1};
   $("casenav").innerHTML=CASE_SECTIONS.map(x=>'<button type="button" class="cn-link" data-casejump="'+x[0]+'">'+esc(x[1])+(cnt[x[0]]?'<span>'+cnt[x[0]]+'</span>':"")+'</button>').join("");
@@ -5459,9 +5682,31 @@ function caseSteps(){
   const steps=[["Screening","screening"],["QC","qc"],["Medical review","medical_review"],["Signed",""],["Sent",""]], idx=sent?4:signed?3:Math.max(0,["screening","qc","medical_review"].indexOf(stage));
   $("casesteps").innerHTML=steps.map((x,i)=>'<span class="cw-step'+(i<idx?" done":i===idx?" now":"")+'"><i>'+(i<idx?"✓":i+1)+'</i>'+esc(x[0])+'</span>').join('<span class="cw-sep"></span>');
 }
-function assistTabs(){
-  $("caseatabs").innerHTML=[["flow","Workflow"],["events","Events"],["checks","Checks"]].map(t=>'<button type="button" class="cw-tab'+(assistTab===t[0]?" on":"")+'" data-assisttab="'+t[0]+'">'+t[1]+'</button>').join("");
-  $("caseassist").style.display=assistTab==="events"?"":"none";$("caseflow").style.display=assistTab==="flow"?"":"none";$("caseassess").style.display=assistTab==="checks"?"":"none";
+function assistTabs(ref){
+  $("caseatabs").innerHTML=[["flow","Workflow"],["events","Events"],["checks","Checks"],["source","Source"]].map(t=>'<button type="button" class="cw-tab'+(assistTab===t[0]?" on":"")+'" data-assisttab="'+t[0]+'">'+t[1]+'</button>').join("");
+  $("caseassist").style.display=assistTab==="events"?"":"none";$("caseassess").style.display=assistTab==="checks"?"":"none";
+  $("caseflow").style.display=assistTab==="flow"?"":"none";
+  $("caseevidence").style.display=assistTab==="source"?"":"none";
+  if(assistTab==="source") loadCaseEvidence(ref);
+}
+let caseEvidence=null, evidenceRequest=0;
+async function loadCaseEvidence(ref){
+  const id=curCase.id, request=++evidenceRequest, box=$("caseevidence");
+  box.textContent="Loading article evidence…";
+  try{
+    const result=await api("case-source",{id});
+    if(id!==curCase?.id||request!==evidenceRequest)return;
+    caseEvidence=result;
+    const units=result.scan?.units||[], excerpt=ref?.excerpt||"", exact=units.find(u=>excerpt && u.text===excerpt)||units.find(u=>excerpt && u.text.includes(excerpt));
+    const changes=result.changes.changes;
+    const contact=(result.scan?.authors||[]).filter(a=>a.corresponding);
+    box.innerHTML=(changes.length?'<h3>Evidence needs re-review</h3>'+changes.map(c=>'<details open><summary>'+esc(c.title)+'</summary><p>Previous '+esc(c.before)+'</p><p>Current '+esc(c.after)+'</p></details>').join("")+(curCase.canEdit!==false&&!curCase.locked&&!curCase.archived?'<button type="button" class="btn outline sm" data-source-reviewed="1">Record evidence review</button>':""):"")+
+      (contact.length?'<p class="sub"><b>Publication contact</b> '+contact.map(a=>esc(a.name+(a.email?" · "+a.email:""))).join(", ")+'</p>':"")+
+      (excerpt?'<p class="sub"><b>Saved field evidence</b> '+esc(excerpt)+'</p>':"")+
+      (units.length?units.map(u=>'<div class="scp" id="article-unit-'+esc(u.id)+'"'+(exact===u?' style="background:var(--brand-soft)"':"")+'><div class="sub">'+esc(u.id+" · "+u.section)+'</div>'+scanSentence(u,"")+'</div>').join(""):'<p class="sub">No article text is available.</p>');
+    if(exact)$("article-unit-"+exact.id)?.scrollIntoView({block:"nearest"});
+  }catch(e){if(request===evidenceRequest)box.textContent=e.message;}
+
 }
 const STAGE_ACT={screening:["Data entry","Complete every field, use the AI for the gaps, then submit to QC."],qc:["Quality check","Check the case against the article. Approve it for medical review or return it to the screener with what to fix."],medical_review:["Medical review","Confirm seriousness, causality and listedness, then approve and sign."]};
 function caseStageUi(){
@@ -5505,8 +5750,8 @@ function aiApply(which){
 async function caseFlowAct(act){
   try{
     if(act==="aifill"){collectCase();message("Asking the AI about the empty fields…");aiFillRes=await api("case-ai-fill",{id:curCase.id});assistTab="flow";assistTabs();$("caseflow").innerHTML=flowHtml();message(aiFillRes.message||(aiFillRes.tokens?aiFillRes.tokens+" tokens used.":"Done."));return;}
-    if(act==="submitqc"){collectCase();await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes});const r=await api("case-submit",{id:curCase.id});await refresh();message("Submitted to QC ("+r.toName+").");$("casedlg").close();if(tab==="My Desk")render();return;}
-    if(act==="qcapprove"){collectCase();await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes});const note=prompt("Note for the medical reviewer (optional)","")||"";const r=await api("case-qc",{id:curCase.id,decision:"approve",note});await refresh();message("Approved. Sent to "+r.toName+" for medical review.");$("casedlg").close();if(tab==="My Desk")render();return;}
+    if(act==="submitqc"){collectCase();await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes,expectedRevision:curCase.editRevision||curCase.updatedAt||""});await clearCaseDraft(curCase.id);const r=await api("case-submit",{id:curCase.id});await refresh();message("Submitted to QC ("+r.toName+").");$("casedlg").close();if(tab==="My Desk")render();return;}
+    if(act==="qcapprove"){collectCase();await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes,expectedRevision:curCase.editRevision||curCase.updatedAt||""});await clearCaseDraft(curCase.id);const note=prompt("Note for the medical reviewer (optional)","")||"";const r=await api("case-qc",{id:curCase.id,decision:"approve",note});await refresh();message("Approved. Sent to "+r.toName+" for medical review.");$("casedlg").close();if(tab==="My Desk")render();return;}
     if(act==="qcreturn"){const note=prompt("What must the screener fix? (recorded)","");if(!note)return;const r=await api("case-qc",{id:curCase.id,decision:"return",note});await refresh();message("Returned to "+r.toName+".");$("casedlg").close();if(tab==="My Desk")render();return;}
   }catch(e){message(e.message,true);}
 }
@@ -5574,8 +5819,22 @@ function renderCase(){
   curCase.data.events.forEach(e=>{const b=blankEvent();Object.keys(b).forEach(k=>{if(!(k in e))e[k]=b[k];});});
   {const d=curCase.data;d.sender=d.sender||{};["type","organisation","name","email","phone","address","country"].forEach(k=>{if(!d.sender[k])d.sender[k]=blankField();});["organisation","department","address","email","phone"].forEach(k=>{if(!d.reporter[k])d.reporter[k]=blankField();});if(!d.patient.age_group)d.patient.age_group=blankField();d.general_comments=d.general_comments||"";d.sender_comments=d.sender_comments||"";}
   const art=data.articles[curCase.pmid]||{};
-  $("casehead").innerHTML='<div style="min-width:0"><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b style="font-size:20px;letter-spacing:-.02em">'+esc(curCase.number)+'</b>'+stageBadge(caseStage(curCase))+triageBadge(curCase)+'<span class="sub">PMID '+esc(curCase.pmid)+'</span><button type="button" class="btn outline sm" data-backtolit="1" title="Open the article in LiteraSift">Open article</button></div><div class="cw-title">'+esc(art.title||"")+'</div></div><label style="min-width:230px">Status<select id="casestatus">'+data.config.caseStatuses.map(s=>'<option'+(s===curCase.status?" selected":"")+'>'+esc(s)+'</option>').join("")+'</select></label>';
-  $("casebody").innerHTML=serBar()+caseForm();
+  $("casehead").innerHTML='<div style="min-width:0"><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b style="font-size:20px;letter-spacing:-.02em">'+esc(curCase.number)+'</b>'+stageBadge(caseStage(curCase))+triageBadge(curCase)+(curCase.evidenceReviewPending?'<button type="button" class="btn outline sm" data-assisttab="source">Evidence needs re-review</button>':"")+'<span class="sub">PMID '+esc(curCase.pmid)+'</span><button type="button" class="btn outline sm" data-backtolit="1" title="Open the article in LiteraSift">Open article</button></div><div class="cw-title">'+esc(art.title||"")+'</div></div><label style="min-width:230px">Status<select id="casestatus">'+data.config.caseStatuses.map(s=>'<option'+(s===curCase.status?" selected":"")+'>'+esc(s)+'</option>').join("")+'</select></label>';
+  curCase.data.products.forEach((p,i)=>{p.pair_id ||= "legacy-"+(i+1);});
+  $("casebody").innerHTML=serBar()+caseForm()+pairEditor();
+  $("casebody").oninput=queueCaseDraft;
+  $("casedlg").onclose=flushCaseDraft;
+  $("casebody").onchange=e=>{
+    if(e.target.dataset.path?.endsWith(".role")){collectCase();renderCase();}
+    queueCaseDraft();
+  };
+  $("casestatus").onchange=queueCaseDraft;
+  $("casebody").onfocusin=e=>{
+    const ref=(gp(curCase.data,e.target.dataset.path||"")?.evidence||[])[0];
+    if(!ref?.excerpt)return;
+    assistTab="source";
+    assistTabs(ref);
+  };
   $("caseassess").innerHTML=assessmentHtml(curAssess);
   caseNav();caseSteps();caseStageUi();assistTabs();$("caseflow").innerHTML=flowHtml();
   if(assistData&&assistCase===curCase.id)$("caseassist").innerHTML=assistHtml();
@@ -5624,19 +5883,21 @@ async function loadExtraction(){
       (rep.candidates.length?'<div class="sub">'+rep.candidates.slice(0,3).map(c=>esc(c.role+": "+c.name+(c.email?" <"+c.email+">":"")+(c.affiliations[0]?" · "+c.affiliations[0]:""))).join("<br>")+'</div>':"")+rep.flags.map(f=>'<div class="sub" style="color:var(--amber)">⚠ '+esc(f)+'</div>').join("")+
       (rep.quoted.length?'<div class="sub">Quoted clinicians (not reporters): '+esc(rep.quoted.map(q=>q.name).join(", "))+'</div>':"")+'</div>';
     if(ex.aggregateOnly)html+='<div class="card" style="padding:12px;margin-bottom:10px;border-color:var(--amber)"><b>Aggregate data only</b><div class="sub">No individual patient is described, so no ICSR draft can come from this article. Consider aggregate safety relevance.</div>'+ex.aggregateMentions.slice(0,2).map(m=>'<div class="sub">“'+esc(m.text)+'”</div>').join("")+'</div>';
-    if(ex.ambiguous.length)html+='<div class="card" style="padding:12px;margin-bottom:10px"><b>Ambiguous attribution</b>'+ex.ambiguous.slice(0,3).map(m=>'<div class="sub">⚠ '+esc(m.reason)+' “'+esc(m.text)+'”</div>').join("")+'</div>';
+    const move = id => mine ? ' <button type="button" class="btn outline sm" data-passage="'+esc(id+"|"+ex.source.articleRevision)+'">Assign passage</button>' : "";
+    if(ex.ambiguous.length)html+='<div class="card" style="padding:12px;margin-bottom:10px"><b>Ambiguous attribution</b>'+ex.ambiguous.slice(0,3).map(m=>'<div class="sub">⚠ '+esc(m.reason)+' “'+esc(m.text)+'”'+move(m.unitId)+'</div>').join("")+'</div>';
     for(const p of ex.patients){
       const evs=p.events, order=["ae","manifestation","lab","indication","history","alternative"];
       html+='<div class="card" style="padding:12px;margin-bottom:10px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><b>'+esc(p.id+" · "+(p.label||"Patient"))+'</b><span class="sub">'+esc([p.descriptor.age&&p.descriptor.age+" "+(p.descriptor.ageUnit||""),p.descriptor.sex].filter(Boolean).join(", ")||"no age or sex given")+'</span></div>'+
-        '<div class="sub" style="margin:6px 0 2px">Drugs (this patient only)</div>'+(p.drugs.length?p.drugs.map(d=>'<div class="row" style="align-items:flex-start"><span>'+badge(d.role,d.role==="suspect"?"red":d.role==="interacting"?"amber":d.role==="treatment"?"blue":"")+' <b>'+esc(d.name)+'</b> '+esc([d.dose,d.route,d.frequency].filter(Boolean).join(" · "))+(d.start?' <span class="sub">start '+esc(d.start.date||"day "+d.start.day)+'</span>':"")+(d.stop?' <span class="sub">'+esc(d.stop.action)+" "+esc(d.stop.date||(d.stop.day?"day "+d.stop.day:""))+'</span>':"")+(d.mentions[0]?'<div class="sub">“'+esc(d.mentions[0].sentence)+'”</div>':"")+'</span></div>').join(""):'<div class="sub">none found</div>')+
+        (mine?'<details><summary>Patient passages</summary>'+p.units.map(id=>'<p class="sub">'+esc(unit(id).text||"")+move(id)+'</p>').join("")+'</details>':"")+
+        '<div class="sub" style="margin:6px 0 2px">Drugs (this patient only)</div>' +(p.drugs.length?p.drugs.map(d=>'<div class="row" style="align-items:flex-start"><span>'+badge(d.role,d.role==="suspect"?"red":d.role==="interacting"?"amber":d.role==="treatment"?"blue":"")+' <b>'+esc(d.name)+'</b> '+esc([d.dose,d.route,d.frequency].filter(Boolean).join(" · "))+(d.start?' <span class="sub">start '+esc(d.start.date||"day "+d.start.day)+'</span>':"")+(d.stop?' <span class="sub">'+esc(d.stop.action)+" "+esc(d.stop.date||(d.stop.day?"day "+d.stop.day:""))+'</span>':"")+(d.mentions[0]?'<div class="sub">“'+esc(d.mentions[0].sentence)+'”</div>':"")+'</span></div>').join(""):'<div class="sub">none found</div>')+
         (p.procedures.length?'<div class="sub">Procedures: '+esc(p.procedures.map(x=>x.name).join(", "))+'</div>':"")+
         '<div class="sub" style="margin:8px 0 2px">Findings (promote or exclude to decide what is captured)</div>'+
         order.flatMap(cat=>evs.filter(e=>e.category===cat)).map(e=>{const d=dec[e.id], m=e.mentions[0], cat=EVCAT[e.category]||[e.category,""];
-          return '<div class="row" style="align-items:flex-start"><span>'+tbadge(cat[0],cat[1],"")+' <b>'+esc(e.verbatim)+'</b>'+(e.normalized&&e.normalized!==e.verbatim.toLowerCase()?' <span class="sub">('+esc(e.normalized)+')</span>':"")+(e.negated?" "+badge("negated","red"):"")+(e.hypothetical?" "+badge("hypothetical","amber"):"")+(e.ime?" "+badge("IME","red"):"")+(d?" "+badge(d.action==="promote"?"Promoted":"Excluded",d.action==="promote"?"green":"red"):"")+
+          return '<div class="row" style="align-items:flex-start"><span>'+tbadge(cat[0],cat[1],"")+' <b>'+esc(e.verbatim)+'</b>'+(e.normalized&&e.normalized!==e.verbatim.toLowerCase()?' <span class="sub">('+esc(e.normalized)+')</span>':"")+(e.negated?" "+badge("negated","red"):"")+(e.hypothetical?" "+badge("hypothetical","amber"):"")+(e.ime?" "+badge("IME","red"):"")+(d?" "+badge(d.action==="promote"?"Promoted":d.action==="link"?"Linked to "+d.parentId:"Excluded",d.action==="promote"?"green":"red"):"")+
             '<div class="sub">'+esc(e.reasons.join("; "))+(e.onset?" · onset "+esc(e.onset.date||"day "+e.onset.day):"")+(e.timeToOnset?" ("+esc(e.timeToOnset.text)+")":"")+(e.outcome?" · "+esc(e.outcome.text):"")+'</div>'+
             (e.suggested.pt?'<div class="sub">Suggested PT: '+esc(e.suggested.pt)+(e.suggested.code?" "+esc(e.suggested.code):"")+' · LLT not suggested (needs the licensed dictionary) · '+esc(e.suggested.source)+'</div>':"")+
             '<details><summary class="sub" style="cursor:pointer">Evidence ('+e.mentions.length+')</summary>'+e.mentions.slice(0,3).map(quote).join("")+'</details></span>'+
-            (mine?'<span style="display:flex;gap:4px;flex-direction:column"><button type="button" class="btn outline sm" data-exdec="promote|'+esc(e.id)+'">Promote</button><button type="button" class="btn outline sm" data-exdec="exclude|'+esc(e.id)+'">Exclude</button></span>':"")+'</div>';}).join("")+
+            (mine?'<span style="display:flex;gap:4px;flex-direction:column"><button type="button" class="btn outline sm" data-exdec="promote|'+esc(e.id)+'">Promote</button>'+(p.events.some(x=>x.id!==e.id&&x.category==="ae"&&!x.negated&&!x.hypothetical)?'<button type="button" class="btn outline sm" data-link-finding="'+esc(e.id+"|"+p.events.filter(x=>x.id!==e.id&&x.category==="ae"&&!x.negated&&!x.hypothetical).map(x=>x.id+" "+x.verbatim).join(", "))+'">Link to reaction</button>':"")+'<button type="button" class="btn outline sm" data-exdec="exclude|'+esc(e.id)+'">Exclude</button></span>':"")+'</div>';}).join("")+
         (p.timeline.length?'<div class="sub" style="margin:8px 0 2px">Chronology</div><div class="chips">'+p.timeline.map(t=>tbadge((t.when.date||(t.when.day!==undefined?"day "+t.when.day:t.when.text))+": "+t.text,t.kind==="lab"?"":"blue",t.sentence)).join("")+'</div>':"")+'</div>';
     }
     if(!ex.patients.length&&!ex.aggregateOnly)html+='<div class="sub">No individual patient was found in the text available.</div>';
@@ -6222,7 +6483,7 @@ async function openSign(kind,id){
     const sel=$("signmeaning");if(sel)sel.onchange=async()=>{const p2=await api("sign-preview",{kind,id,meaning:sel.value});signCtx.pre=p2;$("signstatement").textContent=p2.statement;};
   }catch(e){message(e.message,true);}
 }
-function openCaseData(c,a){if(!curCase||curCase.id!==c.id){assistData=null;smpcRes={};smpcInfo=null;assistTab="flow";aiFillRes=null;assistCase="";}curCase=JSON.parse(JSON.stringify(c));curAssess=a;renderCase();if(!$("casedlg").open)$("casedlg").showModal();}
+function openCaseData(c,a){const reopened=!$("casedlg").open||curCase?.id!==c.id;if(!curCase||curCase.id!==c.id){assistData=null;smpcRes={};smpcInfo=null;assistTab="flow";aiFillRes=null;assistCase="";}curCase=JSON.parse(JSON.stringify(c));curAssess=a;renderCase();if(!$("casedlg").open)$("casedlg").showModal();if(reopened)offerCaseDraft(c);}
 async function downloadCase(format){
   collectCase();
   const res=await fetch("/api/case-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:curCase.id,format})});
@@ -6576,7 +6837,7 @@ function render() {
         '<div class="cellcase"><b>'+esc(c.number)+'</b>'+stageBadge(caseStage(c))+(signed(c)?'<span class="badge green" title="Signed">signed</span>':"")+(tagChips(c)?'<div>'+tagChips(c)+'</div>':"")+'</div>',
         '<div class="cellart"><a class="arttitle" href="'+esc(art.url||"#")+'" target="_blank" rel="noopener">'+esc((art.title||"PMID "+c.pmid).slice(0,140))+'</a><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.molecule||"")+'</div><div class="evline"><b>'+esc(sp)+'</b> · '+esc(ev)+'</div>'+(clinHtml(c)?'<div class="clin">'+clinHtml(c)+'</div>':"")+'</div>',
         '<div class="cellstack"><label><span>Seriousness</span>'+x.ser+'</label>'+x.crit+'<label><span>Listedness</span>'+x.lis+'</label></div>',
-        '<div class="cellclock">'+(clockHtml(c)||due)+triageBadge(c)+'</div>',
+        '<div class="cellclock">'+(clockHtml(c)||due)+triageBadge(c)+(c.evidenceReviewPending?badge("Evidence re-review","amber"):"")+'</div>',
         '<div class="cellstack"><label><span>Assigned to</span>'+who+'</label><label><span>Folder</span>'+x.fold+'</label></div>',
         '<div class="cellstat">'+badge(c.status,stColor[c.status]||"")+'<div>'+(a.valid?badge("Valid ICSR","green"):badge("Missing: "+(a.missing||[]).join(", "),"amber"))+'</div><div class="sub">QC '+(a.score??"")+' / 100</div></div>',
         '<div class="cellact">'+x.act+'<button class="btn sm" data-opencase="'+esc(c.id)+'">Open</button></div>'];};
@@ -6799,8 +7060,25 @@ document.addEventListener("input",event=>{
 document.addEventListener("click",event=>{
   const dt=event.target.closest&&event.target.closest("[data-desktab]");if(dt){deskTab=dt.dataset.desktab;render();return;}
   const aa=event.target.closest&&event.target.closest("[data-aiapply]");if(aa){aiApply(aa.dataset.aiapply);return;}
-  const cj=event.target.closest&&event.target.closest("[data-casejump],[data-assisttab],[data-assistact],[data-assistuse],[data-assistlis],[data-assistser]");
+  const cj=event.target.closest&&event.target.closest("[data-source-reviewed],[data-passage],[data-link-finding],[data-casejump],[data-assisttab],[data-assistact],[data-assistuse],[data-assistlis],[data-assistser]");
   if(cj){
+    if(cj.dataset.sourceReviewed){
+      const note=prompt("What did you check in the revised evidence?","");
+      if(note&&caseEvidence)api("case-source-reviewed",{id:curCase.id,key:caseEvidence.changes.key,note}).then(()=>loadCaseEvidence()).catch(e=>message(e.message,true));
+      return;
+    }
+    if(cj.dataset.passage){
+      const [unitId,revision]=cj.dataset.passage.split("|");
+      const patientId=prompt("Assign this passage to an existing patient ID, or type new.","new");
+      if(patientId)api("patient-passage",{id:active.id,unitId,revision,patientId:patientId.trim()}).then(loadExtraction).catch(e=>message(e.message,true));
+      return;
+    }
+    if(cj.dataset.linkFinding){
+      const [eventId,options]=cj.dataset.linkFinding.split("|");
+      const parentId=prompt("Enter the ID of the parent reaction."+NL+options,"");
+      if(parentId)api("extraction-decide",{id:active.id,eventId,parentId:parentId.trim(),action:"link"}).then(loadExtraction).catch(e=>message(e.message,true));
+      return;
+    }
     if(cj.dataset.casejump){const el=$(cj.dataset.casejump);if(el)el.scrollIntoView({behavior:"smooth",block:"start"});return;}
     if(cj.dataset.assisttab){assistTab=cj.dataset.assisttab;assistTabs();return;}
     if(cj.dataset.assistact){assistAction(cj.dataset.assistact);return;}
@@ -6927,7 +7205,7 @@ document.addEventListener("click",event=>{
         else{
           collectCase();
           if(act==="assess"){const r=await api("case-assess",{id:curCase.id,data:curCase.data});curAssess=r.assessment;$("caseassess").innerHTML=assessmentHtml(curAssess);}
-          else{const r=await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes});curCase=JSON.parse(JSON.stringify(r.case));curAssess=r.assessment;renderCase();await refresh();message("Case saved.");}
+          else{const r=await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes,expectedRevision:curCase.editRevision||curCase.updatedAt||""});await clearCaseDraft(curCase.id);curCase=JSON.parse(JSON.stringify(r.case));curAssess=r.assessment;renderCase();await refresh();message("Case saved.");}
         }
       }catch(e){$("caseerr").textContent=e.message;message(e.message,true);}
       finally{target.disabled=false;}

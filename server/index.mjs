@@ -48,7 +48,7 @@ console.log(screenshotFn ? "Local screenshots: on" : "Local screenshots: off (ru
 console.log(mailConfigured(e) ? "Email: on" : "Email: off (invite and reset links are shown to managers instead)", publicUrl ? "" : "| PUBLIC_URL not set: forgot-password emails are disabled");
 
 // The updater writes the deployed commit next to the app, so /healthz shows which version is running.
-const deployedVersion = await readFile(new URL("../.version", import.meta.url), "utf8").then(v => v.trim().slice(0, 12), () => "dev");
+const deployedVersion = () => readFile(new URL("../.version", import.meta.url), "utf8").then(v => v.trim().slice(0, 12), () => "dev");
 const sign = value => createHmac("sha256", secret).update(value).digest("base64url");
 const makeSession = (email, v) => { const body = Buffer.from(JSON.stringify({ e: email, v: v || 0, x: Date.now() + 7 * 86400000 })).toString("base64url"); return body + "." + sign(body); };
 function readSession(req) {
@@ -99,7 +99,7 @@ async function sendAccountMail(kind, to, link, inviter) {
 
 async function handler(req, res) {
   const url = new URL(req.url, "http://localhost"), path = url.pathname;
-  if (path === "/healthz") return send(res, 200, "ok " + deployedVersion, { "Content-Type": "text/plain" });
+  if (path === "/healthz") return send(res, 200, "ok " + await deployedVersion(), { "Content-Type": "text/plain" });
   const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
   const form = async () => new URLSearchParams((await readBody(req, 10000)).toString());
 

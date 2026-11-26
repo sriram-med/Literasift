@@ -48,7 +48,7 @@ test("a two-patient article produces two separate drafts, each with its own evid
   assert.equal(c1.data.patient.age.value, "54"); assert.equal(c2.data.patient.sex.value, "Female"); assert.deepEqual(c1.data.patient.medical_history.map(h => h.value), ["chronic kidney disease"]); assert.deepEqual(c2.data.patient.medical_history, []);
   assert.equal(c1.data.products[0].route.value, "orally"); assert.match(c2.data.products[0].route.value, /intravenous/i);
   assert.equal(c1.data.products[0].stop_day, null, "stop day is not guessed from the recovery day"); assert.equal(c1.data.products[0].action_taken.value, "Drug withdrawn"); assert.ok(!c2.data.products[0].action_taken.value);
-  for (const c of [c1, c2]) { for (const e of c.data.events) assert.ok(e.verbatim.evidence[0].excerpt.length > 10 && e.verbatim.evidence[0].unit, "each event links to its source sentence"); assert.equal(c.provenance.extractionVersion, "clinical-extraction/1"); assert.equal(c.versions[0].action, "created"); }
+  for (const c of [c1, c2]) { for (const e of c.data.events) assert.ok(e.verbatim.evidence[0].excerpt.length > 10 && e.verbatim.evidence[0].unit, "each event links to its source sentence"); assert.equal(c.provenance.extractionVersion, "clinical-extraction/2"); assert.equal(c.versions[0].action, "created"); }
   assert.ok(c1.data.events.every(e => !/rash|kidney/.test(e.verbatim.value)) && c2.data.events.every(e => !/confusion|myoclonus/.test(e.verbatim.value)), "no cross-patient attribution");
   // separate decisions and separate dates
   assert.equal((await t.state()).assignments[0].disposition.value, "potential_icsr"); assert.equal(c1.data.minimum_criteria.overall, "supported"); assert.equal(c1.data.reportability.decision, null);
