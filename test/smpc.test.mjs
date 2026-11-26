@@ -51,3 +51,21 @@ test("Synchrony export: a full package of the selected cases (E2B per case, CIOM
   assert.match(z.get("manifest.csv").toString(), /LS-1.*not approved/); assert.match(z.get("LS-1/E2B-R3-DRAFT.xml").toString(), /DRAFT: not approved/); assert.match(z.get("line-listing.csv").toString(), /^"Case","PMID"/);
   assert.equal((await t.raw(MANAGER, "/api/cases-export", { format: "package", ids: ["nope"] })).status, 404);
 });
+
+test("automation: causality is suggested separately for every suspect drug x reaction pair, and unassessable pairs stay blank", async () => {
+  const t = await setup(), s = await t.state(), d = (value, state = "edited") => ({ value, state, evidence: [] });
+  s.settings = { ...(s.settings || {}), automation: { smpc: false } };
+  s.cases[0].stage = "screening"; s.cases[0].assignee = MANAGER;
+  s.cases[0].data = { ...s.cases[0].data, products: [
+    { role: "suspect", name: d("drugA"), start_date: d("2026-01-01"), dechallenge: d("Positive: improved after stopping"), rechallenge: d("") },
+    { role: "suspect", name: d("drugB"), start_date: d("2026-01-02"), dechallenge: d("Negative: no change"), rechallenge: d("") },
+    { role: "suspect", name: d("drugC"), start_date: d(""), dechallenge: d(""), rechallenge: d("") }],
+    events: [{ verbatim: d("rash"), onset_date: d("2026-01-05") }] };
+  await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const r = await t.call(MANAGER, "/api/case-automate", { id: "c1" }); assert.equal(r.status, 200, JSON.stringify(r.body));
+  const step = r.body.steps.find(x => x.key === "causality"); assert.ok(step.ok, step.detail); assert.match(step.detail, /2 pairs suggested.*1 left blank/);
+  const c = (await t.state()).cases[0], pairs = c.data.events[0].product_causality, byName = n => pairs[c.data.products.find(p => v2(p.name) === n).pair_id];
+  const v2 = f => f && f.value;
+  assert.equal(v2(byName("drugA").causality_reviewer), "Probable/Likely"); assert.equal(v2(byName("drugB").causality_reviewer), "Possible"); assert.equal(v2(byName("drugC").causality_reviewer) || "", "", "unassessed pair stays blank");
+  assert.equal(byName("drugA").causality_reviewer.state, "proposed"); assert.match(v2(byName("drugA").causality_rationale), /drugA and rash/);
+});
