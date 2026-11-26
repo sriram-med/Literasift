@@ -181,11 +181,13 @@ function mayAccess(state, viewer, a) {
 }
 function caseVisible(state, viewer, c) {
   if (!viewer || !c) return false;
-  if (viewer.role === "manager" || c.createdBy === viewer.email || c.assignee === viewer.email) return true;
+  if (viewer.role === "manager" || c.assignee === viewer.email) return true;
   const r = rolesIn(state, viewer.email, c.portfolio);
   return r.has("manager") || r.has("medical_reviewer");
 }
 const isPortfolioManager = (state, viewer, portfolio) => viewer?.role === "manager" || rolesIn(state, viewer?.email, portfolio).has("manager");
+// Synchrony cases are edited only by the person they are routed to (and managers). Seeing a case is not editing it: a screener who has no case routed to them sees nothing and edits nothing.
+const canEditCase = (state, viewer, c) => Boolean(viewer && c && (viewer.role === "manager" || c.assignee === viewer.email || isPortfolioManager(state, viewer, c.portfolio)));
 // ---- Imports as restartable jobs. A search range is cut into bounded date windows; each window is searched, reconciled (count reported by PubMed against unique PMIDs retrieved)
 // and checkpointed before the next one starts, so a failure resumes where it stopped and a replay changes nothing that was already decided. ----
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -2680,13 +2682,12 @@ function runSearch(state, viewer, body, kb) {
 // Who should take a new case: the molecule's owner, else the active reviewer (matching the portfolio) with the fewest open cases and room left, else a manager.
 function pickCaseAssignee(data, rec) {
   const owned = data.watches.find(w => w.owner && w.portfolio === rec.portfolio && (!w.molecule || w.molecule === rec.molecule));
-  if (owned && data.profiles.some(p => p.email === owned.owner && p.active)) return owned.owner;
+  const isMed = p => (data.memberships || []).some(m => m.email === p.email && m.role === "medical_reviewer" && (m.portfolio === "*" || String(m.portfolio).toLowerCase() === String(rec.portfolio || "").toLowerCase()));
+  if (owned && data.profiles.some(p => p.email === owned.owner && p.active && (p.role === "manager" || isMed(p)))) return owned.owner;
   const open = p => (data.cases || []).filter(c => c.assignee === p.email && !caseClosed(c)).length;
-  const fits = p => p.active && (!p.portfolio || p.portfolio.toLowerCase() === String(rec.portfolio || "").toLowerCase());
-  let pool = data.profiles.filter(p => p.role === "reviewer" && fits(p));
-  if (!data.profiles.some(p => p.role === "reviewer" && p.active)) pool = data.profiles.filter(p => p.role === "manager" && p.active).map(p => ({ ...p, capacity:Infinity }));
-  const best = pool.map(p => ({ p, n:open(p) })).filter(x => x.n < (x.p.capacity ?? Infinity)).sort((a, b) => a.n - b.n || a.p.email.localeCompare(b.p.email))[0];
-  return best?.p.email || "";
+  let pool = data.profiles.filter(p => p.active && isMed(p));
+  if (!pool.length) pool = data.profiles.filter(p => p.role === "manager" && p.active);
+  return pool.map(p => ({ p, n:open(p) })).sort((a, b) => a.n - b.n || a.p.email.localeCompare(b.p.email))[0]?.p.email || "";
 }
 // Reporting due date from the case's country, seriousness and marketing-authorisation record (15 days serious / 90 days non-serious by default).
 function refreshDue(data, rec) { rec.dueAt = regulatoryContext(data.settings?.marketAuth || [], rec.data, rec.molecule).due || ""; }
@@ -2694,7 +2695,7 @@ function makeCase(data, article, item, by, intake, assignTo = "") {
   const at = new Date().toISOString();
   const number = allocateCaseNumber(data);
   const created = { id:crypto.randomUUID(), number, pmid:article.id, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"",
-    data:caseFromArticle(article, item, data.settings || {}), createdBy:by, createdAt:at, updatedAt:at, intake,
+    data:caseFromArticle(article, item, data.settings || {}), createdBy:by, createdAt:at, updatedAt:at, intake, stage:"medical_review",
     history:[{ at, by, action:(intake === "automatic" ? "added automatically from the full text of PMID " : "created from PMID ") + article.id }] };
   created.data.case_id = created.number;
   (data.cases ||= []).push(created);
@@ -2704,16 +2705,18 @@ function makeCase(data, article, item, by, intake, assignTo = "") {
   return created;
 }
 // Adds a draft case for every article whose full text is stored and that has detected events (one case per article).
+// Only articles a screener marked "potential ICSR" and QC selected (approved) become Synchrony cases. Everything else stays in the screening queues.
+const qcSelected = a => a.disposition?.value === "potential_icsr" && (a.qc?.status === "approved" || Boolean(a.routedToMedical) || (!a.qc && a.status === "Complete"));
 function icsrIntake(data, by, scope, limit = 1000, assignTo = "") {
-  const out = { created:[], existing:0, noEvents:0 }, have = new Set((data.cases || []).map(c => c.pmid));
+  const out = { created:[], existing:0, noEvents:0, notSelected:0 }, have = new Set((data.cases || []).map(c => c.pmid));
   for (const article of Object.values(data.articles)) {
     if (article.fullTextStatus !== "Captured" || !article.fullTextKey) continue;
-    const item = data.assignments.find(a => a.pmid === article.id && scope(a));
-    if (!item) continue;
+    const item = data.assignments.find(a => a.pmid === article.id && scope(a) && qcSelected(a));
+    if (!item) { if (data.assignments.some(a => a.pmid === article.id && scope(a))) out.notSelected++; continue; }
     if (have.has(article.id)) { out.existing++; continue; }
     if (!(article.events || []).length) { out.noEvents++; continue; }
     if (out.created.length >= limit) break;
-    out.created.push(makeCase(data, article, item, by, by === "system" ? "automatic" : "manual", assignTo).number);
+    out.created.push(makeCase(data, article, item, by, by === "system" ? "automatic" : "manual", assignTo || item.medicalReviewer || "").number);
     have.add(article.id);
   }
   return out;
@@ -3518,12 +3521,12 @@ async function apiCore(request, env, path) {
   if (request.method === "GET" && path === "/api/state") {
     const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ...scoreArticle(state.articles[a.pmid], a.molecules), client:clientIdFor(state, a) }));
     return json({ viewer, clients:(state.clients || []).map(c => ({ ...c, molecules:state.watches.filter(w => w.client === c.id).map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "" })) })), library:manager ? libraryLayout(state) : [],
-      cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
+      cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, canEdit:canEditCase(state, viewer, c), signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
       dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], meddraInfo:state.meddra || null, stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c), triage:triageFor(state, c) }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
       monitoring:monitoringCounts(state, viewer),
       series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
-      profiles:manager ? state.profiles : [viewer], clientAdmin:manager || viewer.canManageClients === true, watches:manager ? state.watches : viewer.canManageClients === true ? state.watches.map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "", client:w.client || "" })) : [],
+      profiles:manager ? state.profiles : [viewer], people:state.profiles.filter(p => p.active).map(p => ({ email:p.email, name:p.name, role:p.role, active:true })), clientAdmin:manager || viewer.canManageClients === true, watches:manager ? state.watches : viewer.canManageClients === true ? state.watches.map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "", client:w.client || "" })) : [],
       runs:manager ? state.runs : [], assignments,
       articles:manager ? state.articles : Object.fromEntries(assignments.map(a => [a.pmid, state.articles[a.pmid]])) });
   }
@@ -3721,10 +3724,10 @@ async function apiCore(request, env, path) {
     if (!STAGES.includes(stage)) return json({ error:"Choose a stage: " + STAGES.join(", ") + "." }, 400);
     if (stage !== "closed" && !state.profiles.some(p => p.email === to && p.active)) return json({ error:"Choose an active person to route to." }, 400);
     if (reason.length < 5) return json({ error:"Give a reason of at least 5 characters." }, 400);
-    const kind = body.kind === "case" ? "case" : "assignment", may = pf => isPortfolioManager(state, viewer, pf) || rolesIn(state, email, pf).has("medical_reviewer");
+    const kind = body.kind === "case" ? "case" : "assignment", holds = x => kind === "case" ? x.assignee === email : (x.qc?.reviewer === email || x.medicalReviewer === email), may = x => isPortfolioManager(state, viewer, x.portfolio) || rolesIn(state, email, x.portfolio).has("medical_reviewer") || holds(x);
     const pool = kind === "case" ? (state.cases || []).filter(c => ids.has(c.id) && caseVisible(state, viewer, c)) : state.assignments.filter(a => ids.has(a.id) && mayAccess(state, viewer, a));
     if (!pool.length) return json({ error:"Choose at least one item." }, 400);
-    if (pool.some(x => !may(x.portfolio))) return json({ error:"Only a manager or a medical reviewer of the portfolio can re-route work." }, 403);
+    if (pool.some(x => !may(x))) return json({ error:"You can route only work that is currently with you (managers and medical reviewers can route any)." }, 403);
     if (kind === "assignment" && stage === "qc" && pool.some(a => !a.disposition)) return json({ error:"There is no disposition to send to QC yet." }, 409);
     const moved = [];
     await write(env, data => {
@@ -3744,7 +3747,7 @@ async function apiCore(request, env, path) {
   }
   if (["/api/search", "/api/case-tag", "/api/folder-save", "/api/folder-delete", "/api/case-folder", "/api/case-archive", "/api/case-restore", "/api/cases-delete", "/api/case-classify"].includes(path) && viewer) {
     const at = new Date().toISOString(), ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), medical = c => isPortfolioManager(state, viewer, c.portfolio) || rolesIn(state, email, c.portfolio).has("medical_reviewer");
-    const editable = c => caseVisible(state, viewer, c) && (medical(c) || c.assignee === email || c.createdBy === email), chosen = pred => (state.cases || []).filter(c => ids.has(c.id) && pred(c));
+    const editable = c => caseVisible(state, viewer, c) && (medical(c) || c.assignee === email), chosen = pred => (state.cases || []).filter(c => ids.has(c.id) && pred(c));
     if (path === "/api/search") {
       const results = runSearch(state, viewer, body, await loadKb(env));
       await audit(env, { by:email, action:"search.run", target:String(body.q || "").slice(0, 120), detail:{ scope:body.scope || "all", filters:Object.entries(body.filters || {}).filter(([, x]) => x).map(([k, x]) => k + "=" + String(x).slice(0, 40)).join(", "), articles:results.counts.articles, cases:results.counts.cases } });
@@ -3967,6 +3970,10 @@ async function apiCore(request, env, path) {
         a.qc = { ...a.qc, status:decision === "approve" ? "approved" : "returned", decidedBy:email, decidedAt:at, note, reviewer:a.qc.reviewer || email, evidence:evidenceRef(data.articles[a.pmid]) }; a.status = decision === "approve" ? "Complete" : "QC returned"; delete a.stage;
         if (decision === "approve" && a.disposition?.value === "potential_icsr") { a.medicalReviewer = pickMedical(data, a.portfolio, a.reviewer) || a.medicalReviewer || undefined; a.history.push({ status:a.status, note:"Routed to medical review" + (a.medicalReviewer ? ": " + a.medicalReviewer : " (no medical reviewer available)"), by:"routing", at }); } });
       await audit(env, { by:email, action:"review.qc", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ portfolio:item.portfolio, decision, note, screener:item.reviewer } });
+      if (decision === "approve" && state.settings?.autoIcsr !== false) {
+        const made = await write(env, data => icsrIntake(data, "system", a => a.id === item.id, 1));
+        if (made.created.length) await audit(env, { by:"system", action:"case.intake", target:made.created.join(", "), detail:{ source:"QC selected PMID " + item.pmid + " (full text stored)" } });
+      }
       return json({ ok:true });
     }
   }
@@ -4022,7 +4029,7 @@ async function apiCore(request, env, path) {
     if (path === "/api/duplicates" || path === "/api/duplicate-decide" || path === "/api/case-versions" || path === "/api/case-diff" || path === "/api/case-dates" || path === "/api/reportability") {
       const rec = (state.cases || []).find(c => c.id === body.caseId);
       if (!rec || !ownsCase(rec)) return json({ error:"Case not found." }, 404);
-      const pm = isPortfolioManager(state, viewer, rec.portfolio), roles = rolesIn(state, email, rec.portfolio), mayDecide = pm || roles.has("medical_reviewer") || rec.assignee === email || rec.createdBy === email;
+      const pm = isPortfolioManager(state, viewer, rec.portfolio), roles = rolesIn(state, email, rec.portfolio), mayDecide = pm || roles.has("medical_reviewer") || rec.assignee === email;
       if (path === "/api/case-versions") return json({ versions:(rec.versions || []).map(({ n, at, by, action, hash, note }) => ({ n, at, by, action, hash, note })) });
       if (path === "/api/case-diff") {
         const load2 = async n => { const ver = (rec.versions || []).find(x => x.n === Number(n)); const o = ver && await env.BUCKET.get(ver.key); return o ? JSON.parse(await o.text()).data : null; };
@@ -4407,6 +4414,7 @@ async function apiCore(request, env, path) {
     }
     if (path === "/api/case-assess") return json({ assessment:withRegulatory(await assessCase(cfg, body.data || current.data), state, { data:normalizeCase(body.data || current.data), molecule:current.molecule }) });
     if (path === "/api/case-save") {
+      if (!canEditCase(state, viewer, current)) return json({ error:"This case is routed to " + (current.assignee || "nobody") + ". Only the person it is routed to can edit it; ask them to route it to you." }, 403);
       if (current.archived) return json({ error:"This case is archived. Restore it before editing." }, 409);
       if (current.locked) return json({ error:"This case is signed and locked. A manager must supersede the signature before it can be edited." }, 409);
       const data = normalizeCase(body.data || current.data), status = caseStatuses.includes(body.status) ? body.status : current.status, notes = String(body.notes ?? current.notes).slice(0, 4000);
@@ -4854,6 +4862,7 @@ aside{background:var(--side);color:var(--side-fg);padding:18px 14px;display:flex
 .setlink.on{background:var(--brand-soft);color:var(--brand)}.setlink.on span{background:var(--brand);color:var(--primary-fg)}
 .setbody{min-width:0;max-width:980px}.setbody>section:first-child{margin-top:0}
 @media(max-width:980px){.setlayout{grid-template-columns:1fr}.setnav{position:static;flex-direction:row;flex-wrap:wrap}}
+.roban{background:var(--amber-soft);color:var(--amber);border:1px solid var(--amber);border-radius:9px;padding:8px 12px;margin-bottom:12px;font-weight:500}
 .toolbar{display:flex;flex-wrap:wrap;gap:6px 0;align-items:stretch;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:14px;position:sticky;top:72px;z-index:4}
 .tbg{display:flex;flex-direction:column;gap:5px;padding:9px 14px;border-right:1px solid var(--border)}.tbg:last-child{border-right:0}
 .tbl{font-size:10.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}.tbr{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.tbr select,.tbr input{padding:4px 8px;font-size:13px}
@@ -4940,7 +4949,7 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 <dialog id="casedlg" style="width:min(1180px,96vw);max-height:92vh;overflow:auto"><div id="casehead" style="display:flex;justify-content:space-between;gap:12px;align-items:flex-end;margin-bottom:14px"></div>
 <div style="display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));align-items:start"><div id="casebody"></div><div><div id="caseassess"></div></div></div><div id="casereview" style="margin-top:12px"></div>
 <p id="caseerr" class="msg" style="color:var(--red)" role="alert"></p>
-<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"><button type="button" class="btn" data-caseact="save">Save</button><button type="button" class="btn outline" data-caseact="assess">Assess</button><button type="button" class="btn outline" data-caseact="json">Download ICSR JSON</button><button type="button" class="btn outline" data-caseact="package">Download package (ZIP)</button><button type="button" class="btn outline" data-caseact="e2b">E2B(R3) XML</button><button type="button" class="btn outline" data-caseact="cioms">CIOMS I (PDF)</button><button type="button" class="btn outline" data-caseact="fhir">FHIR JSON</button><button type="button" class="btn outline" data-caseact="csv">Line listing (CSV)</button><button type="button" class="btn outline" data-signopen="case" id="casesign">Signature…</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px"><button type="button" class="btn" data-caseact="save" id="casesave">Save</button><button type="button" class="btn outline" data-caseact="routecase" id="caseroutebtn">Route…</button><button type="button" class="btn outline" data-caseact="assess">Assess</button><button type="button" class="btn outline" data-caseact="json">Download ICSR JSON</button><button type="button" class="btn outline" data-caseact="package">Download package (ZIP)</button><button type="button" class="btn outline" data-caseact="e2b">E2B(R3) XML</button><button type="button" class="btn outline" data-caseact="cioms">CIOMS I (PDF)</button><button type="button" class="btn outline" data-caseact="fhir">FHIR JSON</button><button type="button" class="btn outline" data-caseact="csv">Line listing (CSV)</button><button type="button" class="btn outline" data-signopen="case" id="casesign">Signature…</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div>
 <p class="sub" style="margin-top:10px">Human-in-the-loop: values pre-filled from the article are only proposals. Causality and QC are aids; a qualified reviewer decides.</p></dialog>
 <dialog id="signdlg" style="width:min(640px,94vw)"><h2 id="signtitle">Electronic signature</h2><div id="signbody"></div><p id="signerr" class="msg" style="color:var(--red)" role="alert"></p></dialog>
 <dialog id="linkdlg"><h2 id="linktitle"></h2><p id="linknote" class="sub"></p><div style="display:grid;gap:12px"><input id="linkvalue" readonly aria-label="Link"><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" id="linkcopy">Copy link</button><button type="button" class="btn outline" id="linkshare">Share…</button><button type="button" class="btn outline" id="linkclose">Done</button></div></div></dialog>
@@ -5081,6 +5090,10 @@ function renderCase(){
   $("caseassess").innerHTML=assessmentHtml(curAssess);
   loadReview();
   $("caseerr").textContent="";
+  {const ro=curCase.canEdit===false;
+    if(ro){$("casebody").insertAdjacentHTML("afterbegin",'<div class="roban">Read only. This case is with '+esc(((data.people||[]).find(p=>p.email===curCase.assignee)||{}).name||curCase.assignee||"nobody")+'. Only the person it is routed to can edit it.</div>');
+      $("casebody").querySelectorAll("input,select,textarea,button").forEach(el=>{el.disabled=true;});}
+    $("casesave").style.display=ro?"none":"";$("caseroutebtn").style.display=ro?"none":"";}
   $("casedel").style.display=data.viewer.role==="manager"?"":"none";
   $("casesign").dataset.id=curCase.id;$("casesign").textContent=(curCase.signatures||[]).some(x=>!x.superseded)?(curCase.signature_intact===false?"Signature: changed after signing":"Signed · view signature"):"Signature…";
 }
@@ -5285,7 +5298,7 @@ function bulkBar(cls,opts){
     grp("Classify",'<select id="bk_ser" aria-label="Set seriousness"><option value="__">Seriousness…</option><option value="serious">Serious</option><option value="nonserious">Non-serious</option><option value="">From case data</option></select><select id="bk_lis" aria-label="Set listedness"><option value="__">Listedness…</option><option value="listed">Listed</option><option value="unlisted">Unlisted</option><option value="unknown">Unknown</option><option value="">From case data</option></select>'+b("classify","Apply"))+
     grp("Tags",'<select id="bk_tag" aria-label="Tag">'+(data.standardTags||[]).map(t=>'<option>'+esc(t)+'</option>').join("")+'</select><input id="bk_custom" placeholder="or your own tag" style="width:130px">'+b("tag","Add")+b("untag","Remove"))+
     grp("Folder",'<select id="bk_folder" aria-label="Folder"><option value="">No folder</option>'+fl.map(f=>'<option value="'+esc(f.id)+'">'+esc(f.name)+'</option>').join("")+'</select>'+b("folder","Move"))+
-    ((canMedical()&&!opts.archive)||(opts.archive&&canMedical())||mgr?grp("More",(canMedical()&&!opts.archive?b("route","Route…")+b("archive","Archive"):"")+(opts.archive&&canMedical()?b("restore","Restore"):"")+(mgr?b("delcase","Delete…",' style="color:var(--red)"'):"")):"")+'</div>';
+    (!opts.archive||canMedical()||mgr?grp("More",(!opts.archive?b("route","Route…"):"")+(canMedical()&&!opts.archive?b("archive","Archive"):"")+(opts.archive&&canMedical()?b("restore","Restore"):"")+(mgr?b("delcase","Delete…",' style="color:var(--red)"'):"")):"")+'</div>';
 }
 const canEditCase=c=>{const me=data.viewer.email;return canMedical()||c.assignee===me||c.createdBy===me;};
 function rowSelects(c){
@@ -5420,7 +5433,7 @@ function clockHtml(c){
 function routePicker(count){
   return new Promise(resolve=>{
     const old=$("routedlg");if(old)old.remove();
-    const people=(data.profiles||[]).filter(p=>p.active);
+    const people=(data.people||data.profiles||[]).filter(p=>p.active);
     document.body.insertAdjacentHTML("beforeend",'<dialog id="routedlg" style="width:min(480px,94vw)"><h3 style="margin:0 0 8px">Route '+count+' item'+(count===1?"":"s")+'</h3><label>Move to stage<select id="rt_stage"><option value="screening">Screening (screener)</option><option value="qc">QC</option><option value="medical_review" selected>Medical review (reviewer)</option><option value="closed">Closed</option></select></label><label style="margin-top:8px">Give it to<select id="rt_to">'+people.map(p=>'<option value="'+esc(p.email)+'">'+esc(p.name||p.email)+'</option>').join("")+'</select></label><label style="margin-top:8px">Reason (recorded)<textarea id="rt_reason" rows="2"></textarea></label><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button type="button" class="btn outline" id="rt_no">Cancel</button><button type="button" class="btn" id="rt_yes">Route</button></div></dialog>');
     const d=$("routedlg");d.showModal();
     $("rt_no").onclick=()=>{d.close();d.remove();resolve(null);};
@@ -6277,6 +6290,7 @@ document.addEventListener("click",event=>{
     if(act==="close"){$("casedlg").close();return;}
     if(act==="addprod"){collectCase();curCase.data.products.push(blankProduct());renderCase();return;}
     if(act==="addevent"){collectCase();curCase.data.events.push(blankEvent());renderCase();return;}
+    if(act==="routecase"){(async()=>{await routeItems("case",[curCase.id]);const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}else $("casedlg").close();})();return;}
     target.disabled=true;
     (async()=>{
       try{

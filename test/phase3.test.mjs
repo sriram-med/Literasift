@@ -117,11 +117,11 @@ test("duplicate and follow-up review: matches are explained, linking needs a per
   follow.data.events.forEach(e => { if (e.verbatim.value === "status epilepticus") { e.outcome = fld("Recovered with sequelae"); } });
   const different = JSON.parse(JSON.stringify(original)); different.id = "other-1"; different.number = "LS-2026-0901"; different.pmid = "3"; different.createdAt = "2026-12-02T00:00:00Z"; different.provenance = { patientId: "P1" }; different.data.patient.age = fld("29"); different.data.patient.sex = fld("Female"); different.versions = []; different.links = [];
   const s = await t.state(); s.cases.push(follow, different); await t.BUCKET.put("bench.json", JSON.stringify(s));
-  const dup = (await t.call(SCREENER, "/api/duplicates", { caseId: follow.id })).body.candidates;
+  const dup = (await t.call(MEDICAL, "/api/duplicates", { caseId: follow.id })).body.candidates;
   assert.equal(dup.length, 1, "the different patient is not suggested"); assert.equal(dup[0].number, original.number); assert.equal(dup[0].level, "probable"); assert.equal(dup[0].relation, "");
   const why = dup[0].reasons.map(r => r.text).join(" | "); for (const part of ["Same patient descriptors: 54", "Same suspect product: aciclovir", "Same product-event pair", "Same first author", "Same site"]) assert.match(why, new RegExp(part));
   assert.equal(dup[0].link, null, "nothing is linked until a person confirms");
-  assert.equal((await t.call(SCREENER, "/api/duplicate-decide", { caseId: follow.id, otherId: original.id, decision: "follow_up", note: "no" })).status, 400);
+  assert.equal((await t.call(MEDICAL, "/api/duplicate-decide", { caseId: follow.id, otherId: original.id, decision: "follow_up", note: "no" })).status, 400);
   assert.ok([403, 404].includes((await t.call(SCREENER2, "/api/duplicate-decide", { caseId: follow.id, otherId: original.id, decision: "follow_up", note: "Same patient, later report" })).status));
   const decided = await t.call(MEDICAL, "/api/duplicate-decide", { caseId: follow.id, otherId: original.id, decision: "follow_up", note: "Same patient and event; the follow-up adds the outcome" });
   assert.equal(decided.status, 200, JSON.stringify(decided.body)); assert.equal(decided.body.earlier, original.number); assert.equal(decided.body.later, "LS-2026-0900");
@@ -156,7 +156,7 @@ test("E2B(R3): an incomplete case fails with field-level errors, a completed one
   assert.equal((await t.call(MEDICAL, "/api/case-save", { id: c.id, status: "Draft", data, notes: "coded by the medical reviewer" })).status, 200);
   await t.call(MEDICAL, "/api/narrative-generate", { caseId: c.id });
   const ok = (await t.call(MEDICAL, "/api/e2b-validate", { caseId: c.id, profile: "EU" })).body; assert.equal(ok.ok, true, JSON.stringify(ok.issues.filter(i => i.severity === "error"))); assert.ok(ok.warnings >= 1, "warnings stay visible");
-  assert.equal((await t.call(SCREENER, "/api/case-approve", { caseId: c.id, profile: "EU" })).status, 403, "approval is for a medical reviewer or manager");
+  assert.ok([403, 404].includes((await t.call(SCREENER, "/api/case-approve", { caseId: c.id, profile: "EU" })).status), "approval is for a medical reviewer or manager");
   const fda = await t.call(MEDICAL, "/api/case-approve", { caseId: c.id, profile: "FDA" }); assert.equal(fda.status, 409); assert.match(fda.body.error, /review only/);
   const fdaCheck = (await t.call(MEDICAL, "/api/e2b-validate", { caseId: c.id, profile: "FDA" })).body; assert.ok(fdaCheck.issues.some(i => i.field === "FDA.C.1.7.1" && i.severity === "error") && fdaCheck.issues.some(i => i.field === "FDA.C.1.12"));
   const approved = await t.call(MEDICAL, "/api/case-approve", { caseId: c.id, profile: "EU", note: "Checked against the article" }); assert.equal(approved.status, 200, JSON.stringify(approved.body)); assert.match(approved.body.approval.hash, /^[0-9a-f]{64}$/);

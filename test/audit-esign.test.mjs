@@ -152,6 +152,7 @@ test("case approvals follow the signer policy, four-eyes rule and readiness chec
   // Not a valid ICSR needs a reason in the notes.
   assert.equal((await sign(t, MANAGER, "case", created.id, { meaning: "case_invalid" })).status, 409);
   await t.call(MANAGER, "/api/case-save", { id: created.id, status: "Draft", data: created.data, notes: "No identifiable patient." });
+  await t.call(MANAGER, "/api/case-assign", { ids: [created.id], assignee: REVIEWER });   // routed to the reviewer
   // Reviewers cannot sign approvals by default.
   const asReviewer = await t.call(REVIEWER, "/api/sign-preview", { kind: "case", id: created.id, meaning: "case_invalid" });
   assert.equal(asReviewer.status, 200, "the reviewer the case was assigned to can open it");
@@ -203,6 +204,7 @@ test("full-text articles go to the ICSR workbench with verbatim evidence; each a
   const t = await setup();
   const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
   Object.assign(bench.articles["1"], { entities: { diseases: ["hepatic failure"] }, fullTextStatus: "Captured", fullTextKey: "evidence/1/x.pdf", ...worker.applyDetection({ ...bench.articles["1"], entities: { diseases: ["hepatic failure"] } }, ["aciclovir"], null, [], FULL_TEXT) });
+  bench.assignments[0] = { ...bench.assignments[0], disposition: { value: "potential_icsr" }, qc: { status: "approved" }, status: "Complete" };   // QC selected it
   await t.BUCKET.put("bench.json", JSON.stringify(bench));
   const first = (await t.call(REVIEWER, "/api/icsr-intake")).body;
   assert.equal(first.created.length, 1);
@@ -219,6 +221,7 @@ test("articles without detected events or full text are not added", async () => 
   const t = await setup();
   const bench = JSON.parse(await readFile(benchFile(t.dir), "utf8"));
   Object.assign(bench.articles["1"], { fullTextStatus: "Captured", fullTextKey: "evidence/1/x.pdf", events: [] });
+  bench.assignments[0] = { ...bench.assignments[0], disposition: { value: "potential_icsr" }, qc: { status: "approved" }, status: "Complete" };
   await t.BUCKET.put("bench.json", JSON.stringify(bench));
   const r = (await t.call(REVIEWER, "/api/icsr-intake")).body;
   assert.equal(r.created.length, 0); assert.equal(r.noEvents, 1);
@@ -341,9 +344,9 @@ async function seedWithEvents(t) {
 test("Synchrony assigns cases automatically to the least-loaded reviewer and managers can reassign", async () => {
   const t = await setup(); await seedWithEvents(t);
   const first = (await t.call(MANAGER, "/api/case-create", { pmid: "1" })).body.case;
-  assert.ok([REVIEWER, "ravi@example.org"].includes(first.assignee));
+  assert.ok(first.assignee && first.assignee !== "ravi@example.org", "cases go to a medical reviewer or manager, never to a screener");
   assert.ok(first.dueAt, "a reporting due date is set"); assert.match(first.history.at(-1).action, /assigned to .* \(automatic\)/);
-  const other = first.assignee === REVIEWER ? "ravi@example.org" : REVIEWER;
+  const other = REVIEWER;
   assert.equal((await t.call(REVIEWER, "/api/case-assign", { ids: [first.id], assignee: other })).status, 403);
   assert.equal((await t.call(MANAGER, "/api/case-assign", { ids: [first.id], assignee: "nobody@example.org" })).status, 400);
   assert.equal((await t.call(MANAGER, "/api/case-assign", { ids: [first.id], assignee: other })).body.moved, 1);
