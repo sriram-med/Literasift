@@ -231,3 +231,37 @@ test("literature minimum criteria: no name needed, descriptors are listed, every
   assert.ok((xml.match(/displayName="sourceReport"/g) || []).length >= 2, "more than one primary source in the E2B file");
   assert.match(xml, /reportersComments/);
 });
+
+import { withFetch } from "./helpers.mjs";
+test("full-article scanner tags what a reviewer looks for, at no cost and with no outside call", async () => {
+  const t = await scenario(ACICLOVIR);
+  let called = 0; const r = await withFetch(async () => { called++; return new Response("", { status: 500 }); }, () => t.call(SCREENER, "/api/article-scan", { pmid: "1" }));
+  assert.equal(r.status, 200); assert.equal(called, 0, "the scanner makes no network call");
+  const scan = r.body.scan; assert.ok(scan.sentences >= 6 && scan.units.every(u => Array.isArray(u.spans)));
+  for (const k of ["product", "event", "dose", "timing", "dechallenge", "outcome", "patient", "lab"]) assert.ok(scan.counts[k] > 0, k + " tagged: " + JSON.stringify(scan.counts));
+  assert.ok(scan.events.some(e => /status epilepticus/i.test(e.term)));
+  assert.equal(scan.authors.length, 2); assert.equal(scan.authors.find(a => a.corresponding).name, "Anil Rao");
+  assert.equal(r.body.ai.available, false);
+  assert.ok([403, 404].includes((await t.call(SCREENER2, "/api/article-scan", { pmid: "1" })).status), "only people with the article in their queue can scan it");
+});
+
+test("AI event check: off by default and uses no tokens; when on, it is capped, masks personal data, and drops anything not quoted from the text", async () => {
+  const t = await scenario(ACICLOVIR); let calls = 0, sent = "";
+  const reply = events => async (url, init) => { calls++; sent = JSON.parse(init.body).messages[1].content; return new Response(JSON.stringify({ usage: { total_tokens: 640 }, choices: [{ message: { content: JSON.stringify({ events }) } }] }), { status: 200 }); };
+  const off = await withFetch(reply([]), () => t.call(SCREENER, "/api/ai-detect", { pmid: "1" }));
+  assert.equal(off.status, 409); assert.match(off.body.error, /no tokens are used/); assert.equal(calls, 0);
+  await t.call(MANAGER, "/api/settings", { aiEnabled: "on", openaiKey: "sk-test-1234567890abcdef", aiMonthlyTokens: 0 });
+  assert.equal((await withFetch(reply([]), () => t.call(SCREENER, "/api/ai-detect", { pmid: "1" }))).status, 409, "a limit of 0 means no tokens, even with a key");
+  assert.equal(calls, 0);
+  await t.call(MANAGER, "/api/settings", { aiMonthlyTokens: 1500 });
+  const events = [{ term: "Status epilepticus", quote: "He developed status epilepticus on day 5 and was treated with levetiracetam and lorazepam, and haemodialysis was started.", onset: "day 5", outcome: "resolved", serious: true, seriousness_reason: "life-threatening" },
+    { term: "Hepatic failure", quote: "The liver failed completely after the third dose.", onset: "", outcome: "", serious: true, seriousness_reason: "" }];
+  const ok = await withFetch(reply(events), () => t.call(SCREENER, "/api/ai-detect", { pmid: "1" }));
+  assert.equal(ok.status, 200, JSON.stringify(ok.body)); assert.equal(calls, 1);
+  assert.deepEqual(ok.body.events.map(e => e.term), ["Status epilepticus"], "an event whose quote is not in the article is dropped"); assert.deepEqual(ok.body.dropped, ["Hepatic failure"]);
+  assert.equal(ok.body.tokens, 640); assert.ok(!/anil\.rao@/i.test(sent), "no personal contact data is sent");
+  const again = await withFetch(reply(events), () => t.call(SCREENER, "/api/ai-detect", { pmid: "1" }));
+  assert.equal(again.status, 429, "the monthly cap stops the next call before anything is sent"); assert.equal(calls, 1);
+  const st = (await (await t.get(MANAGER, "/api/state")).json()).config.ai; assert.equal(st.used, 640); assert.equal(st.hasKey, true);
+  assert.equal((await (await t.get(SCREENER, "/api/state")).json()).config.ai.hasKey, undefined, "the key status is for managers only");
+});
