@@ -1009,6 +1009,8 @@ async function automateCase(env, state, c, by, lease = null) {
     if (r.error) note("ai", "AI data entry", false, r.error);
     else { let applied = 0; await write(env, d => { const x = d.cases.find(y => y.id === c.id); if (!writable(d,x) || x.locked || (lease && x.editRevision !== revision)) return; const nd = normalizeCase(x.data); for (const p of r.proposals) { const parts = p.path.split("."), last = parts.pop(), t = parts.reduce((o, k) => o && o[k], nd); if (t && t[last] && setProposed(t, last, p.value, [{ excerpt:p.sentence, source:"AI-proposed; the value is quoted from this sentence" }])) applied++; } x.data = nd; });
       note("ai", "AI data entry", true, applied + " field" + (applied === 1 ? "" : "s") + " proposed" + (r.tokens ? " (" + r.tokens + " tokens)" : " (no tokens used)")); }
+    // a second pass compares what is now entered with the article, so QC starts from a short list of doubts instead of a blank page
+    try { const f2 = (await load(env)).state, c2 = f2.cases.find(y => y.id === c.id); if (c2 && writable(f2, c2)) { const rv = await aiReviewCase(env, f2, c2, by, { abstractOnly:true }); if (!rv.error) note("ai-review", "AI check against the article", true, (rv.issues || []).length + " finding" + ((rv.issues || []).length === 1 ? "" : "s") + (rv.tokens ? " (" + rv.tokens + " tokens)" : " (no tokens used)")); } } catch { /* optional */ }
   } else note("ai", "AI data entry", false, "Off (a manager can turn it on under Settings, Case workflow)");
   const recorded = await write(env, d => { const x = d.cases.find(y => y.id === c.id); if (!writable(d,x) || x.locked || (lease && x.editRevision !== revision)) return false; x.automation = { at, by, steps }; (x.history ||= []).push({ at, by, action:"automation ran: " + steps.filter(s2 => s2.ok).length + " of " + steps.length + " steps done" }); return true; });
   if (recorded) await audit(env, { by, action:"case.automate", target:c.number, detail:{ steps:steps.map(s2 => s2.key + ":" + (s2.ok ? "ok" : "no")).join(" ") } });
@@ -4276,7 +4278,7 @@ function automaticQcReviewer(state, c) {
   const a = state.assignments.find(x => x.id === c.provenance?.assignmentId), source = a && state.articles[a.pmid];
   if (!source || !syncEligible(state,a) || a.synchrony?.status !== "prepared" || a.synchrony.fingerprint !== syncFingerprint(state,a,source) || (a.synchrony.issues || []).length) return "";
   const nd = normalizeCase(c.data), la = localAssessment(nd);
-  if (la.validity.missing.length || synchronyChecks(state,c).some(f => ["major","critical"].includes(f.severity)) || (c.qc?.flags || []).some(f => f.status === "open")) return "";
+  if (la.validity.missing.length || synchronyChecks(state,c).some(f => ["major","critical"].includes(f.severity)) || (c.qc?.flags || []).some(f => f.status === "open") || (c.aiReview?.issues || []).length) return "";
   return pickRole(state,c.portfolio,"qc",c.assignee || "");
 }
 async function autoAdvance(env, number) {
@@ -4486,6 +4488,79 @@ function jobsBoard(state) {
     sourceFailures:jobs.flatMap(a => (a.synchrony.issues || []).filter(i => ["full_text", "text_quality"].includes(i.code)).map(i => ({ pmid:a.pmid, portfolio:a.portfolio, code:i.code, text:i.text }))).slice(0, 50),
     ai:{ month, tokens:Number(usage.tokens) || 0, calls:Number(usage.calls) || 0, tokensPerPreparedCase:prepared ? Math.round((Number(usage.tokens) || 0) / prepared) : 0, costPerPreparedCaseUsd:prepared && rate ? Math.round((Number(usage.tokens) || 0) / 1e6 * rate / prepared * 10000) / 10000 : null }, preparedCases:prepared };
 }
+// Authors, affiliations and contact addresses read from the top of a pasted or scanned document. They are proposals: the reporter is confirmed by a person.
+function authorsFromText(text) {
+  const head = String(text || "").slice(0, 4000), lines = head.split(/\r?\n/).map(x => x.trim()).filter(Boolean).slice(0, 30), emails = uniq([...head.matchAll(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g)].map(m => m[0].toLowerCase())).slice(0, 6);
+  const nameRe = /^[A-Z][A-Za-z.'’-]+(?: [A-Z][A-Za-z.'’-]+){1,3}$/;
+  let names = [];
+  for (const line of lines) {
+    if (line.length > 400 || /correspond|@/i.test(line)) continue;
+    const parts = line.replace(/^authors?\s*[:\-]\s*/i, "").replace(/[\d*†‡§¶]+/g, "").split(/\s*(?:,|;|\band\b|&)\s*/).map(x => x.trim()).filter(Boolean);
+    if (parts.length >= 2 && parts.length <= 15 && parts.every(x => nameRe.test(x))) { names = parts; break; }
+  }
+  const affiliations = uniq(lines.filter(l => /\b(University|Hospital|Institute|Department|Dept\.|College|Clinic|Centre|Center|School of)\b/i.test(l) && l.length < 220 && !/correspond/i.test(l)).map(l => l.replace(/^[\d*†‡§¶\s]+/, ""))).slice(0, 4);
+  const corr = lines.find(l => /correspond/i.test(l)) || "";
+  return names.map((name, i) => { const last = name.split(" ").pop().toLowerCase(), mail = emails.find(e => e.split("@")[0].replace(/[^a-z]/g, "").includes(last)) || "", corresponding = Boolean(corr && (corr.toLowerCase().includes(last) || (mail && corr.toLowerCase().includes(mail)))) || (i === 0 && !corr && emails.length === 1 && !mail ? false : false);
+    return { name, affiliations:affiliations.slice(0, 2), email:mail || (corresponding && emails.length === 1 ? emails[0] : ""), corresponding }; });
+}
+async function attachFullText(env, state, id, article, body, email) {
+    let bytes = null, text = "", ext = "txt", type = "text/plain; charset=utf-8";
+    if (body.base64) {
+      try { bytes = Uint8Array.from(atob(String(body.base64)), ch => ch.charCodeAt(0)); } catch { return { error:"That file could not be read.", status:400 }; }
+      if (bytes.length > 25_000_000) return { error:"That file is larger than 25 MB.", status:413 };
+      const head = new TextDecoder().decode(bytes.slice(0, 600));
+      if (head.startsWith("%PDF-")) { ext = "pdf"; type = "application/pdf"; try { text = await pdfToText(env, bytes.buffer); } catch { /* the PDF is kept even if its text cannot be read */ } }
+      else if (/<article\b|<\?xml/.test(head)) { ext = "xml"; type = "application/xml"; text = xmlToText(new TextDecoder().decode(bytes)); }
+      else return { error:"Upload a PDF or an XML file, or paste the text instead.", status:400 };
+    } else if (String(body.text || "").trim().length >= 200) { text = String(body.text).slice(0, 2_000_000); bytes = new TextEncoder().encode(text); }
+    else return { error:"Choose a PDF or XML file, or paste at least a few paragraphs of the article.", status:400 };
+    const key = "evidence/" + id + "/uploaded." + ext;
+    await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:type } });
+    const molecules = [...new Set(state.assignments.filter(a => a.pmid === id).flatMap(a => a.molecules || []))], ime = await loadIme(env);
+    const status = { fullTextStatus:"Captured", fullTextKey:key, fullTextOrigin:"Uploaded", fullTextUploadedBy:email, fullTextLicense:"Supplied by the user: check your licence before sharing", fullTextSource:"", fullTextRestricted:true, fullTextTier:fullTextTier };
+    if (text) {
+      const textKey = "evidence/" + id + "/fulltext.txt";
+      await env.BUCKET.put(textKey, text.slice(0, 2_000_000), { httpMetadata:{ contentType:"text/plain; charset=utf-8" } });
+      Object.assign(status, { fullTextTextKey:textKey, keyPassages:keyPassages(text, molecules) });
+    }
+    let evidencePatch = null;
+    try { const built = await buildFullTextEvidence(env, id, { ...article, ...status }, Boolean(text)); if (built) { evidencePatch = built.patch; if (built.text) text = built.text; } } catch { /* best effort */ }
+    Object.assign(status, applyDetection({ ...article, ...status }, molecules, ime, state.settings?.imePromotions || [], text));
+    await write(env, data => { Object.assign(data.articles[id], status); if (evidencePatch) data.articles[id].evidence = { ...(data.articles[id].evidence || {}), ...evidencePatch }; });
+    await audit(env, { by:email, action:"upload.fulltext", target:"PMID " + id, detail:{ type:ext, bytes:bytes.length, text_read:Boolean(text) } });
+    return { ok:true, textRead:Boolean(text), events:(status.events || []).length };
+  }
+// A second reader for QC: the case as entered against the same patient's own passages. Every issue must cite a sentence, and a suggested value must appear in it.
+async function aiReviewCase(env, state, c, by, opts = {}) {
+  const article = state.articles[c.pmid]; if (!article) return { error:"The article is not available.", status:404 };
+  const scan = scopeScan(await scanArticle(env, state, article), c);
+  if (!scan) return { issues:[], tokens:0, message:"The article describes several patients and this case is not linked to one, so nothing can be checked safely. No tokens were used." };
+  const abstractOnly = Boolean(opts.abstractOnly || article.fullTextRestricted), allowed = abstractOnly ? scan.units.filter(u => u.section === "Abstract" && article.abstract && article.abstract.includes(u.text)) : scan.units, picked = [];
+  let chars = 0; for (const u of allowed.filter(u => u.spans.length)) { if (chars + u.text.length > 2200 || picked.length >= 16) break; picked.push(u); chars += u.text.length; }
+  if (!picked.length) return { issues:[], tokens:0, message:"No sentence in the text mentions the product, event or patient, so there is nothing to compare. No tokens were used." };
+  const d = normalizeCase(c.data), rows = [];
+  const add = (path, label, f) => { if (hasVal(f)) rows.push({ path, label, value:v(f) }); };
+  add("patient.age", "patient age", d.patient.age); add("patient.sex", "patient sex", d.patient.sex);
+  d.products.forEach((p, i) => { if (p.role === "suspect") for (const [k, l] of [["name", "product"], ["dose", "dose"], ["route", "route"], ["start_date", "start"], ["stop_date", "stop"], ["dechallenge", "dechallenge"]]) add("products." + i + "." + k, l + " " + (i + 1), p[k]); });
+  d.events.forEach((e, i) => { for (const [k, l] of [["verbatim", "reaction"], ["onset_date", "onset"], ["outcome", "outcome"]]) add("events." + i + "." + k, l + " " + (i + 1), e[k]); });
+  if (!rows.length) return { issues:[], tokens:0, message:"The case has no entered values to check. No tokens were used." };
+  const redacted = picked.map((u, i) => redactPhi((i + 1) + ". " + u.text).text), hash = await sha256Hex(JSON.stringify([c.id, redacted, rows, aiConfig(env, state).model, AI_PROMPT_VERSION, "review"]));
+  if (c.aiReview?.hash === hash) return { ...c.aiReview, cached:true, tokens:0, message:"Same case and same text as the last check, so the earlier result is shown and no tokens were used." };
+  const system = "You check a case report against numbered sentences. For each entered value that the sentences contradict, reply JSON {\"x\":[{\"f\":field id,\"p\":short problem,\"s\":sentence number,\"v\":corrected value copied from that sentence or empty}]}. Say nothing about values you cannot test.";
+  const user = "Sentences:\n" + redacted.join("\n") + "\nEntered values:\n" + rows.map((r, i) => "f" + i + " " + r.label + " = " + r.value).join("\n");
+  const r = await aiChat(env, state, [{ role:"system", content:system }, { role:"user", content:user }], 420, system.length + user.length, by, "ai.review", c.number);
+  if (r.error) return { error:r.error, status:r.status };
+  const issues = [];
+  for (const x of Array.isArray(r.json.x) ? r.json.x.slice(0, 12) : []) {
+    const row = rows[Number(String(x?.f || "").replace(/^f/, ""))], sentence = picked[Number(x?.s) - 1], problem = String(x?.p || "").trim().slice(0, 200), value = String(x?.v ?? "").trim().slice(0, 120);
+    if (!row || !sentence || problem.length < 3) continue;
+    if (value && !sentence.text.toLowerCase().includes(value.toLowerCase())) continue;
+    if (!issues.some(i => i.path === row.path)) issues.push({ path:row.path, label:row.label, entered:row.value, problem, suggestion:value, sentence:sentence.text.slice(0, 400) });
+  }
+  const out = { hash, at:new Date().toISOString(), issues, checked:rows.length, sentences:picked.length };
+  await write(env, data => { const x = data.cases.find(y => y.id === c.id); if (x) x.aiReview = out; });
+  return { ...out, tokens:r.tokens, used:r.used, limit:r.limit };
+}
 async function synchronyApi(env, state, viewer, body) {
   const action = String(body.action || "view"), email = viewer.email;
   if (action === "shadow_report") {
@@ -4694,35 +4769,42 @@ async function apiCore(request, env, path) {
   }
   if (path === "/api/synchrony-tick" && service) return json({ ...(await prepareSynchrony(env)), packages:await prepareSynchronyExports(env) });
   if (path === "/api/synchrony" && viewer) return synchronyApi(env,state,viewer,body);
+  if (path === "/api/synchrony-import" && viewer) {
+    // A document goes straight into Synchrony: a Discover result, a PDF or XML, or pasted OCR text. It becomes an article, a "potential ICSR" assignment in the chosen portfolio, stored full text, and a prepared draft.
+    const portfolio = String(body.portfolio || "").trim().slice(0, 100), molecule = String(body.molecule || "").trim().slice(0, 100), rec = body.record && typeof body.record === "object" ? body.record : {};
+    if (!portfolio) return json({ error:"Choose a portfolio." }, 400);
+    const title = String(body.title || rec.title || "").trim().slice(0, 300), doi = String(body.doi || rec.doi || "").trim().slice(0, 200), pmid = String(body.pmid || rec.pmid || "").replace(/\D/g, "").slice(0, 12);
+    const hasDoc = Boolean(body.base64) || String(body.text || "").trim().length >= 200;
+    if (!title && !pmid && !hasDoc) return json({ error:"Give a title or PMID, or add the document text." }, 400);
+    const seed = pmid || "DOC-" + (await sha256Hex((doi ? doiOf(doi) : "") || title || String(body.text || "").slice(0, 2000))).slice(0, 10), at = new Date().toISOString(), ime = await loadIme(env);
+    const base = state.articles[seed] || { id:seed, source:pmid ? "PubMed" : "Imported document", title:title || ("Document " + seed), abstract:String(rec.abstract || "").slice(0, 6000), abstractSource:rec.abstract ? "Discover" : "", authors:(Array.isArray(rec.authors) ? rec.authors : []).slice(0, 12).map(x => String(x).slice(0, 80)), journal:String(rec.journal || body.journal || "").slice(0, 200), date:String(rec.year || body.date || "").slice(0, 10), doi:doi ? doiOf(doi) : "", url:doi ? "https://doi.org/" + doiOf(doi) : (pmid ? "https://pubmed.ncbi.nlm.nih.gov/" + pmid + "/" : ""), addedBy:email,
+      enrichedAt:at, enrichVersion:99, entitiesCheckedAt:at, linksCheckedAt:at, oaCheckedAt:at, retractionCheckedAt:at, retractionStatus:"Not applicable", fullTextStatus:"Not captured", fullTextTier };
+    if (!(base.authors || []).length) {
+      const typed = String(body.authors || "").split(/\s*[,;\n]\s*/).map(x => x.trim()).filter(Boolean).slice(0, 20), found = typed.length ? typed.map((name, i) => ({ name, affiliations:body.affiliation ? [String(body.affiliation).slice(0, 200)] : [], email:i === 0 ? String(body.email || "").slice(0, 160) : "", corresponding:i === 0 && Boolean(body.email) })) : authorsFromText(body.text);
+      if (found.length) { base.authors = found.map(a => a.name); base.authorDetails = found; }
+    }
+    const made = !state.articles[seed];
+    if (made) Object.assign(base, applyDetection(base, molecule ? [molecule] : [], ime, state.settings?.imePromotions || [], ""));
+    await write(env, data => {
+      if (!data.articles[seed]) data.articles[seed] = base;
+      let item = data.assignments.find(a => a.pmid === seed && a.portfolio === portfolio);
+      if (!item) { item = { id:crypto.randomUUID(), pmid:seed, portfolio, molecules:molecule ? [molecule] : [], reviewer:email, status:"Complete" }; data.assignments.push(item); }
+      else if (molecule && !(item.molecules || []).includes(molecule)) (item.molecules ||= []).push(molecule);
+      item.status = "Complete"; item.reviewer ||= email; item.disposition = { ...(item.disposition || {}), value:"potential_icsr", by:email, at, note:"Sent to Synchrony" };
+    });
+    const fresh = (await load(env)).state; let attached = null;
+    if (hasDoc) { attached = await attachFullText(env, fresh, seed, fresh.articles[seed], body, email); if (attached.error) return json({ error:attached.error }, attached.status); }
+    if (hasDoc && body.aiAllowed === true) await write(env, data => { if (data.articles[seed]) data.articles[seed].fullTextRestricted = false; });
+    await audit(env, { by:email, action:"synchrony.import", target:seed, detail:{ portfolio, from:body.record ? "discover" : hasDoc ? "document" : "citation", textRead:Boolean(attached?.textRead), aiAllowed:body.aiAllowed === true } });
+    let prepared = null; try { prepared = await prepareSynchrony(env); } catch { /* the scheduled run picks it up */ }
+    const latest = (await load(env)).state, drafts = (latest.cases || []).filter(c => c.pmid === seed && c.portfolio === portfolio).map(c => ({ id:c.id, number:c.number }));
+    return json({ ok:true, pmid:seed, created:made, textRead:Boolean(attached?.textRead), events:attached?.events || 0, drafts, prepared:prepared ? { processed:prepared.processed, created:prepared.created } : null, mode:syncModeFor(latest, portfolio) });
+  }
   if (path === "/api/fulltext-upload" && viewer) {
     // For articles behind a paywall: the user supplies the full text from their own licensed access (library, publisher site, author), as a PDF, an XML file, or pasted text.
     const id = String(body.pmid || ""), item = state.assignments.find(a => a.pmid === id && mayAccess(state, viewer, a)), article = item && state.articles[id];
     if (!article) return json({ error:"Article not found in your queue." }, 404);
-    let bytes = null, text = "", ext = "txt", type = "text/plain; charset=utf-8";
-    if (body.base64) {
-      try { bytes = Uint8Array.from(atob(String(body.base64)), ch => ch.charCodeAt(0)); } catch { return json({ error:"That file could not be read." }, 400); }
-      if (bytes.length > 25_000_000) return json({ error:"That file is larger than 25 MB." }, 413);
-      const head = new TextDecoder().decode(bytes.slice(0, 600));
-      if (head.startsWith("%PDF-")) { ext = "pdf"; type = "application/pdf"; try { text = await pdfToText(env, bytes.buffer); } catch { /* the PDF is kept even if its text cannot be read */ } }
-      else if (/<article\b|<\?xml/.test(head)) { ext = "xml"; type = "application/xml"; text = xmlToText(new TextDecoder().decode(bytes)); }
-      else return json({ error:"Upload a PDF or an XML file, or paste the text instead." }, 400);
-    } else if (String(body.text || "").trim().length >= 200) { text = String(body.text).slice(0, 2_000_000); bytes = new TextEncoder().encode(text); }
-    else return json({ error:"Choose a PDF or XML file, or paste at least a few paragraphs of the article." }, 400);
-    const key = "evidence/" + id + "/uploaded." + ext;
-    await env.BUCKET.put(key, bytes, { httpMetadata:{ contentType:type } });
-    const molecules = [...new Set(state.assignments.filter(a => a.pmid === id).flatMap(a => a.molecules || []))], ime = await loadIme(env);
-    const status = { fullTextStatus:"Captured", fullTextKey:key, fullTextOrigin:"Uploaded", fullTextUploadedBy:email, fullTextLicense:"Supplied by the user: check your licence before sharing", fullTextSource:"", fullTextRestricted:true, fullTextTier:fullTextTier };
-    if (text) {
-      const textKey = "evidence/" + id + "/fulltext.txt";
-      await env.BUCKET.put(textKey, text.slice(0, 2_000_000), { httpMetadata:{ contentType:"text/plain; charset=utf-8" } });
-      Object.assign(status, { fullTextTextKey:textKey, keyPassages:keyPassages(text, molecules) });
-    }
-    let evidencePatch = null;
-    try { const built = await buildFullTextEvidence(env, id, { ...article, ...status }, Boolean(text)); if (built) { evidencePatch = built.patch; if (built.text) text = built.text; } } catch { /* best effort */ }
-    Object.assign(status, applyDetection({ ...article, ...status }, molecules, ime, state.settings?.imePromotions || [], text));
-    await write(env, data => { Object.assign(data.articles[id], status); if (evidencePatch) data.articles[id].evidence = { ...(data.articles[id].evidence || {}), ...evidencePatch }; });
-    await audit(env, { by:email, action:"upload.fulltext", target:"PMID " + id, detail:{ type:ext, bytes:bytes.length, text_read:Boolean(text) } });
-    return json({ ok:true, textRead:Boolean(text), events:(status.events || []).length });
+    const r = await attachFullText(env, state, id, article, body, email); return r.error ? json({ error:r.error }, r.status) : json(r);
   }
   if (["/api/drugkb-status", "/api/drugkb-sync", "/api/drug-lookup", "/api/dictionary-from-kb"].includes(path) && viewer) {
     const at = new Date().toISOString(), kb = await loadKb(env), cfg = withSettings(env, state);
@@ -4880,7 +4962,7 @@ async function apiCore(request, env, path) {
     if (r.error) return json({ ok:false, available:false, reason:r.error, ...base });
     return json({ ok:r.json?.ok === true, available:true, latencyMs:Date.now() - t0, tokens:r.tokens, ...base, used:r.used, limit:r.limit });
   }
-  if (["/api/case-submit", "/api/case-qc", "/api/case-ai-fill", "/api/case-automate"].includes(path) && viewer) {
+  if (["/api/case-submit", "/api/case-qc", "/api/case-ai-fill", "/api/case-ai-review", "/api/case-automate"].includes(path) && viewer) {
     const c = (state.cases || []).find(x => x.id === String(body.id || ""));
     if (!c || !caseVisible(state, viewer, c)) return json({ error:"Case not found." }, 404);
     const at = new Date().toISOString(), stage = c.stage || "medical_review", note = String(body.note || "").trim().slice(0, 600), who = n => (state.profiles.find(p => p.email === n)?.name || n || "nobody");
@@ -4893,6 +4975,10 @@ async function apiCore(request, env, path) {
     if (path === "/api/case-ai-fill") {
       if (!canEditCase(state, viewer, c)) return json({ error:"Only the person this case is routed to can fill it." }, 403);
       const filled = await aiFillCase(env, state, c, email, at); return filled.error ? json({ error:filled.error }, filled.status) : json(filled);
+    }
+    if (path === "/api/case-ai-review") {
+      if (!canEditCase(state, viewer, c) && !isPortfolioManager(state, viewer, c.portfolio)) return json({ error:"Only the person this case is routed to can run the check." }, 403);
+      const out = await aiReviewCase(env, state, c, email); return out.error ? json({ error:out.error }, out.status) : json(out);
     }
     if (path === "/api/case-submit") {
       if (stage !== "screening") return json({ error:"Only a case in data entry can be submitted to QC." }, 409);
@@ -6203,6 +6289,14 @@ dialog.cwin[open]{display:grid;grid-template-rows:auto auto minmax(0,1fr)}
 .cw-top{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;flex-wrap:wrap;padding:14px 22px 10px;border-bottom:1px solid var(--border);background:var(--card)}
 .cw-head{display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap;flex:1 1 420px;min-width:0}.cw-title{color:var(--muted);font-size:13px;margin-top:2px;max-width:70ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cw-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.cw-top{align-items:center;padding:16px 24px 12px;gap:12px 20px}.cw-head{display:grid;grid-template-columns:1fr auto;gap:4px 20px;align-items:center;flex:1 1 520px}.cw-head>div:first-child{min-width:0}.cw-title{max-width:none;font-size:13.5px;margin-top:4px}.cw-status{flex-direction:row!important;align-items:center;gap:8px!important;white-space:nowrap}.cw-status select{min-width:160px}
+.cw-actions{gap:8px;justify-content:flex-end}.cw-actions .btn{padding:8px 14px}
+.cw-more[open]>.cw-menu{display:flex}.cw-menu{right:0}
+.csec label{justify-content:flex-end}.csec .lbl{min-height:20px;flex-wrap:nowrap;white-space:normal}.pdot{font-size:10px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;padding:1px 6px;border-radius:999px;background:var(--amber-soft,#fbecd0);color:var(--amber);white-space:nowrap}
+.serbar{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 18px;margin-bottom:16px}.serhead{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline;margin-bottom:10px}
+.serchips{display:flex;flex-wrap:wrap;gap:8px}.serchip{display:inline-flex;cursor:pointer}.serchip input{position:absolute;opacity:0;pointer-events:none}.serchip span{padding:6px 14px;border:1px solid var(--border);border-radius:999px;font-size:13px;text-transform:capitalize;background:var(--bg)}.serchip input:checked+span{background:var(--red);border-color:var(--red);color:#fff}.serchip input:focus-visible+span{box-shadow:0 0 0 3px #b4232a33}
+.cw-tabs{overflow-x:auto;scrollbar-width:none}.cw-tab{white-space:nowrap;font-size:12.5px;padding:7px 12px;flex:0 0 auto}
+@media(max-width:900px){.cw-head{grid-template-columns:1fr}}
 .cw-more{position:relative}.cw-more>summary{list-style:none;cursor:pointer}.cw-more>summary::-webkit-details-marker{display:none}.cw-more>summary::after{content:" ▾"}
 .cw-menu{position:absolute;right:0;top:110%;z-index:10;background:var(--card);border:1px solid var(--border);border-radius:12px;box-shadow:0 14px 34px -10px #0d151266;padding:6px;display:flex;flex-direction:column;min-width:190px}
 .cw-menu button{border:0;background:none;text-align:left;padding:8px 10px;border-radius:8px;cursor:pointer;color:var(--fg)}.cw-menu button:hover{background:var(--accent)}
@@ -6275,6 +6369,11 @@ section{box-shadow:0 1px 0 #ffffffb3 inset,0 1px 2px #0d15120d,0 10px 24px -14px
 details.tools{margin:0 0 14px}details.tools>summary{cursor:pointer;color:var(--brand);font-size:13px;list-style:none;padding:6px 2px}details.tools>summary::-webkit-details-marker{display:none}details.tools>summary::before{content:"+ "}details.tools[open]>summary::before{content:"- "}
 @media(max-width:760px){.acard.cc,.acard.cc:not(:has(>input)){grid-template-columns:1fr}}
 .pfpick{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 14px}.pfchip{display:inline-flex;align-items:center;gap:0;cursor:pointer}.pfchip input{position:absolute;opacity:0;pointer-events:none}.pfchip span{padding:6px 14px;border:1px solid var(--border);border-radius:999px;background:var(--card);font-size:13px}.pfchip input:checked+span{background:var(--brand);border-color:var(--brand);color:#fff}.pfchip input:focus-visible+span{box-shadow:0 0 0 3px #0e6a5d33}.pfrow{margin:14px 0 4px}.pf-hint{flex-basis:100%}
+.lltable{border-collapse:separate;border-spacing:0 8px;width:100%}.lltable th{background:none;border:0;padding:4px 14px}.lltable td{background:var(--card);padding:14px;vertical-align:top;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}.lltable td:first-child{border-left:4px solid var(--border);border-radius:12px 0 0 12px}.lltable td:last-child{border-right:1px solid var(--border);border-radius:0 12px 12px 0}.lltable tr.ser td:first-child{border-left-color:var(--red)}.lltable tr:hover td{background:var(--accent)}
+.board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(250px,1fr);gap:14px;overflow-x:auto;padding-bottom:10px;align-items:start}.bcol{background:var(--accent);border-radius:16px;padding:12px;min-height:160px}.bcol h4{display:flex;justify-content:space-between;align-items:center;margin:0 4px 10px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}.bcol h4 b{background:var(--card);border-radius:999px;padding:1px 9px;font-size:12px;color:var(--fg)}.bcards{display:grid;gap:10px}.bempty{padding:14px 6px;text-align:center}
+.bcard{display:grid;gap:6px;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:12px;padding:12px 14px;color:inherit;text-decoration:none;transition:box-shadow .15s,transform .15s}.bcard:hover{box-shadow:0 8px 22px #0e6a5d22;transform:translateY(-1px)}.bcard.ser{border-left-color:var(--red)}.bcard.late{border-left-color:var(--amber)}.bc-top{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.bc-title{font-size:13.5px;font-weight:600;line-height:1.35;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.bc-foot{display:flex;justify-content:space-between;align-items:center;margin-top:2px}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden;background:var(--card)}.segb{border:0;background:none;padding:6px 16px;cursor:pointer;font:inherit;font-size:13px;color:var(--muted)}.segb.on{background:var(--brand);color:#fff}
+.impgrid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.impgrid .wide{grid-column:1/-1}
 .acards{display:grid;gap:10px;padding:12px 14px 16px}
 .acard{display:grid;grid-template-columns:1fr 190px;gap:20px;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:14px;padding:16px 18px;transition:box-shadow .15s,transform .15s}
 .acard:hover{box-shadow:0 10px 28px #0e6a5d22;transform:translateY(-1px)}
@@ -6350,9 +6449,8 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 <div><div class="top"><button type="button" class="btn outline icon-btn" id="sidetoggle" aria-label="Collapse the side panel" title="Collapse or expand the side panel"></button><div style="margin-right:auto"><h1 id="heading">LiteraSift</h1><p id="subhead"></p></div><input id="gsearch" type="search" placeholder="Search drugs, brands, cases, citations…" aria-label="Search everything" style="margin-left:auto;margin-right:8px;width:min(340px,40vw);border-radius:999px;padding:9px 16px"><span class="sub" style="margin-right:8px;white-space:nowrap">v0.01 · Dr Sriram</span><button class="btn outline icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button></div>
 <main id="content"><div class="skel"></div><div class="skel"></div><div class="skel"></div></main><footer class="sub" style="margin:28px 0 12px;text-align:center">LiteraSift v0.01 · Developed by Dr Sriram</footer></div></div>
 <div id="toast" role="status"></div><div id="navtip" role="tooltip"></div>
-<dialog id="casedlg" class="cwin"><div class="cw-top"><div id="casehead" class="cw-head"></div><div class="cw-actions"><button type="button" class="btn" data-caseact="save" id="casesave">Save</button><button type="button" class="btn" data-caseact="aifill" id="caseaifill">Fill with AI</button><button type="button" class="btn" data-caseact="submitqc" id="casesubmit">Submit to QC</button><button type="button" class="btn" data-caseact="qcapprove" id="caseqcok">Approve → medical review</button><button type="button" class="btn outline" data-caseact="qcreturn" id="caseqcback">Return to screener</button><button type="button" class="btn outline" data-caseact="routecase" id="caseroutebtn">Route…</button><button type="button" class="btn outline" data-scan="CASEPMID" id="casescanbtn">Scan full text</button><button type="button" class="btn outline" data-caseact="assess">Assess</button>
-<details class="cw-more"><summary class="btn outline">Export</summary><div class="cw-menu"><button type="button" data-caseact="e2b">E2B(R3) XML</button><button type="button" data-caseact="cioms">CIOMS I (PDF)</button><button type="button" data-caseact="fhir">FHIR JSON</button><button type="button" data-caseact="json">ICSR JSON</button><button type="button" data-caseact="csv">Line listing (CSV)</button><button type="button" data-caseact="package">Full package (ZIP)</button></div></details>
-<button type="button" class="btn outline" data-signopen="case" id="casesign">Signature…</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div></div>
+<dialog id="casedlg" class="cwin"><div class="cw-top"><div id="casehead" class="cw-head"></div><div class="cw-actions"><button type="button" class="btn" data-caseact="save" id="casesave">Save</button><button type="button" class="btn" data-caseact="aifill" id="caseaifill">Fill with AI</button><button type="button" class="btn" data-caseact="submitqc" id="casesubmit">Submit to QC</button><button type="button" class="btn" data-caseact="qcapprove" id="caseqcok">Approve → medical review</button><button type="button" class="btn outline" data-caseact="qcreturn" id="caseqcback">Return to screener</button><details class="cw-more"><summary class="btn outline">Export</summary><div class="cw-menu"><button type="button" data-caseact="e2b">E2B(R3) XML</button><button type="button" data-caseact="cioms">CIOMS I (PDF)</button><button type="button" data-caseact="fhir">FHIR JSON</button><button type="button" data-caseact="json">ICSR JSON</button><button type="button" data-caseact="csv">Line listing (CSV)</button><button type="button" data-caseact="package">Full package (ZIP)</button></div></details>
+<button type="button" class="btn outline" data-signopen="case" id="casesign">Signature…</button><details class="cw-more"><summary class="btn outline" aria-label="More actions">More</summary><div class="cw-menu"><button type="button" data-caseact="routecase" id="caseroutebtn">Route…</button><button type="button" data-scan="CASEPMID" id="casescanbtn">Scan full text</button><button type="button" data-caseact="assess">Assess</button><button type="button" data-caseact="delete" id="casedel" style="color:var(--red)">Delete</button></div></details><button type="button" class="btn outline" data-caseact="close" aria-label="Close case">Close</button></div></div>
 <div id="casesteps" class="cw-steps"></div>
 <div class="cw-body"><nav id="casenav" class="cw-nav" aria-label="Case sections"></nav><div class="cw-main"><div id="casebody"></div><div id="casereview" style="margin-top:12px"></div><p id="caseerr" class="msg" style="color:var(--red)" role="alert"></p><p class="sub" style="margin:10px 0 30px">Human-in-the-loop: values pre-filled from the article are only proposals. Detection, coding, listedness and causality are aids; a qualified reviewer decides.</p></div>
 <div class="cw-assist"><div class="cw-tabs" id="caseatabs"></div><div id="caseflow"></div><div id="caseassist" style="display:none"></div><div id="caseautomation" style="display:none" aria-live="polite"></div><div id="caseevidence" style="display:none" aria-live="polite"></div><div id="caseassess" style="display:none"></div></div></div></dialog>
@@ -6492,8 +6590,8 @@ const flagBtn=path=>{
   if(fl)return ' <span class="qcflag" title="'+esc(fl.reason||"")+'">⚑ '+esc(fl.status||"to flag")+'</span>'+(qcMode&&!fl.status?'<button type="button" class="qcflagbtn" data-qcunflag="'+esc(path)+'" title="Remove the flag">×</button>':"");
   return qcMode?' <button type="button" class="qcflagbtn" data-qcflag="'+esc(path)+'" title="Flag this field for the screener">⚑</button>':"";
 };
-const caseInput=(label,path,type)=>{const f=gp(curCase.data,path)||{};return '<label'+(flagInfo(path)?' class="flagged"':"")+'><span class="lbl">'+label+flagBtn(path)+(f.state==="proposed"&&f.value?' <span class="badge amber" title="Proposed from the article: confirm or correct">proposed</span>':"")+'</span><input data-kind="field" data-path="'+path+'" value="'+esc(f.value||"")+'" title="'+esc(caseTitleTip(f))+'"'+(type?' type="'+type+'"':"")+'></label>';};
-const caseSelect=(label,path,options)=>{const f=gp(curCase.data,path)||{};return '<label'+(flagInfo(path)?' class="flagged"':"")+'><span class="lbl">'+label+flagBtn(path)+(f.state==="proposed"&&f.value?' <span class="badge amber">proposed</span>':"")+'</span><select data-kind="field" data-path="'+path+'">'+options.map(o=>'<option'+(o===(f.value||"")?" selected":"")+'>'+esc(o)+'</option>').join("")+'</select></label>';};
+const caseInput=(label,path,type)=>{const f=gp(curCase.data,path)||{};return '<label'+(flagInfo(path)?' class="flagged"':"")+'><span class="lbl">'+label+flagBtn(path)+(f.state==="proposed"&&f.value?' <span class="pdot" title="Proposed from the article: confirm or correct">proposed</span>':"")+'</span><input data-kind="field" data-path="'+path+'" value="'+esc(f.value||"")+'" title="'+esc(caseTitleTip(f))+'"'+(type?' type="'+type+'"':"")+'></label>';};
+const caseSelect=(label,path,options)=>{const f=gp(curCase.data,path)||{};return '<label'+(flagInfo(path)?' class="flagged"':"")+'><span class="lbl">'+label+flagBtn(path)+(f.state==="proposed"&&f.value?' <span class="pdot" title="Proposed from the article: confirm or correct">proposed</span>':"")+'</span><select data-kind="field" data-path="'+path+'">'+options.map(o=>'<option'+(o===(f.value||"")?" selected":"")+'>'+esc(o)+'</option>').join("")+'</select></label>';};
 const blankField=()=>({value:null,normalized_value:null,state:"edited",evidence:[]});
 const blankProduct=()=>({pair_id:crypto.randomUUID(),role:"concomitant",start_not_reported:false,name:blankField(),dose:blankField(),frequency:blankField(),route:blankField(),indication:blankField(),start_date:blankField(),stop_date:blankField(),action_taken:blankField(),dechallenge:blankField(),rechallenge:blankField()});
 const blankEvent=()=>({verbatim:blankField(),llt_code:blankField(),onset_date:blankField(),stop_date:blankField(),outcome:blankField(),expectedness:blankField(),coded_term:blankField(),time_to_onset:blankField(),causality_reporter:blankField(),causality_reviewer:blankField(),causality_method:blankField(),temporal_relationship:blankField(),alternative_causes:blankField(),concomitant_factors:blankField(),objective_evidence:blankField(),listedness:blankField(),assessed_term:blankField(),rsi:blankField(),causality_rationale:blankField(),reviewer_comment:blankField(),llt:blankField(),pt:blankField(),pt_code:blankField(),hlt:blankField(),hlgt:blankField(),soc:blankField(),meddra_version:blankField(),coding_status:blankField(),onset_not_reported:false,seriousness:{serious:false,death:false,life_threatening:false,hospitalization:false,disability:false,congenital_anomaly:false,other_medically_important:false}});
@@ -6573,7 +6671,7 @@ function caseSteps(){
   $("casesteps").innerHTML=steps.map((x,i)=>'<span class="cw-step'+(i<idx?" done":i===idx?" now":"")+'"><i>'+(i<idx?"✓":i+1)+'</i>'+esc(x[0])+'</span>').join('<span class="cw-sep"></span>');
 }
 function assistTabs(ref){
-  $("caseatabs").innerHTML=[["flow","Workflow"],["events","Events"],["checks","Checks"],["source","Source"],["automation","Review and release"]].map(t=>'<button type="button" class="cw-tab'+(assistTab===t[0]?" on":"")+'" data-assisttab="'+t[0]+'">'+t[1]+'</button>').join("");
+  $("caseatabs").innerHTML=[["flow","Workflow"],["events","Events"],["checks","Checks"],["source","Source"],["automation","Release"]].map(t=>'<button type="button" class="cw-tab'+(assistTab===t[0]?" on":"")+'" data-assisttab="'+t[0]+'">'+t[1]+'</button>').join("");
   $("caseassist").style.display=assistTab==="events"?"":"none";$("caseassess").style.display=assistTab==="checks"?"":"none";
   $("caseflow").style.display=assistTab==="flow"?"":"none";
   $("caseevidence").style.display=assistTab==="source"?"":"none";
@@ -6622,7 +6720,10 @@ async function renderSynchronyPanel(){
     const dl=r.deadline||{};
     const agree=(r.agreement||[]).length?'<div class="roban">'+(r.agreement.length)+' difference'+(r.agreement.length===1?"":"s")+' between formats:</div>'+r.agreement.slice(0,12).map(a=>'<div class="sub">'+esc(a.format+' is missing '+a.item+': '+a.expected)+'</div>').join(""):'<div class="sub">Narrative, E2B(R3), CIOMS I and line listing agree on patient, products, reactions, outcome and causality.</div>';
     const validation=r.validation.map(x=>'<div class="sub">'+esc(x.severity+" · "+x.field+" · "+x.message)+'</div>').join("");
-    box.innerHTML='<div class="as-card"><h3>Review exceptions</h3>'+(check||'<p class="sub">No listed findings.</p>')+
+    const rv=curCase.aiReview, qcStage=caseStage(curCase)==="qc", canAi=r.canEdit||qcStage;
+    const aiCard='<div class="as-card"><h3>AI check against the article</h3><div class="sub">Compares the entered values with this patient own sentences. Each finding quotes the sentence it rests on. Redacted, capped and cached.</div>'+(canAi?'<div class="as-btns"><button type="button" class="btn sm" data-aireview="1">'+(rv?"Check again":"Run AI check")+'</button></div>':"")+
+      (rv?(rv.issues.length?rv.issues.map((x,i)=>'<div class="as-sug"><span><b>'+esc(x.label)+'</b>: entered "'+esc(x.entered)+'"'+(x.suggestion?' · article says "'+esc(x.suggestion)+'"':"")+'<div class="sub">'+esc(x.problem)+'</div><div class="sub">"'+esc(x.sentence)+'"</div></span><span class="as-btns">'+(x.suggestion&&r.canEdit?'<button type="button" class="btn outline sm" data-aiuse="'+i+'">Use</button>':"")+(qcStage?'<button type="button" class="btn outline sm" data-aiflag="'+i+'">Flag</button>':"")+'</span></div>').join(""):'<div class="sub" style="margin-top:8px">Nothing contradicts the article ('+rv.checked+' values checked).</div>'):"")+'</div>';
+    box.innerHTML=aiCard+'<div class="as-card"><h3>Review exceptions</h3>'+(check||'<p class="sub">No listed findings.</p>')+
       (r.assignment?.issues?.length?'<details open><summary>Intake exceptions</summary>'+r.assignment.issues.map(x=>'<div class="fl-item"><i>!</i><span>'+esc(x.text)+'<div class="sub">'+esc(x.action||"")+(x.owner?' · owner '+esc(x.owner):"")+'</div></span></div>').join("")+'</details>':"")+'</div>'+((r.chronology||[]).length?'<div class="as-card"><h3>From the article, in order</h3>'+r.chronology.slice(0,14).map(t=>'<div class="fl-item"><i>'+esc({exposure:"▶",action:"■",dechallenge:"↓",rechallenge:"↻",onset:"!",outcome:"✓",test:"⚗",treatment:"+"}[t.kind]||"•")+'</i><span>'+esc(t.text)+(t.negated?' <span class="badge">denied</span>':"")+'<div class="sub">'+esc((t.when||"time not stated")+" · "+t.kind+" · "+(t.source||"")+" · "+t.section)+'</div></span></div>').join("")+'</div>':"")+(r.timeline&&r.timeline.length?'<div class="as-card"><h3>Timeline</h3>'+r.timeline.map(t=>'<div class="fl-item"><i>'+esc({exposure:"▶",action:"■",dechallenge:"↓",rechallenge:"↻",onset:"!",outcome:"✓",test:"⚗"}[t.kind]||"•")+'</i><span>'+esc(t.label)+'<div class="sub">'+esc(t.when||"time not stated")+'</div></span></div>').join("")+'</div>':"")+
       '<div class="as-card"><h3>Drug and reaction assessment</h3>'+(matrix?'<div class="tablewrap"><table><thead><tr><th>Product</th><th>Reaction</th><th>MedDRA</th><th>Seriousness</th><th>Listedness</th><th>Causality</th></tr></thead><tbody>'+matrix+'</tbody></table></div>':'<p class="sub">No suspect product and reaction pair yet.</p>')+'<div class="sub" style="margin-top:8px">Reporting clock: '+esc((dl.due||"not set")+(dl.basis?" · counted from "+dl.basis:""))+'</div>'+(dl.awarenessConfirmed===false?'<div class="roban" style="margin-top:6px">Awareness date not confirmed. The deadline may move.</div>':'')+'</div><div class="as-card"><h3>Format check</h3>'+agree+'</div>'+
       (proposals?'<div class="as-card"><h3>Source-backed proposals</h3>'+proposals+(r.canEdit?button("apply_ai","Apply selected as proposals"):"")+'</div>':"")+
@@ -6812,7 +6913,7 @@ function renderCase(){
   curCase.data.events.forEach(e=>{const b=blankEvent();Object.keys(b).forEach(k=>{if(!(k in e))e[k]=b[k];});});
   {const d=curCase.data;d.sender=d.sender||{};["type","organisation","name","email","phone","address","country"].forEach(k=>{if(!d.sender[k])d.sender[k]=blankField();});["organisation","department","address","email","phone"].forEach(k=>{if(!d.reporter[k])d.reporter[k]=blankField();});if(!d.patient.age_group)d.patient.age_group=blankField();d.general_comments=d.general_comments||"";d.sender_comments=d.sender_comments||"";}
   const art=data.articles[curCase.pmid]||{};
-  $("casehead").innerHTML='<div style="min-width:0"><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b style="font-size:20px;letter-spacing:-.02em">'+esc(curCase.number)+'</b>'+stageBadge(caseStage(curCase))+triageBadge(curCase)+(curCase.evidenceReviewPending?'<button type="button" class="btn outline sm" data-assisttab="source">Evidence needs re-review</button>':"")+'<span class="sub">PMID '+esc(curCase.pmid)+'</span><button type="button" class="btn outline sm" data-backtolit="1" title="Open the article in LiteraSift">Open article</button></div><div class="cw-title">'+esc(art.title||"")+'</div></div><label style="min-width:230px">Status<select id="casestatus">'+data.config.caseStatuses.map(s=>'<option'+(s===curCase.status?" selected":"")+'>'+esc(s)+'</option>').join("")+'</select></label>';
+  $("casehead").innerHTML='<div style="min-width:0"><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b style="font-size:20px;letter-spacing:-.02em">'+esc(curCase.number)+'</b>'+stageBadge(caseStage(curCase))+triageBadge(curCase)+(curCase.evidenceReviewPending?'<button type="button" class="btn outline sm" data-assisttab="source">Evidence needs re-review</button>':"")+'<span class="sub">PMID '+esc(curCase.pmid)+'</span><button type="button" class="btn outline sm" data-backtolit="1" title="Open the article in LiteraSift">Open article</button></div><div class="cw-title" title="'+esc(art.title||"")+'">'+esc(art.title||"")+'</div></div><label class="cw-status">Status<select id="casestatus">'+data.config.caseStatuses.map(s=>'<option'+(s===curCase.status?" selected":"")+'>'+esc(s)+'</option>').join("")+'</select></label>';
   curCase.data.products.forEach((p,i)=>{p.pair_id ||= "legacy-"+(i+1);});
   $("casebody").innerHTML=serBar()+caseForm()+pairEditor();
   $("casebody").oninput=queueCaseDraft;
@@ -7032,7 +7133,7 @@ async function p4action(target){
 }
 function serBar(){
   const keys=["serious","death","life_threatening","hospitalization","disability","congenital_anomaly","other_medically_important"], ev=curCase.data.events||[];
-  return '<div class="card" style="padding:10px;margin-bottom:12px"><b>Case seriousness</b> <span class="sub">Tick a criterion to mark it on every event; adjust single events below. Serious is set whenever any criterion applies.</span><div class="chips" style="margin-top:6px">'+keys.map(k=>'<label class="check"><input type="checkbox" data-serall="'+k+'"'+(ev.length&&ev.every(e=>e.seriousness&&e.seriousness[k])?" checked":"")+'>&nbsp;'+k.replace(/_/g," ")+'</label>').join("")+'</div></div>';
+  return '<div class="serbar"><div class="serhead"><b>Case seriousness</b><span class="sub">Tick a criterion to mark it on every event. Serious is set whenever any criterion applies.</span></div><div class="serchips">'+keys.map(k=>'<label class="serchip"><input type="checkbox" data-serall="'+k+'"'+(ev.length&&ev.every(e=>e.seriousness&&e.seriousness[k])?" checked":"")+'><span>'+k.replace(/_/g," ")+'</span></label>').join("")+'</div></div>';
 }
 function serToggle(el){
   const k=el.dataset.serall,on=el.checked;curCase.data.events.forEach(e=>{e.seriousness[k]=on;e.seriousness.serious=k==="serious"?on:Object.keys(e.seriousness).some(x=>x!=="serious"&&e.seriousness[x]);});
@@ -7278,16 +7379,29 @@ async function openScan(pmid){
   d=$("scandlg");$("scanclose").onclick=()=>{d.close();d.remove();};d.showModal();
   try{const r=await api("article-scan",{pmid});scanCtx={scan:r.scan,ai:r.ai,only:"",aiRes:null,pmid};drawScan();}catch(e){$("scanbody").innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
 }
-let llState={portfolio:"",client:""};
+let llState={portfolio:"",client:"",q:"",f:"all"};
 async function loadLineListing(){
   const box=$("llbox");if(!box)return;
   try{
-    const r=await api("line-listing",{portfolio:llState.portfolio,client:llState.client}), H=r.head, ix=n=>H.indexOf(n);
-    const show=["Case","Client","Suspect product","Event (verbatim)","PT","Serious","Listedness","Outcome","Causality (WHO-UMC)","Stage","Assignee","Clock due","Clock status"];
-    const cols=show.map(ix).filter(i=>i>=0), pf=[...new Set((data.cases||[]).map(c=>c.portfolio).filter(Boolean))].sort();
-    const bar='<div class="filters" style="border:0;padding:0 0 14px"><select id="llpf" aria-label="Portfolio"><option value="">All portfolios</option>'+pf.map(x=>'<option'+(llState.portfolio===x?" selected":"")+'>'+esc(x)+'</option>').join("")+'</select>'+((data.clients||[]).length?'<select id="llcl" aria-label="Client"><option value="">All clients</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'"'+(llState.client===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select>':"")+'<button type="button" class="btn" data-llcsv="1">Download CSV (all '+H.length+' columns)</button><span class="sub" style="align-self:center">'+r.cases+' case'+(r.cases===1?"":"s")+' · '+r.total+' event row'+(r.total===1?"":"s")+' · updated '+esc(new Date(r.generatedAt).toLocaleTimeString())+(r.snapshot?' · daily copy saved '+esc(r.snapshot.date)+' ('+r.snapshot.cases+' cases)':"")+'</span></div>';
-    box.innerHTML=panel("Line listing",bar+(r.rows.length?table(cols.map(i=>H[i]),r.rows.map(row=>cols.map(i=>esc(row[i]))),"",true):'<div class="empty">No cases yet. Cases appear here as soon as QC selects an article for Synchrony.</div>'),"One row per event. Built from the case fields each time you open this page, so it is never out of date."+(data.viewer.role==="manager"?" A copy is also saved once a day by the scheduler.":""),true);
+    const r=await api("line-listing",{portfolio:llState.portfolio,client:llState.client}), H=r.head, ix=n=>H.indexOf(n), g=(row,n)=>{const i=ix(n);return i>=0?String(row[i]==null?"":row[i]):"";};
+    const rows=r.rows.map(row=>({row,case:g(row,"Case"),product:g(row,"Suspect product"),ev:g(row,"Event (verbatim)"),pt:g(row,"PT"),ser:/^(yes|serious|true)/i.test(g(row,"Serious")),lis:g(row,"Listedness"),out:g(row,"Outcome"),cz:g(row,"Causality (WHO-UMC)"),stage:g(row,"Stage"),who:g(row,"Assignee"),due:g(row,"Clock due"),clock:g(row,"Clock status"),client:g(row,"Client"),onset:g(row,"Onset"),sex:g(row,"Sex"),age:g(row,"Age"),country:g(row,"Country"),fatal:/fatal|death|died/i.test(g(row,"Outcome"))}));
+    const today=new Date().toISOString().slice(0,10), isLate=x=>x.due&&x.due<today, unl=x=>/unlisted|unexpected/i.test(x.lis);
+    const F={all:["All events",()=>true],serious:["Serious",x=>x.ser],unlisted:["Unlisted",unl],fatal:["Fatal",x=>x.fatal],late:["Overdue",isLate],unassessed:["No causality",x=>!x.cz]};
+    if(!F[llState.f])llState.f="all";
+    const q=llState.q.trim().toLowerCase(), view=rows.filter(F[llState.f][1]).filter(x=>!q||(x.case+" "+x.product+" "+x.ev+" "+x.pt+" "+x.who+" "+x.client+" "+x.country).toLowerCase().includes(q));
+    const pf=[...new Set((data.cases||[]).map(c=>c.portfolio).filter(Boolean))].sort(), cases=new Set(rows.map(x=>x.case)).size;
+    const tile=(l,n,t)=>'<div class="qstat"><span class="sub">'+l+'</span><b'+(t&&n?' style="color:var(--'+t+')"':"")+'>'+n+'</b></div>';
+    const strip='<div class="qstrip">'+tile("Cases",cases,"")+tile("Events",rows.length,"")+tile("Serious",rows.filter(x=>x.ser).length,"red")+tile("Fatal",rows.filter(x=>x.fatal).length,"red")+tile("Unlisted",rows.filter(unl).length,"amber")+tile("Overdue",rows.filter(isLate).length,"red")+'</div>';
+    const chips='<div class="fbar">'+Object.entries(F).map(([k,f])=>'<button type="button" class="fchip'+(k===llState.f?" on":"")+'" data-llf="'+k+'">'+f[0]+'<b>'+rows.filter(f[1]).length+'</b></button>').join("")+'</div>';
+    const bar='<div class="filters slim" style="border:0;padding:0 0 12px"><input id="llq" type="search" placeholder="Search case, product, event, person" value="'+esc(llState.q)+'" aria-label="Search line listing"><select id="llpf" aria-label="Portfolio"><option value="">All portfolios</option>'+pf.map(x=>'<option'+(llState.portfolio===x?" selected":"")+'>'+esc(x)+'</option>').join("")+'</select>'+((data.clients||[]).length?'<select id="llcl" aria-label="Client"><option value="">All clients</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'"'+(llState.client===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select>':"")+'<button type="button" class="btn outline" data-synexport="csv" title="Download every case as a CSV">Download CSV</button></div>';
+    const pill=(t,tone)=>t?'<span class="badge '+tone+'">'+esc(t)+'</span>':'<span class="sub">-</span>';
+    const czTone=c=>/certain|probable/i.test(c)?"red":/possible/i.test(c)?"amber":"";
+    const body=view.map(x=>{const c=(data.cases||[]).find(k=>k.number===x.case);return '<tr class="llrow'+(x.ser?" ser":"")+'"><td><a href="#"'+(c?' data-opencase="'+esc(c.id)+'"':"")+'><b>'+esc(x.case)+'</b></a><div class="sub">'+esc([x.age&&x.age+" y",x.sex,x.country].filter(Boolean).join(" · "))+'</div></td><td><b>'+esc(x.product||"-")+'</b>'+(x.client?'<div class="sub">'+esc(x.client)+'</div>':"")+'</td><td>'+esc(x.ev||"-")+(x.pt&&x.pt!==x.ev?'<div class="sub">PT '+esc(x.pt)+'</div>':"")+(x.onset?'<div class="sub">onset '+esc(x.onset)+'</div>':"")+'</td><td>'+(x.ser?pill(x.fatal?"Fatal":"Serious","red"):pill("Non-serious",""))+'</td><td>'+pill(x.lis,unl(x)?"amber":/listed|expected/i.test(x.lis)?"green":"")+'</td><td>'+pill(x.cz,czTone(x.cz))+'<div class="sub">'+esc(x.out)+'</div></td><td>'+esc(x.stage)+'<div class="sub">'+esc(x.who)+'</div></td><td>'+(x.due?'<span'+(isLate(x)?' style="color:var(--red);font-weight:600"':"")+'>'+esc(x.due)+'</span>':'<span class="sub">-</span>')+'<div class="sub">'+esc(x.clock)+'</div></td></tr>';}).join("");
+    const grid=view.length?'<div class="tablewrap"><table class="lltable"><thead><tr><th>Case</th><th>Suspect product</th><th>Event</th><th>Seriousness</th><th>Listedness</th><th>Causality and outcome</th><th>Stage</th><th>Due</th></tr></thead><tbody>'+body+'</tbody></table></div>'+(r.total>r.rows.length?'<p class="sub">Showing '+r.rows.length+' of '+r.total+' rows. Narrow by portfolio or client.</p>':""):'<div class="empty">'+(rows.length?"No events match.":"No cases yet. Cases appear here as soon as QC selects an article for Synchrony.")+'</div>';
+    box.innerHTML=strip+chips+'<section>'+'<div class="body">'+bar+grid+'</div></section><p class="sub">One row per event, built from the case fields each time you open this page, so it is never out of date.'+(data.viewer.role==="manager"?" A copy is also saved once a day by the scheduler.":"")+'</p>';
     $("llpf")&&($("llpf").onchange=e=>{llState.portfolio=e.target.value;loadLineListing();});$("llcl")&&($("llcl").onchange=e=>{llState.client=e.target.value;loadLineListing();});
+    if($("llq"))$("llq").oninput=e=>{llState.q=e.target.value;const pos=e.target.selectionStart;clearTimeout(llState.t);llState.t=setTimeout(()=>{loadLineListing().then(()=>{const el=$("llq");if(el){el.focus();el.setSelectionRange(pos,pos);}});},200);};
+    box.querySelectorAll("[data-llf]").forEach(b=>{b.onclick=()=>{llState.f=b.dataset.llf;loadLineListing();};});
   }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
 }
 async function loadAutoPull(){
@@ -7336,7 +7450,7 @@ function discoverResults(){
   const r=dsc.res,mgr=data.viewer.role==="manager";
   const status=r.sources.map(s=>badge(SRC_NAME[s.source]+": "+(s.ok?s.count:"failed"),s.ok?"green":"red")).join(" ");
   const rows=r.results.map((x,i)=>{
-    const lib=x.library?badge("In LiteraSift","green")+' <a href="#" data-p8="openlib|'+esc(x.library.pmid)+'">Open</a>'+(x.library.cases.length?'<div class="sub">'+x.library.cases.map(c=>'<a href="#" data-opencase="'+esc(c.id)+'">'+esc(c.number)+'</a>').join(", ")+'</div>':""):(x.pmid&&mgr?'<button type="button" class="btn outline sm" data-p8="addlib|'+i+'">Add to library</button>':'<span class="sub">'+(x.pmid?"Not in your library":"No PMID")+'</span>');
+    const lib=x.library?badge("In LiteraSift","green")+' <a href="#" data-p8="openlib|'+esc(x.library.pmid)+'">Open</a>'+(x.library.cases.length?'<div class="sub">'+x.library.cases.map(c=>'<a href="#" data-opencase="'+esc(c.id)+'">'+esc(c.number)+'</a>').join(", ")+'</div>':""):(x.pmid&&mgr?'<button type="button" class="btn outline sm" data-p8="addlib|'+i+'">Add to library</button> ':"")+'<button type="button" class="btn sm" data-discsyn="'+i+'">Send to Synchrony</button>';
     const links=Object.entries({PubMed:x.links.pubmed,"Europe PMC":x.links.europepmc,DOI:x.links.doi,Unpaywall:x.links.unpaywall,Crossref:x.links.crossref}).filter(e=>e[1]).map(e=>'<a href="'+esc(e[1])+'" target="_blank" rel="noopener">'+esc(e[0])+'</a>').join(" · ");
     return ['<input type="checkbox" class="dsel" value="'+i+'" aria-label="Select result">','<b>'+esc(x.title)+'</b><div class="sub">'+esc((x.authors||[]).slice(0,4).join(", "))+((x.authors||[]).length>4?" et al":"")+' · '+esc(x.journal)+' '+esc(x.year)+'</div><div class="sub" style="margin-top:3px">'+links+'</div>'+(x.abstract?'<details><summary class="sub">Abstract</summary><div class="sub">'+esc(x.abstract.slice(0,900))+'</div></details>':""),(x.sources||[]).map(s=>badge(SRC_NAME[s]||s,"")).join(" "),oaCell(x.unpaywall),lib];
   });
@@ -7491,7 +7605,7 @@ async function downloadCase(format){
   if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||"Export failed.");}
   const link=document.createElement("a");link.href=URL.createObjectURL(await res.blob());link.download=((/filename="([^"]+)"/.exec(res.headers.get("Content-Disposition")||"")||[])[1])||(curCase.number+(format==="package"?"-package.zip":".json"));link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);
 }
-let libNumbers=null, libSortFor="", synFilter="all", synFolder="", synCat="";
+let libNumbers=null, libSortFor="", synFilter="all", synFolder="", synCat="", synView="list";
 let extracting=null, pullRun="", libPath="/", auditData=null, auditMonth=new Date().toISOString().slice(0,7), auditQ="", auditAction="";
 function drawAudit(){
   const box=$("auditbody");if(!box)return;
@@ -7780,6 +7894,39 @@ function pfPicker(name,selected,hint){
   if(!all.length)return '<div class="pfpick"><span class="sub">No portfolios yet. Add a watchlist first.</span><input type="hidden" name="'+name+'" value=""></div>';
   return '<div class="pfpick" data-pfpick="'+name+'">'+all.map(x=>'<label class="pfchip"><input type="checkbox" data-pfitem="1" value="'+esc(x)+'"'+(sel.has(x)?" checked":"")+'><span>'+esc(x)+'</span></label>').join("")+'<input type="hidden" name="'+name+'" value="'+esc([...sel].join(NL))+'">'+(hint?'<div class="sub pf-hint">'+hint+'</div>':"")+'</div>';
 }
+function openImport(pre){
+  pre=pre||{};const old=$("impdlg");if(old)old.remove();
+  const rec=pre.record||{}, pfs=allPortfolios();
+  document.body.insertAdjacentHTML("beforeend",'<dialog id="impdlg" style="width:min(720px,96vw)"><h3 style="margin:0 0 4px">Add to Synchrony</h3><p class="sub" style="margin:0 0 14px">Upload a PDF or XML, or paste the article or its OCR text. It becomes a potential ICSR in the portfolio you choose, is read for patients, events and authors, and a draft is prepared.</p><form id="impform" class="impgrid">'+
+    '<label class="wide">Title'+'<input name="title" value="'+esc(rec.title||"")+'" placeholder="Article or report title"></label>'+
+    '<label>PMID or DOI<input name="id" value="'+esc(rec.pmid||rec.doi||"")+'" placeholder="Optional"></label><label>Molecule<input name="molecule" value="'+esc(pre.molecule||"")+'" placeholder="e.g. aciclovir"></label>'+
+    '<label>Portfolio<input name="portfolio" list="pfopts" autocomplete="off" required value="'+esc(pre.portfolio||(pfs.length===1?pfs[0]:""))+'" placeholder="Choose, or type a new one"></label><label>Authors (optional, comma separated)<input name="authors" placeholder="Read from the text when empty"></label>'+
+    '<label class="wide">Upload PDF, XML or text file<input type="file" name="file" accept=".pdf,.xml,.txt,.md,text/plain,application/pdf,application/xml"></label>'+
+    '<label class="wide">Or paste the text or OCR output<textarea name="text" rows="7" placeholder="Paste the article text. For a scanned image, run OCR first and paste the result here."></textarea></label>'+
+    (rec.abstract?'<div class="wide sub">The abstract from the search result is used when no text is added.</div>':"")+
+    '<label class="check wide"><input type="checkbox" name="aiAllowed">&nbsp;This text may be sent, redacted, to OpenAI for AI checks (only tick it if your licence allows)</label>'+
+    '<div class="wide" style="display:flex;gap:8px;justify-content:flex-end"><button type="button" class="btn outline" id="impno">Cancel</button><button class="btn" id="impgo">Add and prepare</button></div></form><p id="imperr" class="msg" style="color:var(--red)" role="alert"></p></dialog>');
+  const d=$("impdlg");d.showModal();$("impno").onclick=()=>{d.close();d.remove();};
+  $("impform").onsubmit=async e=>{
+    e.preventDefault();const f=e.target, v=n=>f.elements[n].value.trim(), idv=v("id"), body={title:v("title"),portfolio:v("portfolio"),molecule:v("molecule"),authors:v("authors"),aiAllowed:f.elements.aiAllowed.checked,text:v("text"),record:pre.record||undefined};
+    if(/^\d{5,9}$/.test(idv))body.pmid=idv;else if(idv)body.doi=idv;
+    const file=f.elements.file.files[0];$("impgo").disabled=true;$("imperr").textContent="";
+    try{
+      if(file){if(file.size>20000000)throw new Error("That file is larger than 20 MB.");if(/\.(txt|md)$/i.test(file.name)||file.type==="text/plain")body.text=await file.text();else{const buf=new Uint8Array(await file.arrayBuffer());let bin="";for(let i=0;i<buf.length;i+=8192)bin+=String.fromCharCode.apply(null,buf.subarray(i,i+8192));body.base64=btoa(bin);}}
+      const r=await api("synchrony-import",body);d.close();d.remove();await refresh();
+      message(r.drafts.length?r.drafts.length+" draft"+(r.drafts.length===1?"":"s")+" prepared"+(r.events?" · "+r.events+" event"+(r.events===1?"":"s")+" found":""):r.mode==="shadow"?"Added. Synchrony is in Shadow mode here, so no draft was created.":"Added. No draft yet: see the review exceptions on the article.");
+      tab="Synchrony";render();
+    }catch(err){$("imperr").textContent=err.message;$("impgo").disabled=false;}
+  };
+}
+function caseBoard(list){
+  const cols=[["screening","Data entry"],["qc","QC"],["medical_review","Medical review"],["signed","Signed"],["closed","Sent or closed"]], signedOf=c=>(c.signatures||[]).some(x=>!x.superseded), people=data.people||data.profiles||[], today=todayStr();
+  const colOf=c=>{const st=caseStage(c);return st==="closed"||c.status==="Sent to PV Nexus"?"closed":signedOf(c)?"signed":st;};
+  const by={};list.forEach(c=>{(by[colOf(c)]||(by[colOf(c)]=[])).push(c);});
+  return '<div class="board">'+cols.map(([k,label])=>{const items=(by[k]||[]).sort((a,b)=>String(a.dueAt||"9").localeCompare(String(b.dueAt||"9")));
+    return '<section class="bcol"><h4><span>'+label+'</span><b>'+items.length+'</b></h4><div class="bcards">'+(items.length?items.map(c=>{const art=data.articles[c.pmid]||{},d=c.data||{},sp=((d.products||[]).find(p=>p.role==="suspect")||{name:{}}).name.value||"",ev=(((d.events||[])[0])||{}).verbatim?.value||"",cl=caseCls(c),who=(people.find(p=>p.email===c.assignee)||{}).name||c.assignee||"",late=c.dueAt&&c.dueAt<today&&k!=="closed";
+      return '<a href="#" class="bcard'+(cl.serious?" ser":"")+(late?" late":"")+'" data-opencase="'+esc(c.id)+'"><div class="bc-top"><b>'+esc(c.number)+'</b>'+(cl.serious?'<span class="badge red">Serious</span>':"")+(cl.listed==="unlisted"?'<span class="badge amber">Unlisted</span>':"")+'</div><div class="bc-title">'+esc(art.title||"PMID "+c.pmid)+'</div>'+(sp||ev?'<div class="sub">'+esc(sp||"-")+' · '+esc(ev||"-")+'</div>':"")+'<div class="bc-foot"><span class="ac-who">'+(who?'<span class="av" aria-hidden="true">'+esc(who.slice(0,1).toUpperCase())+'</span>'+esc(who.split(" ")[0]):'<span class="badge amber">Unassigned</span>')+'</span>'+(c.dueAt?'<span class="sub"'+(late?' style="color:var(--red);font-weight:600"':"")+'>'+esc(c.dueAt)+'</span>':"")+'</div></a>';}).join(""):'<div class="sub bempty">Nothing here</div>')+'</div></section>';}).join("")+'</div>';
+}
 // A case as a card: number and stage, title, product and event, status and clock on the right. Optional controls sit in a quiet footer.
 function caseCard(c, o){
   o=o||{};
@@ -7910,7 +8057,7 @@ function render() {
     const bars=(list)=>{if(!list.length)return '<div class="empty" style="padding:14px">No data yet.</div>';const top=list.slice(0,8),max=Math.max(...top.map(x=>x.count));return top.map(x=>'<div class="sbar" title="'+esc(x.cases.join(", "))+'"><div class="sbar-h"><span class="sbar-k">'+esc(x.key)+'</span><b>'+x.count+'</b></div><div class="sbar-t"><i style="width:'+Math.round(x.count/max*100)+'%"></i></div></div>').join("")+(list.length>8?'<div class="sub">+'+(list.length-8)+' more</div>':"");};
     const months=S.monthly.map(m=>'<span class="badge'+((S.trend.hikes||[]).includes(m.month)?" red":"")+'" title="'+esc(m.cases.join(", "))+'">'+esc(m.month)+': '+m.count+'</span>').join(" ");
     const fl=data.caseFolders||[],folderBar=panel("Folders",'<div class="chips"><button type="button" class="btn sm '+(synFolder?"outline":"")+'" data-synfolder="">All cases</button><button type="button" class="btn sm '+(synFolder==="__none"?"":"outline")+'" data-synfolder="__none">Not in a folder</button>'+fl.map(f=>'<span style="display:inline-flex;gap:2px"><button type="button" class="btn sm '+(synFolder===f.id?"":"outline")+'" data-synfolder="'+esc(f.id)+'">'+esc(f.name)+' ('+openCases.filter(c=>c.folderId===f.id).length+')</button>'+(manager?'<button type="button" class="btn outline sm" data-p5="delfolder|'+esc(f.id)+'" title="Delete folder" aria-label="Delete folder">x</button>':"")+'</span>').join("")+(canMedical()?'<button type="button" class="btn outline sm" data-p5="newfolder">+ New folder</button>':"")+'</div>');
-    html=(data.viewer.role==="manager"?'<div id="synjobs"></div>':"")+searchBar+tiles+'<details class="tools"><summary>Overview, folders, intake and exports</summary><div class="sumrow">'+categoryMatrix(openCases)+folderBar+panel("Intake and assignment",intake)+'</div></details>'+'<div class="trkhead"><h2>Case tracker</h2><span class="sub">'+shown.length+' case'+(shown.length===1?"":"s")+'</span><span style="margin-left:auto">'+groupSelect(synGroup,["none","soc","triage","sercat","clock","stage","status","seriousness","listedness","folder","portfolio","owner"],"syn_group")+'</span></div>'+bulkBar("syn_c")+groupedCards(shown,synGroup,rowOf,"No cases in this view.")+
+    html=(data.viewer.role==="manager"?'<div id="synjobs"></div>':"")+searchBar+tiles+'<details class="tools"><summary>Overview, folders, intake and exports</summary><div class="sumrow">'+categoryMatrix(openCases)+folderBar+panel("Intake and assignment",intake)+'</div></details>'+'<div class="trkhead"><h2>Case tracker</h2><span class="sub">'+shown.length+' case'+(shown.length===1?"":"s")+'</span><span style="margin-left:auto;display:flex;gap:10px;align-items:center"><button type="button" class="btn" data-impdoc="1">Add document</button><span class="seg" role="group" aria-label="View"><button type="button" class="segb'+(synView==="list"?" on":"")+'" data-synview="list">List</button><button type="button" class="segb'+(synView==="board"?" on":"")+'" data-synview="board">Board</button></span>'+(synView==="list"?groupSelect(synGroup,["none","soc","triage","sercat","clock","stage","status","seriousness","listedness","folder","portfolio","owner"],"syn_group"):"")+'</span></div>'+(synView==="board"?caseBoard(shown):bulkBar("syn_c")+groupedCards(shown,synGroup,rowOf,"No cases in this view."))+
       panel("Case series summary",'<div class="row"><span><b>'+S.total+'</b> case'+(S.total===1?'':'s')+' · <b>'+S.serious.length+'</b> serious · <b>'+S.fatal.length+'</b> fatal</span><span class="sub">Counted from the case fields. Hover a line to see which cases it counts.</span></div>'+
         '<div class="serieslayout"><div><h3 style="margin:8px 0">Events</h3>'+bars(S.events)+'</div><div><h3 style="margin:8px 0">Suspect products</h3>'+bars(S.products)+'</div><div><h3 style="margin:8px 0">Countries</h3>'+bars(S.countries)+'</div><div><h3 style="margin:8px 0">Age and sex</h3>'+bars(S.ages)+bars(S.sex)+'</div></div>'+
         '<h3 style="margin:14px 0 6px">Cases received per month</h3><div class="chips">'+(months||'<span class="sub">No cases yet.</span>')+'</div><p class="sub" style="margin-top:8px">'+esc(S.trend.basis||"")+(S.monthly.length?" Median "+S.trend.median+", spread "+S.trend.mad+", upper limit "+S.trend.upper+" cases per month (median + 2 x scaled MAD).":"")+(S.trend.hikes&&S.trend.hikes.length&&S.monthly.length>=4?' <b style="color:var(--red)">Above the limit: '+esc(S.trend.hikes.join(", "))+'.</b>':"")+'</p>',"Deterministic: no model writes these figures.")+
@@ -8142,6 +8289,16 @@ document.addEventListener("click",event=>{
   if(sm){sm.disabled=true;$("aismokeout").textContent="Testing…";api("ai-smoke",{}).then(r=>{$("aismokeout").innerHTML=(r.ok?badge("Working","green"):badge("Not available","amber"))+" "+esc(r.ok?("Reply in "+r.latencyMs+" ms · "+r.tokens+" tokens · "+r.used+" of "+r.limit+" used this month · model "+r.model+" · key from "+r.keySource):(r.reason||""));return refresh();}).catch(e=>{$("aismokeout").textContent=e.message;}).finally(()=>{sm.disabled=false;});return;}
   const ks=event.target.closest&&event.target.closest("[data-aikeysave]");
   if(ks){const key=($("aikeyinline")||{}).value||"",lim=Number(($("ailimitinline")||{}).value)||0;if(!key.trim()){message("Paste the key first.",true);return;}ks.disabled=true;api("settings",{openaiKey:key.trim(),aiEnabled:"on",aiMonthlyTokens:lim}).then(()=>refresh()).then(()=>{if(curCase){const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}}message("AI is on. Monthly limit "+lim.toLocaleString()+" tokens.");}).catch(e=>{message(e.message,true);ks.disabled=false;});return;}
+  const air=event.target.closest&&event.target.closest("[data-aireview],[data-aiuse],[data-aiflag]");
+  if(air){
+    const d=air.dataset;
+    if(d.aireview){air.disabled=true;air.textContent="Checking...";api("case-ai-review",{id:curCase.id}).then(r=>{curCase.aiReview={issues:r.issues||[],checked:r.checked||0,hash:r.hash,at:r.at};message(r.message||((r.issues||[]).length+" finding"+((r.issues||[]).length===1?"":"s")+(r.tokens?" · "+r.tokens+" tokens":" · no tokens used")));return renderSynchronyPanel();}).catch(e=>{message(e.message,true);air.disabled=false;air.textContent="Run AI check";});return;}
+    const x=((curCase.aiReview||{}).issues||[])[Number(d.aiuse!==undefined?d.aiuse:d.aiflag)];if(!x)return;
+    if(d.aiflag!==undefined){if(!qcPending.some(q=>q.path===x.path))qcPending.push({path:x.path,reason:(x.problem+(x.suggestion?" Article says: "+x.suggestion+".":"")).slice(0,300)});collectCase();renderCase();message("Flagged for the screener. Return the case to send it.");return;}
+    collectCase();const parts=x.path.split("."),last=parts.pop(),t=parts.reduce((o,k)=>o&&o[k],curCase.data);
+    if(t&&t[last]){t[last]={value:x.suggestion,normalized_value:null,state:"proposed",evidence:[{excerpt:x.sentence,source:"AI check; the value is quoted from this sentence"}]};}
+    renderCase();message("Applied as a proposal. Check it, then save.");return;
+  }
   const aa=event.target.closest&&event.target.closest("[data-aiapply]");if(aa){aiApply(aa.dataset.aiapply);return;}
   const syncAction=event.target.closest?.("[data-sync-act]");
   if(syncAction){syncAction.disabled=true;synchronyAction(syncAction.dataset.syncAct,syncAction.dataset.syncId).catch(e=>message(e.message,true)).finally(()=>{syncAction.disabled=false;});return;}
@@ -8185,7 +8342,7 @@ document.addEventListener("click",event=>{
   const lc=event.target.closest&&event.target.closest("[data-llcsv]");
   if(lc){fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:"csv"})}).then(async res=>{if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"Nothing to export.");const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-line-listing-"+new Date().toISOString().slice(0,10)+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}).catch(e=>message(e.message,true));return;}
   const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -8258,6 +8415,10 @@ document.addEventListener("click",event=>{
     return;
   }
   if(target.dataset.synfilter){synFilter=target.dataset.synfilter;render();return;}
+  const mn=event.target.closest&&event.target.closest(".cw-menu button, .menubox button");if(mn){const dt=mn.closest("details");if(dt)setTimeout(()=>dt.removeAttribute("open"),0);}
+  if(target.dataset.impdoc){openImport({});return;}
+  if(target.dataset.discsyn!==undefined){const x=(dsc.res&&dsc.res.results||[])[Number(target.dataset.discsyn)];if(x)openImport({record:{title:x.title,doi:x.doi,pmid:x.pmid,authors:x.authors,journal:x.journal,year:x.year,abstract:x.abstract},portfolio:(data.watches[0]||{}).portfolio||"",molecule:(dsc.q||"").split(" ")[0]});return;}
+  if(target.dataset.synview){synView=target.dataset.synview;render();return;}
   if(target.dataset.autoassign){target.disabled=true;api("cases-autoassign",{}).then(async r=>{await refresh();message(r.moved+" case"+(r.moved===1?"":"s")+" assigned.");}).catch(e=>{message(e.message,true);target.disabled=false;});return;}
   if(target.dataset.synexport){
     const ticked=[...document.querySelectorAll(".syn_c:checked")].map(x=>x.value), ids=ticked.length?ticked:synShownIds;
