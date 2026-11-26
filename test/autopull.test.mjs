@@ -1,0 +1,42 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { MANAGER, fakeNcbi, withFetch, makeEnv } from "./helpers.mjs";
+
+const dAgo = n => new Date(Date.now() + 5.5 * 3600000 - n * 86400000).toISOString().slice(0, 10);
+const W1 = { portfolio: "Antivirals", molecule: "aciclovir", query: '"aciclovir"[tiab]' }, W2 = { portfolio: "CNS", molecule: "aripiprazole", query: '"aripiprazole"[tiab]' };
+const key = w => encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule);
+const status = t => t.call(MANAGER, "/api/scheduler-status", {}).then(r => r.body);
+
+test("automatic pull: on by default, can be paused, and each molecule can be switched off; 'pull now' overrides the pause", async () => {
+  const t = await makeEnv({ watches: [W1, W2] }), recs = [{ pmid: "1", date: dAgo(1) }], ncbi = fakeNcbi(recs);
+  let s = await status(t);
+  assert.equal(s.autoPull, true); assert.equal(s.perWatch.length, 2); assert.ok(s.perWatch.every(w => w.auto && w.missing >= 1));
+  await t.call(MANAGER, "/api/watch-auto", { watch: key(W2), on: false });
+  await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/scheduled", {}));
+  s = await status(t);
+  assert.equal(s.perWatch.find(w => w.molecule === "aciclovir").missing, 0, "the molecule left on was pulled");
+  assert.ok(s.perWatch.find(w => w.molecule === "aripiprazole").missing >= 1, "the molecule switched off was not");
+  await t.call(MANAGER, "/api/settings", { autoPull: "off" });
+  const paused = await status(t); assert.equal(paused.autoPull, false);
+  const searches = () => ncbi.calls.filter(c => c.startsWith("esearch")).length, calls = searches();
+  await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/scheduled", {}));
+  assert.equal(searches(), calls, "while paused the scheduler runs no new PubMed searches");
+  await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/scheduled", { force: true }));
+  assert.equal((await status(t)).perWatch.find(w => w.molecule === "aripiprazole").missing, 0, "'pull now' ignores the pause and the per-molecule switch");
+});
+
+test("line listing is built live from visible cases and a copy is saved once a day by the scheduler", async () => {
+  const t = await makeEnv({ watches: [W1] });
+  const empty = (await t.call(MANAGER, "/api/line-listing", {})).body; assert.equal(empty.cases, 0); assert.ok(empty.head.includes("Client") && empty.head.includes("Reporter comments"));
+  const s = await t.state();
+  s.cases = [{ id: "c1", number: "LS-1", pmid: "1", portfolio: "Antivirals", molecule: "aciclovir", status: "Draft", assignee: MANAGER, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01", history: [], versions: [], stage: "medical_review",
+    data: { patient: { age: { value: "54" }, sex: { value: "male" } }, reporter: { identifier: { value: "A. Rao" } }, reporter_comments: "We suggest aciclovir neurotoxicity.", other_reporters: [{ name: "S. Iyer" }], dates: {}, products: [{ role: "suspect", name: { value: "aciclovir" } }], events: [{ verbatim: { value: "status epilepticus" }, seriousness: { serious: true, hospitalization: true }, listedness: { value: "Unlisted" } }], confounders: [], treatment_given: [] } }];
+  s.articles["1"] = { id: "1", title: "T", authors: ["Rao A"], journal: "J Case Rep", date: "2026" }; s.clients = [{ id: "k1", name: "Acme" }]; s.watches[0].client = "k1";
+  await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const ll = (await t.call(MANAGER, "/api/line-listing", {})).body, h = ll.head, row = ll.rows[0];
+  assert.equal(ll.cases, 1); assert.equal(row[h.indexOf("Client")], "Acme"); assert.equal(row[h.indexOf("Seriousness criteria")], "hospitalization"); assert.equal(row[h.indexOf("Other authors")], "S. Iyer");
+  assert.equal((await t.call(MANAGER, "/api/line-listing", { client: "nope" })).body.cases, 0, "the client filter applies");
+  await withFetch(fakeNcbi([]).handler, () => t.call(MANAGER, "/api/scheduled", {}));
+  const snap = (await t.state()).lineListingSnapshot; assert.ok(snap && snap.cases === 1);
+  assert.match(await (await t.BUCKET.get(snap.key)).text(), /^"Case","PMID"/);
+});

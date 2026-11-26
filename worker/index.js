@@ -3016,14 +3016,22 @@ function fhirBundle(rec, article) {
   return { resourceType:"Bundle", type:"collection", identifier:{ system:"http://literasift.tech/case", value:rec.number }, timestamp:new Date().toISOString(), entry:entries };
 }
 // Line listing: one row per case and event (the layout used for periodic reports and spreadsheets).
-function lineListing(records, articles) {
-  const head = ["Case", "PMID", "Status", "Assignee", "Due", "Country", "Age", "Age group", "Sex", "Suspect product", "Event (verbatim)", "PT", "PT code", "SOC", "Serious", "Onset", "Outcome", "Causality (WHO-UMC)", "Action taken", "Reference"];
+const LINE_HEAD = ["Case", "PMID", "Status", "Assignee", "Due", "Country", "Age", "Age group", "Sex", "Suspect product", "Event (verbatim)", "PT", "PT code", "SOC", "Serious", "Onset", "Outcome", "Causality (WHO-UMC)", "Action taken", "Reference",
+  "Client", "Portfolio", "Stage", "Seriousness criteria", "Listedness", "LLT code", "Dechallenge", "Rechallenge", "Reporter", "Other authors", "Reporter comments", "Awareness date", "Clock (days)", "Clock due", "Clock status", "Citation", "DOI"];
+function lineListingRows(records, articles, state) {
   const rows = [];
   for (const r of records) {
-    const c = normalizeCase(r.data), s = firstSuspect(c) || {}, events = c.events.filter(e => hasVal(e.verbatim));
-    for (const e of events.length ? events : [{}]) rows.push([r.number, r.pmid, r.status, r.assignee || "", r.dueAt || "", v(c.patient.country), ageText(c.patient), v(c.patient.age_group), v(c.patient.sex), v(s.name), v(e.verbatim), v(e.pt), v(e.pt_code), v(e.soc), e.seriousness?.serious ? "Yes" : "No", v(e.onset_date), v(e.outcome), v(e.causality_reviewer), v(s.action_taken), String(r.data.source_summary || "").split("\n")[0]]);
+    const c = normalizeCase(r.data), s = firstSuspect(c) || {}, events = c.events.filter(e => hasVal(e.verbatim)), art = articles[r.pmid] || {};
+    const wl = state ? state.watches.find(w => w.portfolio === r.portfolio && (w.molecule || "") === (r.molecule || "")) : null, client = state ? (state.clients || []).find(x => x.id === wl?.client)?.name || "" : "";
+    const tl = state ? caseTimeline(state, r) : {}, cls = caseClass(r);
+    for (const e of events.length ? events : [{}]) rows.push([r.number, r.pmid, r.status, r.assignee || "", r.dueAt || "", v(c.patient.country), ageText(c.patient), v(c.patient.age_group), v(c.patient.sex), v(s.name), v(e.verbatim), v(e.pt), v(e.pt_code), v(e.soc), e.seriousness?.serious ? "Yes" : "No", v(e.onset_date), v(e.outcome), v(e.causality_reviewer), v(s.action_taken), String(r.data.source_summary || "").split("\n")[0],
+      client, r.portfolio || "", STAGE_LABEL[r.stage || "medical_review"] || "", Object.entries(e.seriousness || {}).filter(([k, on]) => on && k !== "serious").map(([k]) => k.replace(/_/g, " ")).join("; "), cls.listedness, v(e.llt_code), v(s.dechallenge), v(s.rechallenge), v(c.reporter.identifier), (c.other_reporters || []).map(x => x.name).join("; "), c.reporter_comments || "",
+      v(c.dates?.awareness) || "", tl.days ?? "", tl.due || "", tl.status || "", [(art.authors || []).slice(0, 3).join(", "), art.journal, (art.date || "").slice(0, 4)].filter(Boolean).join(", "), art.doi || ""]);
   }
-  return [head, ...rows].map(row => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
+  return rows;
+}
+function lineListing(records, articles, state) {
+  return [LINE_HEAD, ...lineListingRows(records, articles, state)].map(row => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
 }
 // ---- Case series summary and trend check. Every figure is counted from the case fields, and each one lists the cases it counts, so nothing is estimated or
 // written by a model. The median + MAD hike rule follows pharmacovigilance-verified-safety-report-agent (MIT, Copyright (c) 2026 NiharNandala): a mean and standard
@@ -3518,6 +3526,7 @@ const auditRules = {
   "/api/settings":b => ({ action:"settings.update", target:Object.keys(b).join(", "), detail:"storeRestricted" in b ? "storeRestricted=" + b.storeRestricted : "" }),
   "/api/assign-ranges":(b, r) => ({ action:"assign.ranges", target:decodeWatch(b.watch), detail:(b.ranges || []).map(x => "#" + x.from + "-" + x.to + " to " + x.owner).join("; ") + " (" + (b.order || "relevance") + ", " + (b.pool || "open") + "): " + Object.values(r.per || {}).reduce((n, v) => n + v, 0) + " assigned" }),
   "/api/delete-watch":b => ({ action:"watch.delete", target:decodeWatch(b.watch), detail:"" }),
+  "/api/watch-auto":b => ({ action:"watch.auto", target:decodeWatch(b.watch), detail:b.on === false ? "automatic pull off" : "automatic pull on" }),
   "/api/client-permission":b => ({ action:"client.permission", target:String(b.email || ""), detail:b.allowed === true ? "allowed" : "revoked" }),
   "/api/client-save":(b, r) => ({ action:"client.save", target:String(b.name || "").slice(0, 80), detail:b.id ? "edited" : "created" }),
   "/api/client-delete":b => ({ action:"client.delete", target:String(b.id || ""), detail:"" }),
@@ -4283,13 +4292,19 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"sign.signed", entityType:kind === "case" ? "Case" : "Assignment", entityId:kind === "case" ? record.number : record.id, detail:{ meaning:meaningCode, content_sha256, evidence_sha256, auth:reauth, pmid:record.pmid } });
     return json({ signature, record:saved });
   }
+  if (path === "/api/line-listing" && viewer) {
+    // Built live from the cases this person can see, so it is always current; nothing to prepare or refresh by hand.
+    const list = (state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived && (!body.portfolio || c.portfolio === body.portfolio) && (!body.client || (state.clients || []).find(x => x.id === state.watches.find(w => w.portfolio === c.portfolio && (w.molecule || "") === (c.molecule || ""))?.client)?.id === body.client));
+    const rows = lineListingRows(list, state.articles, state);
+    return json({ head:LINE_HEAD, rows:rows.slice(0, 2000), total:rows.length, cases:list.length, snapshot:manager ? (state.lineListingSnapshot || null) : null, generatedAt:new Date().toISOString() });
+  }
   if (path === "/api/cases-export" && viewer) {
     const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null, list = (state.cases || []).filter(c => caseVisible(state, viewer, c) && (!wanted || wanted.has(c.id)));
     if (!list.length) return json({ error:"No cases to export." }, 404);
     const format = body.format === "e2b" ? "e2b" : "csv", stamp = new Date().toISOString().slice(0, 10);
     await audit(env, { by:email, action:"case.export", target:list.length + " cases", detail:"batch " + format });
     if (format === "e2b") return new Response(e2bBatch(list, state.articles, { sender:state.settings?.senderId, receiver:state.settings?.receiverId }), { headers:{ "Content-Type":"application/xml", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-E2B-R3-' + stamp + '.xml"' } });
-    return new Response(lineListing(list, state.articles), { headers:{ "Content-Type":"text/csv; charset=utf-8", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-line-listing-' + stamp + '.csv"' } });
+    return new Response(lineListing(list, state.articles, state), { headers:{ "Content-Type":"text/csv; charset=utf-8", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-line-listing-' + stamp + '.csv"' } });
   }
   if (path === "/api/library-delete" && viewer) {
     if (!manager) return json({ error:"Manager access required." }, 403);
@@ -4321,7 +4336,8 @@ async function apiCore(request, env, path) {
     if (path === "/api/scheduler-status") {
       const missed = state.watches.flatMap(w => missedWindows(state, w, through)).sort((a, b) => a.from.localeCompare(b.from));
       const age = h.lastBeatAt ? Math.round((Date.now() - Date.parse(h.lastBeatAt)) / 60000) : null;
-      return json({ expectedThrough:through, heartbeat:{ lastBeatAt:h.lastBeatAt || null, lastFinishedAt:h.lastFinishedAt || null, lastSuccessAt:h.lastSuccessAt || null, running:Boolean(h.running), lastError:h.lastError || "", consecutiveFailures:h.consecutiveFailures || 0, ageMinutes:age, recent:(h.beats || []).slice(0, 12) }, stale:age === null || age > staleMin, staleAfterMinutes:staleMin, lastBatch:h.lastBatch || null, missed, watches:state.watches.length });
+      const perWatch = state.watches.map(w => { const last = state.runs.filter(r => r.portfolio === w.portfolio && (r.molecule || "") === (w.molecule || "") && r.status === "Imported").map(r => r.time).sort().pop() || ""; return { watch:encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || ""), portfolio:w.portfolio, molecule:w.molecule || "", client:(state.clients || []).find(x => x.id === w.client)?.name || "", auto:w.auto !== false, missing:missedWindows(state, w, through).filter(m => m.state === "missing").length, lastRunAt:last, articles:state.assignments.filter(a => a.portfolio === w.portfolio && (!w.molecule || (a.molecules || []).includes(w.molecule))).length }; });
+      return json({ autoPull:state.settings?.autoPull !== false, everyMinutes:Number(env.SCHEDULE_MINUTES || 60), perWatch, expectedThrough:through, heartbeat:{ lastBeatAt:h.lastBeatAt || null, lastFinishedAt:h.lastFinishedAt || null, lastSuccessAt:h.lastSuccessAt || null, running:Boolean(h.running), lastError:h.lastError || "", consecutiveFailures:h.consecutiveFailures || 0, ageMinutes:age, recent:(h.beats || []).slice(0, 12) }, stale:age === null || age > staleMin, staleAfterMinutes:staleMin, lastBatch:h.lastBatch || null, missed, watches:state.watches.length });
     }
     const watch = state.watches.find(w => w.portfolio === body.portfolio && (w.molecule || "") === (body.molecule || ""));
     if (!watch || !/^\d{4}-\d{2}-\d{2}$/.test(body.from || "") || !/^\d{4}-\d{2}-\d{2}$/.test(body.to || "") || body.from > body.to) return json({ error:"Choose a watchlist and a date range." }, 400);
@@ -4496,7 +4512,7 @@ async function apiCore(request, env, path) {
           dates:current.data.dates, reportability:current.data.reportability, links:current.links || [], versions:(current.versions || []).map(({ n, at, by, action, hash, note }) => ({ n, at, by, action, hash, note })), validation:{ profile:profileName, issues } }, null, 2), "application/json", "-structured" + (final ? "" : "-DRAFT") + ".json");
       }
       if (format === "fhir") return send(JSON.stringify(fhirBundle(current, article0), null, 2), "application/fhir+json", "-FHIR.json");
-      if (format === "csv") return send(lineListing([current], state.articles), "text/csv; charset=utf-8", "-line-listing.csv");
+      if (format === "csv") return send(lineListing([current], state.articles, state), "text/csv; charset=utf-8", "-line-listing.csv");
       if (format !== "package") return new Response(JSON.stringify(data, null, 2), { headers:{ "Content-Type":"application/json", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="' + current.number + '.json"' } });
       const encoder = new TextEncoder(), article = state.articles[current.pmid] || {}, files = [{ name:"icsr.json", data:encoder.encode(JSON.stringify(data, null, 2)) },
         { name:"E2B-R3-DRAFT.xml", data:encoder.encode(e2bBatch([current], state.articles, { profile:profileName, watermark:"DRAFT: not approved for submission", sender:state.settings?.senderId, receiver:state.settings?.receiverId })) },
@@ -4552,7 +4568,8 @@ async function apiCore(request, env, path) {
     let st = (await load(env)).state;
     for (const run of st.runs.filter(r => r.windows?.some(retryable)).slice(0, 3)) { try { results.push(slim(await runImport(env, run.id, 12, { respectBackoff:true }))); } catch (error) { results.push({ portfolio:run.portfolio, molecule:run.molecule, error:error.message }); } }
     st = (await load(env)).state;
-    const plan = []; for (const watch of st.watches) for (const m of missedWindows(st, watch, through)) if (m.state === "missing") plan.push({ watch, m });
+    const autoOn = st.settings?.autoPull !== false || (manager && body.force === true);
+    const plan = []; if (autoOn) for (const watch of st.watches) { if (watch.auto === false && body.force !== true) continue; for (const m of missedWindows(st, watch, through)) if (m.state === "missing") plan.push({ watch, m }); }
     plan.sort((x, y) => x.m.from.localeCompare(y.m.from));
     for (const { watch, m } of plan.slice(0, maxWatchesPerRun)) {
       try { results.push(slim(await execute(env, watch, m.from, m.to, { mode:"monitor" }))); }
@@ -4563,6 +4580,15 @@ async function apiCore(request, env, path) {
     await write(env, data => { const h = data.scheduler ||= { beats:[] }; h.running = false; h.lastFinishedAt = new Date().toISOString(); h.lastError = failed[0]?.error || ""; h.consecutiveFailures = failed.length ? (h.consecutiveFailures || 0) + 1 : 0;
       if (!failed.length) h.lastSuccessAt = h.lastFinishedAt; if (good) h.lastBatch = { runId:good.runId, portfolio:good.portfolio, molecule:good.molecule, from:good.from, to:good.to, coverage:good.coverage, retrieved:good.retrieved, at:h.lastFinishedAt };
       h.beats = [{ at:startedAt, ok:!failed.length, batches:results.length, failed:failed.length, remaining }, ...(h.beats || [])].slice(0, 50); });
+    // The line listing is rebuilt on every tick and kept once a day, so the file for any day is there without anyone asking for it.
+    try {
+      const fin = (await load(env)).state, today = day();
+      if (fin.lineListingSnapshot?.date !== today && (fin.cases || []).length) {
+        const rows = (fin.cases || []).filter(c => !c.archived), csv = lineListing(rows, fin.articles, fin), key = "exports/line-listing/" + today + ".csv";
+        await env.BUCKET.put(key, csv, { httpMetadata:{ contentType:"text/csv" } });
+        await write(env, data => { data.lineListingSnapshot = { date:today, key, cases:rows.length, at:new Date().toISOString() }; });
+      }
+    } catch { /* the listing is also available live; a failed snapshot is retried on the next tick */ }
     return json({ results, remaining, evidence });
   }
   // Clients are managed by managers, or by a user a manager has allowed to (Settings > User permissions).
@@ -4596,6 +4622,12 @@ async function apiCore(request, env, path) {
   }
   }
   if (!manager) return json({ error:"Manager access required." },403);
+  if (path === "/api/watch-auto") {
+    const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
+    if (!state.watches.some(w => w.portfolio === portfolio && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
+    await write(env, data => { const w = data.watches.find(x => x.portfolio === portfolio && (x.molecule || "") === molecule); if (body.on === false) w.auto = false; else delete w.auto; });
+    return json({ ok:true });
+  }
   if (path === "/api/client-permission") {
     const who = String(body.email || "").trim().toLowerCase();
     if (!state.profiles.some(p => p.email === who && p.role !== "manager")) return json({error:"Choose a team member (not a manager)."},400);
@@ -4621,6 +4653,7 @@ async function apiCore(request, env, path) {
       if ("senderId" in body) settings.senderId = String(body.senderId || "").trim().slice(0, 60);
       if ("receiverId" in body) settings.receiverId = String(body.receiverId || "").trim().slice(0, 60);
       if ("autoIcsr" in body) settings.autoIcsr = body.autoIcsr !== "off" && body.autoIcsr !== false;
+      if ("autoPull" in body) settings.autoPull = body.autoPull !== "off" && body.autoPull !== false;
       if ("esignFourEyes" in body) settings.esignFourEyes = body.esignFourEyes === true;
       if ("pvNexusUrl" in body) settings.pvNexusUrl = String(body.pvNexusUrl || "").trim();
       if (body.pvNexusToken === null) delete settings.pvNexusToken;
@@ -5014,13 +5047,14 @@ const paths = {
   Discover:'<circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2 5-5 2 2-5z"/>',
   Search:'<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
   Clients:'<path d="M3 21h18M5 21V7l7-4 7 4v14M9 21v-6h6v6M9 10h.01M15 10h.01"/>',
+  "Line Listing":'<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/><path d="M3 3v18" opacity=".0"/>',
   Admin:'<rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
   Archive:'<path d="M3 4h18v4H3zM5 8v12h14V8M10 12h4"/>',
   moon:'<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>', sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
+const subtitles = {"Line Listing":"Every case in one table, built automatically from the cases and kept up to date. Download it any time.",Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -5120,7 +5154,7 @@ function caseForm(){
     '<h3 style="margin:16px 0 8px">Treatment and confounding</h3><label>Treatment given for the event (one per line)<textarea id="casetreat" rows="2">'+esc((d.treatment_given||[]).join(NL))+'</textarea></label>'+
     '<label style="margin-top:10px">Confounders and other causes (one per line, as Type: text)<textarea id="caseconf" rows="3">'+esc((d.confounders||[]).map(c=>c.type+": "+c.text).join(NL))+'</textarea></label>'+
     '<h3 style="margin:16px 0 8px">Authors (reporters)</h3><div class="sub" style="margin-bottom:6px">The first or corresponding author is the primary reporter above. Every other author is listed here as an additional reporter, one per line: name | organisation | country | e-mail. All are sent as primary sources in the E2B file.</div><textarea id="caseotherrep" rows="4" placeholder="Sita Iyer | Test Hospital | India | sita@example.org">'+esc((d.other_reporters||[]).map(r=>[r.name,r.organisation,r.country,r.email].join(" | ")).join(NL))+'</textarea>'+
-    '<h3 style="margin:16px 0 8px">Comments</h3><label>Reporter comments (the authors\' own conclusions, e.g. their view on causality)<textarea id="casereportercomment" rows="3">'+esc(d.reporter_comments||"")+'</textarea></label><label style="margin-top:10px">General comments (case handling notes)<textarea id="casegeneral" rows="3">'+esc(d.general_comments||"")+'</textarea></label><label style="margin-top:10px">Sender comments (your company assessment)<textarea id="casesendercomment" rows="3">'+esc(d.sender_comments||"")+'</textarea></label>'+
+    '<h3 style="margin:16px 0 8px">Comments</h3><label>Reporter comments (the authors’ own conclusions, e.g. their view on causality)<textarea id="casereportercomment" rows="3">'+esc(d.reporter_comments||"")+'</textarea></label><label style="margin-top:10px">General comments (case handling notes)<textarea id="casegeneral" rows="3">'+esc(d.general_comments||"")+'</textarea></label><label style="margin-top:10px">Sender comments (your company assessment)<textarea id="casesendercomment" rows="3">'+esc(d.sender_comments||"")+'</textarea></label>'+
     '<label style="margin-top:14px">Source and abstract<textarea id="casesummary" rows="5">'+esc(d.source_summary)+'</textarea></label><label style="margin-top:10px">Reviewer notes<textarea id="casenotes" rows="2">'+esc(curCase.notes||"")+'</textarea></label>';
 }
 function renderCase(){
@@ -5537,6 +5571,31 @@ async function globalSearch(){
   srch.q=q;srch.scope="all";srch.f={};srch.res=null;tab="Search";render();await runSearchUi(true);
 }
 
+let llState={portfolio:"",client:""};
+async function loadLineListing(){
+  const box=$("llbox");if(!box)return;
+  try{
+    const r=await api("line-listing",{portfolio:llState.portfolio,client:llState.client}), H=r.head, ix=n=>H.indexOf(n);
+    const show=["Case","Client","Suspect product","Event (verbatim)","PT","Serious","Listedness","Outcome","Causality (WHO-UMC)","Stage","Assignee","Clock due","Clock status"];
+    const cols=show.map(ix).filter(i=>i>=0), pf=[...new Set((data.cases||[]).map(c=>c.portfolio).filter(Boolean))].sort();
+    const bar='<div class="filters" style="border:0;padding:0 0 14px"><select id="llpf" aria-label="Portfolio"><option value="">All portfolios</option>'+pf.map(x=>'<option'+(llState.portfolio===x?" selected":"")+'>'+esc(x)+'</option>').join("")+'</select>'+((data.clients||[]).length?'<select id="llcl" aria-label="Client"><option value="">All clients</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'"'+(llState.client===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select>':"")+'<button type="button" class="btn" data-llcsv="1">Download CSV (all '+H.length+' columns)</button><span class="sub" style="align-self:center">'+r.cases+' case'+(r.cases===1?"":"s")+' · '+r.total+' event row'+(r.total===1?"":"s")+' · updated '+esc(new Date(r.generatedAt).toLocaleTimeString())+(r.snapshot?' · daily copy saved '+esc(r.snapshot.date)+' ('+r.snapshot.cases+' cases)':"")+'</span></div>';
+    box.innerHTML=panel("Line listing",bar+(r.rows.length?table(cols.map(i=>H[i]),r.rows.map(row=>cols.map(i=>esc(row[i]))),"",true):'<div class="empty">No cases yet. Cases appear here as soon as QC selects an article for Synchrony.</div>'),"One row per event. Built from the case fields each time you open this page, so it is never out of date."+(data.viewer.role==="manager"?" A copy is also saved once a day by the scheduler.":""),true);
+    $("llpf")&&($("llpf").onchange=e=>{llState.portfolio=e.target.value;loadLineListing();});$("llcl")&&($("llcl").onchange=e=>{llState.client=e.target.value;loadLineListing();});
+  }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
+}
+async function loadAutoPull(){
+  const box=$("autobox");if(!box)return;
+  try{
+    const s=await api("scheduler-status",{}),h=s.heartbeat,when=x=>x?new Date(x).toLocaleString([],{dateStyle:"medium",timeStyle:"short"}):"never";
+    const next=h.lastBeatAt?new Date(Date.parse(h.lastBeatAt)+s.everyMinutes*60000):null, missing=s.perWatch.reduce((n,w)=>n+(w.auto?w.missing:0),0);
+    const state=!s.autoPull?badge("Paused","amber"):!h.lastBeatAt?badge("Waiting for first run","amber"):s.stale?badge("Not running","red"):badge("On","green");
+    const head='<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;justify-content:space-between"><div><div style="display:flex;gap:10px;align-items:center"><b style="font-size:16px">Automatic PubMed pull</b>'+state+'</div><div class="sub" style="margin-top:4px">'+(s.autoPull?'New PubMed articles for every molecule below are pulled once a day (through yesterday). Last check <b>'+esc(when(h.lastBeatAt))+'</b>'+(next&&!s.stale?' · next about <b>'+esc(when(next))+'</b>':"")+(missing?' · '+missing+' day-range'+(missing===1?"":"s")+' waiting':' · nothing waiting'):'Nothing is pulled automatically while this is paused.')+'</div></div>'+
+      '<div style="display:flex;gap:8px"><form data-route="settings" style="margin:0"><input type="hidden" name="autoPull" value="'+(s.autoPull?"off":"on")+'"><button class="btn outline">'+(s.autoPull?"Pause":"Turn on")+'</button></form><button type="button" class="btn" data-autorun="1">Pull now</button></div></div>';
+    const rows=s.perWatch.map(w=>['<b>'+esc(w.molecule||w.portfolio)+'</b><div class="sub">'+esc(w.portfolio)+(w.client?" · "+esc(w.client):"")+'</div>',esc(String(w.articles)),w.lastRunAt?esc(when(w.lastRunAt)):'<span class="sub">never</span>',w.missing?badge(w.missing+" waiting","amber"):badge("up to date","green"),
+      '<form data-route="watch-auto" style="margin:0"><input type="hidden" name="watch" value="'+esc(w.watch)+'"><input type="hidden" name="on" value="'+(w.auto?"false":"true")+'"><button class="btn outline sm">'+(w.auto?"Auto: on":"Auto: off")+'</button></form>']);
+    box.innerHTML='<section><div class="body">'+head+'</div>'+(rows.length?table(["Molecule","Articles","Last pulled","Status","Daily pull"],rows,"",true):'<div class="empty">Add a molecule below and it is pulled automatically from then on.</div>')+'</section>';
+  }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
+}
 async function loadScheduler(){
   const box=$("schedbox");if(!box)return;
   try{
@@ -5977,13 +6036,13 @@ function clientsHtml(){
 function stat(label,value,icon,warn){return '<div class="card tilt'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Clients","Synchrony","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Queue","Synchrony"].concat(data.clientAdmin?["Clients"]:[])).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
+  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Clients","Synchrony","Line Listing","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Queue","Synchrony","Line Listing"].concat(data.clientAdmin?["Clients"]:[])).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   libNumbers=null;
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
   const open=mine.filter(a=>a.status!=="Complete").length;
   $("identity").innerHTML="<b>"+esc(data.viewer.name)+"</b><small>"+esc(data.viewer.email)+" · "+esc(data.viewer.role)+"</small>";
-  const NAVG={Overview:0,"My Queue":0,"All Assignments":0,Clients:0,Synchrony:0,"Search & Pull":1,Search:1,Discover:1,Library:1,Batches:1,Watchlists:1,Archive:1,Team:2,Admin:2,Audit:2,Settings:2,Account:2}, NAVL=["Work","Sources","Team"];
+  const NAVG={Overview:0,"My Queue":0,"All Assignments":0,Clients:0,Synchrony:0,"Line Listing":0,"Search & Pull":1,Search:1,Discover:1,Library:1,Batches:1,Watchlists:1,Archive:1,Team:2,Admin:2,Audit:2,Settings:2,Account:2}, NAVL=["Work","Sources","Team"];
   const navTabs=tabs.map((x,i)=>[x,i]).sort((a,b)=>(NAVG[a[0]]||0)-(NAVG[b[0]]||0)||a[1]-b[1]).map(x=>x[0]);
   let lastG=-1;
   $("nav").innerHTML=navTabs.map(x=>{const g=NAVG[x]||0,head=g!==lastG?'<div class="navlabel">'+NAVL[g]+'</div>':"";lastG=g;return head+'<button class="navbtn" data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+ic(x)+x+(x==="My Queue"&&open?'<span class="n">'+open+"</span>":"")+'</button>';}).join("");
@@ -6095,7 +6154,7 @@ function render() {
       Object.entries(groups).sort((x,y)=>y[1].n-x[1].n).map(([k,g])=>'<div class="row"><span>'+esc(k)+'</span><span class="sub">'+g.d+" / "+g.n+'</span></div>').join(""),"Work through every article assigned to you; mark each Complete when screened."):"")+queueView(mine);
   }
   if(tab==="All Assignments") html=queueView(items);
-  if(tab==="Watchlists") html=panel("Product dictionaries",'<div id="dictbox"></div><form class="grid" data-route="dictionary-save" style="margin-top:12px"><label>Portfolio<input id="dictpf" name="portfolio" required list="pfopts"></label><label class="wide">Products, one per line: name | generics | brands | salts | aliases (names separated by commas)<textarea id="dicttext" name="productsText" rows="5" placeholder="aciclovir | acyclovir | Zovirax, Zovir | aciclovir sodium | ACV"></textarea></label><div><button class="btn">Save dictionary</button></div></form>',"A product listed here is searched under all its names. A name can belong to one product only. Saving a dictionary does not change a watchlist until you preview and apply a new query version.")+
+  if(tab==="Watchlists") html='<div id="autobox"><div class="skel"></div></div>'+panel("Product dictionaries",'<div id="dictbox"></div><form class="grid" data-route="dictionary-save" style="margin-top:12px"><label>Portfolio<input id="dictpf" name="portfolio" required list="pfopts"></label><label class="wide">Products, one per line: name | generics | brands | salts | aliases (names separated by commas)<textarea id="dicttext" name="productsText" rows="5" placeholder="aciclovir | acyclovir | Zovirax, Zovir | aciclovir sodium | ACV"></textarea></label><div><button class="btn">Save dictionary</button></div></form>',"A product listed here is searched under all its names. A name can belong to one product only. Saving a dictionary does not change a watchlist until you preview and apply a new query version.")+
     panel("Query versions",(data.watches.length?'<div class="grid" style="margin-bottom:10px"><label>Watchlist<select id="wsel">'+watchOptions+'</select></label><label>Effective from<input id="wefrom" type="date"></label><label class="wide">Note<input id="wnote" placeholder="Why the query changes"></label><div><button type="button" class="btn outline" id="wprevbtn" data-wpreview="1">Preview change from dictionary</button></div></div><div id="wprev"></div>':'<div class="empty">Save a watchlist first.</div>')+table(["Watchlist","Version","Effective from","By","Note"],data.watches.flatMap(w=>(w.versions||[{version:1,query:w.query,effectiveFrom:"initial",by:"",note:""}]).slice().reverse().slice(0,3).map(v=>[esc(w.portfolio+(w.molecule?" · "+w.molecule:"")),"v"+v.version,esc(v.effectiveFrom==="0000-00-00"?"start":v.effectiveFrom),esc(v.by||""),esc(v.note||"")])),"No versions yet."),"Versions apply prospectively. An import records the version and the exact query it ran with.")+
     panel("Add a watchlist",'<form class="grid" data-route="watch"><label>Portfolio<input name="portfolio" required></label><label>Molecule<input name="molecule" placeholder="Optional"></label>'+((data.clients||[]).length?'<label>Client<select name="client"><option value="">No client</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>').join("")+'</select></label>':"")+'<label class="wide">PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><div><button class="btn">Save watchlist</button></div></form>')+
     panel("Add molecules in bulk",'<form class="grid" data-route="watches"><label>Portfolio<input name="portfolio" required></label>'+((data.clients||[]).length?'<label>Client<select name="client"><option value="">No client</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>').join("")+'</select></label>':"")+'<label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label>Assign all to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Save molecules</button></div></form>',"One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs.")+
@@ -6140,6 +6199,7 @@ function render() {
   if(tab==="Discover")html=discoverHtml();
   if(tab==="Archive")html=archiveHtml();
   if(tab==="Clients")html=clientsHtml();
+  if(tab==="Line Listing")html='<div id="llbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Team"){
     const hosted=data.config.accounts, accts=data.accounts.users;
     const pfList=[...new Set([...data.watches.map(w=>w.portfolio),...data.assignments.map(a=>a.portfolio)])].sort(), mem=data.memberships||[];
@@ -6178,6 +6238,8 @@ function render() {
   if(tab==="Settings"&&$("memorybox"))loadMemory();
   if(tab==="Batches"&&$("batchcov"))loadBatches();
   if(tab==="Batches"&&$("schedbox"))loadScheduler();
+  if(tab==="Line Listing"&&$("llbox"))loadLineListing();
+  if(tab==="Watchlists"&&$("autobox"))loadAutoPull();
   if(tab==="Admin"&&$("kbstatus"))loadKbStatus();
   if(tab==="Watchlists"&&$("dictbox"))loadDictionaries();
   if(tab==="Synchrony"){
@@ -6242,6 +6304,10 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueBody(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
+  const ar=event.target.closest&&event.target.closest("[data-autorun]");
+  if(ar){ar.disabled=true;message("Pulling new articles…");api("scheduled",{force:true}).then(r=>{message("Pull finished: "+r.results.length+" batch"+(r.results.length===1?"":"es")+(r.remaining?", "+r.remaining+" more waiting":"")+".");return refresh();}).catch(e=>message(e.message,true)).finally(()=>{ar.disabled=false;});return;}
+  const lc=event.target.closest&&event.target.closest("[data-llcsv]");
+  if(lc){fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:"csv"})}).then(async res=>{if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"Nothing to export.");const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-line-listing-"+new Date().toISOString().slice(0,10)+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}).catch(e=>message(e.message,true));return;}
   const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
   const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
@@ -6584,6 +6650,7 @@ document.addEventListener("submit",async event=>{
   if(route==="client-delete"&&!confirm("Remove this client? Its molecules are kept."))return;
   if(route==="assign-molecule")body.reassign=body.reassign==="on";
   if(route==="client-permission")body.allowed=body.allowed==="true";
+  if(route==="watch-auto")body.on=body.on==="true";
   if(route==="review")body.id=active.id;
   if(route==="dictionary-save"){body.products=String(body.productsText||"").split(NL).map(l=>l.split("|").map(x=>x.trim())).filter(c=>c[0]).map(c=>({name:c[0],generics:c[1]||"",brands:c[2]||"",salts:c[3]||"",aliases:c[4]||""}));delete body.productsText;}
   if(route==="pull"){["safety","humans","caseReports","english","noReviews"].forEach(k=>{body[k==="safety"?"safetyOnly":k]=body[k]==="on";});}
