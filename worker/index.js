@@ -6,14 +6,23 @@ async function load(env) {
   const object = await env.BUCKET.get(KEY);
   return { object, state: object ? await object.json() : blank() };
 }
-async function write(env, mutate) {
-  for (let attempt = 0; attempt < 5; attempt++) {
+const writeQueues = new WeakMap();
+// Writers in one process line up instead of racing, so a busy moment cannot starve one of them; the compare-and-swap below still protects against other processes.
+function write(env, mutate) {
+  const queue = writeQueues.get(env.BUCKET) || Promise.resolve(), run = queue.then(() => writeOnce(env, mutate));
+  writeQueues.set(env.BUCKET, run.catch(() => {}));
+  return run;
+}
+async function writeOnce(env, mutate) {
+  // Many writers can race on one object (scheduler ticks, imports, reviewers). Each retry re-reads and re-applies the change; a short random pause keeps one writer from losing every round.
+  for (let attempt = 0; attempt < 14; attempt++) {
     const { object, state } = await load(env);
     const value = mutate(state);
     const saved = await env.BUCKET.put(KEY, JSON.stringify(state), {
       onlyIf: object ? { etagMatches: object.etag } : { etagDoesNotMatch: "*" }
     });
     if (saved) return value;
+    await new Promise(resolve => setTimeout(resolve, Math.random() * Math.min(60, 3 * (attempt + 1))));
   }
   throw new Error("Concurrent update. Please retry.");
 }
@@ -786,9 +795,9 @@ async function scanArticle(env, state, article) {
 const LABEL_SECTIONS = [["adverse_reactions", "Adverse reactions"], ["warnings_and_cautions", "Warnings and precautions"], ["warnings", "Warnings"], ["precautions", "Precautions"], ["boxed_warning", "Boxed warning"], ["contraindications", "Contraindications"], ["overdosage", "Overdosage"]];
 const slugOf = t => String(t || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
 const labelLinks = name => ({ dailymed:"https://dailymed.nlm.nih.gov/dailymed/search.cfm?labeltype=all&query=" + encodeURIComponent(name), ema:"https://www.ema.europa.eu/en/search?search_api_fulltext=" + encodeURIComponent(name), emc:"https://www.medicines.org.uk/emc/search?q=" + encodeURIComponent(name) });
-async function fetchLabel(env, name) {
+async function fetchLabel(env, name, opts = {}) {
   const key = "smpc/" + slugOf(name) + ".json", now = Date.now();
-  try { const cached = await env.BUCKET.get(key); if (cached) { const c = JSON.parse(await cached.text()); if (now - Date.parse(c.fetchedAt) < (c.label ? 30 : 1) * 86400000) return c; } } catch { /* refetch */ }
+  if (!opts.fresh) try { const cached = await env.BUCKET.get(key); if (cached) { const c = JSON.parse(await cached.text()); if (now - Date.parse(c.fetchedAt) < (c.label ? 30 : 1) * 86400000) return c; } } catch { /* refetch */ }
   const q = encodeURIComponent('openfda.generic_name:"' + name + '"') + "+" + encodeURIComponent('openfda.brand_name:"' + name + '"') + "+" + encodeURIComponent('openfda.substance_name:"' + name + '"');
   let label = null, error = "";
   try {
@@ -939,6 +948,7 @@ async function automateCase(env, state, c, by, lease = null) {
   const writable = (d,x) => x && (!lease || (syncDraftOpen(d,x) && d.settings?.automation?.auto !== false && x.syncEnrichment?.lease === lease));
   const at = new Date().toISOString(), steps = [], note = (key, label, ok, detail) => steps.push({ key, label, ok, detail });
   const article = state.articles[c.pmid], data = normalizeCase(c.data), base = JSON.parse(JSON.stringify(data)), cfg = state.settings?.automation || {};
+  let refBasis = null;
   // 1. events: if the case has none, take the ones the scanner found in the text
   let scan = null, scanScoped = true; try { if (article) { const raw = await scanArticle(env, state, article); scan = scopeScan(raw, c); scanScoped = Boolean(scan) || !raw; } } catch { /* text unavailable */ }
   if (scan?.patients === 1 && !data.events.some(e => hasVal(e.verbatim))) {
@@ -963,8 +973,9 @@ async function automateCase(env, state, c, by, lease = null) {
   if (cfg.smpc !== false && suspect) {
     try {
       const got = await fetchLabel(env, v(suspect.name));
-      if (got.label) { let listed = 0, missed = 0; assist.events.forEach(a => { const e = data.events[a.index]; if (!e || !a.verbatim) return; const terms = uniq([a.verbatim, v(e.pt), v(e.llt), ...a.meddra.slice(0, 2).flatMap(m => [m.pt.name, m.llt.name])]).filter(Boolean), r = matchEventInLabel(got.label.sections, terms);
-          if (r.listedness === "listed") { setProposed(e, "listedness", "Listed", r.quote ? [{ excerpt:r.quote, source:"FDA label via openFDA, " + r.sectionLabel }] : []); setProposed(e, "rsi", "FDA label via openFDA (" + (got.label.brand || got.label.generic) + "), " + r.sectionLabel + (got.label.effective ? ", effective " + got.label.effective : ""), []); listed++; } else missed++; });
+      if (got.label) { let listed = 0, missed = 0; const used = []; assist.events.forEach(a => { const e = data.events[a.index]; if (!e || !a.verbatim) return; const terms = uniq([a.verbatim, v(e.pt), v(e.llt), ...a.meddra.slice(0, 2).flatMap(m => [m.pt.name, m.llt.name])]).filter(Boolean), r = matchEventInLabel(got.label.sections, terms);
+          if (r.listedness === "listed") { setProposed(e, "listedness", "Listed", r.quote ? [{ excerpt:r.quote, source:"FDA label via openFDA, " + r.sectionLabel }] : []); setProposed(e, "rsi", "FDA label via openFDA (" + (got.label.brand || got.label.generic) + "), " + r.sectionLabel + (got.label.effective ? ", effective " + got.label.effective : ""), []); used.push({ index:a.index, term:a.verbatim }); listed++; } else missed++; });
+        refBasis = { product:got.label.generic || v(suspect.name), query:v(suspect.name), market:"US (FDA label)", setId:got.label.setId, version:String(got.label.version || ""), effective:got.label.effective || "", at, events:used };
         note("smpc", "Listedness (SmPC)", true, listed + " listed in the label; " + missed + " not found, so left for you to confirm in the EU SmPC"); }
       else note("smpc", "Listedness (SmPC)", false, got.error || "No label found online for " + v(suspect.name));
     } catch (error) { note("smpc", "Listedness (SmPC)", false, String(error.message).slice(0, 100)); }
@@ -1001,7 +1012,7 @@ async function automateCase(env, state, c, by, lease = null) {
   // save what the free steps did, then the capped AI step on the saved case
   const ops = diffCase(base, data);
   const revision = crypto.randomUUID();
-  const saved = await write(env, d => { const x = d.cases.find(y => y.id === c.id); if (!writable(d,x) || x.locked || (lease && x.editRevision !== c.editRevision)) return false; const fresh = normalizeCase(x.data); applyCaseOps(fresh, ops); x.data = fresh; x.updatedAt = at; x.editRevision = revision; return true; });
+  const saved = await write(env, d => { const x = d.cases.find(y => y.id === c.id); if (!writable(d,x) || x.locked || (lease && x.editRevision !== c.editRevision)) return false; const fresh = normalizeCase(x.data); applyCaseOps(fresh, ops); x.data = fresh; if (refBasis && !x.referenceBasis) x.referenceBasis = refBasis; x.updatedAt = at; x.editRevision = revision; return true; });
   if (!saved) return { at, steps };
   if (cfg.ai === true && !(state.settings?.syncAiPortfolios || []).includes(c.portfolio)) note("ai", "AI data entry", false, "The portfolio " + c.portfolio + " is not allowed to use AI (Settings, Synchrony pilot portfolios)");
   else if (cfg.ai === true) {
@@ -1435,6 +1446,7 @@ function caseEvidenceDelta(state, rec) {
     changes.push({ title:"Citation revised", before:old.slice(0,2).join("\n").slice(0,6000), after:next.slice(0,2).join("\n").slice(0,6000) });
   }
   if (originalText !== undefined && originalText !== current.fulltext) changes.push({ title:"Full-text evidence changed", before:originalText || "No stored full text", after:current.fulltext || "No stored full text" });
+  if (rec.referenceChange?.status === "open") changes.push({ title:"Reference safety information revised", before:rec.referenceChange.product + " label " + (rec.referenceChange.from.effective || rec.referenceChange.from.version || "earlier version"), after:rec.referenceChange.product + " label " + (rec.referenceChange.to.effective || rec.referenceChange.to.version || "newer version") + ". Check listedness of: " + (rec.referenceChange.events.map(x => x.term).join(", ") || "the reactions") });
   for (const label of current.labels) {
     if (label.cited !== label.latest && !previous?.labels.some(p => p.cited === label.cited && p.latest === label.latest)) changes.push({ title:"Reference safety information revised", before:label.before, after:label.after });
   }
@@ -4069,17 +4081,60 @@ async function syncPrepareAi(env, state, assignment, article, extraction, patien
   return { status:"prepared", proposals, tokens:response.tokens, model:response.model };
 }
 // A released (signed) case is never edited. When its source evidence changes, one linked follow-up version is opened for review instead, once per evidence revision.
+// Safety references move: a label is revised, an SmPC is replaced. Once a day this compares the label each case relied on with the current one, names the reactions whose listedness depends on it,
+// puts the case back on the reviewer's desk (open cases) or opens a linked follow-up version (released cases). Nothing already signed is changed.
+async function checkReferenceSafety(env, opts = {}) {
+  const { state } = await load(env), now = Date.now(), seen = new Map(), changed = [];
+  for (const c of state.cases || []) {
+    const b = c.referenceBasis; if (!b?.product || c.archived || c.followUpOf && !b.version) continue;
+    const key = b.query || b.product;
+    if (!seen.has(key)) {
+      const last = state.referenceChecks?.[key];
+      if (!opts.force && last && now - Date.parse(last) < 86400000) { seen.set(key, null); continue; }
+      let got = null; try { got = await fetchLabel(env, key, { fresh:true }); } catch { /* try again tomorrow */ }
+      seen.set(key, got?.label ? { setId:got.label.setId || "", version:String(got.label.version || ""), effective:got.label.effective || "" } : null);
+    }
+  }
+  await write(env, data => {
+    data.referenceChecks ||= {};
+    for (const [key, cur] of seen) if (cur) data.referenceChecks[key] = new Date().toISOString();
+    for (const c of data.cases || []) {
+      const b = c.referenceBasis, cur = b && seen.get(b.query || b.product); if (!cur || c.archived) continue;
+      const moved = (cur.version && cur.version !== b.version) || (cur.effective && b.effective && cur.effective !== b.effective) || (cur.setId && b.setId && cur.setId !== b.setId); if (!moved) continue;
+      if (c.referenceChange?.status === "open" && c.referenceChange.to.version === cur.version && c.referenceChange.to.effective === cur.effective) continue;
+      const at = new Date().toISOString();
+      c.referenceChange = { status:"open", product:b.product, market:b.market, from:{ version:b.version, effective:b.effective }, to:cur, events:b.events || [], at };
+      (c.history ||= []).push({ at, by:"system", action:"Reference safety information for " + b.product + " changed (" + (b.effective || b.version || "earlier") + " to " + (cur.effective || cur.version) + ")" });
+      if (!c.locked) {
+        c.evidenceReviewPending = true;
+        const q = "Re-check listedness against the revised " + b.product + " label" + ((b.events || []).length ? " for: " + b.events.map(x => x.term).join(", ") : "");
+        const rows = c.followups ||= []; if (!rows.some(f => f.question === q && f.status === "open")) rows.push({ id:crypto.randomUUID(), question:q, by:"system", at, status:"open", kind:"reference" });
+      }
+      changed.push(c.number);
+    }
+    // released cases get a linked follow-up version for the changed reference; the original signed record stays as it was
+    openFollowUpVersions(data, "system", p => syncModeFor(data, p) === "active");
+  });
+  if (changed.length) await audit(env, { by:"system", action:"reference.changed", entityType:"Reference data", entityId:changed.length + " cases", detail:{ cases:changed.slice(0, 50) } });
+  return { checked:[...seen.values()].filter(Boolean).length, changed };
+}
 function openFollowUpVersions(data, by, allowed = () => true) {
   const opened = [];
   for (const original of [...(data.cases || [])]) {
     if (!allowed(original.portfolio) || !original.locked || !activeSignature(original) || original.archived || original.followUpOf) continue;
     const article = data.articles[original.pmid]; if (!article || !caseEvidenceDelta(data, original).changes.length) continue;
-    const key = ["followup", original.id, JSON.stringify(evidenceRef(article))].join("|");
+    const key = ["followup", original.id, JSON.stringify(evidenceRef(article)), original.referenceChange?.status === "open" ? original.referenceChange.to.version + "|" + original.referenceChange.to.effective : ""].join("|");
     if (data.cases.some(c => c.provenance?.followUpKey === key)) continue;
     const at = new Date().toISOString(), number = allocateCaseNumber(data), copy = JSON.parse(JSON.stringify(original.data)); delete copy.approval;
     const rec = { id:crypto.randomUUID(), number, pmid:original.pmid, portfolio:original.portfolio, molecule:original.molecule || "", status:"Draft", stage:"medical_review", createdAt:at, updatedAt:at, createdBy:by, assignee:original.assignee || "", screener:original.screener, intake:"follow-up", followUpOf:original.id, notes:"",
       data:{ ...copy, case_id:number, narrative:undefined }, provenance:{ ...(original.provenance || {}), idempotencyKey:undefined, followUpKey:key, followUpOfNumber:original.number, evidence:evidenceRef(article) },
       links:[{ otherId:original.id, otherNumber:original.number, kind:"follow_up_of", status:"confirmed", by, at, note:"Source evidence changed after release", reasons:caseEvidenceDelta(data, original).changes.map(x => x.title) }], history:[{ at, by, action:"Follow-up version opened from " + original.number + " because the source evidence changed. The released version is unchanged." }] };
+    if (original.referenceChange?.status === "open") {
+      // the new version starts with the changed label as its basis and the dependent listedness fields blank, so automation proposes them again from the new text
+      const rc = original.referenceChange; rec.referenceBasis = { ...rc.to, product:rc.product, market:rc.market, events:[] };
+      for (const ev of rec.data.events || []) if (rc.events.some(x => x.term === (ev.verbatim?.value || ""))) { ev.listedness = icsrField("", "proposed"); ev.rsi = icsrField("", "proposed"); ev.expectedness = icsrField("", "proposed"); delete ev.listedness_assessment; }
+      rec.referenceChange = null; original.referenceChange = { ...rc, status:"followed_up", followUp:number };
+    }
     rec.provenance.sourceSnapshot = caseEvidenceSnapshot(data, rec);
     original.links = [...(original.links || []), { otherId:rec.id, otherNumber:number, kind:"has_follow_up", status:"confirmed", by, at, note:"Source evidence changed after release" }];
     (original.history ||= []).push({ at, by, action:"Follow-up version " + number + " opened for changed source evidence" });
@@ -4584,6 +4639,7 @@ async function synchronyApi(env, state, viewer, body) {
   }
   if (action === "desk") return json({ queues:deskQueues(state, viewer) });
   if (action === "jobs") { if (viewer.role !== "manager") return json({error:"Manager access required."},403); return json(jobsBoard(state)); }
+  if (action === "reference_check") { if (viewer.role !== "manager") return json({error:"Manager access required."},403); return json(await checkReferenceSafety(env, { force:true })); }
   if (action === "run") {
     if (viewer.role !== "manager") return json({error:"Manager access required."},403);
     return json({ ...(await prepareSynchrony(env)), packages:await prepareSynchronyExports(env) });
@@ -4599,7 +4655,7 @@ async function synchronyApi(env, state, viewer, body) {
     const local = localAssessment(normalizeCase(c.data));
     return json({ mode:syncMode(state), checks:synchronyChecks(state,c), narrative:draft, validation:validateE2b(c,article,c.approval?.profile || "ICH",await loadMeddra(env)),
       ai:c.preparation?.ai || null, timeline:caseChronology(normalizeCase(c.data)), chronology:(c.preparation?.chronology || []).map(i => ({ ...i, source:evidenceKind(article, i) })), qcFlags:c.qc?.flags || [], followups:c.followups || [], suggestedFollowups:(local.follow_up?.questions || []).slice(0,10),
-      handoffs:c.handoffs || [], release:c.preparedRelease || null, agreement, matrix:assessmentMatrix(state,c), deadline:deadlineBasis(state,c),
+      handoffs:c.handoffs || [], release:c.preparedRelease || null, agreement, matrix:assessmentMatrix(state,c), deadline:deadlineBasis(state,c), referenceChange:c.referenceChange || null, referenceBasis:c.referenceBasis || null,
       canEdit:edit && !c.locked && !c.archived, assignment:a?.synchrony ? { status:a.synchrony.status, issues:a.synchrony.issues || [], mode:a.synchrony.mode } : null });
   }
   if (action === "package") {
@@ -4634,6 +4690,17 @@ async function synchronyApi(env, state, viewer, body) {
       await audit(env,{by:email,action:"synchrony.ai.applied",entityType:"Case",entityId:c.number,detail:{fields:saved.applied}});
     }
     return json({ applied:saved.applied });
+  }
+  if (action === "reference_ack") {
+    const out = await write(env, d => { const x = d.cases.find(r => r.id === c.id); if (!x || !canEditCase(d, viewer, x) || x.locked || x.referenceChange?.status !== "open") return null;
+      const rc = x.referenceChange, at = new Date().toISOString(); x.referenceBasis = { ...(x.referenceBasis || {}), ...rc.to, product:rc.product, market:rc.market, at, events:x.referenceBasis?.events || rc.events };
+      x.referenceChange = { ...rc, status:"acknowledged", by:email, at, note:String(body.note || "").slice(0, 300) };
+      for (const f of x.followups || []) if (f.kind === "reference" && f.status === "open") Object.assign(f, { status:"resolved", resolution:"Listedness re-checked against the revised label", resolvedBy:email, resolvedAt:at });
+      if (!caseEvidenceDelta(d, x).changes.length) x.evidenceReviewPending = false;
+      (x.history ||= []).push({ at, by:email, action:"Confirmed listedness against the revised " + rc.product + " label" }); return true; });
+    if (!out) return json({ error:"There is no open reference change on this case, or it is signed." }, 409);
+    await audit(env, { by:email, action:"reference.acknowledged", entityType:"Case", entityId:c.number });
+    return json({ ok:true });
   }
   if (!["followup_add","followup_resolve","handoff","acknowledge","reject"].includes(action)) return json({error:"Unknown Synchrony action."},400);
   const note = String(body.note || "").trim().slice(0,1200), recipient = String(body.recipient || "").trim().slice(0,160);
@@ -4767,7 +4834,7 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"review", target:"PMID " + reviewed.pmid, detail:reviewed.before + " → " + body.status + (body.note ? " (note saved)" : "") });
     return json({ ok:true });
   }
-  if (path === "/api/synchrony-tick" && service) return json({ ...(await prepareSynchrony(env)), packages:await prepareSynchronyExports(env) });
+  if (path === "/api/synchrony-tick" && service) return json({ ...(await prepareSynchrony(env)), packages:await prepareSynchronyExports(env), reference:await checkReferenceSafety(env).catch(() => null) });
   if (path === "/api/synchrony" && viewer) return synchronyApi(env,state,viewer,body);
   if (path === "/api/synchrony-import" && viewer) {
     // A document goes straight into Synchrony: a Discover result, a PDF or XML, or pasted OCR text. It becomes an article, a "potential ICSR" assignment in the chosen portfolio, stored full text, and a prepared draft.
@@ -5901,7 +5968,7 @@ async function apiCore(request, env, path) {
     }
     const remaining = Math.max(0, plan.length - maxWatchesPerRun), failed = results.filter(r => r.error), good = results.filter(r => !r.error && r.runId && ["reconciled", "zero_results"].includes(r.coverage)).pop();
     const evidence = await collectEvidence(env);
-    const synchrony = await prepareSynchrony(env);
+    const synchrony = await prepareSynchrony(env); await checkReferenceSafety(env).catch(() => null);
     const packages = await prepareSynchronyExports(env);
     await write(env, data => { const h = data.scheduler ||= { beats:[] }; h.running = false; h.lastFinishedAt = new Date().toISOString(); h.lastError = failed[0]?.error || ""; h.consecutiveFailures = failed.length ? (h.consecutiveFailures || 0) + 1 : 0;
       if (!failed.length) h.lastSuccessAt = h.lastFinishedAt; if (good) h.lastBatch = { runId:good.runId, portfolio:good.portfolio, molecule:good.molecule, from:good.from, to:good.to, coverage:good.coverage, retrieved:good.retrieved, at:h.lastFinishedAt };
@@ -6700,7 +6767,7 @@ async function loadSynJobs(){
       r.enrichmentRetry.map(f=>'<div class="sub">'+esc(f.number)+' · '+esc(f.error)+'</div>').join("")+
       '<div class="sub" style="margin:8px 0">OpenAI this month: '+r.ai.tokens+' tokens in '+r.ai.calls+' calls · '+r.ai.tokensPerPreparedCase+' tokens per prepared case'+(r.ai.costPerPreparedCaseUsd!==null?' · about $'+r.ai.costPerPreparedCaseUsd+' per case':"")+'</div>'+
       (r.failures.length?r.failures.map(f=>'<div class="row"><span>PMID '+esc(f.pmid)+' · '+esc(f.portfolio)+' · '+esc(f.status)+' after '+f.attempts+' attempt'+(f.attempts===1?"":"s")+'<div class="sub">'+esc(f.error)+(f.history.length?" · history: "+f.history.map(h=>esc(h.error)).join(" / "):"")+'</div></span></div>').join(""):"")+
-      (r.sourceFailures.length?'<div class="sub" style="margin-top:8px">Source problems: '+r.sourceFailures.length+' (missing or unreadable full text)</div>':"")+'</details>';
+      (data.config.automation&&data.config.automation.smpc?'<button type="button" class="btn outline sm" data-sync-act="reference_check" style="margin-top:8px" title="Compare the labels cases relied on with the current ones">Check safety references now</button> ':"")+(r.sourceFailures.length?'<div class="sub" style="margin-top:8px">Source problems: '+r.sourceFailures.length+' (missing or unreadable full text)</div>':"")+'</details>';
   }catch(e){box.textContent="";}
 }
 async function renderSynchronyPanel(){
@@ -6723,7 +6790,8 @@ async function renderSynchronyPanel(){
     const rv=curCase.aiReview, qcStage=caseStage(curCase)==="qc", canAi=r.canEdit||qcStage;
     const aiCard='<div class="as-card"><h3>AI check against the article</h3><div class="sub">Compares the entered values with this patient own sentences. Each finding quotes the sentence it rests on. Redacted, capped and cached.</div>'+(canAi?'<div class="as-btns"><button type="button" class="btn sm" data-aireview="1">'+(rv?"Check again":"Run AI check")+'</button></div>':"")+
       (rv?(rv.issues.length?rv.issues.map((x,i)=>'<div class="as-sug"><span><b>'+esc(x.label)+'</b>: entered "'+esc(x.entered)+'"'+(x.suggestion?' · article says "'+esc(x.suggestion)+'"':"")+'<div class="sub">'+esc(x.problem)+'</div><div class="sub">"'+esc(x.sentence)+'"</div></span><span class="as-btns">'+(x.suggestion&&r.canEdit?'<button type="button" class="btn outline sm" data-aiuse="'+i+'">Use</button>':"")+(qcStage?'<button type="button" class="btn outline sm" data-aiflag="'+i+'">Flag</button>':"")+'</span></div>').join(""):'<div class="sub" style="margin-top:8px">Nothing contradicts the article ('+rv.checked+' values checked).</div>'):"")+'</div>';
-    box.innerHTML=aiCard+'<div class="as-card"><h3>Review exceptions</h3>'+(check||'<p class="sub">No listed findings.</p>')+
+    const rc=r.referenceChange, refCard=rc&&rc.status==="open"?'<div class="as-card" style="border-color:var(--amber)"><h3>Safety reference changed</h3><div class="sub">'+esc(rc.product)+' label '+esc(rc.from.effective||rc.from.version||"earlier")+' to '+esc(rc.to.effective||rc.to.version||"newer")+'. Listedness of these reactions relied on it: <b>'+esc((rc.events||[]).map(x=>x.term).join(", ")||"the reactions")+'</b>.</div>'+(r.canEdit?'<div class="as-btns"><button type="button" class="btn sm" data-refack="1">Listedness re-checked</button><button type="button" class="btn outline sm" data-caseact="automate">Run automation again</button></div>':"")+'</div>':rc&&rc.status==="followed_up"?'<div class="as-card"><div class="sub">The safety reference changed after release. Follow-up version '+esc(rc.followUp||"")+' carries the review.</div></div>':"";
+    box.innerHTML=refCard+aiCard+'<div class="as-card"><h3>Review exceptions</h3>'+(check||'<p class="sub">No listed findings.</p>')+
       (r.assignment?.issues?.length?'<details open><summary>Intake exceptions</summary>'+r.assignment.issues.map(x=>'<div class="fl-item"><i>!</i><span>'+esc(x.text)+'<div class="sub">'+esc(x.action||"")+(x.owner?' · owner '+esc(x.owner):"")+'</div></span></div>').join("")+'</details>':"")+'</div>'+((r.chronology||[]).length?'<div class="as-card"><h3>From the article, in order</h3>'+r.chronology.slice(0,14).map(t=>'<div class="fl-item"><i>'+esc({exposure:"▶",action:"■",dechallenge:"↓",rechallenge:"↻",onset:"!",outcome:"✓",test:"⚗",treatment:"+"}[t.kind]||"•")+'</i><span>'+esc(t.text)+(t.negated?' <span class="badge">denied</span>':"")+'<div class="sub">'+esc((t.when||"time not stated")+" · "+t.kind+" · "+(t.source||"")+" · "+t.section)+'</div></span></div>').join("")+'</div>':"")+(r.timeline&&r.timeline.length?'<div class="as-card"><h3>Timeline</h3>'+r.timeline.map(t=>'<div class="fl-item"><i>'+esc({exposure:"▶",action:"■",dechallenge:"↓",rechallenge:"↻",onset:"!",outcome:"✓",test:"⚗"}[t.kind]||"•")+'</i><span>'+esc(t.label)+'<div class="sub">'+esc(t.when||"time not stated")+'</div></span></div>').join("")+'</div>':"")+
       '<div class="as-card"><h3>Drug and reaction assessment</h3>'+(matrix?'<div class="tablewrap"><table><thead><tr><th>Product</th><th>Reaction</th><th>MedDRA</th><th>Seriousness</th><th>Listedness</th><th>Causality</th></tr></thead><tbody>'+matrix+'</tbody></table></div>':'<p class="sub">No suspect product and reaction pair yet.</p>')+'<div class="sub" style="margin-top:8px">Reporting clock: '+esc((dl.due||"not set")+(dl.basis?" · counted from "+dl.basis:""))+'</div>'+(dl.awarenessConfirmed===false?'<div class="roban" style="margin-top:6px">Awareness date not confirmed. The deadline may move.</div>':'')+'</div><div class="as-card"><h3>Format check</h3>'+agree+'</div>'+
       (proposals?'<div class="as-card"><h3>Source-backed proposals</h3>'+proposals+(r.canEdit?button("apply_ai","Apply selected as proposals"):"")+'</div>':"")+
@@ -6734,6 +6802,9 @@ async function renderSynchronyPanel(){
   }catch(e){if(request===syncPanelRequest)box.textContent=e.message;}
 }
 async function synchronyAction(action, taskId){
+  if(action==="reference_check"){
+    const r=await api("synchrony",{action});await refresh();render();message(r.checked+" label"+(r.checked===1?"":"s")+" checked · "+r.changed.length+" case"+(r.changed.length===1?"":"s")+" affected");return;
+  }
   if(action==="run"){
     const result=await api("synchrony",{action});
     await refresh();render();message(result.processed+" prepared · "+result.created+" drafts · "+result.packages+" packages");
@@ -8289,6 +8360,7 @@ document.addEventListener("click",event=>{
   if(sm){sm.disabled=true;$("aismokeout").textContent="Testing…";api("ai-smoke",{}).then(r=>{$("aismokeout").innerHTML=(r.ok?badge("Working","green"):badge("Not available","amber"))+" "+esc(r.ok?("Reply in "+r.latencyMs+" ms · "+r.tokens+" tokens · "+r.used+" of "+r.limit+" used this month · model "+r.model+" · key from "+r.keySource):(r.reason||""));return refresh();}).catch(e=>{$("aismokeout").textContent=e.message;}).finally(()=>{sm.disabled=false;});return;}
   const ks=event.target.closest&&event.target.closest("[data-aikeysave]");
   if(ks){const key=($("aikeyinline")||{}).value||"",lim=Number(($("ailimitinline")||{}).value)||0;if(!key.trim()){message("Paste the key first.",true);return;}ks.disabled=true;api("settings",{openaiKey:key.trim(),aiEnabled:"on",aiMonthlyTokens:lim}).then(()=>refresh()).then(()=>{if(curCase){const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}}message("AI is on. Monthly limit "+lim.toLocaleString()+" tokens.");}).catch(e=>{message(e.message,true);ks.disabled=false;});return;}
+  const rfa=event.target.closest&&event.target.closest("[data-refack]");if(rfa){const note=prompt("Note: what did you check in the revised label?","Listedness re-checked against the revised label")||"";if(note.length<5)return;api("synchrony",{id:curCase.id,action:"reference_ack",note}).then(async()=>{await refreshCase();message("Recorded.");}).catch(e=>message(e.message,true));return;}
   const air=event.target.closest&&event.target.closest("[data-aireview],[data-aiuse],[data-aiflag]");
   if(air){
     const d=air.dataset;
@@ -8342,7 +8414,7 @@ document.addEventListener("click",event=>{
   const lc=event.target.closest&&event.target.closest("[data-llcsv]");
   if(lc){fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:"csv"})}).then(async res=>{if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"Nothing to export.");const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-line-listing-"+new Date().toISOString().slice(0,10)+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}).catch(e=>message(e.message,true));return;}
   const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);

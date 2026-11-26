@@ -137,3 +137,12 @@ test("overlapping batch ZIP requests produce one export version, and a changed m
   const s = await t.state(); s.articles["81"].fullTextKey = "evidence/81/pmc.xml"; s.articles["81"].fullTextStatus = "Captured"; await t.BUCKET.put("bench.json", JSON.stringify(s)); await t.BUCKET.put("evidence/81/pmc.xml", "<article/>");
   assert.equal((await t.raw(MANAGER, "/api/batch-zip", { runId: "r1" })).headers.get("X-Export-Version"), "2");
 });
+
+test("many writers racing on the state all land: no write is lost and none gives up", async () => {
+  const t = await makeEnv({ profiles: [{ email: MANAGER, name: "Boss", role: "manager", active: true }, { email: SCREENER, name: "Asha", role: "reviewer", active: true, capacity: 99 }] });
+  // 30 simultaneous profile saves go through the normal route; every one must succeed and every profile must exist afterwards
+  const names = Array.from({ length: 30 }, (_, i) => "p" + i + "@example.org");
+  const out = await Promise.all(names.map(e => t.call(MANAGER, "/api/profile", { name: "P " + e, email: e, role: "reviewer", capacity: 10 })));
+  assert.deepEqual([...new Set(out.map(r => r.status))], [200], JSON.stringify(out.filter(r => r.status !== 200).slice(0, 2).map(r => r.body)));
+  const s = await t.state(); for (const e of names) assert.ok(s.profiles.some(p => p.email === e), e + " was saved");
+});
