@@ -4995,6 +4995,14 @@ aside{background:var(--side);color:var(--side-fg);padding:18px 14px;display:flex
 .navbtn:hover{background:var(--side-hover);color:#fff}.navbtn[aria-current]{background:var(--side-hover);color:#fff;box-shadow:inset 2px 0 0 #3cc3ab}
 .navbtn .n{margin-left:auto;font-size:12px;background:#0e6a5d;color:#fff;border-radius:99px;padding:0 7px}
 .spacer{flex:1}
+.top #sidetoggle{padding:7px 9px;flex:none}
+.shell{transition:grid-template-columns .22s ease}
+.shell.collapsed{grid-template-columns:68px minmax(0,1fr)}
+.shell.collapsed aside{padding:14px 8px;align-items:center}
+.shell.collapsed .nl,.shell.collapsed .navlabel,.shell.collapsed .who,.shell.collapsed aside form,.shell.collapsed .brand>:not(.logo){display:none}
+.shell.collapsed .brand{padding:4px 0 14px}.shell.collapsed aside nav{width:100%;align-items:center}
+.shell.collapsed .navbtn{justify-content:center;padding:9px 0;position:relative}.shell.collapsed .navbtn .n{position:absolute;top:2px;right:6px;font-size:10px;padding:0 5px}
+.shell.collapsed .navlabel+.navbtn{margin-top:0}
 .fbar{display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 16px}
 .fchip{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);background:var(--card);color:var(--fg);border-radius:99px;padding:5px 8px 5px 14px;font-weight:500;font-size:13px;cursor:pointer;box-shadow:0 1px 0 #ffffffb3 inset,0 2px 0 #0d15120d;transition:background .15s,border-color .15s}
 .fchip b{display:inline-block;min-width:24px;text-align:center;border-radius:99px;background:var(--accent);padding:1px 7px;font-size:12px;font-variant-numeric:tabular-nums}
@@ -5098,8 +5106,8 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 @media(max-width:860px){.shell{grid-template-columns:1fr}aside{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center}.brand{padding:4px 10px}.who,.spacer{display:none}.navbtn{width:auto}.grid2{grid-template-columns:1fr}.top,main{padding-left:16px;padding-right:16px}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}.tile3d{transform:none}}
 </style>
-<div class="shell"><aside><div class="brand"><span class="logo"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18M6 12h12M10 19h4"/></svg></span>LiteraSift</div><nav id="nav" aria-label="LiteraSift"></nav><div class="spacer"></div><div class="who" id="identity"></div></aside>
-<div><div class="top"><div><h1 id="heading">LiteraSift</h1><p id="subhead"></p></div><input id="gsearch" type="search" placeholder="Search drugs, brands, cases, citations…" aria-label="Search everything" style="margin-left:auto;margin-right:8px;width:min(340px,40vw);border-radius:999px;padding:9px 16px"><span class="sub" style="margin-right:8px;white-space:nowrap">v0.01 · Dr Sriram</span><button class="btn outline icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button></div>
+<div class="shell"><aside><div class="brand"><span class="logo"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18M6 12h12M10 19h4"/></svg></span><span class="bname">LiteraSift</span></div><nav id="nav" aria-label="LiteraSift"></nav><div class="spacer"></div><div class="who" id="identity"></div></aside>
+<div><div class="top"><button type="button" class="btn outline icon-btn" id="sidetoggle" aria-label="Collapse the side panel" title="Collapse or expand the side panel"></button><div style="margin-right:auto"><h1 id="heading">LiteraSift</h1><p id="subhead"></p></div><input id="gsearch" type="search" placeholder="Search drugs, brands, cases, citations…" aria-label="Search everything" style="margin-left:auto;margin-right:8px;width:min(340px,40vw);border-radius:999px;padding:9px 16px"><span class="sub" style="margin-right:8px;white-space:nowrap">v0.01 · Dr Sriram</span><button class="btn outline icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button></div>
 <main id="content"><div class="skel"></div><div class="skel"></div><div class="skel"></div></main><footer class="sub" style="margin:28px 0 12px;text-align:center">LiteraSift v0.01 · Developed by Dr Sriram</footer></div></div>
 <div id="toast" role="status"></div>
 <dialog id="casedlg" style="width:min(1180px,96vw);max-height:92vh;overflow:auto"><div id="casehead" style="display:flex;justify-content:space-between;gap:12px;align-items:flex-end;margin-bottom:14px"></div>
@@ -5132,6 +5140,7 @@ const paths = {
   "Line Listing":'<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/><path d="M3 3v18" opacity=".0"/>',
   Admin:'<rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
   Archive:'<path d="M3 4h18v4H3zM5 8v12h14V8M10 12h4"/>',
+  sidebar:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
   moon:'<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>', sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
@@ -6163,7 +6172,7 @@ function render() {
   const NAVG={Overview:0,"My Queue":0,"All Assignments":0,Clients:0,Synchrony:0,"Line Listing":0,"Search & Pull":1,Search:1,Discover:1,Library:1,Batches:1,Watchlists:1,Archive:1,Team:2,Admin:2,Audit:2,Settings:2,Account:2}, NAVL=["Work","Sources","Team"];
   const navTabs=tabs.map((x,i)=>[x,i]).sort((a,b)=>(NAVG[a[0]]||0)-(NAVG[b[0]]||0)||a[1]-b[1]).map(x=>x[0]);
   let lastG=-1;
-  $("nav").innerHTML=navTabs.map(x=>{const g=NAVG[x]||0,head=g!==lastG?'<div class="navlabel">'+NAVL[g]+'</div>':"";lastG=g;return head+'<button class="navbtn" data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+ic(x)+x+(x==="My Queue"&&open?'<span class="n">'+open+"</span>":"")+'</button>';}).join("");
+  $("nav").innerHTML=navTabs.map(x=>{const g=NAVG[x]||0,head=g!==lastG?'<div class="navlabel">'+NAVL[g]+'</div>':"";lastG=g;return head+'<button class="navbtn" title="'+x+'" data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+ic(x)+'<span class="nl">'+x+'</span>'+(x==="My Queue"&&open?'<span class="n">'+open+"</span>":"")+'</button>';}).join("");
   $("heading").textContent=tab; $("subhead").textContent=subtitles[tab];
   const watchOptions=data.watches.map(w=>'<option value="'+esc(encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||""))+'">'+esc(w.portfolio+(w.molecule?" · "+w.molecule:""))+'</option>').join("");
   let html="";
@@ -6421,6 +6430,10 @@ $("gsearch").addEventListener("keydown",e=>{if(e.key==="Enter")globalSearch();})
   document.addEventListener("pointermove",e=>{const el=e.target.closest&&e.target.closest(".tilt");document.querySelectorAll(".tilt.live").forEach(x=>{if(x!==el){x.classList.remove("live");x.style.transform="";}});
     if(!el)return;const r=el.getBoundingClientRect(),px=(e.clientX-r.left)/r.width-.5,py=(e.clientY-r.top)/r.height-.5;el.classList.add("live");el.style.transform="perspective(900px) rotateX("+(-py*5).toFixed(2)+"deg) rotateY("+(px*6).toFixed(2)+"deg) translateY(-2px)";});
   document.addEventListener("pointerleave",()=>document.querySelectorAll(".tilt.live").forEach(x=>{x.classList.remove("live");x.style.transform="";}),true);})();
+(()=>{const shell=document.querySelector(".shell"),btn=$("sidetoggle");btn.innerHTML=ic("sidebar");
+  const set=on=>{shell.classList.toggle("collapsed",on);btn.setAttribute("aria-label",on?"Expand the side panel":"Collapse the side panel");btn.setAttribute("aria-pressed",String(on));try{localStorage.setItem("literasift-side",on?"1":"0");}catch{}};
+  set((()=>{try{return localStorage.getItem("literasift-side")==="1";}catch{return false;}})());
+  btn.onclick=()=>set(!shell.classList.contains("collapsed"));})();
 $("theme").onclick=()=>setTheme(document.documentElement.dataset.theme==="dark"?"light":"dark");
 document.addEventListener("input",event=>{
   const key=event.target.dataset?.filter;
