@@ -34,9 +34,26 @@ test("a draft with every required field and no exceptions is sent to QC; one wit
   const d = JSON.parse(JSON.stringify(c.data));
   d.reporter.country = f("India"); d.reporter.qualification = f("Physician"); d.products[0].indication = f("herpes zoster"); d.products[0].start_date = f("2026-10-01"); d.events[0].onset_date = f("2026-10-04"); d.events[0].outcome = f("Recovered/resolved"); d.events[0].listedness = f("Listed");
   await t.call(SCREENER, "/api/case-save", { id: c.id, status: "Draft", data: d });
-  const done = await worker.autoAdvance(t.env, c.number), after = (await t.state()).cases.find(x => x.id === c.id);
-  console.log("ADV", done, after.stage, after.assignee, after.history.at(-1).action);
-  assert.equal(done, true); { assert.equal(after.stage, "qc"); assert.equal(after.assignee, QC); assert.equal(after.screener, SCREENER); assert.match(after.history.at(-1).action, /auto-submitted/); }
+  const tick = await scheduled(t);
+  assert.equal(tick.status, 200, JSON.stringify(tick.body));
+  assert.equal(tick.body.advanced, 1);
+  const after = (await t.state()).cases.find(x => x.id === c.id);
+  assert.equal(after.stage, "qc");
+  assert.equal(after.assignee, QC);
+  assert.equal(after.screener, SCREENER);
+  assert.match(after.history.at(-1).action, /auto-submitted/);
+  assert.equal((await scheduled(t)).body.advanced, 0);
+  const final = (await t.state()).cases.find(x => x.id === c.id);
+  assert.equal(final.history.filter(h => h.action.includes("auto-submitted")).length, 1);
+
+  await update(t, state => {
+    const returned = state.cases.find(x => x.id === c.id);
+    returned.stage = "screening";
+    returned.assignee = SCREENER;
+    returned.qc = { status: "returned", flags: [] };
+  });
+  assert.equal((await scheduled(t)).body.advanced, 0);
+  assert.equal((await t.state()).cases.find(x => x.id === c.id).stage, "screening");
 });
 
 test("My Desk queues, source labels, deadline basis and the jobs board", async () => {
@@ -57,4 +74,88 @@ test("My Desk queues, source labels, deadline basis and the jobs board", async (
   assert.match(q.dueSoon[0].reason, /Overdue/); assert.match(q.qcReturns[0].reason, /Reaction/);
   const board = worker.jobsBoard(fake); assert.equal(board.counts.failed, 1); assert.equal(board.failures[0].attempts, 3); assert.equal(board.sourceFailures.length, 1);
   assert.deepEqual((await t.call(QC, "/api/synchrony", { action: "desk" })).body.queues.qcReturns, [], "other people's queues stay empty");
+});
+
+const scheduled = t => t.call("", "/api/synchrony-tick", {}, { Authorization: "Bearer " + t.env.RUN_TOKEN });
+async function update(t, mutate) {
+  const state = await t.state();
+  mutate(state);
+  await t.BUCKET.put("bench.json", JSON.stringify(state));
+}
+async function pending(t, settings = {}) {
+  await update(t, state => {
+    Object.assign(state.settings, settings);
+    state.assignments[0].status = "Pending";
+    delete state.assignments[0].disposition;
+  });
+}
+
+test("scheduled screening advances an evidence-backed citation once and prepares patient-specific drafts", async () => {
+  const t = await env();
+  await pending(t);
+  const r = await scheduled(t);
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.screened, 1);
+  const state = await t.state();
+  assert.equal(state.assignments[0].disposition.by, "system");
+  assert.equal(state.assignments[0].disposition.value, "potential_icsr");
+  assert.equal(state.cases.length, 2);
+  assert.equal(new Set(state.cases.map(c => c.provenance.patientId)).size, 2);
+  assert.ok(state.cases.every(c => c.automation && c.stage === "screening"));
+  assert.equal((await scheduled(t)).body.screened, 0);
+  assert.equal((await t.state()).cases.length, 2);
+});
+
+test("article QC still gates automated preparation when required", async () => {
+  const t = await env();
+  await pending(t, { qcPotentialIcsr: true });
+  assert.equal((await scheduled(t)).body.screened, 1);
+  const state = await t.state();
+  assert.equal(state.assignments[0].qc.status, "pending");
+  assert.equal(state.assignments[0].qc.reviewer, QC);
+  assert.equal((state.cases || []).length, 0);
+  const qc = await t.call(QC, "/api/qc-decision", { id: "watch-1", decision: "approve" });
+  assert.equal(qc.status, 200, JSON.stringify(qc.body));
+  assert.equal((await scheduled(t)).body.created, 2);
+});
+
+test("uncertain evidence, existing decisions and portfolios outside Active screening stay in review", async () => {
+  for (const settings of [{ syncMode: "shadow" }, { syncActivePortfolios: ["Other"] }, { syncAutoScreen: false }]) {
+    const t = await env();
+    await pending(t, settings);
+    assert.equal((await scheduled(t)).body.screened, 0);
+    assert.equal((await t.state()).assignments[0].disposition, undefined);
+  }
+  const t = await env();
+  await pending(t);
+  const textKey = article.evidence.parsed.key;
+  const parsed = await (await t.BUCKET.get(textKey)).json();
+  await t.BUCKET.put(textKey, JSON.stringify({ ...parsed, authors: [], correspondence: [], correspondenceEmails: [] }));
+  assert.equal((await scheduled(t)).body.screened, 0);
+  const state = await t.state();
+  assert.equal(state.assignments[0].syncScreen.status, "needs_review");
+  assert.equal(state.assignments[0].disposition, undefined);
+  const excluded = await t.call(SCREENER, "/api/disposition", { id: "watch-1", value: "aggregate_safety" });
+  assert.equal(excluded.status, 200);
+  await t.BUCKET.put(textKey, JSON.stringify(parsed));
+  assert.equal((await scheduled(t)).body.screened, 0);
+  assert.equal((await t.state()).assignments[0].disposition.value, "aggregate_safety");
+});
+
+test("scheduler resumes enrichment after interruption and keeps the case history idempotent", async () => {
+  const t = await env({ auto: false });
+  assert.equal((await scheduled(t)).body.created, 2);
+  await update(t, state => {
+    state.settings.automation.auto = true;
+    state.cases[0].syncEnrichment = { status: "running", until: Date.now() - 1, attempts: 1, lease: "interrupted" };
+  });
+  const result = await scheduled(t);
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.created, 0);
+  await scheduled(t);
+  for (const c of (await t.state()).cases) {
+    assert.ok(c.automation);
+    assert.equal(c.syncEnrichment, undefined);
+    assert.equal(c.history.filter(h => h.action.startsWith("automation ran")).length, 1);
+  }
 });
