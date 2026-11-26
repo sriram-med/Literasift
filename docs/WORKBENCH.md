@@ -140,3 +140,8 @@ A search bar sits at the top of Synchrony and filters the tracker live. All word
 - **OpenAI controls:** pause (rules only), monthly and per-case token limits, results cached by evidence, task, model and prompt version, and a synthetic smoke test (Settings, Case workflow, "Run smoke test") that reports only availability and usage. The key can come from the server environment (`OPENAI_API_KEY`) or Settings; it is never returned.
 - **Shadow report:** `POST /api/synchrony {action:"shadow_report", reference:[{pmid, patients:[{reactions:[...]}]}]}` (manager) compares the proposals with a reference set and reports wrong-patient attribution, missed and false reactions, unsupported evidence, reviewer minutes and tokens per case.
 - The regression for the whole path is `test/synchrony-e2e.test.mjs`: one synthetic article from Potential ICSR to separate patient drafts, field-specific QC, medical approval, a signed package, replay with no duplicate case or package, and revised evidence opening a linked follow-up while the original signed version is intact.
+
+### Assignments list and clean-draft hand-off
+
+- All Assignments and My Queue show one search box, a status filter, a "More filters" menu (access, full text, country, events, source, client, portfolio, sort) and one Export menu. Filters still update the table in place.
+- Settings > Case workflow > Case automation has "Send clean drafts to QC". In Active mode, a prepared draft with no exceptions, no missing required fields, no major QC or expectedness findings, no date conflicts and no open QC flags goes to QC by itself and the history records it. Anything else stays with the screener and shows on the review desk. QC approval, medical review, signing and transmission remain human.
