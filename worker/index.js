@@ -823,14 +823,19 @@ async function caseAssist(env, state, c) {
   return { events, meddraLoaded:Boolean(midx), imeLoaded:Boolean(ime), textSource:({ ocr:"ocr (scanned PDF read by OCR)", "pdf-text-layer":"PDF text layer", "jats-xml":"structured full text (XML)" })[art.evidence?.fulltext?.extraction?.method] || (art.fullTextKey ? "full text" : "citation and abstract"), suspects:data.products.filter(p => p.role === "suspect").map(p => v(p.name)).filter(Boolean) };
 }
 // ---- Optional AI check of events (OpenAI). Off by default, never automatic, hard monthly token cap (0 = none), and only the sentences the scanner tagged are sent, with personal data masked.
-const aiConfig = (env, state) => { const a = state.settings?.ai || {}, key = env.OPENAI_API_KEY || state.settings?.openaiKey || ""; return { enabled:a.enabled === true, model:a.model || "gpt-4o-mini", monthlyTokens:Number(a.monthlyTokens) || 0, key, hasKey:Boolean(key) }; };
+const AI_PROMPT_VERSION = "2026-11-b";
+const aiConfig = (env, state) => { const a = state.settings?.ai || {}, key = env.OPENAI_API_KEY || state.settings?.openaiKey || ""; return { enabled:a.enabled === true && a.paused !== true, paused:a.paused === true, perCaseTokens:a.perCaseTokens === undefined ? 4000 : Number(a.perCaseTokens) || 0, model:a.model || "gpt-4o-mini", monthlyTokens:Number(a.monthlyTokens) || 0, key, hasKey:Boolean(key), keySource:env.OPENAI_API_KEY ? "server environment" : state.settings?.openaiKey ? "settings" : "none" }; };
 const aiMonth = () => new Date().toISOString().slice(0, 7);
 const aiUsed = state => state.aiUsage?.month === aiMonth() ? Number(state.aiUsage.tokens) || 0 : 0;
+const QC_PATH = /^(?:(?:patient|reporter|sender)\.[a-z_]+|(?:products|events|labs)\.\d{1,2}\.[a-z_]+|events\.\d{1,2}\.product_causality\.[A-Za-z0-9_-]+\.[a-z_]+|narrative)$/;
+const getCasePath = (data, path) => { if (path === "narrative") return String(data.narrative?.text || ""); const x = path.split(".").reduce((o, k) => o == null ? o : o[k], data); return x && typeof x === "object" && "value" in x ? String(x.value ?? "") : String(x ?? ""); };
 // One small, capped call. Returns the model's JSON text plus the tokens really used; refuses before sending when the monthly limit would be exceeded.
-async function aiChat(env, state, messages, maxOut, estimateChars, by, action, target) {
+async function aiChat(env, state, messages, maxOut, estimateChars, by, action, target, caseKey = target) {
   const cfg = aiConfig(env, state);
+  if (cfg.paused) return { error:"AI is paused. Rules and dictionaries are used instead and no tokens are used.", status:409 };
   if (!cfg.enabled || !cfg.hasKey || cfg.monthlyTokens <= 0) return { error:"AI assist is off, so no tokens are used. A manager can turn it on in Settings and set a monthly token limit.", status:409 };
   const estimate = Math.ceil(estimateChars / 2) + maxOut + 64;
+  if (cfg.perCaseTokens && caseKey) { const spent = Number(state.aiCaseUsage?.[caseKey]) || 0; if (spent + estimate > cfg.perCaseTokens) return { error:"This case has reached its AI token limit (" + spent + " of " + cfg.perCaseTokens + "). Nothing was sent.", status:429 }; }
   const reservation = await write(env,data => {
     const current = aiConfig(env,data), month = aiMonth();
     const u = data.aiUsage?.month === month ? data.aiUsage : (data.aiUsage = { month,tokens:0,calls:0,reserved:0 });
@@ -854,6 +859,7 @@ async function aiChat(env, state, messages, maxOut, estimateChars, by, action, t
       u.reserved = Math.max(0,(u.reserved || 0) - estimate);
       u.tokens += tokens;
       if (tokens) u.calls += 1;
+      if (caseKey && tokens) { const m = data.aiCaseUsage ||= {}; m[caseKey] = (Number(m[caseKey]) || 0) + tokens; const keys = Object.keys(m); if (keys.length > 5000) for (const k of keys.slice(0, keys.length - 4000)) delete m[k]; }
     });
   }
   await audit(env, { by, action, target, detail:{ model:cfg.model, tokens } });
@@ -879,7 +885,7 @@ async function aiFillCase(env, state, c, by, at = new Date().toISOString()) {
   for (const u of scan.units.filter(u => u.spans.length).sort((a, b) => weight(b) - weight(a) || a.id.localeCompare(b.id))) { if (chars + u.text.length > 1800 || picked.length >= 14) continue; picked.push(u); chars += u.text.length; }
   if (!picked.length) return { proposals:[], tokens:0, message:"No sentence in the text mentions the product, event or patient, so there is nothing to send. No tokens were used." };
   const redacted = picked.map((u, i) => redactPhi((i + 1) + ". " + u.text).text);
-  const hash = await sha256Hex(JSON.stringify([c.id, redacted, missing.map(m => m.id)]));
+  const hash = await sha256Hex(JSON.stringify([c.id, redacted, missing.map(m => m.id), aiConfig(env, state).model, AI_PROMPT_VERSION]));
   if (c.aiFill?.hash === hash) return { proposals:c.aiFill.proposals, tokens:0, cached:true, message:"Same text and same gaps as the last request, so the earlier answer is shown and no tokens were used." };
   const maxOut = Math.min(420, 28 * missing.length + 60), system = "Fill case-report fields from numbered sentences. Reply JSON {\"f\":[{\"i\":id,\"v\":value copied from the sentence,\"s\":sentence number}]}. Omit anything not stated.";
   const user = "Sentences:\n" + redacted.join("\n") + "\nFields:\n" + missing.map(m => m.id + " " + m.label).join("\n");
@@ -3949,7 +3955,7 @@ const SYNC_ENGINE = 1;
 const syncMode = state => state.settings?.syncMode || "shadow";
 const syncEligible = (state, a) => state.settings?.autoIcsr !== false && a.disposition?.value === "potential_icsr" && a.qc?.status !== "pending" && a.qc?.status !== "returned";
 const syncFingerprint = (state, a, article) => JSON.stringify([
-  SYNC_ENGINE, syncMode(state), citationEvidence(article), evidenceRef(article).fulltext,
+  SYNC_ENGINE, AI_PROMPT_VERSION, syncMode(state), citationEvidence(article), evidenceRef(article).fulltext,
   article.fullTextTextKey || "", a.molecules || [], a.patientPassages || null, a.patientDecisions || null,
   a.extractionDecisions || null, state.dictionaries?.[a.portfolio]?.version || 0,
   state.settings?.ai?.enabled || false, state.settings?.ai?.monthlyTokens || 0, state.settings?.ai?.model || "", state.settings?.syncAiPortfolios || []
@@ -3974,7 +3980,8 @@ function syncExceptions(a, article, extraction, patients, state) {
   if ((state.cases || []).some(c => c.pmid === a.pmid && c.portfolio === a.portfolio && !c.provenance?.patientId && !c.data?.patient_ref?.id) && patients.length > 1) {
     issues.push({ code:"legacy_case", text:"This citation already has an unsegmented case. Confirm attribution before creating further cases." });
   }
-  return issues.slice(0, 80);
+  const ACTION = { full_text:"Attach the authorised PDF on the case Source tab or ask the corresponding author for it. Synchrony resumes by itself when full text arrives.", text_quality:"Upload a text-based copy, or enable OCR on the server. Synchrony re-reads the document automatically.", aggregate:"Keep it for literature monitoring, or exclude it as aggregate-only with a reason.", attribution:"Assign the unassigned passages to a patient in the patient separator, then run again.", patient:"Check the article for an individually described patient; exclude the citation with a reason if there is none.", reporter:"Add the author's affiliation or contact from the article's correspondence block, or send a follow-up question.", product:"Confirm the suspect product named in the article, or add it from the text.", event:"Confirm the adverse event and its link to the product, or exclude the patient with a reason.", legacy_case:"Open the earlier case and confirm which patient it describes." };
+  return issues.slice(0, 80).map(i => ({ ...i, action:ACTION[i.code] || "Review and resolve.", owner:a.reviewer || "" }));
 }
 async function syncPrepareAi(env, state, assignment, article, extraction, patient, data) {
   const cfg = aiConfig(env, state);
@@ -4008,6 +4015,25 @@ async function syncPrepareAi(env, state, assignment, article, extraction, patien
   }
   return { status:"prepared", proposals, tokens:response.tokens, model:response.model };
 }
+// A released (signed) case is never edited. When its source evidence changes, one linked follow-up version is opened for review instead, once per evidence revision.
+function openFollowUpVersions(data, by) {
+  const opened = [];
+  for (const original of [...(data.cases || [])]) {
+    if (!original.locked || !activeSignature(original) || original.archived || original.followUpOf) continue;
+    const article = data.articles[original.pmid]; if (!article || !caseEvidenceDelta(data, original).changes.length) continue;
+    const key = ["followup", original.id, JSON.stringify(evidenceRef(article))].join("|");
+    if (data.cases.some(c => c.provenance?.followUpKey === key)) continue;
+    const at = new Date().toISOString(), number = allocateCaseNumber(data), copy = JSON.parse(JSON.stringify(original.data)); delete copy.approval;
+    const rec = { id:crypto.randomUUID(), number, pmid:original.pmid, portfolio:original.portfolio, molecule:original.molecule || "", status:"Draft", stage:"medical_review", createdAt:at, updatedAt:at, createdBy:by, assignee:original.assignee || "", screener:original.screener, intake:"follow-up", followUpOf:original.id, notes:"",
+      data:{ ...copy, case_id:number, narrative:undefined }, provenance:{ ...(original.provenance || {}), idempotencyKey:undefined, followUpKey:key, followUpOfNumber:original.number, evidence:evidenceRef(article) },
+      links:[{ otherId:original.id, otherNumber:original.number, kind:"follow_up_of", status:"confirmed", by, at, note:"Source evidence changed after release", reasons:caseEvidenceDelta(data, original).changes.map(x => x.title) }], history:[{ at, by, action:"Follow-up version opened from " + original.number + " because the source evidence changed. The released version is unchanged." }] };
+    rec.provenance.sourceSnapshot = caseEvidenceSnapshot(data, rec);
+    original.links = [...(original.links || []), { otherId:rec.id, otherNumber:number, kind:"has_follow_up", status:"confirmed", by, at, note:"Source evidence changed after release" }];
+    (original.history ||= []).push({ at, by, action:"Follow-up version " + number + " opened for changed source evidence" });
+    refreshDue(data, rec); data.cases.push(rec); opened.push({ number, from:original.number });
+  }
+  return opened;
+}
 async function prepareSynchrony(env, limit = 2) {
   const initial = (await load(env)).state;
   if (syncMode(initial) === "off" || initial.settings?.autoIcsr === false) return { processed:0, created:0 };
@@ -4017,7 +4043,8 @@ async function prepareSynchrony(env, limit = 2) {
     const signature = syncFingerprint(initial, a, article);
     return !a.synchrony || a.synchrony.fingerprint !== signature || syncDue(a.synchrony, at);
   }).slice(0,limit);
-  let processed = 0, created = 0;
+  let processed = 0, created = 0, followUps = [];
+  if (syncMode(initial) === "active") { followUps = await write(env, data => openFollowUpVersions(data, "system")); for (const f of followUps) await audit(env, { by:"system", action:"synchrony.followup_version", target:f.number, detail:{ from:f.from } }); }
   for (const candidate of pending) {
     const article = initial.articles[candidate.pmid], fingerprint = syncFingerprint(initial,candidate,article), lease = crypto.randomUUID();
     const claimed = await write(env, state => {
@@ -4064,11 +4091,13 @@ async function prepareSynchrony(env, limit = 2) {
           numbers.push(number);
         }
         a.synchrony = { status:issues.length ? "needs_review" : "prepared", mode:syncMode(data), fingerprint, at:new Date().toISOString(), issues,
-          patients:patients.map(p=>({ id:p.id, label:p.label, overall:p.assessment.overall })), created:numbers, ai:prepared.map(p=>p.ai.status).join(", ") || "not_requested", shadowCount:prepared.reduce((n,p)=>n+p.ai.proposals.length,0) };
+          patients:patients.map(p=>({ id:p.id, label:p.label, overall:p.assessment.overall, reactions:uniq(p.patient.events.filter(e => e.category === "ae" && !e.negated && !e.hypothetical).map(e => String(e.verbatim || "").toLowerCase())).slice(0, 20) })), created:numbers, ai:prepared.map(p=>p.ai.status).join(", ") || "not_requested", shadowCount:prepared.reduce((n,p)=>n+p.ai.proposals.length,0) };
         return numbers;
       });
       if (out) {
         processed++; created+=out.length;
+        // the free automation steps (events, IME, MedDRA, seriousness, listedness, causality, investigations, narrative) run on every new draft
+        for (const number of out) { try { const st = (await load(env)).state, cur = st.cases.find(x => x.number === number); if (cur && st.settings?.automation?.auto !== false) await automateCase(env, st, cur, "system"); } catch { /* the case can be automated again from its workspace */ } }
         await audit(env,{by:"system",action:"synchrony.prepared",entityType:"Assignment",entityId:assignment.id,detail:{patients:patients.length,drafts:out,exceptions:issues.map(i=>i.code)}});
       }
     } catch (error) {
@@ -4081,7 +4110,38 @@ async function prepareSynchrony(env, limit = 2) {
       });
     }
   }
-  return { processed, created };
+  return { processed, created, followUps:followUps.length };
+}
+// Dates that contradict each other, found before a reviewer has to spot them.
+function caseDateConflicts(data) {
+  const out = [], iso = f => { const x = v(f); return /^\d{4}-\d{2}-\d{2}$/.test(x) ? x : ""; };
+  const suspects = data.products.filter(p => p.role === "suspect" && iso(p.start_date)), first = suspects.map(p => iso(p.start_date)).sort()[0] || "";
+  for (const p of data.products) if (iso(p.start_date) && iso(p.stop_date) && iso(p.stop_date) < iso(p.start_date)) out.push("The stop date of " + v(p.name) + " is before its start date.");
+  for (const e of data.events) {
+    if (iso(e.onset_date) && first && iso(e.onset_date) < first) out.push("The onset of " + v(e.verbatim) + " is before the first suspect product was started.");
+    if (iso(e.onset_date) && iso(e.stop_date) && iso(e.stop_date) < iso(e.onset_date)) out.push("The end of " + v(e.verbatim) + " is before its onset.");
+  }
+  const aware = iso(data.dates?.awareness); if (aware && data.events.some(e => iso(e.onset_date) && iso(e.onset_date) > aware && data.dates?.publication && String(data.dates.publication).slice(0, 10) < iso(e.onset_date))) out.push("A reaction onset is after the awareness date.");
+  return uniq(out);
+}
+// One ordered list of what happened to the patient: exposure, dose changes, onset, action taken, dechallenge, rechallenge, tests, outcome.
+function caseChronology(data) {
+  const iso = f => { const x = v(f); return /^\d{4}-\d{2}-\d{2}$/.test(x) ? x : ""; }, items = [];
+  const base = data.products.filter(p => p.role === "suspect").map(p => iso(p.start_date)).filter(Boolean).sort()[0] || "";
+  const rel = (date, day) => date && base ? Math.round((Date.parse(date) - Date.parse(base)) / 864e5) : Number.isFinite(day) ? day - 1 : null;
+  const add = (kind, label, date, day, text) => { if (!label) return; items.push({ kind, label, when:date || (Number.isFinite(day) ? "day " + day : text || ""), sort:rel(date, day) }); };
+  for (const p of data.products) if (p.role === "suspect" && hasVal(p.name)) {
+    add("exposure", "Started " + v(p.name) + [v(p.dose), v(p.route), v(p.frequency)].filter(Boolean).map(x => " " + x).join(""), iso(p.start_date), p.start_day, v(p.start_date));
+    if (hasVal(p.action_taken) || hasVal(p.stop_date) || Number.isFinite(p.stop_day)) add("action", (v(p.action_taken) || "Stopped") + ": " + v(p.name), iso(p.stop_date), p.stop_day, v(p.stop_date));
+    if (hasVal(p.dechallenge)) add("dechallenge", "Dechallenge: " + v(p.dechallenge), iso(p.stop_date), p.stop_day, "");
+    if (hasVal(p.rechallenge)) add("rechallenge", "Rechallenge: " + v(p.rechallenge), "", null, "");
+  }
+  for (const e of data.events) if (hasVal(e.verbatim)) {
+    add("onset", "Onset of " + v(e.verbatim), iso(e.onset_date), e.onset_day, v(e.time_to_onset));
+    if (hasVal(e.outcome)) add("outcome", "Outcome of " + v(e.verbatim) + ": " + v(e.outcome), iso(e.stop_date), null, v(e.stop_date));
+  }
+  for (const l of data.labs || []) add("test", l.test + " " + l.result + (l.unit ? " " + l.unit : ""), /^\d{4}-\d{2}-\d{2}$/.test(l.date) ? l.date : "", Number((/day (\d+)/i.exec(l.date) || [])[1]) || null, l.date);
+  return items.sort((a, b) => (a.sort ?? 9e6) - (b.sort ?? 9e6)).map(({ kind, label, when }) => ({ kind, label, when }));
 }
 function synchronyChecks(state, c) {
   const article = state.articles[c.pmid] || {}, data = normalizeCase(c.data), local = localAssessment(data);
@@ -4093,6 +4153,7 @@ function synchronyChecks(state, c) {
     if (v(event.onset_date) && v(event.stop_date) && v(event.onset_date)>v(event.stop_date)) checks.push({ severity:"major", field:"events", text:"Reaction onset is later than reaction end." });
     if (hasVal(event.verbatim) && !event.verbatim.evidence?.length && data.source_type==="literature") checks.push({ severity:"warning", field:"events", text:"Reaction needs source evidence: " + v(event.verbatim) });
   }
+  caseDateConflicts(data).forEach(text => checks.push({ severity:"major", field:"dates", text }));
   checks.push(...caseEvidenceDelta(state,c).changes.map(x=>({ severity:"major", field:"source", text:x.title })));
   if (caseTimeline(state,c).left !== null && caseTimeline(state,c).left<=3) checks.push({ severity:"warning", field:"reportability", text:"A configured review deadline is near or overdue." });
   if (article.id && publicationDuplicates(state,article).length) checks.push({ severity:"warning", field:"source", text:"Potential duplicate publication. Review the linked citation." });
@@ -4146,6 +4207,25 @@ async function prepareSynchronyExports(env) {
 
 async function synchronyApi(env, state, viewer, body) {
   const action = String(body.action || "view"), email = viewer.email;
+  if (action === "shadow_report") {
+    // Compare what Synchrony proposed (in Shadow or Active mode) with a reference set a clinician has already worked out. Nothing is changed.
+    if (viewer.role !== "manager") return json({error:"Manager access required."},403);
+    const refs = (Array.isArray(body.reference) ? body.reference : []).slice(0, 200), norm = t => String(t || "").toLowerCase().trim(), articles = [];
+    const totals = { articles:0, wrongPatient:0, missedReactions:0, falseReactions:0, unsupportedEvidence:0, patientCountMismatch:0 };
+    for (const ref of refs) {
+      const asg = state.assignments.find(x => x.pmid === String(ref.pmid) && (!ref.portfolio || x.portfolio === ref.portfolio) && x.synchrony?.patients), pred = (asg?.synchrony?.patients || []).map(p => ({ id:p.id, set:new Set((p.reactions || []).map(norm)) }));
+      const truth = (Array.isArray(ref.patients) ? ref.patients : []).map(p => new Set((p.reactions || []).map(norm)));
+      const allTruth = new Set(truth.flatMap(t => [...t])), allPred = new Set(pred.flatMap(p => [...p.set]));
+      const best = set => truth.map((t, i) => ({ i, n:[...set].filter(x => t.has(x)).length })).sort((a, b) => b.n - a.n)[0];
+      let wrong = 0; for (const p of pred) for (const r of p.set) { const home = truth.findIndex(t => t.has(r)), match = best(p.set); if (home >= 0 && match && match.n > 0 && home !== match.i) wrong++; }
+      const missed = [...allTruth].filter(r => !allPred.has(r)), falsePicks = [...allPred].filter(r => !allTruth.has(r));
+      const cases = state.cases.filter(c => c.pmid === String(ref.pmid) && (!asg || c.portfolio === asg.portfolio)), unsupported = cases.reduce((n, c) => { const d = normalizeCase(c.data); return n + [...d.events.flatMap(e => [e.verbatim, e.onset_date, e.outcome]), ...d.products.flatMap(p => [p.name, p.dose, p.start_date])].filter(f => hasVal(f) && f.state === "proposed" && !(f.evidence || []).length).length; }, 0);
+      articles.push({ pmid:String(ref.pmid), prepared:Boolean(asg), predictedPatients:pred.length, referencePatients:truth.length, wrongPatient:wrong, missedReactions:missed, falseReactions:falsePicks, unsupportedEvidence:unsupported });
+      totals.articles++; totals.wrongPatient += wrong; totals.missedReactions += missed.length; totals.falseReactions += falsePicks.length; totals.unsupportedEvidence += unsupported; if (pred.length !== truth.length) totals.patientCountMismatch++;
+    }
+    const minutes = state.cases.map(c => { const done = (c.history || []).find(h => /approved|signed/i.test(h.action || "")); return done ? Math.max(0, (Date.parse(done.at) - Date.parse(c.createdAt)) / 60000) : null; }).filter(x => x !== null), tokens = state.aiUsage?.month === aiMonth() ? Number(state.aiUsage.tokens) || 0 : 0;
+    return json({ mode:syncMode(state), totals, articles, reviewerMinutesAverage:minutes.length ? Math.round(minutes.reduce((a, b) => a + b, 0) / minutes.length) : null, tokensPerCase:Math.round(tokens / Math.max(1, state.cases.length)), cases:state.cases.length });
+  }
   if (action === "run") {
     if (viewer.role !== "manager") return json({error:"Manager access required."},403);
     return json({ ...(await prepareSynchrony(env)), packages:await prepareSynchronyExports(env) });
@@ -4158,7 +4238,7 @@ async function synchronyApi(env, state, viewer, body) {
     const draft = c.data.narrative?.text || buildNarrative(c).text;
     const local = localAssessment(normalizeCase(c.data));
     return json({ mode:syncMode(state), checks:synchronyChecks(state,c), narrative:draft, validation:validateE2b(c,article,c.approval?.profile || "ICH",await loadMeddra(env)),
-      ai:c.preparation?.ai || null, followups:c.followups || [], suggestedFollowups:(local.follow_up?.questions || []).slice(0,10),
+      ai:c.preparation?.ai || null, timeline:caseChronology(normalizeCase(c.data)), qcFlags:c.qc?.flags || [], followups:c.followups || [], suggestedFollowups:(local.follow_up?.questions || []).slice(0,10),
       handoffs:c.handoffs || [], release:c.preparedRelease || null,
       canEdit:edit && !c.locked && !c.archived, assignment:a?.synchrony ? { status:a.synchrony.status, issues:a.synchrony.issues || [], mode:a.synchrony.mode } : null });
   }
@@ -4274,7 +4354,7 @@ async function apiCore(request, env, path) {
       cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, evidenceReviewPending:caseEvidenceDelta(state, c).changes.length>0, canEdit:canEditCase(state, viewer, c), signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
       dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], meddraInfo:state.meddra || null, stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c), triage:triageFor(state, c) }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
       monitoring:monitoringCounts(state, viewer),
-      series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ syncMode:syncMode(state), syncAiPortfolios:manager ? (state.settings?.syncAiPortfolios || []) : [], automation:{ auto:state.settings?.automation?.auto !== false, smpc:state.settings?.automation?.smpc !== false, ai:state.settings?.automation?.ai === true }, ai:(() => { const c = aiConfig(env, state); return { available:c.enabled && c.hasKey && c.monthlyTokens > 0, ...(manager ? { enabled:c.enabled, model:c.model, monthlyTokens:c.monthlyTokens, hasKey:c.hasKey, used:aiUsed(state), month:aiMonth() } : {}) }; })(), retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ syncMode:syncMode(state), syncAiPortfolios:manager ? (state.settings?.syncAiPortfolios || []) : [], automation:{ auto:state.settings?.automation?.auto !== false, smpc:state.settings?.automation?.smpc !== false, ai:state.settings?.automation?.ai === true }, ai:(() => { const c = aiConfig(env, state); return { available:c.enabled && c.hasKey && c.monthlyTokens > 0, paused:c.paused, ...(manager ? { enabled:state.settings?.ai?.enabled === true, model:c.model, monthlyTokens:c.monthlyTokens, perCaseTokens:c.perCaseTokens, hasKey:c.hasKey, keySource:c.keySource, used:aiUsed(state), month:aiMonth() } : {}) }; })(), retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], people:state.profiles.filter(p => p.active).map(p => ({ email:p.email, name:p.name, role:p.role, active:true })), clientAdmin:manager || viewer.canManageClients === true, watches:manager ? state.watches : viewer.canManageClients === true ? state.watches.map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "", client:w.client || "" })) : [],
       runs:manager ? state.runs : [], assignments,
@@ -4502,6 +4582,16 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"case.source_reviewed", entityType:"Case", entityId:rec.number, detail:{ note:note.slice(0, 1000), changes:evidence.changes } });
     return json({ ok:true });
   }
+  if (path === "/api/ai-smoke" && viewer) {
+    // A synthetic one-word request that proves the configured key works. It reports availability and usage only: never the key, never any case text.
+    if (!manager) return json({ error:"Manager access required." }, 403);
+    const cfg = aiConfig(env, state), raw = state.settings?.ai || {}, base = { configured:cfg.hasKey, keySource:cfg.keySource, enabled:raw.enabled === true, paused:cfg.paused, model:cfg.model, monthlyTokens:cfg.monthlyTokens, perCaseTokens:cfg.perCaseTokens, used:aiUsed(state) };
+    if (!cfg.hasKey) return json({ ok:false, available:false, reason:"No API key is configured on the server or in Settings.", ...base });
+    if (!raw.enabled || cfg.paused || !cfg.monthlyTokens) return json({ ok:false, available:false, reason:cfg.paused ? "AI is paused." : !raw.enabled ? "AI is switched off." : "The monthly token limit is 0.", ...base });
+    const t0 = Date.now(), r = await aiChat(env, state, [{ role:"system", content:"Reply with the JSON {\"ok\":true}." }, { role:"user", content:"ping" }], 12, 40, email, "ai.smoke", "synthetic", "");
+    if (r.error) return json({ ok:false, available:false, reason:r.error, ...base });
+    return json({ ok:r.json?.ok === true, available:true, latencyMs:Date.now() - t0, tokens:r.tokens, ...base, used:r.used, limit:r.limit });
+  }
   if (["/api/case-submit", "/api/case-qc", "/api/case-ai-fill", "/api/case-automate"].includes(path) && viewer) {
     const c = (state.cases || []).find(x => x.id === String(body.id || ""));
     if (!c || !caseVisible(state, viewer, c)) return json({ error:"Case not found." }, 404);
@@ -4523,20 +4613,26 @@ async function apiCore(request, env, path) {
       const a = localAssessment(normalizeCase(c.data)), problems = [...a.validity.missing.map(m => "Missing: " + m), ...a.qc.findings.filter(f => f.severity === "critical" || f.severity === "major").map(f => f.title), ...synchronyChecks(state,c).filter(f=>f.severity==="major"&&f.field==="source").map(f=>f.text)];
       if (problems.length) return json({ error:"Finish the data entry first: " + problems.slice(0, 6).join("; ") + ".", problems }, 409);
       const next = pickRole(state, c.portfolio, "qc", email); if (!next) return json({ error:"No QC reviewer is set up. A manager must add one in Team." }, 409);
-      await write(env, data => { const x = data.cases.find(y => y.id === c.id); x.stage = "qc"; x.assignee = next; x.assignedAt = at; x.screener = x.screener || c.assignee; x.status = "Draft"; x.submittedAt = at; x.qc = { ...(x.qc || {}), status:"pending", rounds:x.qc?.rounds || 0 }; refreshDue(data, x); x.updatedAt = at; (x.history ||= []).push({ at, by:email, action:"submitted to QC (" + next + ")" + (note ? ": " + note : "") }); });
+      // Flagged fields QC returned: record which ones changed, and rebuild a narrative nobody edited so it follows the corrected fields.
+      let recheck = null;
+      if ((c.qc?.flags || []).some(f => f.status === "open")) { const nd = normalizeCase(c.data), flags = c.qc.flags.map(f => ({ ...f, status:f.status === "open" ? (getCasePath(nd, f.path) !== f.was ? "fixed" : "unchanged") : f.status })); recheck = { fixed:flags.filter(f => f.status === "fixed").length, unchanged:flags.filter(f => f.status === "unchanged").length, flags }; }
+      await write(env, data => { const x = data.cases.find(y => y.id === c.id); if (recheck) { x.qc = { ...(x.qc || {}), flags:recheck.flags }; if (recheck.fixed && x.data?.narrative && !x.data.narrative.edited) x.data.narrative = { ...buildNarrative({ ...x, data:normalizeCase(x.data) }), basedOn:null }; } x.stage = "qc"; x.assignee = next; x.assignedAt = at; x.screener = x.screener || c.assignee; x.status = "Draft"; x.submittedAt = at; x.qc = { ...(x.qc || {}), status:"pending", rounds:x.qc?.rounds || 0 }; refreshDue(data, x); x.updatedAt = at; (x.history ||= []).push({ at, by:email, action:"submitted to QC (" + next + ")" + (note ? ": " + note : "") }); });
       await audit(env, { by:email, action:"case.submit", target:c.number, detail:{ to:next, note } });
-      return json({ ok:true, to:next, toName:who(next) });
+      return json({ ok:true, to:next, toName:who(next), recheck:recheck ? { fixed:recheck.fixed, unchanged:recheck.unchanged } : null });
     }
     if (stage !== "qc") return json({ error:"This case is not waiting for QC." }, 409);
     if (!(c.assignee === email || isPortfolioManager(state, viewer, c.portfolio))) return json({ error:"Only the QC reviewer it is routed to can decide this." }, 403);
     const decision = body.decision === "return" ? "return" : body.decision === "approve" ? "approve" : "";
     if (!decision) return json({ error:"Approve or return the case." }, 400);
-    if (decision === "return" && note.length < 5) return json({ error:"Say what the screener must fix (at least 5 characters)." }, 400);
+    const flagPaths = (Array.isArray(body.fields) ? body.fields : []).slice(0, 30).map(f => ({ path:String(f?.path || ""), reason:String(f?.reason || "").trim().slice(0, 300) })).filter(f => QC_PATH.test(f.path));
+    if (decision === "return" && note.length < 5 && !flagPaths.length) return json({ error:"Say what the screener must fix (at least 5 characters), or flag the fields.", }, 400);
+    if (flagPaths.some(f => f.reason.length < 3)) return json({ error:"Give a reason for every flagged field." }, 400);
     const target = decision === "approve" ? pickRole(state, c.portfolio, "medical_reviewer", email) : (c.screener || c.createdBy || ""), tp = state.profiles.find(p => p.email === target && p.active);
     if (!tp) return json({ error:decision === "approve" ? "No medical reviewer is set up. A manager must add one in Team." : "The screener is no longer active; route the case to someone with Route." }, 409);
     await write(env, data => { const x = data.cases.find(y => y.id === c.id); x.stage = decision === "approve" ? "medical_review" : "screening"; x.assignee = target; x.assignedAt = at; x.status = "Draft"; const q = x.qc ||= {}; q.status = decision === "approve" ? "approved" : "returned"; q.by = email; q.at = at; q.note = note; q.rounds = (q.rounds || 0) + (decision === "return" ? 1 : 0); refreshDue(data, x); x.updatedAt = at;
+      if (decision === "return") { const nd = normalizeCase(x.data); q.flags = flagPaths.map(f => ({ path:f.path, reason:f.reason, was:getCasePath(nd, f.path), status:"open", by:email, at })); } else q.flags = (q.flags || []).map(f => ({ ...f, status:f.status === "open" ? "accepted" : f.status }));
       (x.history ||= []).push({ at, by:email, action:"QC " + (decision === "approve" ? "approved, sent to medical review (" + target + ")" : "returned to the screener (" + target + ")") + (note ? ": " + note : "") }); });
-    await audit(env, { by:email, action:"case.qc", target:c.number, detail:{ decision, to:target, note } });
+    await audit(env, { by:email, action:"case.qc", target:c.number, detail:{ decision, to:target, note, flagged:flagPaths.map(f => f.path) } });
     return json({ ok:true, decision, to:target, toName:who(target) });
   }
   if ((path === "/api/case-assist" || path === "/api/smpc-check") && viewer) {
@@ -5525,6 +5621,7 @@ async function apiCore(request, env, path) {
       else if (typeof body.pvNexusToken === "string" && body.pvNexusToken.trim()) settings.pvNexusToken = body.pvNexusToken.trim();
       for (const key of ["coreApiKey", "wileyTdmToken", "elsevierApiKey", "elsevierInsttoken"]) { if (body[key] === null) delete settings[key]; else if (typeof body[key] === "string" && body[key].trim()) settings[key] = body[key].trim(); }
       if (body.openaiKey === null) delete settings.openaiKey; else if (typeof body.openaiKey === "string" && body.openaiKey.trim()) settings.openaiKey = body.openaiKey.trim();
+      if ("aiPaused" in body || "aiPerCase" in body) { const a = settings.ai ||= {}; if ("aiPaused" in body) a.paused = body.aiPaused === "on" || body.aiPaused === true; if ("aiPerCase" in body) a.perCaseTokens = Math.max(0, Math.min(200000, Number(body.aiPerCase) || 0)); }
       if ("aiEnabled" in body || "aiModel" in body || "aiMonthlyTokens" in body) { const a = settings.ai ||= {}; if ("aiEnabled" in body) a.enabled = body.aiEnabled === "on" || body.aiEnabled === true; if (body.aiModel) a.model = String(body.aiModel).trim(); if ("aiMonthlyTokens" in body) a.monthlyTokens = Number(body.aiMonthlyTokens); }
       if (body.ncbiApiKey === null) delete settings.ncbiApiKey;
       else if (typeof body.ncbiApiKey === "string" && body.ncbiApiKey.trim()) settings.ncbiApiKey = body.ncbiApiKey.trim();
@@ -5847,6 +5944,7 @@ dialog.cwin[open]{display:grid;grid-template-rows:auto auto minmax(0,1fr)}
 #navtip{position:fixed;z-index:60;background:#0d1512;color:#fff;border:1px solid #ffffff26;padding:5px 11px;border-radius:8px;font-size:12.5px;font-weight:500;pointer-events:none;opacity:0;transform:translateX(-4px);transition:opacity .08s,transform .08s;box-shadow:0 8px 22px -8px #000a;white-space:nowrap}#navtip.on{opacity:1;transform:none}
 .labgrid{display:flex;flex-direction:column;gap:6px}.labrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.labrow input,.labrow select{padding:5px 8px;font-size:13px}
 .synsearch{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--card);border:1px solid var(--border);border-radius:99px;padding:6px 14px;margin:2px 0 12px;box-shadow:var(--shadow)}.synsearch>.ic{color:var(--muted)}.synsearch input{flex:1;min-width:220px;border:0;box-shadow:none;background:none;padding:6px 4px;outline:none}.synsearch input:focus{box-shadow:none}.synq-help{position:relative}.synq-help summary{cursor:pointer}.synq-help>div{position:absolute;z-index:6;right:0;top:130%;width:min(520px,80vw);background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;box-shadow:0 14px 34px -10px #0d151266;line-height:1.7}.synq-help code{background:var(--accent);border-radius:5px;padding:0 5px}
+.flagged>input,.flagged>select{border-color:var(--amber);box-shadow:0 0 0 2px #a85b0833}.lbl{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.qcflag{font-size:11px;color:var(--amber);font-weight:600}.qcflagbtn{border:0;background:none;color:var(--muted);cursor:pointer;padding:0 4px;font-size:13px}.qcflagbtn:hover{color:var(--amber)}
 .roban{background:var(--amber-soft);color:var(--amber);border:1px solid var(--amber);border-radius:9px;padding:8px 12px;margin-bottom:12px;font-weight:500}
 .serieslayout{display:grid;gap:22px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.serieslayout h3{font-size:13px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
 .sbar{margin-bottom:9px}.sbar-h{display:flex;justify-content:space-between;gap:10px;font-size:13px}.sbar-k{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sbar-t{height:6px;border-radius:99px;background:var(--accent);margin-top:3px;overflow:hidden}.sbar-t i{display:block;height:100%;background:var(--brand);border-radius:99px}
@@ -6074,8 +6172,15 @@ const SIT=["Pregnancy exposure","Neonatal exposure","Paediatric patient","Elderl
 const QUAL=["","Physician","Pharmacist","Other health professional","Health professional (published literature)","Lawyer","Consumer or other non-health professional"];
 const gp=(o,p)=>p.split(".").reduce((x,k)=>x==null?x:x[k],o);
 const caseTitleTip=f=>((f.evidence||[])[0]||{}).excerpt||"";
-const caseInput=(label,path,type)=>{const f=gp(curCase.data,path)||{};return '<label>'+label+(f.state==="proposed"&&f.value?' <span class="badge amber" title="Proposed from the article: confirm or correct">proposed</span>':"")+'<input data-kind="field" data-path="'+path+'" value="'+esc(f.value||"")+'" title="'+esc(caseTitleTip(f))+'"'+(type?' type="'+type+'"':"")+'></label>';};
-const caseSelect=(label,path,options)=>{const f=gp(curCase.data,path)||{};return '<label>'+label+(f.state==="proposed"&&f.value?' <span class="badge amber">proposed</span>':"")+'<select data-kind="field" data-path="'+path+'">'+options.map(o=>'<option'+(o===(f.value||"")?" selected":"")+'>'+esc(o)+'</option>').join("")+'</select></label>';};
+let qcPending=[];
+const flagInfo=path=>((curCase.qc&&curCase.qc.flags)||[]).find(x=>x.path===path&&x.status!=="accepted")||qcPending.find(x=>x.path===path)||null;
+const flagBtn=path=>{
+  const fl=flagInfo(path), qcMode=caseStage(curCase)==="qc"&&curCase.canEdit!==false;
+  if(fl)return ' <span class="qcflag" title="'+esc(fl.reason||"")+'">⚑ '+esc(fl.status||"to flag")+'</span>'+(qcMode&&!fl.status?'<button type="button" class="qcflagbtn" data-qcunflag="'+esc(path)+'" title="Remove the flag">×</button>':"");
+  return qcMode?' <button type="button" class="qcflagbtn" data-qcflag="'+esc(path)+'" title="Flag this field for the screener">⚑</button>':"";
+};
+const caseInput=(label,path,type)=>{const f=gp(curCase.data,path)||{};return '<label'+(flagInfo(path)?' class="flagged"':"")+'><span class="lbl">'+label+flagBtn(path)+(f.state==="proposed"&&f.value?' <span class="badge amber" title="Proposed from the article: confirm or correct">proposed</span>':"")+'</span><input data-kind="field" data-path="'+path+'" value="'+esc(f.value||"")+'" title="'+esc(caseTitleTip(f))+'"'+(type?' type="'+type+'"':"")+'></label>';};
+const caseSelect=(label,path,options)=>{const f=gp(curCase.data,path)||{};return '<label'+(flagInfo(path)?' class="flagged"':"")+'><span class="lbl">'+label+flagBtn(path)+(f.state==="proposed"&&f.value?' <span class="badge amber">proposed</span>':"")+'</span><select data-kind="field" data-path="'+path+'">'+options.map(o=>'<option'+(o===(f.value||"")?" selected":"")+'>'+esc(o)+'</option>').join("")+'</select></label>';};
 const blankField=()=>({value:null,normalized_value:null,state:"edited",evidence:[]});
 const blankProduct=()=>({pair_id:crypto.randomUUID(),role:"concomitant",start_not_reported:false,name:blankField(),dose:blankField(),frequency:blankField(),route:blankField(),indication:blankField(),start_date:blankField(),stop_date:blankField(),action_taken:blankField(),dechallenge:blankField(),rechallenge:blankField()});
 const blankEvent=()=>({verbatim:blankField(),llt_code:blankField(),onset_date:blankField(),stop_date:blankField(),outcome:blankField(),expectedness:blankField(),coded_term:blankField(),time_to_onset:blankField(),causality_reporter:blankField(),causality_reviewer:blankField(),causality_method:blankField(),temporal_relationship:blankField(),alternative_causes:blankField(),concomitant_factors:blankField(),objective_evidence:blankField(),listedness:blankField(),assessed_term:blankField(),rsi:blankField(),causality_rationale:blankField(),reviewer_comment:blankField(),llt:blankField(),pt:blankField(),pt_code:blankField(),hlt:blankField(),hlgt:blankField(),soc:blankField(),meddra_version:blankField(),coding_status:blankField(),onset_not_reported:false,seriousness:{serious:false,death:false,life_threatening:false,hospitalization:false,disability:false,congenital_anomaly:false,other_medically_important:false}});
@@ -6178,7 +6283,7 @@ async function renderSynchronyPanel(){
     const handoffs=r.handoffs.map(x=>'<div class="row"><span>'+esc(x.recipient+" · "+x.reference)+(x.acknowledgement?'<br><small>'+esc(x.acknowledgement.note)+'</small>':"")+'</span>'+(x.acknowledgement?"":button("acknowledge","Acknowledge",x.id))+'</div>').join("");
     const validation=r.validation.map(x=>'<div class="sub">'+esc(x.severity+" · "+x.field+" · "+x.message)+'</div>').join("");
     box.innerHTML='<div class="as-card"><h3>Review exceptions</h3>'+(check||'<p class="sub">No listed findings.</p>')+
-      (r.assignment?.issues?.length?'<details><summary>Intake exceptions</summary>'+r.assignment.issues.map(x=>'<p class="sub">'+esc(x.text)+'</p>').join("")+'</details>':"")+'</div>'+
+      (r.assignment?.issues?.length?'<details open><summary>Intake exceptions</summary>'+r.assignment.issues.map(x=>'<div class="fl-item"><i>!</i><span>'+esc(x.text)+'<div class="sub">'+esc(x.action||"")+(x.owner?' · owner '+esc(x.owner):"")+'</div></span></div>').join("")+'</details>':"")+'</div>'+(r.timeline&&r.timeline.length?'<div class="as-card"><h3>Timeline</h3>'+r.timeline.map(t=>'<div class="fl-item"><i>'+esc({exposure:"▶",action:"■",dechallenge:"↓",rechallenge:"↻",onset:"!",outcome:"✓",test:"⚗"}[t.kind]||"•")+'</i><span>'+esc(t.label)+'<div class="sub">'+esc(t.when||"time not stated")+'</div></span></div>').join("")+'</div>':"")+
       (proposals?'<div class="as-card"><h3>Source-backed proposals</h3>'+proposals+(r.canEdit?button("apply_ai","Apply selected as proposals"):"")+'</div>':"")+
       '<div class="as-card"><h3>Follow-up</h3>'+follow+(r.canEdit?suggested+button("followup_add","Add question"):"")+'</div>'+
       '<div class="as-card"><h3>Release package</h3>'+(r.release?badge("Prepared · "+r.release.profile,"green"):"")+
@@ -6254,6 +6359,12 @@ function aiKeyHtml(){
   if(data.viewer.role!=="manager")return '<div class="sub" style="margin-top:6px">AI is off, so no tokens are used. Ask a manager to turn it on in Settings.</div>';
   return '<div class="sub" style="margin-top:8px">Paste the OpenAI API key here to turn the AI on. It is stored with the app data, shown only as "Set" afterwards, and capped by the monthly token limit below.</div><div class="as-btns" style="flex-direction:column;align-items:stretch"><input type="password" id="aikeyinline" autocomplete="off" placeholder="sk-..."><input type="number" id="ailimitinline" min="1000" step="1000" value="'+(a.monthlyTokens||200000)+'" aria-label="Monthly token limit"><button type="button" class="btn sm" data-aikeysave="1">Save key and turn on</button></div>';
 }
+function flagsHtml(){
+  const saved=(curCase.qc&&curCase.qc.flags)||[], rows=saved.map(f=>({path:f.path,reason:f.reason,status:f.status})).concat(qcPending.map(f=>({path:f.path,reason:f.reason,status:"to send"})));
+  if(!rows.length)return "";
+  const tone=s=>s==="fixed"||s==="accepted"?"green":s==="unchanged"?"red":"amber";
+  return '<div class="as-card"><div class="as-row"><b>Flagged fields</b><span class="sub">'+rows.length+'</span></div>'+rows.map(f=>'<div class="fl-item"><i>⚑</i><span>'+esc(f.path.split(".").join(" › "))+' '+badge(f.status,tone(f.status))+'<div class="sub">'+esc(f.reason)+'</div></span></div>').join("")+'</div>';
+}
 function flowHtml(){
   const st=caseStage(curCase), info=STAGE_ACT[st]||STAGE_ACT.medical_review, d=curCase.data, q=curCase.qc||{}, ed=curCase.canEdit!==false;
   const head='<div class="as-card flow-'+st+'"><div class="as-row"><b>'+esc(info[0])+'</b>'+badge(st==="screening"?"Screener":st==="qc"?"QC":"Medical reviewer",st==="screening"?"blue":st==="qc"?"amber":"green")+'</div><div class="sub">'+esc(info[1])+'</div>'+
@@ -6273,7 +6384,7 @@ function flowHtml(){
   }else if(st==="medical_review"){
     body='<div class="as-card"><b>Medical review</b><div class="sub" style="margin:4px 0 8px">Confirm the proposals (coding, seriousness, listedness), set causality for each event, then approve and sign. Route the case to QC or the screener if something is wrong.</div><div class="as-btns"><button type="button" class="btn outline sm" data-caseact="routecase">Route…</button></div></div>';
   }else body='<div class="as-card"><div class="sub">This case is with someone else. You can read it but not change it.</div></div>';
-  return head+automationHtml()+list+body;
+  return head+flagsHtml()+automationHtml()+list+body;
 }
 function aiFillHtml(){
   const r=aiFillRes;if(!r)return "";
@@ -6293,7 +6404,7 @@ async function caseFlowAct(act){
     if(act==="automate"){collectCase();assistBusy="auto";$("caseflow").innerHTML=flowHtml();try{await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes,expectedRevision:curCase.editRevision||curCase.updatedAt||""});const r=await api("case-automate",{id:curCase.id});await refresh();curCase=JSON.parse(JSON.stringify((data.cases||[]).find(x=>x.id===curCase.id)||r.case));assistData=null;assistBusy="";renderCase();message("Automation finished: "+r.steps.filter(x=>x.ok).length+" of "+r.steps.length+" steps. Check the proposals.");}catch(e){assistBusy="";$("caseflow").innerHTML=flowHtml();message(e.message,true);}return;}
     if(act==="submitqc"){collectCase();await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes,expectedRevision:curCase.editRevision||curCase.updatedAt||""});await clearCaseDraft(curCase.id);const r=await api("case-submit",{id:curCase.id});await refresh();message("Submitted to QC ("+r.toName+").");$("casedlg").close();if(tab==="My Desk")render();return;}
     if(act==="qcapprove"){collectCase();await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes,expectedRevision:curCase.editRevision||curCase.updatedAt||""});await clearCaseDraft(curCase.id);const note=prompt("Note for the medical reviewer (optional)","")||"";const r=await api("case-qc",{id:curCase.id,decision:"approve",note});await refresh();message("Approved. Sent to "+r.toName+" for medical review.");$("casedlg").close();if(tab==="My Desk")render();return;}
-    if(act==="qcreturn"){const note=prompt("What must the screener fix? (recorded)","");if(!note)return;const r=await api("case-qc",{id:curCase.id,decision:"return",note});await refresh();message("Returned to "+r.toName+".");$("casedlg").close();if(tab==="My Desk")render();return;}
+    if(act==="qcreturn"){collectCase();const note=prompt(qcPending.length?"Overall note for the screener (optional)":"What must the screener fix? (recorded)","")||"";if(!note&&!qcPending.length)return;const r=await api("case-qc",{id:curCase.id,decision:"return",note,fields:qcPending});qcPending=[];await refresh();message("Returned to "+r.toName+".");$("casedlg").close();if(tab==="My Desk")render();return;}
   }catch(e){message(e.message,true);}
 }
 const SERFLAGS=["death","life_threatening","hospitalization","disability","congenital_anomaly","other_medically_important"];
@@ -7030,7 +7141,7 @@ function autoOnOpen(){
   if(!curCase||curCase.intake==="synchrony-automation"||curCase.automation||curCase.canEdit===false||caseStage(curCase)!=="screening"||curCase.autoTried)return;
   curCase.autoTried=true;caseFlowAct("automate");
 }
-function openCaseData(c,a){const reopened=!$("casedlg").open||curCase?.id!==c.id;if(!curCase||curCase.id!==c.id){assistData=null;smpcRes={};smpcInfo=null;assistTab="flow";aiFillRes=null;assistCase="";}curCase=JSON.parse(JSON.stringify(c));curAssess=a;renderCase();if(!$("casedlg").open)$("casedlg").showModal();if(reopened)offerCaseDraft(c);autoOnOpen();}
+function openCaseData(c,a){const reopened=!$("casedlg").open||curCase?.id!==c.id;if(!curCase||curCase.id!==c.id){assistData=null;smpcRes={};smpcInfo=null;assistTab="flow";aiFillRes=null;assistCase="";qcPending=[];}curCase=JSON.parse(JSON.stringify(c));curAssess=a;renderCase();if(!$("casedlg").open)$("casedlg").showModal();if(reopened)offerCaseDraft(c);autoOnOpen();}
 async function downloadCase(format){
   collectCase();
   const res=await fetch("/api/case-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:curCase.id,format})});
@@ -7278,7 +7389,7 @@ function aiSettingsHtml(){
   return panel("AI event check (OpenAI, optional)",'<div class="row"><span>Status</span>'+(a.available?badge("On","green"):badge("Off: no tokens are used","amber"))+'</div>'+
     '<form class="grid" data-route="settings" style="margin-top:10px"><label>Switch<select name="aiEnabled"><option value="off"'+(a.enabled?"":" selected")+'>Off</option><option value="on"'+(a.enabled?" selected":"")+'>On for configured AI actions</option></select></label>'+
     '<label>OpenAI API key<input type="password" name="openaiKey" autocomplete="off" placeholder="'+(a.hasKey?"Set; leave blank to keep":"sk-...")+'"></label><label>Model<input name="aiModel" value="'+esc(a.model||"gpt-4o-mini")+'"></label>'+
-    '<label>Monthly token limit (0 = none)<input type="number" min="0" max="5000000" step="1000" name="aiMonthlyTokens" value="'+(a.monthlyTokens||0)+'"></label><div><button class="btn">Save</button></div></form>'+
+    '<label>Monthly token limit (0 = none)<input type="number" min="0" max="5000000" step="1000" name="aiMonthlyTokens" value="'+(a.monthlyTokens||0)+'"></label><label>Per-case token limit (0 = none)<input type="number" min="0" max="200000" step="500" name="aiPerCase" value="'+(a.perCaseTokens===undefined?4000:a.perCaseTokens)+'"></label><label>Pause<select name="aiPaused"><option value="off"'+(a.paused?"":" selected")+'>Running</option><option value="on"'+(a.paused?" selected":"")+'>Paused: rules only, no tokens</option></select></label><div><button class="btn">Save</button></div></form>'+'<div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button type="button" class="btn outline sm" data-aismoke="1">Run smoke test</button><span id="aismokeout" class="sub">Sends one synthetic word to check the key works. Reports only availability and usage.</span></div>'+
     '<div class="sub" style="margin-top:8px">Used this month: <b>'+(a.used||0).toLocaleString()+'</b> of '+(a.monthlyTokens||0).toLocaleString()+' tokens.'+(a.hasKey?' <button type="button" class="btn outline sm" data-aikeyremove="1">Remove key</button>':"")+'</div>',
     "Background preparation additionally requires an allowed portfolio under Synchrony automation. Only the sentences the scanner tagged are sent, with names, e-mail addresses, phone numbers and dates of birth masked. Every proposed event must quote the article word for word or it is thrown away. Nothing is applied to a case until a reviewer adds and confirms it. A monthly token limit is enforced before each call; with a limit of 0 nothing is ever sent.");
 }
@@ -7645,6 +7756,14 @@ document.addEventListener("input",event=>{
 document.addEventListener("click",event=>{
   const qc=event.target.closest&&event.target.closest("[data-synqclear]");if(qc){synQuery="";render();const el=$("synq");if(el)el.focus();return;}
   const dt=event.target.closest&&event.target.closest("[data-desktab]");if(dt){deskTab=dt.dataset.desktab;render();return;}
+  const qf=event.target.closest&&event.target.closest("[data-qcflag],[data-qcunflag]");
+  if(qf){
+    if(qf.dataset.qcunflag){qcPending=qcPending.filter(x=>x.path!==qf.dataset.qcunflag);}
+    else{const why=prompt("What must the screener fix in this field? (recorded)","");if(!why||why.trim().length<3)return;qcPending.push({path:qf.dataset.qcflag,reason:why.trim()});}
+    collectCase();renderCase();return;
+  }
+  const sm=event.target.closest&&event.target.closest("[data-aismoke]");
+  if(sm){sm.disabled=true;$("aismokeout").textContent="Testing…";api("ai-smoke",{}).then(r=>{$("aismokeout").innerHTML=(r.ok?badge("Working","green"):badge("Not available","amber"))+" "+esc(r.ok?("Reply in "+r.latencyMs+" ms · "+r.tokens+" tokens · "+r.used+" of "+r.limit+" used this month · model "+r.model+" · key from "+r.keySource):(r.reason||""));return refresh();}).catch(e=>{$("aismokeout").textContent=e.message;}).finally(()=>{sm.disabled=false;});return;}
   const ks=event.target.closest&&event.target.closest("[data-aikeysave]");
   if(ks){const key=($("aikeyinline")||{}).value||"",lim=Number(($("ailimitinline")||{}).value)||0;if(!key.trim()){message("Paste the key first.",true);return;}ks.disabled=true;api("settings",{openaiKey:key.trim(),aiEnabled:"on",aiMonthlyTokens:lim}).then(()=>refresh()).then(()=>{if(curCase){const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}}message("AI is on. Monthly limit "+lim.toLocaleString()+" tokens.");}).catch(e=>{message(e.message,true);ks.disabled=false;});return;}
   const aa=event.target.closest&&event.target.closest("[data-aiapply]");if(aa){aiApply(aa.dataset.aiapply);return;}
