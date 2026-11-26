@@ -912,6 +912,11 @@ async function automateCase(env, state, c, by) {
       else note("smpc", "Listedness (SmPC)", false, got.error || "No label found online for " + v(suspect.name));
     } catch (error) { note("smpc", "Listedness (SmPC)", false, String(error.message).slice(0, 100)); }
   } else note("smpc", "Listedness (SmPC)", false, suspect ? "Switched off in Settings" : "No suspect product yet");
+  // investigations: laboratory, radiological and other tests the article states (only populated rows are kept and exported)
+  try {
+    if (scan && !(data.labs || []).length) { const rows = extractInvestigations(scan.units.map(u => ({ id:u.id, text:u.text, section:u.section }))); data.labs = rows; note("investigations", "Investigations", rows.length > 0, rows.length ? rows.length + " test" + (rows.length === 1 ? "" : "s") + " found in the text" : "No tests or results found in the text"); }
+    else note("investigations", "Investigations", (data.labs || []).length > 0, (data.labs || []).length + " test(s) on the case");
+  } catch { note("investigations", "Investigations", false, "Could not be read"); }
   // 6. narrative
   try { if (!data.narrative?.text) { const n = buildNarrative({ ...c, data }); if (n?.text) { data.narrative = n; note("narrative", "Narrative", true, "Generated from the case fields"); } else note("narrative", "Narrative", false, "Not enough data yet"); } else note("narrative", "Narrative", true, "Already written"); } catch { note("narrative", "Narrative", false, "Could not be generated"); }
   // save what the free steps did, then the capped AI step on the saved case
@@ -1004,6 +1009,39 @@ function monitoringCounts(state, viewer) {
     pendingEvidenceIds:uniq(scope.map(a => a.pmid)).filter(id => state.articles[id] && !isFinalEvidence(evidenceStatus(state.articles[id]))).slice(0, 500), unassigned:scope.filter(a => !a.reviewer).length, overdue:scope.filter(a => open(a) && a.dueAt && a.dueAt < today).length, qcReturned:scope.filter(a => a.qc?.status === "returned").length, qcPending:scope.filter(a => a.qc?.status === "pending").length };
 }
 // ---- ICH E2D(R1) minimum criteria and one draft per supported patient. The four criteria are assessed for each patient on its own evidence, as supported, uncertain or missing.
+// ---- Investigations (laboratory, radiological and other tests) read from the text. Only what the article states is returned: a test with a result. ----
+const LAB_ANALYTES = ["blood urea nitrogen", "alanine aminotransferase", "aspartate aminotransferase", "alkaline phosphatase", "gamma-glutamyl transferase", "creatinine clearance", "white blood cell count", "platelet count", "c-reactive protein", "prothrombin time", "creatine kinase", "oxygen saturation", "blood pressure", "heart rate", "temperature", "creatinine", "urea", "bun", "alt", "ast", "alp", "ggt", "bilirubin", "albumin", "sodium", "potassium", "calcium", "magnesium", "phosphate", "glucose", "hba1c", "haemoglobin", "hemoglobin", "wbc", "platelets", "neutrophils", "lymphocytes", "eosinophils", "crp", "esr", "inr", "aptt", "ck", "cpk", "troponin", "lactate", "ammonia", "egfr", "tsh", "lipase", "amylase", "ldh", "ferritin", "d-dimer", "procalcitonin", "cholesterol", "triglycerides", "uric acid", "qtc", "spo2"];
+const LAB_UNIT = "(?:mg\\/dl|mmol\\/l|[µμu]mol\\/l|iu\\/l|u\\/l|g\\/dl|g\\/l|ng\\/ml|pg\\/ml|ng\\/l|[µμu]g\\/l|mg\\/l|meq\\/l|mmol\\/mol|ml\\/min|mmhg|bpm|°c|%|\\/[µμu]l|[x×]\\s?10\\^?[⁹9]\\/l)";
+const LAB_RE = new RegExp("\\b(?:(serum|plasma|urine|urinary|blood|csf|arterial)\\s+)?(" + LAB_ANALYTES.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")\\b", "gi");
+const IMAGING_RE = /\b(chest x-?ray|x-?ray|radiograph\w*|ct(?: scan)?(?: of the \w+| head| brain| chest| abdomen)?|computed tomography|mri(?: brain| scan)?|magnetic resonance imaging|ultraso\w+|echocardiogra\w+|ecg|ekg|electrocardiogra\w+|eeg|electroencephalogra\w+|angiogra\w+|pet(?:-ct)?|biops\w+|lumbar puncture|endoscopy|colonoscopy|bronchoscopy|culture|pcr|spirometry|fundoscopy|audiometry|nerve conduction(?: study)?)\b/i;
+const IMAGING_KIND = /x-?ray|radiograph|^ct|computed|mri|magnetic|ultraso|echo|angiogra|pet/i;
+function extractInvestigations(units) {
+  const out = [], seen = new Set(), cap = t => t ? t.charAt(0).toUpperCase() + t.slice(1) : t;
+  const when = text => { const m = /\b(?:on |at |by |after |during )?(day \d+|admission|presentation|discharge|follow-up|\d+ (?:hours?|days?|weeks?|months?) (?:after|later|following))\b/i.exec(text); return m ? m[1] : ""; };
+  const grade = text => /\b(elevated|raised|increased|high|rose|rise|peak(?:ed)?)\b/i.test(text) ? "High" : /\b(decreased|reduced|low|fell|dropped|decline[d]?)\b/i.test(text) ? "Low" : /\b(normal|within normal)\b/i.test(text) ? "Normal" : "";
+  const push = row => { const k = (row.test + "|" + row.result).toLowerCase(); if (!row.test || !row.result || seen.has(k) || out.length >= 20) return; seen.add(k); out.push(row); };
+  for (const u of units) {
+    const text = String(u.text || ""); if (!text) continue;
+    const ev = [{ excerpt:text.slice(0, 300), source:"found in the article text" }], date = when(text), assessment = grade(text);
+    for (const m of text.matchAll(LAB_RE)) {
+      const analyte = m[2].toLowerCase(), tail = text.slice(m.index + m[0].length, m.index + m[0].length + 90).split(/;|\.(?=\s|$)/)[0];
+      if (analyte === "blood pressure") { const bp = /(\d{2,3}\/\d{2,3})\s*(mmhg)?/i.exec(tail); if (bp) push({ category:"laboratory", test:"Blood pressure", result:bp[1], unit:"mmHg", date, reference_range:"", assessment, comment:"", state:"proposed", evidence:ev }); continue; }
+      const re = new RegExp("(?:from\\s+(\\d+(?:\\.\\d+)?)\\s*(?:" + LAB_UNIT + ")?\\s*(?:to|->|→)\\s*)?(\\d+(?:\\.\\d+)?)\\s*(" + LAB_UNIT + ")", "i"), hit = re.exec(tail);
+      if (!hit) continue;
+      push({ category:"laboratory", test:cap((m[1] ? m[1] + " " : "").toLowerCase() + (analyte.length <= 4 ? analyte.toUpperCase() : analyte)), result:hit[2], unit:hit[3].replace(/^u(?=mol|g)/i, "µ").replace(/^u\/l$/i, "U/L").replace(/^iu\/l$/i, "IU/L").replace(/^mmhg$/i, "mmHg"), date, reference_range:"", assessment, comment:hit[1] ? "from " + hit[1] + " to " + hit[2] : "", state:"proposed", evidence:ev });
+    }
+    const im = IMAGING_RE.exec(text);
+    if (im) {
+      const after = text.slice(im.index + im[0].length).replace(/^[\s,:()-]+/, ""), finding = /^(?:showed|revealed|demonstrated|disclosed|was|were|noted|found|confirmed|excluded|consistent with|suggestive of|negative for|positive for|normal|performed|done)\b\s*(.{4,170}?)(?:[.;]|$)/i.exec(after);
+      if (finding) push({ category:IMAGING_KIND.test(im[0]) ? "imaging" : "other", test:cap(im[0].trim()), result:(/^(?:showed|revealed|demonstrated|disclosed|noted|found|confirmed|performed|done|was|were)\b/i.test(finding[0]) ? finding[1] : finding[0]).replace(/[.;\s]+$/, "").slice(0, 170), unit:"", date, reference_range:"", assessment:/\b(normal|unremarkable|no (?:abnormal|acute|evidence))\b/i.test(finding[0]) ? "Normal" : /\b(abnormal|lesion|mass|haemorrhage|hemorrhage|infarct|oedema|edema|effusion|atrophy|consolidation|dilat\w+|enhanc\w+)\b/i.test(finding[0]) ? "Abnormal" : "", comment:"", state:"proposed", evidence:ev });
+    }
+  }
+  return out;
+}
+const patientUnitList = (ex, patient) => {
+  const ids = [...(patient.evidence || []).map(e => e.unitId), ...(patient.drugs || []).flatMap(x => x.mentions.map(m => m.unitId)), ...(patient.events || []).flatMap(x => x.mentions.map(m => m.unitId)), ...(ex.patients.length === 1 ? Object.entries(ex.unitIndex).filter(([, u]) => !/introduction|background|discussion|reference|method/i.test(u.section || "")).map(([id]) => id) : [])];
+  return uniq(ids).map(id => ({ id, text:(ex.unitIndex[id] || {}).text || "", section:(ex.unitIndex[id] || {}).section || "" })).filter(u => u.text);
+};
 // Screening disposition, the minimum-criteria assessment and regulatory reportability are three separate decisions. ----
 const sentenceRef = (ex, unitId) => { const u = ex.unitIndex[unitId] || {}; return { unitId, section:u.section || "", sentence:u.text || "", cell:u.cell || null }; };
 // Published case reports almost never give a name. A patient is identifiable when the text pins down one specific person by descriptors instead:
@@ -1130,7 +1168,7 @@ function caseFromPatient(article, patient, ex, assignment, settings, ctx) {
   const data = normalizeCase({ source_type:"literature", receipt_date:"", patient:{ identifier:f([d.age && d.age + "-" + String(d.ageUnit || "years").replace(/s$/, "") + "-old", d.sex && d.sex.toLowerCase(), d.labelText].filter(Boolean).join(" ") + " (name withheld in the publication)", patient.evidence.map(e => e.unitId)), age:f(d.age, patient.evidence.map(e => e.unitId)), age_unit:icsrField(d.ageUnit || "years", "proposed"), sex:f(d.sex, patient.evidence.map(e => e.unitId)), medical_history:history, country:f(article0.patientCountry?.name || "", []) },
     reporter:{ identifier:icsrField(top.name ? top.name + (top.corresponding ? " (corresponding author)" : " (first author)") : "", "proposed", []), qualification:icsrField("Health professional (published literature)", "proposed"), country:icsrField(article0.affiliationCountry || "", "proposed"), organisation:icsrField(top.affiliations?.[0] || article0.affiliation || "", "proposed"), email:icsrField(top.email || ex.reporters.correspondenceEmails[0] || "", "proposed") },
     sender:{ type:icsrField(settings.senderType || "Pharmaceutical company", "proposed"), organisation:icsrField(settings.senderOrg || ""), name:icsrField(settings.senderName || ""), email:icsrField(settings.senderEmail || ""), phone:icsrField(settings.senderPhone || ""), country:icsrField(settings.senderCountry || "") },
-    reporter_comments:authorConclusions(ex), other_reporters:(ex.reporters.authors || []).filter(a => a.name && a.name !== top.name).slice(0, 40).map(a => ({ name:a.name, organisation:(a.affiliations || [])[0] || "", country:countryFromAffiliation((a.affiliations || [])[0] || "")?.name || "", email:a.email || "", qualification:"Health professional (published literature)", corresponding:Boolean(a.corresponding) })),
+    labs:extractInvestigations(patientUnitList(ex, patient)), reporter_comments:authorConclusions(ex), other_reporters:(ex.reporters.authors || []).filter(a => a.name && a.name !== top.name).slice(0, 40).map(a => ({ name:a.name, organisation:(a.affiliations || [])[0] || "", country:countryFromAffiliation((a.affiliations || [])[0] || "")?.name || "", email:a.email || "", qualification:"Health professional (published literature)", corresponding:Boolean(a.corresponding) })),
     products, events, drug_history:patient.drugs.filter(x => x.role === "prior").map(x => x.name),
     treatment_given:[...patient.drugs.filter(x => x.role === "treatment").map(x => x.name), ...patient.procedures.map(x => x.name)], treatment_refs:[...patient.drugs.filter(x => x.role === "treatment").map(x => ({ name:x.name, evidence:evid(x.mentions.map(m => m.unitId)) })), ...patient.procedures.map(x => ({ name:x.name, evidence:evid(x.mentions.map(m => m.unitId)) }))], confounders:[...patient.events.filter(e => e.category === "history" || e.category === "alternative").map(e => ({ type:e.category === "history" ? "Comorbidity" : "Other cause", text:e.verbatim, evidence:e.mentions[0]?.sentence || "" })), ...patient.events.filter(e => e.category === "lab").map(e => ({ type:"Laboratory finding", text:e.verbatim, evidence:e.mentions[0]?.sentence || "" }))],
     source_summary:cite + (article.abstract ? "\n\nAbstract: " + article.abstract : ""), source_documents:[{ filename:article.fullTextKey ? "PMID_" + article.id : "PMID " + article.id + " citation and abstract", media_type:"text/plain", source_type:article.fullTextKey ? "full text" : "citation" }],
@@ -1216,6 +1254,7 @@ function buildNarrative(rec) {
     const ser = e.seriousness?.serious ? " This was considered serious (" + (v(e.seriousness_basis).replace(/: "[^"]*"/g, "") || "criterion not stated") + ")." : "";
     say(when + ", the patient " + (i ? "also " : "") + "developed " + v(e.verbatim) + (hasVal(e.pt) && v(e.pt).toLowerCase() !== v(e.verbatim).toLowerCase() ? " (suggested term: " + v(e.pt) + ")" : "") + (e.manifestations?.length ? ", with " + e.manifestations.map(m => m.verbatim).join(" and ") : "") + "." + ser + (hasVal(e.outcome) ? " Outcome: " + v(e.outcome) + "." : ""), refs(e.verbatim, e.onset_date, e.time_to_onset, e.outcome, e.seriousness_basis, { evidence:(e.manifestations || []).flatMap(m => m.evidence || []) }), "event", e.extraction_ref || "");
   });
+  { const labs = (c.labs || []).filter(l => l.test && l.result); if (labs.length) say("Relevant investigations: " + labs.map(l => l.test + " " + l.result + (l.unit ? " " + l.unit : "") + (l.date ? " (" + l.date + ")" : "")).join("; ") + ".", labs.flatMap(l => (l.evidence || []).map(e => ({ source_file:"article text", excerpt:e.excerpt }))).slice(0, 3), "investigations"); }
   if (c.treatment_given.length) say("Treatment given: " + c.treatment_given.join(", ") + ".", (c.treatment_refs || []).flatMap(t => t.evidence || []).slice(0, 3), "treatment");
   if (suspect) {
     if (hasVal(suspect.action_taken)) say("Action taken with " + v(suspect.name) + ": " + v(suspect.action_taken).toLowerCase() + (suspect.stop_day != null ? " (day " + suspect.stop_day + ")" : "") + ".", refs(suspect.action_taken), "action");
@@ -2478,7 +2517,7 @@ function normalizeCase(input) {
     products:(data.products || []).slice(0, 30).map(p => ({ ...group(p, FIELDS.product), pair_id:validPairId(p?.pair_id) ? p.pair_id : null, role:["suspect", "concomitant", "interacting"].includes(p?.role) ? p.role : "suspect", start_not_reported:p?.start_not_reported === true,
       dechallenge_basis:["reported", "unknown", "unreported", "not_applicable"].includes(p?.dechallenge_basis) ? p.dechallenge_basis : "", rechallenge_basis:["reported", "unknown", "unreported", "not_applicable"].includes(p?.rechallenge_basis) ? p.rechallenge_basis : "", start_day:Number.isFinite(p?.start_day) ? p.start_day : null, stop_day:Number.isFinite(p?.stop_day) ? p.stop_day : null })),
     events:(data.events || []).slice(0, 30).map(e => ({ ...group(e, FIELDS.event), product_causality:Object.fromEntries(Object.entries(e?.product_causality || {}).filter(([key]) => validPairId(key)).slice(0, 30).map(([key, pair]) => [key, group(pair, PAIR_FIELDS)])), onset_not_reported:e?.onset_not_reported === true, ime_flag:e?.ime_flag === true, onset_day:Number.isFinite(e?.onset_day) ? e.onset_day : null, needs_medical_judgment:(e?.needs_medical_judgment || []).map(String).slice(0, 10), manifestations:(e?.manifestations || []).slice(0, 20), extraction_ref:String(e?.extraction_ref || ""), listedness_assessment:e?.listedness_assessment || null, naranjo:e?.naranjo || null, who_umc_calc:e?.who_umc_calc || null, causality_suggestions:(e?.causality_suggestions || []).slice(0, 10), seriousness:Object.fromEntries(SERIOUS_FLAGS.map(k => [k, Boolean(e?.seriousness?.[k])])) })).map(syncListedness),
-    labs:Array.isArray(data.labs) ? data.labs.slice(0, 100) : [], source_documents:(data.source_documents || []).slice(0, 20).map(d => ({ filename:String(d?.filename || "").slice(0, 200), media_type:d?.media_type || null, size_bytes:Number(d?.size_bytes) || 0, source_type:d?.source_type || "unknown" })),
+    labs:(Array.isArray(data.labs) ? data.labs : []).slice(0, 100).map(l => ({ category:["laboratory", "imaging", "other"].includes(l?.category) ? l.category : "laboratory", test:String(l?.test ?? l?.name ?? "").trim().slice(0, 160), result:String(l?.result ?? l?.value ?? "").trim().slice(0, 300), unit:String(l?.unit || "").trim().slice(0, 40), date:String(l?.date || "").trim().slice(0, 60), reference_range:String(l?.reference_range ?? l?.range ?? "").trim().slice(0, 80), assessment:String(l?.assessment || "").trim().slice(0, 40), comment:String(l?.comment || "").trim().slice(0, 300), state:["proposed", "accepted", "edited", "rejected"].includes(l?.state) ? l.state : "edited", evidence:Array.isArray(l?.evidence) ? l.evidence.slice(0, 3) : [] })).filter(l => l.test && l.result), source_documents:(data.source_documents || []).slice(0, 20).map(d => ({ filename:String(d?.filename || "").slice(0, 200), media_type:d?.media_type || null, size_bytes:Number(d?.size_bytes) || 0, source_type:d?.source_type || "unknown" })),
     source_summary:String(data.source_summary || "").slice(0, 20000), warnings:(data.warnings || []).map(String).slice(0, 20), special_situations:(data.special_situations || []).map(String).slice(0, 30),
     // LiteraSift extensions (PV Nexus ignores unknown keys): care given for the event, and factors that confound the assessment.
     treatment_given:(data.treatment_given || []).map(String).map(t => t.slice(0, 200)).slice(0, 20),
@@ -2635,7 +2674,8 @@ function caseFromArticle(article, assignment, settings = {}) {
       ...(eventDate(quote) ? { onset_date:icsrField(eventDate(quote), "proposed", ev(e.term, quote)) } : {}) }; })
     : [{ verbatim:icsrField(condition, "proposed", condition ? ev(condition, article.abstract) : []) }];
   const social = article.source === "Social media";
-  const built = normalizeCase({ source_type:social ? "social" : "literature", source_platform:social ? article.platform || "" : "", receipt_date:new Date().toISOString().slice(0, 10),
+  const absUnits = String((article.title || "") + ". " + (article.abstract || "")).split(/(?<=[.!?])\s+/).map((t, i) => ({ id:"a" + i, text:t, section:"Abstract" })).filter(u => u.text.length > 8);
+  const built = normalizeCase({ labs:social ? [] : extractInvestigations(absUnits), source_type:social ? "social" : "literature", source_platform:social ? article.platform || "" : "", receipt_date:new Date().toISOString().slice(0, 10),
     patient:{ identifier:patientIdentity(facts?.patient, ev), country:icsrField(article.patientCountry?.name || "", "proposed", article.patientCountry ? ev(article.patientCountry.evidence) : []),
       age:fe(facts?.patient?.age, { evidence:facts?.patient?.evidence }), age_unit:icsrField(facts?.patient?.age_unit || "years", "proposed"), age_group:icsrField(facts?.patient?.age ? "" : groupFromWord(facts?.patient?.age_group), "proposed", facts?.patient?.evidence ? ev(facts.patient.evidence) : []), sex:fe(facts?.patient?.sex, { evidence:facts?.patient?.evidence }),
       weight:fe(facts?.patient?.weight, { evidence:facts?.patient?.evidence }), medical_history:history },
@@ -3079,6 +3119,7 @@ function caseNarrativeText(c, citation) {
     if (hasVal(suspect.dechallenge)) out.push("Dechallenge: " + v(suspect.dechallenge) + ".");
     if (hasVal(suspect.rechallenge)) out.push("Rechallenge: " + v(suspect.rechallenge) + ".");
   }
+  { const labs = (c.labs || []).filter(l => l.test && l.result); if (labs.length) out.push("Relevant investigations: " + labs.map(l => l.test + " " + l.result + (l.unit ? " " + l.unit : "") + (l.date ? " (" + l.date + ")" : "")).join("; ") + "."); }
   if (c.treatment_given.length) out.push("Treatment given for the event: " + c.treatment_given.join(", ") + ".");
   if (c.confounders.length) out.push("Potential confounders: " + c.confounders.map(x => x.type + ": " + x.text).join("; ") + ".");
   const suspects = c.products.filter(p => p.role === "suspect" && hasVal(p.name));
@@ -3145,6 +3186,11 @@ function e2bCase(rec, article, opts = {}) {
   const repCom = c.reporter_comments || c.general_comments, senderCom = [c.sender_comments, c.reporter_comments && c.general_comments ? "General comments: " + c.general_comments : ""].filter(Boolean).join("\n");
   const senderXml = hasVal(c.sender.organisation) || hasVal(c.sender.name) ? `<subjectOf1 typeCode="SUBJ"><controlActEvent classCode="CACT" moodCode="EVN"><author typeCode="AUT">${person(v(c.sender.name), v(c.sender.organisation), v(c.sender.email), v(c.sender.phone), v(c.sender.address), v(c.sender.country), "")}</author></controlActEvent></subjectOf1>` : "";
   const commentXml = (code, name, value) => value ? `<component typeCode="COMP"><observationEvent classCode="OBS" moodCode="EVN"><code code="${code}" codeSystem="${OID.obs}" displayName="${name}"/><value xsi:type="ED">${xmlEsc(value)}</value></observationEvent></component>` : "";
+  const ucum = u => String(u || "").replace(/[µμ]/g, "u").replace(/[x×]\s?10\^?[⁹9]\/L/i, "10*9/L").replace(/°C/i, "Cel");
+  const labRows = (c.labs || []).filter(l => l.test && l.result).slice(0, 50).map(l => {
+    const numeric = /^-?\d+(?:\.\d+)?$/.test(l.result), extras = [l.date, l.comment, l.assessment, l.reference_range ? "reference " + l.reference_range : ""].filter(Boolean).join("; ");
+    return `<component typeCode="COMP"><observation classCode="OBS" moodCode="EVN"><code nullFlavor="UNK"><originalText>${xmlEsc(l.test)}</originalText></code>${extras ? `<text>${xmlEsc(extras)}</text>` : ""}${numeric ? `<value xsi:type="PQ" value="${xmlEsc(l.result)}" unit="${xmlEsc(ucum(l.unit) || "1")}"/>` : `<value xsi:type="ED">${xmlEsc(l.result + (l.unit ? " " + l.unit : ""))}</value>`}</observation></component>`;
+  }).join("");
   const weight = v(p.weight) ? `<subjectOf2 typeCode="SBJ">${obs("7", "bodyWeight", `<value xsi:type="PQ" value="${xmlEsc(v(p.weight))}" unit="kg"/>`)}</subjectOf2>` : "";
   const received = hl7Date(rec.data.receipt_date) || hl7Date(rec.createdAt);
   const message = `<PORR_IN049016UV><id root="${OID.msgSender}" extension="${xmlEsc(rec.number)}"/><creationTime value="${hl7Now()}"/><interactionId root="2.16.840.1.113883.1.6" extension="PORR_IN049016UV"/><processingCode code="P"/><processingModeCode code="T"/><acceptAckCode code="AL"/>` +
@@ -3157,6 +3203,7 @@ function e2bCase(rec, article, opts = {}) {
     `<player1 classCode="PSN" determinerCode="INSTANCE">${v(p.identifier) ? `<name>${xmlEsc(v(p.identifier))}</name>` : ""}${sexCode ? `<administrativeGenderCode code="${sexCode}" codeSystem="1.0.5218"/>` : ""}</player1>` +
     age + ageGroup + weight + reactions + (drugs ? `<subjectOf2 typeCode="SBJ"><organizer classCode="CATEGORY" moodCode="EVN"><code code="4" codeSystem="${OID.obs}" displayName="drugInformation"/>${drugs}</organizer></subjectOf2>` : "") +
     (history ? `<subjectOf2 typeCode="SBJ"><organizer classCode="CATEGORY" moodCode="EVN"><code code="1" codeSystem="${OID.obs}" displayName="relevantMedicalHistoryAndConcurrentConditions"/>${history}</organizer></subjectOf2>` : "") +
+    (labRows ? `<subjectOf2 typeCode="SBJ"><organizer classCode="CATEGORY" moodCode="EVN"><code code="3" codeSystem="${OID.obs}" displayName="testsAndProceduresRelevantToTheInvestigation"/>${labRows}</organizer></subjectOf2>` : "") +
     `</primaryRole></subject1>${causality}</adverseEventAssessment></component>` + commentXml("10", "reportersComments", repCom) + commentXml("2", "sendersComments", senderCom) + reporterXml + senderXml + `</investigationEvent></subject></controlActProcess></PORR_IN049016UV>`;
   return message;
 }
@@ -3254,8 +3301,10 @@ function ciomsPdf(rec, article, opts = {}) {
   table(["Drug", "Dose/frequency", "Route", "Start", "Stop", "Indication"], [2, 1.6, 1.1, 1.1, 1.1, 1.6], others.map(x => [v(x.name), [v(x.dose), v(x.frequency)].filter(Boolean).join(", ") || "-", v(x.route) || "-", v(x.start_date) || "-", v(x.stop_date) || "-", v(x.indication) || "-"]));
   caption("19. Other relevant history (allergies, pregnancy, pre-existing conditions)");
   table(["Condition", "Start", "End", "Ongoing"], [4, 1.4, 1.4, 1.2], p.medical_history.filter(hasVal).map(h => [v(h), "-", "-", "-"]));
-  caption("Relevant investigations / laboratory results");
-  table(["Test", "Result", "Unit", "Reference range", "Date"], [2.2, 1.4, 1, 1.6, 1.2], (c.labs || []).slice(0, 30).map(l => [l.test || l.name, l.result || l.value, l.unit, l.reference_range || l.range, l.date]));
+  if ((c.labs || []).some(l => l.test && l.result)) {
+    caption("Relevant investigations / laboratory results");
+    table(["Test", "Result", "Unit", "Reference range", "Date"], [2.2, 2, 0.9, 1.4, 1.1], (c.labs || []).filter(l => l.test && l.result).slice(0, 30).map(l => [l.test, l.result + (l.assessment ? " (" + l.assessment.toLowerCase() + ")" : ""), l.unit, l.reference_range, l.date]));
+  }
   band("V. MEDICAL ASSESSMENT");
   (events.length ? events : [{}]).forEach((e, i) => {
     if (events.length > 1) { caption("Event " + (i + 1) + " of " + events.length + ": " + v(e.verbatim)); }
@@ -3324,11 +3373,12 @@ function fhirBundle(rec, article) {
   events.forEach((e, i) => entries.push({ fullUrl:"urn:uuid:ae-" + rec.number + "-" + (i + 1), resource:{ resourceType:"AdverseEvent", id:"ae-" + rec.number + "-" + (i + 1), actuality:"actual", event:{ text:v(e.verbatim), ...(hasVal(e.pt_code) ? { coding:[{ system:"http://terminology.hl7.org/CodeSystem/mdr", code:v(e.pt_code), display:v(e.pt) }] } : {}) },
     subject:{ reference:"urn:uuid:" + patientId }, ...(v(e.onset_date) ? { date:v(e.onset_date) } : {}), seriousness:{ text:e.seriousness?.serious ? "Serious" : "Non-serious" }, ...(hasVal(e.outcome) ? { outcome:{ text:v(e.outcome) } } : {}),
     ...(suspect && hasVal(suspect.name) ? { suspectEntity:[{ instance:{ display:v(suspect.name) } }] } : {}), note:[{ text:caseNarrativeText(c, "") }] } }));
+  (c.labs || []).filter(l => l.test && l.result).forEach((l, i) => entries.push({ fullUrl:"urn:uuid:obs-" + rec.number + "-" + (i + 1), resource:{ resourceType:"Observation", id:"obs-" + rec.number + "-" + (i + 1), status:"final", category:[{ text:l.category }], code:{ text:l.test }, subject:{ reference:"urn:uuid:" + patientId }, ...(/^-?\d+(?:\.\d+)?$/.test(l.result) ? { valueQuantity:{ value:Number(l.result), unit:l.unit } } : { valueString:l.result }), ...(l.date ? { effectiveString:l.date } : {}), ...(l.reference_range ? { referenceRange:[{ text:l.reference_range }] } : {}), ...(l.assessment ? { interpretation:[{ text:l.assessment }] } : {}) } }));
   return { resourceType:"Bundle", type:"collection", identifier:{ system:"http://literasift.tech/case", value:rec.number }, timestamp:new Date().toISOString(), entry:entries };
 }
 // Line listing: one row per case and event (the layout used for periodic reports and spreadsheets).
 const LINE_HEAD = ["Case", "PMID", "Status", "Assignee", "Due", "Country", "Age", "Age group", "Sex", "Suspect product", "Event (verbatim)", "PT", "PT code", "SOC", "Serious", "Onset", "Outcome", "Causality (WHO-UMC)", "Action taken", "Reference",
-  "Client", "Portfolio", "Stage", "Seriousness criteria", "Listedness", "LLT code", "Dechallenge", "Rechallenge", "Reporter", "Other authors", "Reporter comments", "Awareness date", "Clock (days)", "Clock due", "Clock status", "Citation", "DOI"];
+  "Client", "Portfolio", "Stage", "Seriousness criteria", "Listedness", "LLT code", "Dechallenge", "Rechallenge", "Reporter", "Other authors", "Reporter comments", "Awareness date", "Clock (days)", "Clock due", "Clock status", "Citation", "DOI", "Investigations"];
 function lineListingRows(records, articles, state) {
   const rows = [];
   for (const r of records) {
@@ -3337,7 +3387,7 @@ function lineListingRows(records, articles, state) {
     const tl = state ? caseTimeline(state, r) : {}, cls = caseClass(r);
     for (const e of events.length ? events : [{}]) rows.push([r.number, r.pmid, r.status, r.assignee || "", r.dueAt || "", v(c.patient.country), ageText(c.patient), v(c.patient.age_group), v(c.patient.sex), v(s.name), v(e.verbatim), v(e.pt), v(e.pt_code), v(e.soc), e.seriousness?.serious ? "Yes" : "No", v(e.onset_date), v(e.outcome), v(e.causality_reviewer), v(s.action_taken), String(r.data.source_summary || "").split("\n")[0],
       client, r.portfolio || "", STAGE_LABEL[r.stage || "medical_review"] || "", Object.entries(e.seriousness || {}).filter(([k, on]) => on && k !== "serious").map(([k]) => k.replace(/_/g, " ")).join("; "), cls.listedness, v(e.llt_code), v(s.dechallenge), v(s.rechallenge), v(c.reporter.identifier), (c.other_reporters || []).map(x => x.name).join("; "), c.reporter_comments || "",
-      v(c.dates?.awareness) || "", tl.days ?? "", tl.due || "", tl.status || "", [(art.authors || []).slice(0, 3).join(", "), art.journal, (art.date || "").slice(0, 4)].filter(Boolean).join(", "), art.doi || ""]);
+      v(c.dates?.awareness) || "", tl.days ?? "", tl.due || "", tl.status || "", [(art.authors || []).slice(0, 3).join(", "), art.journal, (art.date || "").slice(0, 4)].filter(Boolean).join(", "), art.doi || "", (c.labs || []).filter(l => l.test && l.result).map(l => l.test + " " + l.result + (l.unit ? " " + l.unit : "") + (l.date ? " (" + l.date + ")" : "")).join("; ")]);
   }
   return rows;
 }
@@ -5449,6 +5499,7 @@ dialog.cwin[open]{display:grid;grid-template-rows:auto auto minmax(0,1fr)}
 .fl-item{display:flex;gap:10px;align-items:flex-start;padding:5px 0;border-top:1px solid var(--border)}.fl-item:first-of-type{border-top:0}.fl-item i{flex:none;display:grid;place-items:center;width:18px;height:18px;border-radius:50%;border:1px solid var(--border);font-style:normal;font-size:11px;color:var(--green)}.fl-item.ok i{background:var(--green-soft);border-color:transparent}
 .flow-screening{border-left:4px solid var(--blue)}.flow-qc{border-left:4px solid var(--amber)}.flow-medical_review{border-left:4px solid var(--green)}
 #navtip{position:fixed;z-index:60;background:#0d1512;color:#fff;border:1px solid #ffffff26;padding:5px 11px;border-radius:8px;font-size:12.5px;font-weight:500;pointer-events:none;opacity:0;transform:translateX(-4px);transition:opacity .08s,transform .08s;box-shadow:0 8px 22px -8px #000a;white-space:nowrap}#navtip.on{opacity:1;transform:none}
+.labgrid{display:flex;flex-direction:column;gap:6px}.labrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.labrow input,.labrow select{padding:5px 8px;font-size:13px}
 .roban{background:var(--amber-soft);color:var(--amber);border:1px solid var(--amber);border-radius:9px;padding:8px 12px;margin-bottom:12px;font-weight:500}
 .serieslayout{display:grid;gap:22px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.serieslayout h3{font-size:13px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
 .sbar{margin-bottom:9px}.sbar-h{display:flex;justify-content:space-between;gap:10px;font-size:13px}.sbar-k{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sbar-t{height:6px;border-radius:99px;background:var(--accent);margin-top:3px;overflow:hidden}.sbar-t i{display:block;height:100%;background:var(--brand);border-radius:99px}
@@ -5690,7 +5741,7 @@ function collectCase(){
   const old=d.patient.medical_history, lines=$("casehist").value.split("\\n").map(x=>x.trim()).filter(Boolean);
   d.patient.medical_history=lines.map(t=>old.find(h=>h.value===t)||{value:t,normalized_value:null,state:"edited",evidence:[]});
   d.special_situations=[...box.querySelectorAll("[data-kind=situation]")].filter(x=>x.checked).map(x=>x.value).concat(d.special_situations.filter(x=>!SIT.includes(x)));
-  d.general_comments=$("casegeneral").value;d.reporter_comments=$("casereportercomment").value;d.other_reporters=$("caseotherrep").value.split(NL).map(l=>l.split("|").map(x=>x.trim())).filter(c=>c[0]).map(c=>({name:c[0],organisation:c[1]||"",country:c[2]||"",email:c[3]||"",qualification:(d.other_reporters||[]).find(r=>r.name===c[0]&&r.email===(c[3]||""))?.qualification||"Health professional (published literature)",corresponding:(d.other_reporters||[]).some(r=>r.name===c[0]&&r.email===(c[3]||"")&&r.corresponding)}));d.sender_comments=$("casesendercomment").value;d.source_summary=$("casesummary").value;curCase.notes=$("casenotes").value;curCase.status=$("casestatus").value;
+  d.labs=[...document.querySelectorAll("#casebody .labrow")].map(r=>{const o={};r.querySelectorAll(".labin").forEach(x=>{o[x.dataset.k]=x.value;});const old=(d.labs||[])[Number(r.dataset.i)]||{};const same=["category","test","result","unit","date","reference_range","assessment"].every(k=>String(old[k]||"")===String(o[k]||""));return Object.assign({comment:old.comment||"",evidence:old.evidence||[]},o,{state:same?(old.state||"edited"):"edited"});});d.general_comments=$("casegeneral").value;d.reporter_comments=$("casereportercomment").value;d.other_reporters=$("caseotherrep").value.split(NL).map(l=>l.split("|").map(x=>x.trim())).filter(c=>c[0]).map(c=>({name:c[0],organisation:c[1]||"",country:c[2]||"",email:c[3]||"",qualification:(d.other_reporters||[]).find(r=>r.name===c[0]&&r.email===(c[3]||""))?.qualification||"Health professional (published literature)",corresponding:(d.other_reporters||[]).some(r=>r.name===c[0]&&r.email===(c[3]||"")&&r.corresponding)}));d.sender_comments=$("casesendercomment").value;d.source_summary=$("casesummary").value;curCase.notes=$("casenotes").value;curCase.status=$("casestatus").value;
   d.treatment_given=$("casetreat").value.split(NL).map(x=>x.trim()).filter(Boolean);
   const oldConf=d.confounders||[];
   d.confounders=$("caseconf").value.split(NL).map(x=>x.trim()).filter(Boolean).map(line=>{const i=line.indexOf(":"),type=i>0?line.slice(0,i).trim():"Other",text=i>0?line.slice(i+1).trim():line;return oldConf.find(c=>c.type===type&&c.text===text)||{type,text,evidence:""};});
@@ -5714,6 +5765,12 @@ function pickerHtml(){
   const cands=(art.events||[]).filter(e=>!have.has(e.term.toLowerCase()));
   return cands.length?'<div class="sub" style="margin-bottom:6px">Event picker: events detected in the article (red = important medical event). Click to add.</div><div class="chips" style="margin-bottom:10px">'+cands.map((e,i)=>'<button type="button" class="badge '+(e.ime?"red":"")+'" style="cursor:pointer" data-pickevent="'+esc(e.term)+'" title="'+esc((e.evidence||"")+(e.ime?" · "+e.ime.provenance:""))+'">+ '+esc(e.term)+'</button>').join("")+'</div>':"";
 }
+function labsHtml(d){
+  const rows=d.labs||[];
+  if(!rows.length)return '<div class="sub">None recorded. Run automation to read them from the text, or add a test.</div>';
+  const cat=["laboratory","imaging","other"], inp=(i,k,w,ph)=>'<input class="labin" data-k="'+k+'" value="'+esc(rows[i][k]||"")+'" placeholder="'+ph+'" style="width:'+w+'" aria-label="'+ph+'">';
+  return '<div class="labgrid">'+rows.map((l,i)=>'<div class="labrow" data-i="'+i+'"><select class="labin" data-k="category" aria-label="Type">'+cat.map(c=>'<option'+(c===l.category?" selected":"")+'>'+c+'</option>').join("")+'</select>'+inp(i,"test","170px","Test")+inp(i,"result","300px","Result")+inp(i,"unit","80px","Unit")+inp(i,"date","110px","Date or day")+inp(i,"reference_range","110px","Reference")+inp(i,"assessment","90px","High / low")+(l.state==="proposed"?badge("proposed","amber"):"")+'<button type="button" class="btn outline sm" data-caseact="dellab" data-i="'+i+'">Remove</button></div>').join("")+'</div>';
+}
 function caseForm(){
   const d=curCase.data, mine=gp;
   const products=d.products.map((p,i)=>'<div class="card" style="margin-bottom:10px;padding:12px"><div class="grid" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+
@@ -5731,6 +5788,7 @@ function caseForm(){
     '</section><section class="csec" id="cs-sender"><h3>Sender</h3><div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">'+caseSelect("Sender type","sender.type",["","Pharmaceutical company","Regulatory authority","Health professional","Regional pharmacovigilance centre","Patient or consumer","Other"])+caseInput("Organisation","sender.organisation")+caseInput("Contact name","sender.name")+caseInput("E-mail","sender.email")+caseInput("Phone","sender.phone")+caseInput("Country","sender.country")+'</div>'+
     '</section><section class="csec" id="cs-products"><h3>Products <button type="button" class="btn outline sm" data-caseact="addprod">Add product</button></h3>'+products+
     '</section><section class="csec" id="cs-events"><h3>Events <button type="button" class="btn outline sm" data-caseact="addevent">Add event</button></h3>'+pickerHtml()+events+
+    '</section><section class="csec" id="cs-invest"><h3>Investigations <button type="button" class="btn outline sm" data-caseact="addlab">Add test</button></h3><div class="sub" style="margin-bottom:8px">Laboratory, radiological and other tests the article reports. Only rows with a test and a result are saved and exported; blank rows are dropped.</div>'+labsHtml(d)+
     '</section><section class="csec" id="cs-special"><h3>Special situations</h3><div class="chips">'+SIT.map(x=>'<label class="check"><input type="checkbox" data-kind="situation" value="'+esc(x)+'"'+(d.special_situations.includes(x)?" checked":"")+'>&nbsp;'+esc(x)+'</label>').join("")+'</div>'+
     '</section><section class="csec" id="cs-treat"><h3>Treatment and confounding</h3><label>Treatment given for the event (one per line)<textarea id="casetreat" rows="2">'+esc((d.treatment_given||[]).join(NL))+'</textarea></label>'+
     '<label style="margin-top:10px">Confounders and other causes (one per line, as Type: text)<textarea id="caseconf" rows="3">'+esc((d.confounders||[]).map(c=>c.type+": "+c.text).join(NL))+'</textarea></label>'+
@@ -5739,9 +5797,9 @@ function caseForm(){
     '</section><section class="csec" id="cs-source"><h3>Source and notes</h3><label>Source and abstract<textarea id="casesummary" rows="5">'+esc(d.source_summary)+'</textarea></label><label style="margin-top:10px">Reviewer notes<textarea id="casenotes" rows="2">'+esc(curCase.notes||"")+'</textarea></label></section>';
 }
 let assistCase="", assistTab="flow", aiFillRes=null, assistTab0="flow", assistData=null, smpcRes={}, smpcInfo=null, assistBusy="", smpcPaste="";
-const CASE_SECTIONS=[["cs-patient","Patient"],["cs-reporter","Reporter"],["cs-sender","Sender"],["cs-products","Products"],["cs-events","Events"],["cs-pairs","Drug–event causality"],["cs-special","Special situations"],["cs-treat","Treatment and confounders"],["cs-authors","Authors"],["cs-comments","Comments"],["cs-source","Source and notes"]];
+const CASE_SECTIONS=[["cs-patient","Patient"],["cs-reporter","Reporter"],["cs-sender","Sender"],["cs-products","Products"],["cs-events","Events"],["cs-pairs","Drug–event causality"],["cs-invest","Investigations"],["cs-special","Special situations"],["cs-treat","Treatment and confounders"],["cs-authors","Authors"],["cs-comments","Comments"],["cs-source","Source and notes"]];
 function caseNav(){
-  const d=curCase.data, cnt={"cs-products":d.products.length,"cs-events":d.events.length,"cs-authors":(d.other_reporters||[]).length+1};
+  const d=curCase.data, cnt={"cs-products":d.products.length,"cs-events":d.events.length,"cs-invest":(d.labs||[]).length,"cs-authors":(d.other_reporters||[]).length+1};
   $("casenav").innerHTML=CASE_SECTIONS.map(x=>'<button type="button" class="cn-link" data-casejump="'+x[0]+'">'+esc(x[1])+(cnt[x[0]]?'<span>'+cnt[x[0]]+'</span>':"")+'</button>').join("");
 }
 function caseSteps(){
@@ -7283,6 +7341,8 @@ document.addEventListener("click",event=>{
     const act=target.dataset.caseact;
     if(act==="close"){$("casedlg").close();return;}
     if(act==="addprod"){collectCase();curCase.data.products.push(blankProduct());renderCase();return;}
+    if(act==="addlab"){collectCase();curCase.data.labs.push({category:"laboratory",test:"",result:"",unit:"",date:"",reference_range:"",assessment:"",comment:"",state:"edited",evidence:[]});renderCase();return;}
+    if(act==="dellab"){collectCase();curCase.data.labs.splice(Number(target.dataset.i),1);renderCase();return;}
     if(act==="addevent"){collectCase();curCase.data.events.push(blankEvent());renderCase();return;}
     if(act==="aifill"||act==="submitqc"||act==="qcapprove"||act==="qcreturn"||act==="automate"){caseFlowAct(act);return;}
     if(act==="routecase"){(async()=>{await routeItems("case",[curCase.id]);const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}else $("casedlg").close();})();return;}
@@ -7581,7 +7641,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  istStamp, extractClinical, zipFiles, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  istStamp, extractInvestigations, extractClinical, zipFiles, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);

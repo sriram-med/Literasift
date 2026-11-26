@@ -335,3 +335,29 @@ test("Synchrony export formats: CIOMS I PDFs, FHIR bundles and narratives for th
   const fh = await get("fhir"); assert.ok([...readZip(Buffer.from(await fh.arrayBuffer())).keys()].some(n => /FHIR\.json$/.test(n)));
   const nr = await get("narrative"); assert.match(await nr.text(), new RegExp("=== " + c.number));
 });
+
+test("investigations: laboratory, imaging and other tests are pre-populated from the text, and only populated rows reach any export", async () => {
+  const t = await scenario(ACICLOVIR); await t.call(SCREENER, "/api/drafts-create", { id: "a1" });
+  let c = (await t.cases())[0]; const names = c.data.labs.map(l => l.test);
+  assert.ok(c.data.labs.length >= 1 && names.some(n => /creatinine/i.test(n)), "pre-populated: " + names);
+  const cr = c.data.labs.find(l => /creatinine/i.test(l.test)); assert.equal(cr.result, "2.4"); assert.equal(cr.unit, "mg/dL"); assert.equal(cr.date, "day 3"); assert.equal(cr.state, "proposed"); assert.match(cr.evidence[0].excerpt, /creatinine rose/);
+  assert.match(c.data.narrative?.text || worker.caseNarrativeText(worker.normalizeCase(c.data), "ref"), /Relevant investigations: .*creatinine 2\.4 mg\/dL/i);
+  // blank rows and rows without a result are dropped on save, so they cannot be exported
+  const mine = JSON.parse(JSON.stringify(c.data)); mine.labs.push({ category: "laboratory", test: "", result: "" }, { category: "imaging", test: "CT head", result: "" }, { category: "imaging", test: "MRI brain", result: "normal", unit: "", date: "day 4" });
+  const save = await t.call(MEDICAL, "/api/case-save", { id: c.id, status: "Draft", data: mine }); assert.equal(save.status, 200, JSON.stringify(save.body));
+  c = (await t.cases())[0]; assert.ok(!c.data.labs.some(l => l.test === "CT head" || !l.test), "rows without a result are not kept"); assert.ok(c.data.labs.some(l => l.test === "MRI brain"));
+  const xml = await (await t.raw(MEDICAL, "/api/case-export", { id: c.id, format: "e2b", profile: "EU" })).text();
+  assert.match(xml, /testsAndProceduresRelevantToTheInvestigation/); assert.match(xml, /<originalText>MRI brain<\/originalText>/); assert.ok(!/CT head/.test(xml)); assert.match(xml, /<value xsi:type="PQ" value="2.4" unit="mg\/dL"\/>/);
+  const csv = await (await t.raw(MEDICAL, "/api/case-export", { id: c.id, format: "csv" })).text(); assert.match(csv, /Investigations/); assert.match(csv, /MRI brain normal \(day 4\)/); assert.ok(!/CT head/.test(csv));
+  // a case with no investigations exports no empty investigations block at all
+  const none = JSON.parse(JSON.stringify(c.data)); none.labs = []; await t.call(MEDICAL, "/api/case-save", { id: c.id, status: "Draft", data: none });
+  const xml2 = await (await t.raw(MEDICAL, "/api/case-export", { id: c.id, format: "e2b", profile: "EU" })).text(); assert.ok(!/testsAndProceduresRelevantToTheInvestigation/.test(xml2), "no empty block");
+  const fhir = await (await t.raw(MEDICAL, "/api/case-export", { id: c.id, format: "fhir" })).json(); assert.ok(!fhir.entry.some(e => e.resource.resourceType === "Observation"));
+});
+
+test("investigation extractor reads results, units, days and imaging findings, and ignores doses", () => {
+  const rows = worker.extractInvestigations([{ id: "1", text: "At admission the ALT was 220 U/L and the platelet count 98 x10^9/L. Blood pressure 90/60 mmHg." }, { id: "2", text: "MRI brain showed bilateral basal ganglia hyperintensity consistent with toxic encephalopathy." }, { id: "3", text: "A chest X-ray was normal." }, { id: "4", text: "He took aciclovir 10 mg/kg intravenously." }]);
+  const by = n => rows.find(r => r.test === n);
+  assert.deepEqual([by("ALT").result, by("ALT").unit, by("ALT").date], ["220", "U/L", "admission"]); assert.equal(by("Blood pressure").result, "90/60");
+  assert.equal(by("MRI brain").category, "imaging"); assert.match(by("MRI brain").result, /^bilateral basal ganglia/); assert.equal(by("Chest X-ray").assessment, "Normal"); assert.equal(rows.length, 5, "the drug dose is not a test");
+});
