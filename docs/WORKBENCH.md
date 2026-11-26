@@ -113,3 +113,9 @@ The QC check now happens on the **finished case**, not on the article (set `qcPo
 3. **Medical review.** Confirms coding, seriousness and listedness, sets causality, approves and signs. Route sends it to QC or the screener if something is wrong.
 
 Every hand-off is recorded in the case history and the audit trail. All times printed on screenshots, snapshot cards and PDF snapshot lines are IST (UTC+05:30); the capture browser also runs in Asia/Kolkata. Stored timestamps and signatures stay UTC.
+
+## Automation first (Synchrony)
+
+- **Case automation** runs on every new draft and when a screener opens a case that has not been automated: event detection (from the full-text scan when the case has none), IME flags, MedDRA exact matches, seriousness from the text, listedness from the online label (openFDA) and the narrative. Everything is a proposal with its evidence; a person's own entry is never overwritten; running it again is safe. The AI data-entry step is separate: off unless a manager turns it on under Settings, Case workflow, and set a monthly token limit.
+- **Paste the OpenAI key in the app:** in the case workspace (Workflow tab) a manager sees a field to paste the key and set the limit; it can also be set under Settings, Case workflow.
+- **Export from Synchrony** follows the ticked cases, or every case shown: line listing (CSV), E2B(R3) batch (XML), CIOMS I (ZIP of PDFs), FHIR (ZIP), narratives (TXT), and a full package (per-case E2B, CIOMS and narrative, plus line listing, batch XML and manifest).

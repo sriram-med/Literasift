@@ -138,6 +138,7 @@ test("duplicate and follow-up review: matches are explained, linking needs a per
 
 test("E2B(R3): an incomplete case fails with field-level errors, a completed one validates and is approved by a medical reviewer, and final output is gated, versioned and tamper-evident", async () => {
   const t = await scenario(ACICLOVIR, { article: { affiliationCountry: "India" } });
+  await t.call(MANAGER, "/api/settings", { autoRun: "off" });   // this test checks the raw draft, before automation fills the narrative
   await t.call(SCREENER, "/api/drafts-create", { id: "a1" });
   let c = (await t.cases())[0];
   const bad = await t.call(MEDICAL, "/api/e2b-validate", { caseId: c.id, profile: "EU" });
@@ -308,4 +309,29 @@ test("AI data entry: asks only for empty fields, sends few sentences, accepts on
 
 test("screenshots and snapshot cards print IST, not UTC", () => {
   assert.equal(worker.istStamp("2026-11-25T20:00:00Z"), "2026-11-26 01:30 IST"); assert.equal(worker.istStamp("2026-11-25T04:49:00Z"), "2026-11-25 10:19 IST"); assert.equal(worker.istStamp(""), "");
+});
+
+test("automation: a new case is filled by the free steps (events, seriousness, narrative, online listedness) as proposals, never over a human value, with the AI step off by default", async () => {
+  const t = await scenario(ACICLOVIR); let aiCalls = 0;
+  const net = async url => { if (String(url).includes("api.fda.gov")) return new Response(JSON.stringify({ results: [{ set_id: "s1", version: "3", effective_time: "20240101", openfda: { brand_name: ["Zovirax"], generic_name: ["aciclovir"] }, adverse_reactions: ["Neurotoxicity including status epilepticus has been reported in patients with renal impairment."] }] }), { status: 200 }); if (String(url).includes("openai")) aiCalls++; return new Response("", { status: 404 }); };
+  await withFetch(net, () => t.call(SCREENER, "/api/drafts-create", { id: "a1" }));
+  let c = (await t.cases())[0]; assert.ok(c.automation && c.automation.steps.length >= 6, "automation ran when the draft was made");
+  const step = k => c.automation.steps.find(x => x.key === k);
+  assert.equal(step("seriousness").ok, true); assert.equal(step("narrative").ok, true); assert.equal(step("smpc").ok, true, step("smpc").detail); assert.equal(step("ai").ok, false); assert.match(step("ai").detail, /Off/); assert.equal(aiCalls, 0, "no AI call without being switched on");
+  const ev = c.data.events.find(e => /status epilepticus/i.test(e.verbatim.value)); assert.ok(ev, "event present");
+  assert.equal(ev.seriousness.serious, true); assert.equal(ev.listedness.value, "Listed"); assert.equal(ev.listedness.state, "proposed"); assert.match(ev.rsi.value, /FDA label/); assert.ok(c.data.narrative.text.length > 40);
+  // a human value is never overwritten, and running again is safe
+  const mine = JSON.parse(JSON.stringify(c.data)); const e0 = mine.events.find(e => /status epilepticus/i.test(e.verbatim.value)); e0.listedness = { value: "Unlisted", state: "edited", evidence: [] };
+  assert.equal((await t.call(MANAGER, "/api/case-save", { id: c.id, status: "Draft", data: mine })).status, 200);
+  const again = await withFetch(net, () => t.call(MANAGER, "/api/case-automate", { id: c.id })); assert.equal(again.status, 200, JSON.stringify(again.body));
+  c = (await t.cases())[0]; assert.equal(c.data.events.find(e => /status epilepticus/i.test(e.verbatim.value)).listedness.value, "Unlisted", "the person's value stays");
+  assert.equal((await t.call(QC, "/api/case-automate", { id: c.id })).status, 404, "only people who can see it"); assert.equal((await t.call(SCREENER, "/api/case-automate", { id: c.id })).status, 404, "a screener whose case has moved on cannot run it");
+});
+
+test("Synchrony export formats: CIOMS I PDFs, FHIR bundles and narratives for the selection", async () => {
+  const t = await scenario(ACICLOVIR); await t.call(SCREENER, "/api/drafts-create", { id: "a1" }); const c = (await t.cases())[0];
+  const get = async format => t.raw(MANAGER, "/api/cases-export", { format, ids: [c.id] });
+  const ci = await get("cioms"); assert.equal(ci.status, 200); const names = [...readZip(Buffer.from(await ci.arrayBuffer())).keys()]; assert.ok(names.some(n => /CIOMS-I-DRAFT\.pdf$/.test(n)), names.join());
+  const fh = await get("fhir"); assert.ok([...readZip(Buffer.from(await fh.arrayBuffer())).keys()].some(n => /FHIR\.json$/.test(n)));
+  const nr = await get("narrative"); assert.match(await nr.text(), new RegExp("=== " + c.number));
 });

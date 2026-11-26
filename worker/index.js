@@ -850,6 +850,82 @@ function aiFillFields(c) {
   return out.slice(0, 30);
 }
 const aiPathOf = id => { const m = /^p\.(\w+)$/.exec(id) || null; if (m) return "patient." + m[1]; const r = /^r(\d+)\.(\w+)$/.exec(id); if (r) return "products." + r[1] + "." + r[2]; const e = /^e(\d+)\.(\w+)$/.exec(id); return e ? "events." + e[1] + "." + e[2] : ""; };
+// AI proposals for the fields still empty on a case. Used by the button and by the automation. Returns { error, status } or the result; never changes the case itself except to remember the answer.
+async function aiFillCase(env, state, c, by, at = new Date().toISOString()) {
+  const missing = aiFillFields(c);
+  if (!missing.length) return { proposals:[], tokens:0, message:"Every field the AI could help with is already filled. No tokens were used." };
+  const article = state.articles[c.pmid]; if (!article) return { error:"The article is not available.", status:404 };
+  const scan = await scanArticle(env, state, article), weight = u => new Set(u.spans.map(sp => sp.kind)).size;
+  const picked = []; let chars = 0;
+  for (const u of scan.units.filter(u => u.spans.length).sort((a, b) => weight(b) - weight(a) || a.id.localeCompare(b.id))) { if (chars + u.text.length > 1800 || picked.length >= 14) continue; picked.push(u); chars += u.text.length; }
+  if (!picked.length) return { proposals:[], tokens:0, message:"No sentence in the text mentions the product, event or patient, so there is nothing to send. No tokens were used." };
+  const redacted = picked.map((u, i) => redactPhi((i + 1) + ". " + u.text).text);
+  const hash = await sha256Hex(JSON.stringify([c.id, redacted, missing.map(m => m.id)]));
+  if (c.aiFill?.hash === hash) return { proposals:c.aiFill.proposals, tokens:0, cached:true, message:"Same text and same gaps as the last request, so the earlier answer is shown and no tokens were used." };
+  const maxOut = Math.min(420, 28 * missing.length + 60), system = "Fill case-report fields from numbered sentences. Reply JSON {\"f\":[{\"i\":id,\"v\":value copied from the sentence,\"s\":sentence number}]}. Omit anything not stated.";
+  const user = "Sentences:\n" + redacted.join("\n") + "\nFields:\n" + missing.map(m => m.id + " " + m.label).join("\n");
+  const r = await aiChat(env, state, [{ role:"system", content:system }, { role:"user", content:user }], maxOut, system.length + user.length, by, "ai.fill", c.number);
+  if (r.error) return { error:r.error, status:r.status };
+  const proposals = [], dropped = [], byId = new Map(missing.map(m => [m.id, m]));
+  for (const x of Array.isArray(r.json.f) ? r.json.f.slice(0, 40) : []) {
+    const id = String(x?.i || ""), value = String(x?.v ?? "").trim().slice(0, 120), sentence = picked[Number(x?.s) - 1], path2 = aiPathOf(id);
+    if (!byId.has(id) || !path2 || !value || !sentence) { dropped.push(id || "?"); continue; }
+    if (!sentence.text.toLowerCase().includes(value.toLowerCase())) { dropped.push(id); continue; }   // every value must appear in the sentence it cites
+    if (!proposals.some(p => p.id === id)) proposals.push({ id, path:path2, label:byId.get(id).label, value, sentence:sentence.text.slice(0, 400) });
+  }
+  await write(env, data => { const x = data.cases.find(y => y.id === c.id); if (x) x.aiFill = { hash, at, tokens:r.tokens, proposals }; });
+  return { proposals, dropped, tokens:r.tokens, estimate:r.estimate, used:r.used, limit:r.limit, asked:missing.length, sentences:picked.length };
+}
+// ---- Automation. Runs the free steps for a case (event detection, IME, MedDRA, seriousness, online SmPC listedness, narrative) and, only if a manager allowed it, the capped AI step.
+// Everything is written as a proposal with its evidence; a human confirms. Safe to run again: it never overwrites a value a person entered.
+const setProposed = (obj, key, value, evidence) => { if (hasVal(obj[key])) return false; obj[key] = { value:String(value), normalized_value:null, state:"proposed", evidence:evidence || [] }; return true; };
+async function automateCase(env, state, c, by) {
+  const at = new Date().toISOString(), steps = [], note = (key, label, ok, detail) => steps.push({ key, label, ok, detail });
+  const article = state.articles[c.pmid], data = normalizeCase(c.data), cfg = state.settings?.automation || {};
+  // 1. events: if the case has none, take the ones the scanner found in the text
+  let scan = null; try { if (article) scan = await scanArticle(env, state, article); } catch { /* text unavailable */ }
+  if (scan && !data.events.some(e => hasVal(e.verbatim))) {
+    let added = 0;
+    for (const e of scan.events.slice(0, 6)) { const u = scan.units.find(x => x.text.toLowerCase().includes(e.term.toLowerCase())); const ev = normalizeCase({ events:[{ verbatim:{ value:e.term, state:"proposed", evidence:u ? [{ excerpt:u.text.slice(0, 300), source:"found by the full-text scan" }] : [] } }] }).events[0]; data.events.push(ev); added++; }
+    note("events", "Event detection", added > 0, added ? added + " event" + (added === 1 ? "" : "s") + " found in the text" : "No events found");
+  } else note("events", "Event detection", data.events.some(e => hasVal(e.verbatim)), data.events.filter(e => hasVal(e.verbatim)).length + " event(s) on the case");
+  // 2-4. IME, MedDRA, seriousness (no network, no cost)
+  const assist = await caseAssist(env, state, { ...c, data });
+  let coded = 0, ser = 0, ime = 0;
+  for (const a of assist.events) {
+    const e = data.events[a.index]; if (!e || !a.verbatim) continue; const ev = e.verbatim.evidence || [];
+    if (a.ime) ime++;
+    if (!a.coded && a.meddra[0]?.match === "exact term") { const m = a.meddra[0]; for (const [k, val] of [["llt", m.llt.name], ["llt_code", m.llt.code], ["pt", m.pt.name], ["pt_code", m.pt.code], ["hlt", m.hlt.name], ["hlgt", m.hlgt.name], ["soc", m.soc.name], ["meddra_version", m.version]]) setProposed(e, k, val, ev); setProposed(e, "coding_status", "Proposed (MedDRA " + m.version + ")", ev); coded++; }
+    if (a.seriousness.flags.serious) { const sflags = e.seriousness ||= {}; for (const k of ["death", "life_threatening", "hospitalization", "disability", "congenital_anomaly", "other_medically_important"]) if (a.seriousness.flags[k]) sflags[k] = true; sflags.serious = true; ser++; }
+  }
+  note("ime", "IME list", true, ime ? ime + " important medical event" + (ime === 1 ? "" : "s") + " flagged" : (assist.imeLoaded ? "None on the IME list" : "IME list not loaded"));
+  note("meddra", "MedDRA coding", assist.meddraLoaded ? coded > 0 || assist.events.every(a => !a.verbatim || a.coded) : false, assist.meddraLoaded ? coded + " event" + (coded === 1 ? "" : "s") + " coded (exact matches only)" : "No MedDRA release loaded");
+  note("seriousness", "Seriousness", true, ser ? ser + " event" + (ser === 1 ? "" : "s") + " marked from the text" : "No seriousness criterion found in the text");
+  // 5. listedness from the online label (opt-out)
+  const suspect = data.products.find(p => p.role === "suspect" && hasVal(p.name));
+  if (cfg.smpc !== false && suspect) {
+    try {
+      const got = await fetchLabel(env, v(suspect.name));
+      if (got.label) { let listed = 0, missed = 0; assist.events.forEach(a => { const e = data.events[a.index]; if (!e || !a.verbatim) return; const terms = uniq([a.verbatim, v(e.pt), v(e.llt), ...a.meddra.slice(0, 2).flatMap(m => [m.pt.name, m.llt.name])]).filter(Boolean), r = matchEventInLabel(got.label.sections, terms);
+          if (r.listedness === "listed") { setProposed(e, "listedness", "Listed", r.quote ? [{ excerpt:r.quote, source:"FDA label via openFDA, " + r.sectionLabel }] : []); setProposed(e, "rsi", "FDA label via openFDA (" + (got.label.brand || got.label.generic) + "), " + r.sectionLabel + (got.label.effective ? ", effective " + got.label.effective : ""), []); listed++; } else missed++; });
+        note("smpc", "Listedness (SmPC)", true, listed + " listed in the label; " + missed + " not found, so left for you to confirm in the EU SmPC"); }
+      else note("smpc", "Listedness (SmPC)", false, got.error || "No label found online for " + v(suspect.name));
+    } catch (error) { note("smpc", "Listedness (SmPC)", false, String(error.message).slice(0, 100)); }
+  } else note("smpc", "Listedness (SmPC)", false, suspect ? "Switched off in Settings" : "No suspect product yet");
+  // 6. narrative
+  try { if (!data.narrative?.text) { const n = buildNarrative({ ...c, data }); if (n?.text) { data.narrative = n; note("narrative", "Narrative", true, "Generated from the case fields"); } else note("narrative", "Narrative", false, "Not enough data yet"); } else note("narrative", "Narrative", true, "Already written"); } catch { note("narrative", "Narrative", false, "Could not be generated"); }
+  // save what the free steps did, then the capped AI step on the saved case
+  await write(env, d => { const x = d.cases.find(y => y.id === c.id); if (!x || x.locked) return; x.data = normalizeCase(data); x.updatedAt = at; });
+  if (cfg.ai === true) {
+    const fresh = (await load(env)).state, cur = fresh.cases.find(y => y.id === c.id), r = cur ? await aiFillCase(env, fresh, cur, by, at) : { error:"gone" };
+    if (r.error) note("ai", "AI data entry", false, r.error);
+    else { let applied = 0; await write(env, d => { const x = d.cases.find(y => y.id === c.id); if (!x) return; const nd = normalizeCase(x.data); for (const p of r.proposals) { const parts = p.path.split("."), last = parts.pop(), t = parts.reduce((o, k) => o && o[k], nd); if (t && t[last] && setProposed(t, last, p.value, [{ excerpt:p.sentence, source:"AI-proposed; the value is quoted from this sentence" }])) applied++; } x.data = nd; });
+      note("ai", "AI data entry", true, applied + " field" + (applied === 1 ? "" : "s") + " proposed" + (r.tokens ? " (" + r.tokens + " tokens)" : " (no tokens used)")); }
+  } else note("ai", "AI data entry", false, "Off (a manager can turn it on under Settings, Case workflow)");
+  await write(env, d => { const x = d.cases.find(y => y.id === c.id); if (!x) return; x.automation = { at, by, steps }; (x.history ||= []).push({ at, by, action:"automation ran: " + steps.filter(s2 => s2.ok).length + " of " + steps.length + " steps done" }); });
+  await audit(env, { by, action:"case.automate", target:c.number, detail:{ steps:steps.map(s2 => s2.key + ":" + (s2.ok ? "ok" : "no")).join(" ") } });
+  return { at, steps };
+}
 async function aiDetectEvents(env, state, article, scan, by) {
   const cfg = aiConfig(env, state);
   if (!cfg.enabled || !cfg.hasKey || cfg.monthlyTokens <= 0) return { error:"AI assist is off, so no tokens are used. A manager can turn it on in Settings and set a monthly token limit.", status:409 };
@@ -2380,7 +2456,7 @@ const SERIOUS_FLAGS = ["serious", "death", "life_threatening", "hospitalization"
 // The listedness dropdown and the expectedness field used by the exports are one value; a choice that differs from a stored label-passage decision is marked as a manual override.
 function syncListedness(e) {
   const chosen = hasVal(e.listedness) ? v(e.listedness) : hasVal(e.expectedness) ? v(e.expectedness) : "";
-  if (chosen) { e.listedness = icsrField(chosen, "edited"); e.expectedness = icsrField(chosen, "edited"); }
+  if (chosen) { const src = hasVal(e.listedness) ? e.listedness : e.expectedness, state = src.state === "proposed" ? "proposed" : "edited", ev = src.evidence || []; e.listedness = icsrField(chosen, state, ev); e.expectedness = icsrField(chosen, state, ev); }
   if (e.listedness_assessment && chosen && ({ listed:"Listed", unlisted:"Unlisted", unknown:"Unknown" }[e.listedness_assessment.decision] || "") !== chosen) e.listedness_assessment = { ...e.listedness_assessment, manual_override:true };
   return e;
 }
@@ -3809,7 +3885,7 @@ async function apiCore(request, env, path) {
       cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, evidenceReviewPending:caseEvidenceDelta(state, c).changes.length>0, canEdit:canEditCase(state, viewer, c), signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
       dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], meddraInfo:state.meddra || null, stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c), triage:triageFor(state, c) }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
       monitoring:monitoringCounts(state, viewer),
-      series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ ai:(() => { const c = aiConfig(env, state); return { available:c.enabled && c.hasKey && c.monthlyTokens > 0, ...(manager ? { enabled:c.enabled, model:c.model, monthlyTokens:c.monthlyTokens, hasKey:c.hasKey, used:aiUsed(state), month:aiMonth() } : {}) }; })(), retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ automation:{ auto:state.settings?.automation?.auto !== false, smpc:state.settings?.automation?.smpc !== false, ai:state.settings?.automation?.ai === true }, ai:(() => { const c = aiConfig(env, state); return { available:c.enabled && c.hasKey && c.monthlyTokens > 0, ...(manager ? { enabled:c.enabled, model:c.model, monthlyTokens:c.monthlyTokens, hasKey:c.hasKey, used:aiUsed(state), month:aiMonth() } : {}) }; })(), retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], people:state.profiles.filter(p => p.active).map(p => ({ email:p.email, name:p.name, role:p.role, active:true })), clientAdmin:manager || viewer.canManageClients === true, watches:manager ? state.watches : viewer.canManageClients === true ? state.watches.map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "", client:w.client || "" })) : [],
       runs:manager ? state.runs : [], assignments,
@@ -4035,36 +4111,19 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"case.source_reviewed", entityType:"Case", entityId:rec.number, detail:{ note:note.slice(0, 1000), changes:evidence.changes } });
     return json({ ok:true });
   }
-  if (["/api/case-submit", "/api/case-qc", "/api/case-ai-fill"].includes(path) && viewer) {
+  if (["/api/case-submit", "/api/case-qc", "/api/case-ai-fill", "/api/case-automate"].includes(path) && viewer) {
     const c = (state.cases || []).find(x => x.id === String(body.id || ""));
     if (!c || !caseVisible(state, viewer, c)) return json({ error:"Case not found." }, 404);
     const at = new Date().toISOString(), stage = c.stage || "medical_review", note = String(body.note || "").trim().slice(0, 600), who = n => (state.profiles.find(p => p.email === n)?.name || n || "nobody");
     if (c.locked || c.archived) return json({ error:"This case is locked or archived." }, 409);
+    if (path === "/api/case-automate") {
+      if (!canEditCase(state, viewer, c)) return json({ error:"Only the person this case is routed to can run automation on it." }, 403);
+      const r = await automateCase(env, state, c, email), fresh = (await load(env)).state.cases.find(x => x.id === c.id);
+      return json({ ...r, case:fresh });
+    }
     if (path === "/api/case-ai-fill") {
       if (!canEditCase(state, viewer, c)) return json({ error:"Only the person this case is routed to can fill it." }, 403);
-      const missing = aiFillFields(c);
-      if (!missing.length) return json({ proposals:[], tokens:0, message:"Every field the AI could help with is already filled. No tokens were used." });
-      const article = state.articles[c.pmid]; if (!article) return json({ error:"The article is not available." }, 404);
-      const scan = await scanArticle(env, state, article), weight = u => new Set(u.spans.map(sp => sp.kind)).size;
-      const picked = []; let chars = 0;
-      for (const u of scan.units.filter(u => u.spans.length).sort((a, b) => weight(b) - weight(a) || a.id.localeCompare(b.id))) { if (chars + u.text.length > 1800 || picked.length >= 14) continue; picked.push(u); chars += u.text.length; }
-      if (!picked.length) return json({ proposals:[], tokens:0, message:"No sentence in the text mentions the product, event or patient, so there is nothing to send. No tokens were used." });
-      const redacted = picked.map((u, i) => redactPhi((i + 1) + ". " + u.text).text);
-      const hash = await sha256Hex(JSON.stringify([c.id, redacted, missing.map(m => m.id)]));
-      if (c.aiFill?.hash === hash) return json({ proposals:c.aiFill.proposals, tokens:0, cached:true, message:"Same text and same gaps as the last request, so the earlier answer is shown and no tokens were used." });
-      const maxOut = Math.min(420, 28 * missing.length + 60), system = "Fill case-report fields from numbered sentences. Reply JSON {\"f\":[{\"i\":id,\"v\":value copied from the sentence,\"s\":sentence number}]}. Omit anything not stated.";
-      const user = "Sentences:\n" + redacted.join("\n") + "\nFields:\n" + missing.map(m => m.id + " " + m.label).join("\n");
-      const r = await aiChat(env, state, [{ role:"system", content:system }, { role:"user", content:user }], maxOut, system.length + user.length, email, "ai.fill", c.number);
-      if (r.error) return json({ error:r.error }, r.status);
-      const proposals = [], dropped = [], byId = new Map(missing.map(m => [m.id, m]));
-      for (const x of Array.isArray(r.json.f) ? r.json.f.slice(0, 40) : []) {
-        const id = String(x?.i || ""), value = String(x?.v ?? "").trim().slice(0, 120), sentence = picked[Number(x?.s) - 1], path2 = aiPathOf(id);
-        if (!byId.has(id) || !path2 || !value || !sentence) { dropped.push(id || "?"); continue; }
-        if (!sentence.text.toLowerCase().includes(value.toLowerCase())) { dropped.push(id); continue; }   // every value must appear in the sentence it cites
-        if (!proposals.some(p => p.id === id)) proposals.push({ id, path:path2, label:byId.get(id).label, value, sentence:sentence.text.slice(0, 400) });
-      }
-      await write(env, data => { const x = data.cases.find(y => y.id === c.id); x.aiFill = { hash, at, tokens:r.tokens, proposals }; });
-      return json({ proposals, dropped, tokens:r.tokens, estimate:r.estimate, used:r.used, limit:r.limit, asked:missing.length, sentences:picked.length });
+      const filled = await aiFillCase(env, state, c, email, at); return filled.error ? json({ error:filled.error }, filled.status) : json(filled);
     }
     if (path === "/api/case-submit") {
       if (stage !== "screening") return json({ error:"Only a case in data entry can be submitted to QC." }, 409);
@@ -4450,6 +4509,7 @@ async function apiCore(request, env, path) {
         await write(env, data => { const c = data.cases.find(x => x.id === o.id); pushVersion(c, entry); });
         await audit(env, { by:email, action:"case.draft_created", entityType:"Case", entityId:o.number, detail:{ pmid:item.pmid, patient:o.patient, portfolio:item.portfolio, assessment:assessed.find(x => x.patient.id === o.patient)?.assessment.overall } });
       }
+      for (const o of created) { try { const st2 = (await load(env)).state, cur = st2.cases.find(x => x.id === o.id); if (cur && st2.settings?.automation?.auto !== false) await automateCase(env, st2, cur, email); } catch { /* automation can be run again from the case */ } }
       void cfg;
       return json({ created, existing, skipped, patients:ex.patients.length });
     }
@@ -4680,7 +4740,13 @@ async function apiCore(request, env, path) {
   if (path === "/api/cases-export" && viewer) {
     const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null, list = (state.cases || []).filter(c => caseVisible(state, viewer, c) && (!wanted || wanted.has(c.id)));
     if (!list.length) return json({ error:"No cases to export." }, 404);
-    const format = ["e2b", "package"].includes(body.format) ? body.format : "csv", stamp = new Date().toISOString().slice(0, 10);
+    const format = ["e2b", "package", "cioms", "fhir", "narrative"].includes(body.format) ? body.format : "csv", stamp = new Date().toISOString().slice(0, 10);
+    if (["cioms", "fhir", "narrative"].includes(format)) {
+      const enc = new TextEncoder(), picked = list.slice(0, 300); await audit(env, { by:email, action:"case.export", target:picked.length + " cases", detail:"batch " + format });
+      if (format === "narrative") return new Response(picked.map(c => "=== " + c.number + " · PMID " + c.pmid + " · " + (c.molecule || "") + " ===\r\n" + (c.data?.narrative?.text || buildNarrative(c).text || "") + "\r\n").join("\r\n"), { headers:{ "Content-Type":"text/plain; charset=utf-8", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-narratives-' + stamp + '.txt"' } });
+      const files = []; for (const c of picked) { const art = state.articles[c.pmid] || {}, ok = await approvalValid(c); files.push(format === "cioms" ? { name:safeName(c.number) + (ok ? "-CIOMS-I.pdf" : "-CIOMS-I-DRAFT.pdf"), data:ciomsPdf(c, art, ok ? { final:true, approval:c.approval } : {}) } : { name:safeName(c.number) + "-FHIR.json", data:enc.encode(JSON.stringify(fhirBundle(c, art), null, 2)) }); }
+      return new Response(zipFiles(files), { headers:{ "Content-Type":"application/zip", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-' + format + '-' + stamp + '.zip"' } });
+    }
     await audit(env, { by:email, action:"case.export", target:list.length + " cases", detail:"batch " + format });
     if (format === "e2b") return new Response(e2bBatch(list, state.articles, { sender:state.settings?.senderId, receiver:state.settings?.receiverId }), { headers:{ "Content-Type":"application/xml", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-E2B-R3-' + stamp + '.xml"' } });
     if (format === "package") {
@@ -5056,6 +5122,7 @@ async function apiCore(request, env, path) {
       if ("receiverId" in body) settings.receiverId = String(body.receiverId || "").trim().slice(0, 60);
       if ("autoIcsr" in body) settings.autoIcsr = body.autoIcsr !== "off" && body.autoIcsr !== false;
       if ("autoPull" in body) settings.autoPull = body.autoPull !== "off" && body.autoPull !== false;
+      if ("autoRun" in body || "autoSmpc" in body || "autoAi" in body) { const a = settings.automation ||= {}; if ("autoRun" in body) a.auto = body.autoRun !== "off"; if ("autoSmpc" in body) a.smpc = body.autoSmpc !== "off"; if ("autoAi" in body) a.ai = body.autoAi === "on"; }
       if ("esignFourEyes" in body) settings.esignFourEyes = body.esignFourEyes === true;
       if ("pvNexusUrl" in body) settings.pvNexusUrl = String(body.pvNexusUrl || "").trim();
       if (body.pvNexusToken === null) delete settings.pvNexusToken;
@@ -5714,6 +5781,17 @@ function caseStageUi(){
   show("caseaifill",st==="screening"&&ed);show("casesubmit",st==="screening"&&ed);show("caseqcok",st==="qc"&&ed);show("caseqcback",st==="qc"&&ed);
 }
 const FLOW_CHECKS=[["Patient identified","age, sex or other descriptor",d=>Boolean(d.patient.age.value||d.patient.sex.value||d.patient.identifier.value)],["Reporter","name or organisation",d=>Boolean(d.reporter.identifier.value||d.reporter.organisation.value)],["Suspect product","name",d=>d.products.some(p=>p.role==="suspect"&&p.name.value)],["Dose, route, frequency","of the suspect product",d=>d.products.some(p=>p.role==="suspect"&&(p.dose.value||p.route.value))],["Start and stop dates","or marked not reported",d=>d.products.some(p=>p.role==="suspect"&&(p.start_date.value||p.start_day!=null||p.start_not_reported))],["Event","verbatim term",d=>d.events.some(e=>e.verbatim.value)],["Onset and outcome","or marked not reported",d=>d.events.some(e=>e.verbatim.value&&(e.onset_date.value||e.onset_not_reported||e.time_to_onset.value)&&e.outcome.value)],["MedDRA coding","LLT or PT for every event",d=>d.events.filter(e=>e.verbatim.value).every(e=>e.pt_code.value||e.llt_code.value)],["Listedness","set on every event",d=>d.events.filter(e=>e.verbatim.value).every(e=>e.listedness.value)],["Reporter comments","the authors view",d=>Boolean(d.reporter_comments)]];
+function automationHtml(){
+  const a=curCase.automation, ed=curCase.canEdit!==false, running=assistBusy==="auto";
+  const rows=a?a.steps.map(x=>'<div class="fl-item'+(x.ok?" ok":"")+'"><i>'+(x.ok?"✓":"–")+'</i><span>'+esc(x.label)+'<div class="sub">'+esc(x.detail)+'</div></span></div>').join(""):'<div class="sub">Not run yet.</div>';
+  return '<div class="as-card"><div class="as-row"><b>Automation</b>'+(running?badge("running…","amber"):a?badge("ran "+new Date(a.at).toLocaleString([],{dateStyle:"medium",timeStyle:"short"}),"green"):badge("not run","amber"))+'</div><div class="sub">Events, IME, MedDRA, seriousness, online listedness and the narrative are filled in as proposals for you to confirm. Nothing you typed is overwritten.</div>'+rows+(ed?'<div class="as-btns"><button type="button" class="btn sm" data-caseact="automate"'+(running?" disabled":"")+'>'+(a?"Run again":"Run automation")+'</button></div>':"")+'</div>';
+}
+function aiKeyHtml(){
+  const a=data.config.ai||{};
+  if(a.available)return "";
+  if(data.viewer.role!=="manager")return '<div class="sub" style="margin-top:6px">AI is off, so no tokens are used. Ask a manager to turn it on in Settings.</div>';
+  return '<div class="sub" style="margin-top:8px">Paste the OpenAI API key here to turn the AI on. It is stored with the app data, shown only as "Set" afterwards, and capped by the monthly token limit below.</div><div class="as-btns" style="flex-direction:column;align-items:stretch"><input type="password" id="aikeyinline" autocomplete="off" placeholder="sk-..."><input type="number" id="ailimitinline" min="1000" step="1000" value="'+(a.monthlyTokens||200000)+'" aria-label="Monthly token limit"><button type="button" class="btn sm" data-aikeysave="1">Save key and turn on</button></div>';
+}
 function flowHtml(){
   const st=caseStage(curCase), info=STAGE_ACT[st]||STAGE_ACT.medical_review, d=curCase.data, q=curCase.qc||{}, ed=curCase.canEdit!==false;
   const head='<div class="as-card flow-'+st+'"><div class="as-row"><b>'+esc(info[0])+'</b>'+badge(st==="screening"?"Screener":st==="qc"?"QC":"Medical reviewer",st==="screening"?"blue":st==="qc"?"amber":"green")+'</div><div class="sub">'+esc(info[1])+'</div>'+
@@ -5725,7 +5803,7 @@ function flowHtml(){
   if(st==="screening"&&ed){
     const a=data.config.ai||{};
     body='<div class="as-card"><div class="as-row"><b>Fill the gaps with AI</b>'+(a.available?badge("on","green"):badge("off","amber"))+'</div><div class="sub">Rules and the dictionaries already did the free part. The AI is asked only about fields that are still empty, from at most 14 short sentences (about 600 tokens), and every answer must be a word-for-word match from the article.</div>'+
-      '<div class="as-btns"><button type="button" class="btn sm" data-caseact="aifill"'+(a.available?"":" disabled")+'>Fill empty fields</button></div>'+(a.available?"":'<div class="sub" style="margin-top:6px">AI is off, so no tokens are used.'+(data.viewer.role==="manager"?" Turn it on in Settings.":" A manager can turn it on in Settings.")+'</div>')+aiFillHtml()+'</div>'+
+      '<div class="as-btns"><button type="button" class="btn sm" data-caseact="aifill"'+(a.available?"":" disabled")+'>Fill empty fields</button></div>'+aiKeyHtml()+aiFillHtml()+'</div>'+
       '<div class="as-card"><b>When it is complete</b><div class="sub" style="margin:4px 0 8px">Submit to QC. You will not be able to edit it again unless QC returns it.</div><button type="button" class="btn sm" data-caseact="submitqc">Submit to QC</button></div>';
   }else if(st==="qc"&&ed){
     body='<div class="as-card"><b>QC decision</b><div class="sub" style="margin:4px 0 8px">Approving sends the case to a medical reviewer. Returning sends it back to the screener who did the data entry, with your note.</div><div class="as-btns"><button type="button" class="btn sm" data-caseact="qcapprove">Approve → medical review</button><button type="button" class="btn outline sm" data-caseact="qcreturn">Return to screener</button></div></div>'+
@@ -5733,7 +5811,7 @@ function flowHtml(){
   }else if(st==="medical_review"){
     body='<div class="as-card"><b>Medical review</b><div class="sub" style="margin:4px 0 8px">Confirm the proposals (coding, seriousness, listedness), set causality for each event, then approve and sign. Route the case to QC or the screener if something is wrong.</div><div class="as-btns"><button type="button" class="btn outline sm" data-caseact="routecase">Route…</button></div></div>';
   }else body='<div class="as-card"><div class="sub">This case is with someone else. You can read it but not change it.</div></div>';
-  return head+list+body;
+  return head+automationHtml()+list+body;
 }
 function aiFillHtml(){
   const r=aiFillRes;if(!r)return "";
@@ -5750,6 +5828,7 @@ function aiApply(which){
 async function caseFlowAct(act){
   try{
     if(act==="aifill"){collectCase();message("Asking the AI about the empty fields…");aiFillRes=await api("case-ai-fill",{id:curCase.id});assistTab="flow";assistTabs();$("caseflow").innerHTML=flowHtml();message(aiFillRes.message||(aiFillRes.tokens?aiFillRes.tokens+" tokens used.":"Done."));return;}
+    if(act==="automate"){collectCase();assistBusy="auto";$("caseflow").innerHTML=flowHtml();try{await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes});const r=await api("case-automate",{id:curCase.id});await refresh();curCase=JSON.parse(JSON.stringify((data.cases||[]).find(x=>x.id===curCase.id)||r.case));assistData=null;assistBusy="";renderCase();message("Automation finished: "+r.steps.filter(x=>x.ok).length+" of "+r.steps.length+" steps. Check the proposals.");}catch(e){assistBusy="";$("caseflow").innerHTML=flowHtml();message(e.message,true);}return;}
     if(act==="submitqc"){collectCase();await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes,expectedRevision:curCase.editRevision||curCase.updatedAt||""});await clearCaseDraft(curCase.id);const r=await api("case-submit",{id:curCase.id});await refresh();message("Submitted to QC ("+r.toName+").");$("casedlg").close();if(tab==="My Desk")render();return;}
     if(act==="qcapprove"){collectCase();await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes,expectedRevision:curCase.editRevision||curCase.updatedAt||""});await clearCaseDraft(curCase.id);const note=prompt("Note for the medical reviewer (optional)","")||"";const r=await api("case-qc",{id:curCase.id,decision:"approve",note});await refresh();message("Approved. Sent to "+r.toName+" for medical review.");$("casedlg").close();if(tab==="My Desk")render();return;}
     if(act==="qcreturn"){const note=prompt("What must the screener fix? (recorded)","");if(!note)return;const r=await api("case-qc",{id:curCase.id,decision:"return",note});await refresh();message("Returned to "+r.toName+".");$("casedlg").close();if(tab==="My Desk")render();return;}
@@ -6483,7 +6562,11 @@ async function openSign(kind,id){
     const sel=$("signmeaning");if(sel)sel.onchange=async()=>{const p2=await api("sign-preview",{kind,id,meaning:sel.value});signCtx.pre=p2;$("signstatement").textContent=p2.statement;};
   }catch(e){message(e.message,true);}
 }
-function openCaseData(c,a){const reopened=!$("casedlg").open||curCase?.id!==c.id;if(!curCase||curCase.id!==c.id){assistData=null;smpcRes={};smpcInfo=null;assistTab="flow";aiFillRes=null;assistCase="";}curCase=JSON.parse(JSON.stringify(c));curAssess=a;renderCase();if(!$("casedlg").open)$("casedlg").showModal();if(reopened)offerCaseDraft(c);}
+function autoOnOpen(){
+  if(!curCase||curCase.automation||curCase.canEdit===false||caseStage(curCase)!=="screening"||curCase.autoTried)return;
+  curCase.autoTried=true;caseFlowAct("automate");
+}
+function openCaseData(c,a){const reopened=!$("casedlg").open||curCase?.id!==c.id;if(!curCase||curCase.id!==c.id){assistData=null;smpcRes={};smpcInfo=null;assistTab="flow";aiFillRes=null;assistCase="";}curCase=JSON.parse(JSON.stringify(c));curAssess=a;renderCase();if(!$("casedlg").open)$("casedlg").showModal();if(reopened)offerCaseDraft(c);autoOnOpen();}
 async function downloadCase(format){
   collectCase();
   const res=await fetch("/api/case-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:curCase.id,format})});
@@ -6709,7 +6792,7 @@ let setSec="Access";
 const SET_GROUPS=[["Access","Access & permissions",["User permissions"]],
   ["Sources","Sources & retrieval",["Unpaywall (open access)","NCBI / PubMed access","Publisher and aggregator access","Closed-access articles","Restricted-licence full text","Sources","Extraction sources","What Unpaywall adds across the site"]],
   ["Reference","Safety reference data",["MedDRA dictionary (licensed)","Important medical events (IME list)","Marketing authorisations by country","Coding memory"]],
-  ["Workflow","Case workflow",["Synchrony (ICSR workbench)","AI event check (OpenAI, optional)","PV Nexus (ICSR processing)"]],
+  ["Workflow","Case workflow",["Synchrony (ICSR workbench)","Case automation","AI event check (OpenAI, optional)","PV Nexus (ICSR processing)"]],
   ["Storage","Storage & capture",["Article screenshots","Library folder on the server"]]];
 function settingsLayout(all){
   const parts=all.split("<section>").filter(Boolean).map(x=>"<section>"+x), byTitle=new Map(), used=new Set();
@@ -6721,6 +6804,10 @@ function settingsLayout(all){
   if(!live.some(x=>x.id===setSec))setSec=live[0].id;
   const cur=live.find(x=>x.id===setSec);
   return '<div class="setlayout"><nav class="setnav" aria-label="Settings sections">'+live.map(x=>'<button type="button" class="setlink'+(x.id===setSec?" on":"")+'" data-setsec="'+x.id+'">'+esc(x.label)+'<span>'+x.items.length+'</span></button>').join("")+'</nav><div class="setbody">'+cur.items.join("")+'</div></div>';
+}
+function automationSettingsHtml(){
+  const a=data.config.automation||{auto:true,smpc:true,ai:false}, sel=(name,on,labelOn,labelOff)=>'<select name="'+name+'"><option value="on"'+(on?" selected":"")+'>'+labelOn+'</option><option value="off"'+(on?"":" selected")+'>'+labelOff+'</option></select>';
+  return panel("Case automation",'<form class="grid" data-route="settings"><label>Run on every new case<br>'+sel("autoRun",a.auto,"On: detect, code, grade and write it up","Off: only when someone presses Run")+'</label><label>Online listedness (SmPC)<br>'+sel("autoSmpc",a.smpc,"On: look up the product label online","Off: no lookups")+'</label><label>AI data entry<br>'+sel("autoAi",a.ai,"On: ask the AI about empty fields (uses tokens)","Off: no tokens")+'</label><div><button class="btn">Save</button></div></form>',"When a screener opens a case, automation fills in event detection, IME flags, MedDRA exact matches, seriousness, listedness from the online label and the narrative, all as proposals. The AI step is separate and stays off unless you turn it on here and set a token limit below.");
 }
 function aiSettingsHtml(){
   const a=data.config.ai||{};
@@ -6828,7 +6915,7 @@ function render() {
     const selectedIds=new Set(data.assignments.filter(x=>x.disposition&&x.disposition.value==="potential_icsr"&&((x.qc&&x.qc.status==="approved")||x.routedToMedical||(!x.qc&&x.status==="Complete"))).map(x=>x.pmid)), ready=Object.values(data.articles).filter(a=>selectedIds.has(a.id)&&a.fullTextStatus==="Captured"&&a.fullTextKey&&(a.events||[]).length&&!(data.cases||[]).some(c=>c.pmid===a.id)).length;
     const intake='<div class="row"><span>'+ready+' article'+(ready===1?"":"s")+' selected by QC with stored full text and detected events '+(ready===1?"is":"are")+' not in Synchrony yet.'+(data.config.autoIcsr?' New ones are added automatically.':' Automatic adding is off (Settings).')+'</span><button class="btn" data-icsrintake="1"'+(ready?"":" disabled")+'>Add to Synchrony</button></div>'+
       '<div class="row"><span>'+openCases.filter(c=>!c.assignee).length+' open case'+(openCases.filter(c=>!c.assignee).length===1?"":"s")+' without an assignee.'+(data.config.autoAssignCases?' New cases are assigned automatically to the reviewer with the fewest open cases.':' Automatic assignment is off (Settings).')+'</span>'+(manager?'<button class="btn outline" data-autoassign="1">Assign unassigned now</button>':"")+'</div>'+
-      '<div class="row"><span>Export the cases ticked in the tracker, or every case shown when none is ticked ('+shown.length+' now).</span><span style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn outline sm" data-synexport="csv">Line listing (CSV)</button><button class="btn outline sm" data-synexport="e2b">E2B(R3) batch (XML)</button><button class="btn sm" data-synexport="package">Full package (ZIP)</button></span></div>';
+      '<div class="row"><span>Export the cases ticked in the tracker, or every case shown when none is ticked ('+shown.length+' now).</span><span style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn outline sm" data-synexport="csv">Line listing (CSV)</button><button class="btn outline sm" data-synexport="e2b">E2B(R3) batch (XML)</button><button class="btn outline sm" data-synexport="cioms">CIOMS I (ZIP of PDFs)</button><button class="btn outline sm" data-synexport="fhir">FHIR (ZIP)</button><button class="btn outline sm" data-synexport="narrative">Narratives (TXT)</button><button class="btn sm" data-synexport="package">Full package (ZIP)</button></span></div>';
     const rowOf=c=>{
       const a=c.assessment||{},d=c.data,sp=(d.products.find(p=>p.role==="suspect")||{name:{}}).name.value||"—",ev=((d.events[0]||{}).verbatim||{}).value||"—",art=data.articles[c.pmid]||{},dl=left(c);
       const who=manager?'<select data-assignsel="'+esc(c.id)+'" aria-label="Assignee"><option value="">Unassigned</option>'+people.map(p=>'<option value="'+esc(p.email)+'"'+(p.email===c.assignee?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select>':esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||"Unassigned");
@@ -6919,7 +7006,7 @@ function render() {
       "Events found in articles are matched against the EMA list of important medical events (ICH E2A criterion 6, other medically important condition). Upload PV Nexus's ime-meddra.json (it holds MedDRA 29.1, EMA/211097/2026) or a CSV/TXT with one preferred term per line. The list is stored with your data, not in the source code, because MedDRA content is licensed. Matching uses preferred-term wording, so lay phrases may need MeSH or PubTator hints or a promoted term.")+
     panel("Marketing authorisations by country",'<textarea id="matext" rows="6" placeholder="molecule, country, status, MAH, MA number, serious days, non-serious days">'+esc("molecule,country,status,MAH,MA number,serious_days,nonserious_days"+NL+(data.config.ma||[]).map(e=>[e.molecule,e.country,e.status,e.mah,e.number,e.serious_days||"",e.nonserious_days||""].join(",")).join(NL))+'</textarea><div style="margin-top:10px"><button type="button" class="btn" data-masave="1">Save authorisations</button> <span class="sub">'+(data.config.ma||[]).length+' records</span></div>',
       "There is no open worldwide source for marketing-authorisation status, so this table is yours to maintain. The country decides the regulator, whether the product is authorised there, and the reporting clock shown on ICSR cases (default 15 days for serious and 90 for non-serious cases unless a row says otherwise; confirm with local regulations). Statuses are read as Authorised, Not authorised, Withdrawn or Under review.")+
-    aiSettingsHtml()+panel("PV Nexus (ICSR processing)",'<form class="grid" data-route="settings"><label>PV Nexus API address (optional)<input name="pvNexusUrl" value="'+esc((data.config.pvNexus||{}).url||"")+'" placeholder="https://your-pv-nexus-backend"'+((data.config.pvNexus||{}).urlFromEnv?" disabled":"")+'></label><label>API token (optional)<input type="password" name="pvNexusToken" autocomplete="off" placeholder="'+((data.config.pvNexus||{}).tokenSet?"Token is set; leave blank to keep it":"Sent as a Bearer token if your gateway needs one")+'"></label><div><button class="btn">Save</button>'+((data.config.pvNexus||{}).tokenSet?' <button type="button" class="btn outline" data-pvremove="1">Remove token</button>':"")+'</div></form>',
+    automationSettingsHtml()+aiSettingsHtml()+panel("PV Nexus (ICSR processing)",'<form class="grid" data-route="settings"><label>PV Nexus API address (optional)<input name="pvNexusUrl" value="'+esc((data.config.pvNexus||{}).url||"")+'" placeholder="https://your-pv-nexus-backend"'+((data.config.pvNexus||{}).urlFromEnv?" disabled":"")+'></label><label>API token (optional)<input type="password" name="pvNexusToken" autocomplete="off" placeholder="'+((data.config.pvNexus||{}).tokenSet?"Token is set; leave blank to keep it":"Sent as a Bearer token if your gateway needs one")+'"></label><div><button class="btn">Save</button>'+((data.config.pvNexus||{}).tokenSet?' <button type="button" class="btn outline" data-pvremove="1">Remove token</button>':"")+'</div></form>',
       "ICSR cases are assessed here with a port of PV Nexus's deterministic rules (validity, QC, causality suggestion, follow-up questions), checked to give identical results. If you enter the address of a PV Nexus backend, the same checks are run by it instead, and LiteraSift falls back to the local rules if it is unreachable.")+
     panel("Publisher and aggregator access",'<form class="grid" data-route="settings"><label>CORE API key (free, core.ac.uk)<input type="password" name="coreApiKey" autocomplete="off" placeholder="'+((data.config.retrievalKeys||{}).core?"Set; leave blank to keep":"Paste your CORE key")+'"></label><label>Wiley text-mining token<input type="password" name="wileyTdmToken" autocomplete="off" placeholder="'+((data.config.retrievalKeys||{}).wiley?"Set; leave blank to keep":"Wiley-TDM-Client-Token")+'"></label><label>Elsevier API key<input type="password" name="elsevierApiKey" autocomplete="off" placeholder="'+((data.config.retrievalKeys||{}).elsevier?"Set; leave blank to keep":"X-ELS-APIKey")+'"></label><label>Elsevier institution token (optional)<input type="password" name="elsevierInsttoken" autocomplete="off" placeholder="'+((data.config.retrievalKeys||{}).elsevierInst?"Set; leave blank to keep":"X-ELS-Insttoken")+'"></label><div><button class="btn">Save</button> '+Object.entries({coreApiKey:"core",wileyTdmToken:"wiley",elsevierApiKey:"elsevier",elsevierInsttoken:"elsevierInst"}).filter(([,k])=>(data.config.retrievalKeys||{})[k]).map(([f,k])=>'<button type="button" class="btn outline sm" data-keyremove="'+f+'">Remove '+esc(k)+'</button>').join(" ")+'</div></form>',"Extra places to look for full texts, each used only with a key you hold. CORE searches open repository copies. The Wiley and Elsevier text-mining services return only what your institution is licensed to read, and may refuse requests from this server if your licence is tied to your campus network. Those texts are stored as restricted. Leave all blank to skip.")+
     panel("Coding memory",'<div id="memorybox"><div class="empty">Loading…</div></div>',"When a reviewer marks an event coding as Reviewed, LiteraSift remembers it and suggests it for similar events in other cases. Deleting an entry or the whole memory only stops those suggestions: the cases keep their codings. Every deletion is recorded in the audit trail.")+
@@ -7059,6 +7146,8 @@ document.addEventListener("input",event=>{
 });
 document.addEventListener("click",event=>{
   const dt=event.target.closest&&event.target.closest("[data-desktab]");if(dt){deskTab=dt.dataset.desktab;render();return;}
+  const ks=event.target.closest&&event.target.closest("[data-aikeysave]");
+  if(ks){const key=($("aikeyinline")||{}).value||"",lim=Number(($("ailimitinline")||{}).value)||0;if(!key.trim()){message("Paste the key first.",true);return;}ks.disabled=true;api("settings",{openaiKey:key.trim(),aiEnabled:"on",aiMonthlyTokens:lim}).then(()=>refresh()).then(()=>{if(curCase){const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}}message("AI is on. Monthly limit "+lim.toLocaleString()+" tokens.");}).catch(e=>{message(e.message,true);ks.disabled=false;});return;}
   const aa=event.target.closest&&event.target.closest("[data-aiapply]");if(aa){aiApply(aa.dataset.aiapply);return;}
   const cj=event.target.closest&&event.target.closest("[data-source-reviewed],[data-passage],[data-link-finding],[data-casejump],[data-assisttab],[data-assistact],[data-assistuse],[data-assistlis],[data-assistser]");
   if(cj){
@@ -7195,7 +7284,7 @@ document.addEventListener("click",event=>{
     if(act==="close"){$("casedlg").close();return;}
     if(act==="addprod"){collectCase();curCase.data.products.push(blankProduct());renderCase();return;}
     if(act==="addevent"){collectCase();curCase.data.events.push(blankEvent());renderCase();return;}
-    if(act==="aifill"||act==="submitqc"||act==="qcapprove"||act==="qcreturn"){caseFlowAct(act);return;}
+    if(act==="aifill"||act==="submitqc"||act==="qcapprove"||act==="qcreturn"||act==="automate"){caseFlowAct(act);return;}
     if(act==="routecase"){(async()=>{await routeItems("case",[curCase.id]);const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}else $("casedlg").close();})();return;}
     target.disabled=true;
     (async()=>{
