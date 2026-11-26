@@ -191,6 +191,8 @@ const canEditCase = (state, viewer, c) => Boolean(viewer && c && (viewer.role ==
 // ---- Imports as restartable jobs. A search range is cut into bounded date windows; each window is searched, reconciled (count reported by PubMed against unique PMIDs retrieved)
 // and checkpointed before the next one starts, so a failure resumes where it stopped and a replay changes nothing that was already decided. ----
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Times printed on screenshots, snapshots and PDF exports are Indian Standard Time (UTC+05:30), never UTC. Stored timestamps stay ISO UTC.
+const istStamp = iso => { const d = new Date(iso); if (!iso || Number.isNaN(d.getTime())) return ""; const x = new Date(d.getTime() + 19800000).toISOString(); return x.slice(0, 10) + " " + x.slice(11, 16) + " IST"; };
 const DATE_FIELDS = { crdt:{ label:"Create Date", tag:"crdt" }, pdat:{ label:"Publication Date", tag:"dp" } };
 async function withRetry(env, fn, { tries = 4 } = {}) {
   for (let attempt = 0; ; attempt++) {
@@ -453,7 +455,7 @@ function citationSnapshotSvg(article, efetch) {
   add((article.authors || []).join(", "), 12, false, "#52525b", 14);
   add("Abstract", 13, true, "#20558a", 4);
   add(article.abstract || "No abstract in the retrieved record.", 12, false, "#18181b", 14);
-  if (article.pullQuery) add("Search query: " + article.pullQuery + " · " + (article.pullDateField || "Date") + " range " + (article.pullRange || "") + " · retrieved " + (article.pullAt || efetch?.retrievedAt || "").slice(0, 16).replace("T", " ") + " UTC", 10, false, "#52525b", 6);
+  if (article.pullQuery) add("Search query: " + article.pullQuery + " · " + (article.pullDateField || "Date") + " range " + (article.pullRange || "") + " · retrieved " + istStamp(article.pullAt || efetch?.retrievedAt || ""), 10, false, "#52525b", 6);
   if (efetch?.sha256) add("EFetch XML SHA-256: " + efetch.sha256, 9, false, "#71717a", 4);
   let y = 30; const body = lines.map(l => { y += l.size * 1.35; const out = `<text x="40" y="${y.toFixed(1)}" font-family="Helvetica,Arial,sans-serif" font-size="${l.size}" font-weight="${l.bold ? 700 : 400}" fill="${l.color}">${esc(l.text)}</text>`; y += l.gap; return out; }).join("");
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${Math.ceil(y + 30)}" viewBox="0 0 ${width} ${Math.ceil(y + 30)}"><rect width="100%" height="100%" fill="#ffffff"/><rect x="1" y="1" width="${width - 2}" height="${Math.ceil(y + 28)}" fill="none" stroke="#b45309" stroke-width="2"/>${body}</svg>`;
@@ -815,6 +817,30 @@ async function caseAssist(env, state, c) {
 const aiConfig = (env, state) => { const a = state.settings?.ai || {}, key = env.OPENAI_API_KEY || state.settings?.openaiKey || ""; return { enabled:a.enabled === true, model:a.model || "gpt-4o-mini", monthlyTokens:Number(a.monthlyTokens) || 0, key, hasKey:Boolean(key) }; };
 const aiMonth = () => new Date().toISOString().slice(0, 7);
 const aiUsed = state => state.aiUsage?.month === aiMonth() ? Number(state.aiUsage.tokens) || 0 : 0;
+// One small, capped call. Returns the model's JSON text plus the tokens really used; refuses before sending when the monthly limit would be exceeded.
+async function aiChat(env, state, messages, maxOut, estimateChars, by, action, target) {
+  const cfg = aiConfig(env, state);
+  if (!cfg.enabled || !cfg.hasKey || cfg.monthlyTokens <= 0) return { error:"AI assist is off, so no tokens are used. A manager can turn it on in Settings and set a monthly token limit.", status:409 };
+  const estimate = Math.ceil(estimateChars / 3.5) + maxOut, used = aiUsed(state);
+  if (used + estimate > cfg.monthlyTokens) return { error:"The monthly AI token limit would be exceeded (" + used + " used of " + cfg.monthlyTokens + "). Nothing was sent.", status:429 };
+  let res; try { res = await fetch("https://api.openai.com/v1/chat/completions", { method:"POST", signal:AbortSignal.timeout(40000), headers:{ "Content-Type":"application/json", Authorization:"Bearer " + cfg.key }, body:JSON.stringify({ model:cfg.model, temperature:0, max_tokens:maxOut, response_format:{ type:"json_object" }, messages }) }); }
+  catch (error) { return { error:"The AI service could not be reached: " + String(error.message).slice(0, 120), status:502 }; }
+  if (!res.ok) return { error:"The AI service refused the request (HTTP " + res.status + ").", status:502 };
+  const out = await res.json().catch(() => ({})), tokens = Number(out.usage?.total_tokens) || estimate;
+  await write(env, data => { const u = data.aiUsage?.month === aiMonth() ? data.aiUsage : (data.aiUsage = { month:aiMonth(), tokens:0, calls:0 }); u.tokens += tokens; u.calls += 1; });
+  await audit(env, { by, action, target, detail:{ model:cfg.model, tokens } });
+  let json = {}; try { json = JSON.parse(out.choices?.[0]?.message?.content || "{}"); } catch { /* empty */ }
+  return { json, tokens, used:used + tokens, limit:cfg.monthlyTokens, estimate, model:cfg.model };
+}
+// The data-entry fields the AI may propose, in the order they are asked. Seriousness, MedDRA codes and listedness are never asked of the AI: rules and the dictionaries do those for free.
+function aiFillFields(c) {
+  const d = normalizeCase(c.data), out = [], need = (id, label, f) => { if (!hasVal(f)) out.push({ id, label }); };
+  need("p.age", "patient age", d.patient.age); need("p.sex", "patient sex", d.patient.sex); need("p.weight", "patient weight", d.patient.weight); need("p.country", "country where the event occurred", d.patient.country);
+  d.products.forEach((p, i) => { if (p.role !== "suspect") return; for (const [k, l] of [["dose", "dose"], ["route", "route"], ["frequency", "frequency"], ["indication", "indication"], ["start_date", "start date or day"], ["stop_date", "stop date or day"], ["action_taken", "action taken with the drug"], ["dechallenge", "dechallenge result"], ["rechallenge", "rechallenge result"]]) need("r" + i + "." + k, l + " of " + (v(p.name) || "the suspect drug"), p[k]); });
+  d.events.forEach((e, i) => { if (!hasVal(e.verbatim)) return; for (const [k, l] of [["onset_date", "onset date or day"], ["time_to_onset", "time to onset"], ["outcome", "outcome"]]) need("e" + i + "." + k, l + " of " + v(e.verbatim), e[k]); });
+  return out.slice(0, 30);
+}
+const aiPathOf = id => { const m = /^p\.(\w+)$/.exec(id) || null; if (m) return "patient." + m[1]; const r = /^r(\d+)\.(\w+)$/.exec(id); if (r) return "products." + r[1] + "." + r[2]; const e = /^e(\d+)\.(\w+)$/.exec(id); return e ? "events." + e[1] + "." + e[2] : ""; };
 async function aiDetectEvents(env, state, article, scan, by) {
   const cfg = aiConfig(env, state);
   if (!cfg.enabled || !cfg.hasKey || cfg.monthlyTokens <= 0) return { error:"AI assist is off, so no tokens are used. A manager can turn it on in Settings and set a monthly token limit.", status:409 };
@@ -1798,8 +1824,8 @@ async function exportPdf(env, state, viewer, manager, body) {
       "Reviewer: " + (item.reviewer || "Unassigned") + " · Status: " + item.status + (item.note ? " · Note: " + item.note : ""),
       "Retraction check: " + (article.retractionStatus || "Pending") + " · Access: " + (article.oaStatus || "Pending") + " · Full text: " + (article.fullTextStatus || "Pending") +
         (article.citedBy !== undefined ? " · Cited by: " + article.citedBy : "")];
-    if (article.pullQuery) lines.push("Search query: " + article.pullQuery + " · Date range: " + (article.pullRange || "-") + " · Retrieved: " + (article.pullAt ? article.pullAt.slice(0, 16).replace("T", " ") + " UTC" : "-"));
-    if (fresh.screenshotAt) lines.push("Snapshot taken: " + fresh.screenshotAt.slice(0, 16).replace("T", " ") + " UTC");
+    if (article.pullQuery) lines.push("Search query: " + article.pullQuery + " · Date range: " + (article.pullRange || "-") + " · Retrieved: " + (article.pullAt ? istStamp(article.pullAt) : "-"));
+    if (fresh.screenshotAt) lines.push("Snapshot taken: " + istStamp(fresh.screenshotAt));
     if ((article.authors || []).length) lines.push("Authors: " + article.authors.join(", "));
     if ((article.meshTerms || []).length) lines.push("MeSH: " + article.meshTerms.slice(0, 12).join("; "));
     if (article.abstract) lines.push("Abstract: " + article.abstract.replace(/\s+/g, " ").slice(0, 1800));
@@ -2511,6 +2537,12 @@ function stageOf(a) {
   if (a.qc?.status === "returned") return "screening";
   return a.disposition.value === "potential_icsr" ? "medical_review" : "closed";
 }
+function pickRole(state, portfolio, role, exclude = "") {
+  const today = day(), away = p => p.awayFrom && p.awayFrom <= today && (!p.awayUntil || p.awayUntil >= today);
+  const pool = state.profiles.filter(p => p.active && p.email !== exclude && !away(p) && (state.memberships || []).some(m => m.email === p.email && m.role === role && (m.portfolio === "*" || m.portfolio === portfolio)));
+  const load = p => (state.cases || []).filter(c => c.assignee === p.email && !caseClosed(c)).length;
+  return pool.map(p => ({ p, n:load(p) })).sort((x, y) => x.n - y.n || x.p.email.localeCompare(y.p.email))[0]?.p.email || state.profiles.find(p => p.role === "manager" && p.active && p.email !== exclude)?.email || "";
+}
 function pickMedical(state, portfolio, exclude = "") {
   const today = day(), away = p => p.awayFrom && p.awayFrom <= today && (!p.awayUntil || p.awayUntil >= today);
   const pool = state.profiles.filter(p => p.active && p.email !== exclude && !away(p) && (state.memberships || []).some(m => m.email === p.email && m.role === "medical_reviewer" && (m.portfolio === "*" || m.portfolio === portfolio)));
@@ -2835,11 +2867,11 @@ function pickCaseAssignee(data, rec) {
 }
 // Reporting due date from the case's country, seriousness and marketing-authorisation record (15 days serious / 90 days non-serious by default).
 function refreshDue(data, rec) { rec.dueAt = regulatoryContext(data.settings?.marketAuth || [], rec.data, rec.molecule).due || ""; }
-function makeCase(data, article, item, by, intake, assignTo = "") {
+function makeCase(data, article, item, by, intake, assignTo = "", stage = "medical_review") {
   const at = new Date().toISOString();
   const number = allocateCaseNumber(data);
   const created = { id:crypto.randomUUID(), number, pmid:article.id, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"",
-    data:caseFromArticle(article, item, data.settings || {}), createdBy:by, createdAt:at, updatedAt:at, intake, stage:"medical_review",
+    data:caseFromArticle(article, item, data.settings || {}), createdBy:by, createdAt:at, updatedAt:at, intake, stage, ...(stage === "screening" && assignTo ? { screener:assignTo } : {}),
     history:[{ at, by, action:(intake === "automatic" ? "added automatically from the full text of PMID " : "created from PMID ") + article.id }] };
   created.data.case_id = created.number;
   (data.cases ||= []).push(created);
@@ -2850,7 +2882,7 @@ function makeCase(data, article, item, by, intake, assignTo = "") {
 }
 // Adds a draft case for every article whose full text is stored and that has detected events (one case per article).
 // Only articles a screener marked "potential ICSR" and QC selected (approved) become Synchrony cases. Everything else stays in the screening queues.
-const qcSelected = a => a.disposition?.value === "potential_icsr" && (a.qc?.status === "approved" || Boolean(a.routedToMedical) || (!a.qc && a.status === "Complete"));
+const qcSelected = a => a.disposition?.value === "potential_icsr" && (a.qc?.status === "approved" || Boolean(a.routedToMedical));
 function icsrIntake(data, by, scope, limit = 1000, assignTo = "") {
   const out = { created:[], existing:0, noEvents:0, notSelected:0 }, have = new Set((data.cases || []).map(c => c.pmid));
   for (const article of Object.values(data.articles)) {
@@ -3877,6 +3909,59 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"meddra.loaded", target:"MedDRA " + info.version + " " + info.language, detail:{ ...info.counts, filename:info.filename, licence_confirmed:true } });
     return json({ ok:true, info });
   }
+  if (["/api/case-submit", "/api/case-qc", "/api/case-ai-fill"].includes(path) && viewer) {
+    const c = (state.cases || []).find(x => x.id === String(body.id || ""));
+    if (!c || !caseVisible(state, viewer, c)) return json({ error:"Case not found." }, 404);
+    const at = new Date().toISOString(), stage = c.stage || "medical_review", note = String(body.note || "").trim().slice(0, 600), who = n => (state.profiles.find(p => p.email === n)?.name || n || "nobody");
+    if (c.locked || c.archived) return json({ error:"This case is locked or archived." }, 409);
+    if (path === "/api/case-ai-fill") {
+      if (!canEditCase(state, viewer, c)) return json({ error:"Only the person this case is routed to can fill it." }, 403);
+      const missing = aiFillFields(c);
+      if (!missing.length) return json({ proposals:[], tokens:0, message:"Every field the AI could help with is already filled. No tokens were used." });
+      const article = state.articles[c.pmid]; if (!article) return json({ error:"The article is not available." }, 404);
+      const scan = await scanArticle(env, state, article), weight = u => new Set(u.spans.map(sp => sp.kind)).size;
+      const picked = []; let chars = 0;
+      for (const u of scan.units.filter(u => u.spans.length).sort((a, b) => weight(b) - weight(a) || a.id.localeCompare(b.id))) { if (chars + u.text.length > 1800 || picked.length >= 14) continue; picked.push(u); chars += u.text.length; }
+      if (!picked.length) return json({ proposals:[], tokens:0, message:"No sentence in the text mentions the product, event or patient, so there is nothing to send. No tokens were used." });
+      const redacted = picked.map((u, i) => redactPhi((i + 1) + ". " + u.text).text);
+      const hash = await sha256Hex(JSON.stringify([c.id, redacted, missing.map(m => m.id)]));
+      if (c.aiFill?.hash === hash) return json({ proposals:c.aiFill.proposals, tokens:0, cached:true, message:"Same text and same gaps as the last request, so the earlier answer is shown and no tokens were used." });
+      const maxOut = Math.min(420, 28 * missing.length + 60), system = "Fill case-report fields from numbered sentences. Reply JSON {\"f\":[{\"i\":id,\"v\":value copied from the sentence,\"s\":sentence number}]}. Omit anything not stated.";
+      const user = "Sentences:\n" + redacted.join("\n") + "\nFields:\n" + missing.map(m => m.id + " " + m.label).join("\n");
+      const r = await aiChat(env, state, [{ role:"system", content:system }, { role:"user", content:user }], maxOut, system.length + user.length, email, "ai.fill", c.number);
+      if (r.error) return json({ error:r.error }, r.status);
+      const proposals = [], dropped = [], byId = new Map(missing.map(m => [m.id, m]));
+      for (const x of Array.isArray(r.json.f) ? r.json.f.slice(0, 40) : []) {
+        const id = String(x?.i || ""), value = String(x?.v ?? "").trim().slice(0, 120), sentence = picked[Number(x?.s) - 1], path2 = aiPathOf(id);
+        if (!byId.has(id) || !path2 || !value || !sentence) { dropped.push(id || "?"); continue; }
+        if (!sentence.text.toLowerCase().includes(value.toLowerCase())) { dropped.push(id); continue; }   // every value must appear in the sentence it cites
+        if (!proposals.some(p => p.id === id)) proposals.push({ id, path:path2, label:byId.get(id).label, value, sentence:sentence.text.slice(0, 400) });
+      }
+      await write(env, data => { const x = data.cases.find(y => y.id === c.id); x.aiFill = { hash, at, tokens:r.tokens, proposals }; });
+      return json({ proposals, dropped, tokens:r.tokens, estimate:r.estimate, used:r.used, limit:r.limit, asked:missing.length, sentences:picked.length });
+    }
+    if (path === "/api/case-submit") {
+      if (stage !== "screening") return json({ error:"Only a case in data entry can be submitted to QC." }, 409);
+      if (!canEditCase(state, viewer, c)) return json({ error:"Only the person doing the data entry can submit it." }, 403);
+      const a = localAssessment(normalizeCase(c.data)), problems = [...a.validity.missing.map(m => "Missing: " + m), ...a.qc.findings.filter(f => f.severity === "critical" || f.severity === "major").map(f => f.title)];
+      if (problems.length) return json({ error:"Finish the data entry first: " + problems.slice(0, 6).join("; ") + ".", problems }, 409);
+      const next = pickRole(state, c.portfolio, "qc", email); if (!next) return json({ error:"No QC reviewer is set up. A manager must add one in Team." }, 409);
+      await write(env, data => { const x = data.cases.find(y => y.id === c.id); x.stage = "qc"; x.assignee = next; x.assignedAt = at; x.screener = x.screener || c.assignee; x.status = "Draft"; x.submittedAt = at; x.qc = { ...(x.qc || {}), status:"pending", rounds:x.qc?.rounds || 0 }; refreshDue(data, x); x.updatedAt = at; (x.history ||= []).push({ at, by:email, action:"submitted to QC (" + next + ")" + (note ? ": " + note : "") }); });
+      await audit(env, { by:email, action:"case.submit", target:c.number, detail:{ to:next, note } });
+      return json({ ok:true, to:next, toName:who(next) });
+    }
+    if (stage !== "qc") return json({ error:"This case is not waiting for QC." }, 409);
+    if (!(c.assignee === email || isPortfolioManager(state, viewer, c.portfolio))) return json({ error:"Only the QC reviewer it is routed to can decide this." }, 403);
+    const decision = body.decision === "return" ? "return" : body.decision === "approve" ? "approve" : "";
+    if (!decision) return json({ error:"Approve or return the case." }, 400);
+    if (decision === "return" && note.length < 5) return json({ error:"Say what the screener must fix (at least 5 characters)." }, 400);
+    const target = decision === "approve" ? pickRole(state, c.portfolio, "medical_reviewer", email) : (c.screener || c.createdBy || ""), tp = state.profiles.find(p => p.email === target && p.active);
+    if (!tp) return json({ error:decision === "approve" ? "No medical reviewer is set up. A manager must add one in Team." : "The screener is no longer active; route the case to someone with Route." }, 409);
+    await write(env, data => { const x = data.cases.find(y => y.id === c.id); x.stage = decision === "approve" ? "medical_review" : "screening"; x.assignee = target; x.assignedAt = at; x.status = "Draft"; const q = x.qc ||= {}; q.status = decision === "approve" ? "approved" : "returned"; q.by = email; q.at = at; q.note = note; q.rounds = (q.rounds || 0) + (decision === "return" ? 1 : 0); refreshDue(data, x); x.updatedAt = at;
+      (x.history ||= []).push({ at, by:email, action:"QC " + (decision === "approve" ? "approved, sent to medical review (" + target + ")" : "returned to the screener (" + target + ")") + (note ? ": " + note : "") }); });
+    await audit(env, { by:email, action:"case.qc", target:c.number, detail:{ decision, to:target, note } });
+    return json({ ok:true, decision, to:target, toName:who(target) });
+  }
   if ((path === "/api/case-assist" || path === "/api/smpc-check") && viewer) {
     const c = (state.cases || []).find(x => x.id === String(body.id || body.caseId || ""));
     if (!c || !caseVisible(state, viewer, c)) return json({ error:"Case not found." }, 404);
@@ -4129,7 +4214,7 @@ async function apiCore(request, env, path) {
       if (!["potential_icsr", "full_text_needed", "aggregate_safety", "excluded"].includes(value)) return json({ error:"Choose potential ICSR, full text needed, aggregate safety relevance, or exclude." }, 400);
       if (value === "excluded" && (!EXCLUSION_REASONS.includes(reason) || (reason.startsWith("Other") && note.length < 3))) return json({ error:"Choose a reason for the exclusion" + (reason.startsWith("Other") ? " and explain it in the note." : "."), reasons:EXCLUSION_REASONS }, 400);
       const rate = Number(state.settings?.qcRate ?? 10), hash = [...(item.pmid + "|" + item.portfolio)].reduce((n, c) => (n * 31 + c.charCodeAt(0)) >>> 0, 7) % 100;
-      const needsQc = value === "potential_icsr" ? state.settings?.qcPotentialIcsr !== false : value === "full_text_needed" ? false : hash < rate;
+      const needsQc = value === "potential_icsr" ? state.settings?.qcPotentialIcsr === true : value === "full_text_needed" ? false : hash < rate;
       const qcPool = state.profiles.filter(p => p.active && p.email !== item.reviewer && rolesIn(state, p.email, item.portfolio).has("qc"));
       const load = p => state.assignments.filter(x => x.qc?.reviewer === p.email && x.qc.status === "pending").length;
       const qcReviewer = needsQc ? qcPool.map(p => ({ p, n:load(p) })).sort((a, b) => a.n - b.n || a.p.email.localeCompare(b.p.email))[0]?.p.email || "" : "";
@@ -4195,7 +4280,7 @@ async function apiCore(request, env, path) {
           const number = allocateCaseNumber(data), a = data.assignments.find(x => x.id === item.id);
           const caseData = caseFromPatient(data.articles[item.pmid], p, ex, a, data.settings || {}, { criteria:assessment, decisions:a.extractionDecisions || {}, ime }); applyMeddraProposals(caseData, midx);
           caseData.case_id = number;
-          const rec = { id:crypto.randomUUID(), number, pmid:item.pmid, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"", data:caseData, createdBy:email, createdAt:at, updatedAt:at, assignee:a.medicalReviewer || pickMedical(data, item.portfolio) || item.reviewer || email, stage:"medical_review", intake:"patient-draft",
+          const rec = { id:crypto.randomUUID(), number, pmid:item.pmid, portfolio:item.portfolio, molecule:(item.molecules || [])[0] || "", status:"Draft", notes:"", data:caseData, createdBy:email, createdAt:at, updatedAt:at, ...(a.qc || a.routedToMedical || data.settings?.qcPotentialIcsr === true ? { assignee:a.medicalReviewer || pickMedical(data, item.portfolio) || item.reviewer || email, stage:"medical_review" } : { assignee:a.reviewer || email, screener:a.reviewer || email, stage:"screening" }), intake:"patient-draft",
             provenance:{ evidence:evidenceRef(data.articles[item.pmid]), idempotencyKey:idem, patientId:p.id, patientLabel:p.label, extractionVersion:ex.version, extractedAt:ex.createdAt, fullTextSha256:ex.source.fullTextSha256, assignmentId:item.id, criteriaOverall:assessment.overall, forced },
             history:[{ at, by:email, action:"draft created for " + (p.label || p.id) + " from PMID " + item.pmid + " (" + item.portfolio + ")" }] };
           refreshDue(data, rec); (data.cases ||= []).push(rec); done.push({ existing:false, number, patient:p.id, id:rec.id });
@@ -7031,7 +7116,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  extractClinical, zipFiles, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  istStamp, extractClinical, zipFiles, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);

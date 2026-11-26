@@ -582,10 +582,10 @@ test("record cards and tile sheets show the source, the search query and when it
   const { recordCardHtml, tilesHtml } = await import("../server/screenshots.mjs");
   const a = { id: "34567890", title: "T", pullQuery: '"aciclovir"[tiab] AND humans[mh]', pullRange: "2026-10-01 to 2026-11-20", pullAt: "2026-11-25T04:49:12Z" };
   const card = recordCardHtml(a);
-  for (const text of ["PubMed®", "Search query", "aciclovir&quot;[tiab] AND humans[mh]", "2026-10-01 to 2026-11-20", "2026-11-25 04:49 UTC", "retrieved through the NCBI E-utilities API"]) assert.ok(card.includes(text), text);
+  for (const text of ["PubMed®", "Search query", "aciclovir&quot;[tiab] AND humans[mh]", "2026-10-01 to 2026-11-20", "2026-11-25 10:19 IST", "retrieved through the NCBI E-utilities API"]) assert.ok(card.includes(text), text);
   assert.ok(card.includes("not a capture of the PubMed web page"));
   const sheet = tilesHtml({ portfolio: "P", molecule: "m", query: "q1", from: "2026-10-01", to: "2026-11-20", source: "PubMed", time: "2026-11-25T04:49:12Z" }, [a]);
-  assert.ok(sheet.includes("PubMed®") && sheet.includes("2026-11-25 04:49 UTC") && sheet.includes("q1"));
+  assert.ok(sheet.includes("PubMed®") && sheet.includes("2026-11-25 10:19 IST") && sheet.includes("q1"));
 });
 
 test("coding memory can be listed, entries deleted, or all cleared; cases are untouched and every deletion is audited", async () => {
@@ -638,7 +638,7 @@ test("a PDF export takes a fresh snapshot when the stored one is out of date, an
   await t.BUCKET.put("bench.json", JSON.stringify(bench));
   const res = await worker.fetch(new Request("http://localhost/api/export", { method: "POST", headers: { "oai-authenticated-user-email": MANAGER, "Content-Type": "application/json" }, body: JSON.stringify({ pmids: ["1"], title: "T" }) }), t.env);
   assert.equal(res.status, 200); const pdf = new TextDecoder("latin1").decode(await res.arrayBuffer());
-  assert.deepEqual(calls, ["1"]); assert.ok(pdf.includes("Search query:") && pdf.includes("2026-11-25 04:49 UTC") && pdf.includes("Snapshot taken:"));
+  assert.deepEqual(calls, ["1"]); assert.ok(pdf.includes("Search query:") && pdf.includes("2026-11-25 10:19 IST") && pdf.includes("Snapshot taken:"));
   assert.ok(!pdf.includes("could not be embedded") && !pdf.includes("not captured yet"));
   assert.equal(JSON.parse(await readFile(benchFile(t.dir), "utf8")).articles["1"].screenshotKind, "record2");
   await worker.fetch(new Request("http://localhost/api/export", { method: "POST", headers: { "oai-authenticated-user-email": MANAGER, "Content-Type": "application/json" }, body: JSON.stringify({ pmids: ["1"], title: "T" }) }), t.env);

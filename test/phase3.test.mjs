@@ -265,3 +265,47 @@ test("AI event check: off by default and uses no tokens; when on, it is capped, 
   const st = (await (await t.get(MANAGER, "/api/state")).json()).config.ai; assert.equal(st.used, 640); assert.equal(st.hasKey, true);
   assert.equal((await (await t.get(SCREENER, "/api/state")).json()).config.ai.hasKey, undefined, "the key status is for managers only");
 });
+
+test("workflow: screener data entry -> submit to QC -> QC returns or approves -> medical review; each hand-off moves ownership", async () => {
+  const t = await scenario(ACICLOVIR); const s0 = await t.state();
+  s0.settings.qcPotentialIcsr = false; s0.assignments[0] = { ...s0.assignments[0], status: "Pending", disposition: undefined }; await t.BUCKET.put("bench.json", JSON.stringify(s0));
+  const d = await t.call(SCREENER, "/api/disposition", { id: "a1", value: "potential_icsr" }); assert.equal(d.status, 200, JSON.stringify(d.body)); assert.equal(d.body.qc, null, "no article-level QC: the QC check is on the finished case");
+  assert.equal((await t.call(SCREENER, "/api/drafts-create", { id: "a1" })).status, 200);
+  let c = (await t.cases())[0]; assert.deepEqual([c.stage, c.assignee, c.screener], ["screening", SCREENER, SCREENER]);
+  assert.equal((await t.call(QC, "/api/case-qc", { id: c.id, decision: "approve" })).status, 404, "QC cannot see it while it is in data entry");
+  const early = await t.call(SCREENER, "/api/case-submit", { id: c.id }); assert.equal(early.status, 409); assert.match(early.body.error, /Finish the data entry first/);
+  const mine = (await (await t.get(SCREENER, "/api/state")).json()).cases[0]; mine.data.products[0].start_not_reported = true; mine.data.events.forEach(e => { e.onset_not_reported = true; e.listedness = fld("Listed"); e.expectedness = fld("Listed"); });
+  assert.equal((await t.call(SCREENER, "/api/case-save", { id: c.id, status: "Draft", data: mine.data })).status, 200);
+  const sub = await t.call(SCREENER, "/api/case-submit", { id: c.id, note: "Complete" }); assert.equal(sub.status, 200, JSON.stringify(sub.body)); assert.equal(sub.body.to, QC);
+  c = (await t.cases())[0]; assert.deepEqual([c.stage, c.assignee], ["qc", QC]);
+  assert.equal((await t.call(SCREENER, "/api/case-save", { id: c.id, status: "Draft", data: mine.data })).status, 404, "the screener has handed it over");
+  assert.equal((await t.call(QC, "/api/case-qc", { id: c.id, decision: "return", note: "no" })).status, 400);
+  assert.equal((await t.call(QC, "/api/case-qc", { id: c.id, decision: "return", note: "Dose route is missing" })).body.to, SCREENER);
+  c = (await t.cases())[0]; assert.deepEqual([c.stage, c.assignee, c.qc.status, c.qc.rounds], ["screening", SCREENER, "returned", 1]);
+  assert.equal((await t.call(SCREENER, "/api/case-submit", { id: c.id })).status, 200, "the screener fixes it and sends it again");
+  const ok = await t.call(QC, "/api/case-qc", { id: c.id, decision: "approve" }); assert.equal(ok.body.to, MEDICAL);
+  c = (await t.cases())[0]; assert.deepEqual([c.stage, c.assignee, c.qc.status], ["medical_review", MEDICAL, "approved"]);
+  assert.equal((await t.call(SCREENER, "/api/case-submit", { id: c.id })).status, 404);
+  assert.ok(c.history.some(h => /submitted to QC/.test(h.action)) && c.history.some(h => /returned to the screener/.test(h.action)) && c.history.some(h => /sent to medical review/.test(h.action)));
+});
+
+test("AI data entry: asks only for empty fields, sends few sentences, accepts only values quoted from them, caches, and is capped", async () => {
+  const t = await scenario(ACICLOVIR); const s0 = await t.state();
+  s0.settings.qcPotentialIcsr = false; s0.assignments[0] = { ...s0.assignments[0], status: "Pending", disposition: undefined }; await t.BUCKET.put("bench.json", JSON.stringify(s0));
+  await t.call(SCREENER, "/api/disposition", { id: "a1", value: "potential_icsr" }); await t.call(SCREENER, "/api/drafts-create", { id: "a1" }); const c = (await t.cases())[0];
+  let calls = 0, sent = ""; const reply = f => async (u, init) => { calls++; sent = JSON.parse(init.body).messages[1].content; return new Response(JSON.stringify({ usage: { total_tokens: 310 }, choices: [{ message: { content: JSON.stringify({ f }) } }] }), { status: 200 }); };
+  const off = await withFetch(reply([]), () => t.call(SCREENER, "/api/case-ai-fill", { id: c.id })); assert.equal(off.status, 409); assert.equal(calls, 0);
+  await t.call(MANAGER, "/api/settings", { aiEnabled: "on", openaiKey: "sk-test-1234567890abcdef", aiMonthlyTokens: 3000 });
+  const out = await withFetch(reply([{ i: "p.weight", v: "98 kg", s: 1 }, { i: "r0.route", v: "intravenously", s: 1 }, { i: "r0.dose", v: "99 mg", s: 1 }, { i: "nonsense", v: "x", s: 1 }]), () => t.call(SCREENER, "/api/case-ai-fill", { id: c.id }));
+  assert.equal(out.status, 200, JSON.stringify(out.body)); assert.equal(calls, 1);
+  assert.ok(out.body.sentences <= 14 && sent.length < 2600, "a small prompt: " + sent.length + " characters");
+  assert.ok(!/anil\.rao@/.test(sent)); const ids = out.body.proposals.map(p => p.id);
+  assert.ok(!ids.includes("p.weight") && !ids.includes("r0.dose") && !ids.includes("nonsense"), "values not found in the cited sentence are dropped: " + ids);
+  assert.equal(out.body.tokens, 310);
+  const again = await withFetch(reply([]), () => t.call(SCREENER, "/api/case-ai-fill", { id: c.id })); assert.equal(again.body.cached, true); assert.equal(again.body.tokens, 0); assert.equal(calls, 1, "the same question is not paid for twice");
+  assert.equal((await t.call(QC, "/api/case-ai-fill", { id: c.id })).status, 404, "only people who can see the case");
+});
+
+test("screenshots and snapshot cards print IST, not UTC", () => {
+  assert.equal(worker.istStamp("2026-11-25T20:00:00Z"), "2026-11-26 01:30 IST"); assert.equal(worker.istStamp("2026-11-25T04:49:00Z"), "2026-11-25 10:19 IST"); assert.equal(worker.istStamp(""), "");
+});
