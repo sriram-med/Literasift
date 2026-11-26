@@ -284,6 +284,24 @@ async function runScheduled() {
   }
   console.log(JSON.stringify({ time: new Date().toISOString(), batches: results.length, failed: results.filter(r => r.error).length, remaining: last?.remaining || 0, evidence: last?.evidence }));
 }
+// Process a bounded batch without running the PubMed schedule again.
+let synchronyRunning = false;
+async function tickSynchrony() {
+  if (synchronyRunning) return;
+  synchronyRunning = true;
+  try {
+    const response = await worker.fetch(new Request("http://localhost/api/synchrony-tick", {
+      method: "POST", headers: { Authorization: "Bearer " + runToken }, body: "{}"
+    }), env);
+    if (!response.ok) console.error("Synchrony scheduler:", response.status);
+  } catch (error) {
+    console.error("Synchrony scheduler:", error.message);
+  } finally {
+    synchronyRunning = false;
+  }
+}
+setTimeout(tickSynchrony,15000);
+setInterval(tickSynchrony,60000);
 // Daily consistent backup of the SQLite store with an integrity check; the newest 14 are kept.
 async function backupDaily() {
   if (!useSqlite) return;
