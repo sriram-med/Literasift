@@ -6136,12 +6136,25 @@ section{box-shadow:0 1px 0 #ffffffb3 inset,0 1px 2px #0d15120d,0 10px 24px -14px
 .tile3d{display:grid;place-items:center;width:38px;height:38px;border-radius:11px;flex:none;font-weight:700;font-size:16px;color:#fff;background:linear-gradient(145deg,#19a08b,#0e6a5d 60%,#0a4f45);box-shadow:0 1px 0 #ffffff59 inset,0 3px 0 #08463c,0 10px 16px -6px #0e6a5d99;text-shadow:0 1px 1px #0004;transform:perspective(200px) rotateX(8deg) rotateY(-8deg);transition:transform .3s}
 .tile3d:hover,summary:hover .tile3d,.clientcard:hover .tile3d{transform:perspective(200px) rotateX(0) rotateY(0) translateY(-2px)}
 .chip3d{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);background:linear-gradient(var(--card),var(--accent));border-radius:99px;padding:3px 10px;font-size:12px;font-weight:500;cursor:pointer;box-shadow:0 1px 0 #ffffffb3 inset,0 2px 0 #0d15120f;color:var(--fg)}.chip3d:hover{border-color:var(--red);color:var(--red)}
+.covcard{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px 20px;margin-bottom:14px;display:grid;gap:12px}.cov-top{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.cov-n{font-size:28px;font-weight:600;font-variant-numeric:tabular-nums}
+.acards{display:grid;gap:10px;padding:12px 14px 16px}
+.acard{display:grid;grid-template-columns:1fr 190px;gap:20px;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:14px;padding:16px 18px;transition:box-shadow .15s,transform .15s}
+.acard:hover{box-shadow:0 10px 28px #0e6a5d22;transform:translateY(-1px)}
+.acard.r-green{border-left-color:var(--green)}.acard.r-red{border-left-color:var(--red)}.acard.r-blue{border-left-color:var(--brand)}.acard.r-amber{border-left-color:var(--amber)}
+.ac-title{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:15.5px;font-weight:600;line-height:1.35;color:inherit;text-decoration:none}.ac-title:hover{color:var(--brand)}
+.ac-meta{color:var(--muted,#6b7280);font-size:12.5px;margin:5px 0 10px}
+.ac-chips{display:flex;flex-wrap:wrap;gap:6px}.badge.mol{background:var(--accent);border-color:transparent}
+.ac-more{margin-top:10px}.ac-more>summary{cursor:pointer;font-size:12.5px;color:var(--brand);list-style:none}.ac-more>summary::-webkit-details-marker{display:none}.ac-more>summary::before{content:"+ "}.ac-more[open]>summary::before{content:"- "}
+.abstract{font-size:13.5px;line-height:1.6;max-width:78ch}
+.ac-side{display:flex;flex-direction:column;align-items:flex-end;gap:8px;text-align:right;justify-content:space-between}
+.ac-who{display:flex;align-items:center;gap:8px;font-size:13px}.av{width:24px;height:24px;border-radius:50%;background:var(--brand);color:#fff;display:inline-grid;place-items:center;font-size:12px;font-weight:600}
+@media(max-width:760px){.acard{grid-template-columns:1fr}.ac-side{flex-direction:row;flex-wrap:wrap;align-items:center;text-align:left}}
 .qstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:14px;margin:6px 0 18px;perspective:900px}
-.qstat{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:12px 16px;display:flex;flex-direction:column}.qstat b{font-size:26px;line-height:32px;font-weight:600;font-variant-numeric:tabular-nums}
+.qstat{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px 20px;display:flex;flex-direction:column;gap:2px}.qstat .sub{text-transform:uppercase;letter-spacing:.06em;font-size:11px}.qstat b{font-size:26px;line-height:32px;font-weight:600;font-variant-numeric:tabular-nums}
 .clientgrp{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:18px;overflow:hidden}
 .clientgrp>summary{display:flex;align-items:center;gap:14px;padding:14px 18px;cursor:pointer;list-style:none;background:linear-gradient(var(--card),var(--accent))}.clientgrp>summary::-webkit-details-marker{display:none}
 .cg-main{display:flex;flex-direction:column;flex:1}.cg-main b{font-size:16px;letter-spacing:-.01em}.cg-prog{display:flex;align-items:center;gap:8px;width:170px}.cg-prog .bar{flex:1}
-.molgrp{border-top:1px solid var(--border)}.molgrp>summary{display:flex;align-items:center;gap:10px;padding:10px 18px;cursor:pointer;list-style:none;background:var(--accent)}.molgrp>summary::-webkit-details-marker{display:none}
+.molgrp{border-top:1px solid var(--border)}.molgrp>summary{display:flex;align-items:center;gap:10px;padding:14px 18px 4px;cursor:pointer;list-style:none;background:none}.molgrp>summary b{font-size:13px;text-transform:uppercase;letter-spacing:.06em}.molgrp>summary::-webkit-details-marker{display:none}
 .mol-dot{width:9px;height:9px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#5fe0c8,#0e6a5d);box-shadow:0 2px 3px #0e6a5d80}
 .qwrap{background:none;border:0;box-shadow:none;overflow:visible}.qwrap>.filters{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:16px}
 .clientgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:18px;margin-bottom:18px;perspective:1100px}
@@ -6183,7 +6196,7 @@ input,select,textarea{background:var(--card);border:1px solid var(--border);bord
 input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px #0e6a5d33}input[type=checkbox]{width:auto}
 .filters input{flex:1;min-width:200px}
 .filters.slim{align-items:end;gap:12px}.fl{display:grid;gap:3px;min-width:140px}.fl .sub{font-size:11px}
-details.menu{position:relative}details.menu>summary{list-style:none;cursor:pointer}details.menu>summary::-webkit-details-marker{display:none}.menubox{position:absolute;right:0;top:calc(100% + 6px);z-index:30;background:var(--card);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 32px #0003;padding:8px;display:grid;gap:2px;min-width:230px}.menubox button{background:none;border:0;text-align:left;padding:8px 10px;border-radius:8px;cursor:pointer;color:inherit;font:inherit}.menubox button:hover{background:var(--hover,#0e6a5d14)}.dq{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin-bottom:14px}.menubox.wide2{grid-template-columns:repeat(2,minmax(160px,1fr));gap:12px;padding:14px;min-width:360px}
+details.menu{position:relative}details.menu>summary{list-style:none;cursor:pointer}details.menu>summary::-webkit-details-marker{display:none}.menubox{position:absolute;right:0;top:calc(100% + 6px);z-index:30;background:var(--card);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 32px #0003;padding:8px;display:grid;gap:2px;min-width:230px}.menubox button{background:none;border:0;text-align:left;padding:8px 10px;border-radius:8px;cursor:pointer;color:inherit;font:inherit}.menubox button:hover{background:var(--hover,#0e6a5d14)}.dq{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin-bottom:14px}.menubox select{width:100%;min-width:0}.fl{min-width:0}.menubox.wide2{grid-template-columns:repeat(2,minmax(160px,1fr));gap:12px;padding:14px;min-width:360px}
 form.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));align-items:end}form.grid .wide{grid-column:1/-1}
 label{display:flex;flex-direction:column;gap:5px;font-weight:500;font-size:13px}label.check{flex-direction:row;align-items:center;font-weight:400}
 .empty{text-align:center;color:var(--muted);padding:34px 10px}
@@ -7495,18 +7508,25 @@ function evidenceChips(item){
   return '<div class="chips">'+chips.join("")+"</div>";
 }
 function queueRows(items){
-  return table((libNumbers?["No."]:[]).concat(["Article","Relevance","Portfolio","Reviewer","Status",""]),items.slice(0,200).map(a=>{
-    const item=data.articles[a.pmid]||{};
-    item._molecules=a.molecules;
-    return (libNumbers?['<b>'+esc(libNumbers[a.pmid]||"")+'</b>']:[]).concat(['<a class="title" target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><div class="sub">PMID '+esc(a.pmid)+' · '+esc(item.journal)+' · '+esc(item.date)+((item.authors||[]).length?' · '+esc(item.authors.slice(0,3).join(", ")+(item.authors.length>3?" et al.":"")):"")+'</div>'+evidenceChips({...item,id:a.pmid})+
-        (eventChips(item)?'<div class="chips" style="margin-top:6px"><span class="sub">Events:</span>'+eventChips(item)+'</div>':"")+
-        (item.abstract?'<details class="abs"><summary>Abstract</summary><div>'+mark(item.abstract.slice(0,2500),a.molecules,(item.entities||{}).diseases)+'</div></details>':"")+
-        (((item.entities||{}).diseases||[]).length?'<div class="sub" style="margin-top:6px">Conditions mentioned: '+esc(item.entities.diseases.slice(0,5).join(", "))+'</div>':""),
-      relevanceCell(a),
-      esc(a.portfolio)+((a.molecules||[]).length?'<div class="chips">'+a.molecules.map(m=>badge(m)).join("")+"</div>":""),
-      (a.reviewer?esc(a.reviewer):badge("Unassigned","amber"))+(a.dueAt?'<div class="sub"'+(isOpenItem(a)&&a.dueAt<todayStr()?' style="color:var(--red)"':"")+'>due '+esc(a.dueAt)+'</div>':""),badge(a.status,statusColor[a.status]||(a.status==="QC returned"?"red":a.status==="Awaiting QC"?"blue":""))+(a.disposition?'<div class="sub">'+esc(DISPO_LABEL[a.disposition.value]||a.disposition.value)+'</div>':"")+(isLikely(a)?'<div>'+tbadge("Likely case","green","A single patient with an event and a drug, from a case report")+'</div>':""),
-      '<button class="btn outline sm" data-review="'+esc(a.id)+'">Review</button>']);
-  }),"No articles match.")+(items.length>200?'<p class="sub" style="padding:10px 14px">Showing 200 of '+items.length+". Refine the filters to narrow the list.</p>":"");
+  const people=data.people||data.profiles||[], RAIL={Complete:"green","QC returned":"red","Awaiting QC":"blue","Full text needed":"amber","In review":"blue"};
+  const cards=items.slice(0,200).map(a=>{
+    const item=data.articles[a.pmid]||{}; item._molecules=a.molecules;
+    const rev=a.reviewer?((people.find(x=>x.email===a.reviewer)||{}).name||a.reviewer):"", late=isOpenItem(a)&&a.dueAt&&a.dueAt<todayStr();
+    const first=(item.authors||[])[0]?item.authors[0]+((item.authors||[]).length>1?" et al.":""):"";
+    const ev=eventChips(item), key=[(isLikely(a)?tbadge("Likely case","green","A single patient with an event and a drug, from a case report"):""),(a.level?'<span class="badge '+(levelColor[a.level]||"")+'" title="'+esc((a.why||[]).join(" · "))+'">'+esc(a.level)+" "+(a.score??"")+'</span>':""),(a.disposition?'<span class="badge">'+esc(DISPO_LABEL[a.disposition.value]||a.disposition.value)+'</span>':"")].join("");
+    return '<article class="acard r-'+(RAIL[a.status]||"")+'"><div class="ac-main">'+
+      '<a class="ac-title" target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title||"PMID "+a.pmid)+'</a>'+
+      '<div class="ac-meta">'+(libNumbers&&libNumbers[a.pmid]?'<b>No. '+esc(libNumbers[a.pmid])+'</b> · ':"")+[esc(item.journal||""),esc(item.date||""),esc(first),"PMID "+esc(a.pmid)].filter(Boolean).join(" · ")+'</div>'+
+      '<div class="ac-chips">'+key+(a.molecules||[]).map(m=>'<span class="badge mol">'+esc(m)+'</span>').join("")+'</div>'+
+      '<details class="ac-more"><summary>Details</summary><div class="chips" style="margin:8px 0">'+evidenceChips({...item,id:a.pmid})+'</div>'+(ev?'<div class="chips" style="margin-bottom:8px"><span class="sub">Events:</span>'+ev+'</div>':"")+
+        (item.abstract?'<div class="abstract">'+mark(item.abstract.slice(0,2500),a.molecules,(item.entities||{}).diseases)+'</div>':"")+
+        (((item.entities||{}).diseases||[]).length?'<div class="sub" style="margin-top:6px">Conditions mentioned: '+esc(item.entities.diseases.slice(0,5).join(", "))+'</div>':"")+'</details></div>'+
+      '<div class="ac-side">'+badge(a.status,statusColor[a.status]||(a.status==="QC returned"?"red":a.status==="Awaiting QC"?"blue":""))+
+      '<div class="ac-who">'+(rev?'<span class="av" aria-hidden="true">'+esc(rev.slice(0,1).toUpperCase())+'</span><span>'+esc(rev)+'</span>':badge("Unassigned","amber"))+'</div>'+
+      (a.dueAt?'<div class="sub"'+(late?' style="color:var(--red);font-weight:600"':"")+'>'+(late?"Overdue · ":"Due ")+esc(a.dueAt)+'</div>':"")+
+      '<button class="btn sm" data-review="'+esc(a.id)+'">Review</button></div></article>';
+  }).join("");
+  return '<div class="acards">'+cards+'</div>'+(items.length>200?'<p class="sub" style="padding:10px 14px">Showing 200 of '+items.length+". Refine the filters to narrow the list.</p>":"");
 }
 function queueBody(list){
   if(!list.length)return '<div class="empty">No articles match.</div>';
@@ -7766,8 +7786,7 @@ function render() {
   if(tab==="My Queue"){
     const groups={};mine.forEach(a=>{const k=(a.molecules||[]).length?a.molecules.join(", "):a.portfolio;(groups[k]||={n:0,d:0}).n++;if(a.status==="Complete")groups[k].d++;});
     const done=mine.filter(a=>a.status==="Complete").length;
-    html=(mine.length?panel("My coverage",'<div class="row"><span>'+done+" of "+mine.length+' articles screened</span><b>'+Math.round(done/mine.length*100)+'%</b></div><div class="bar"><i data-width="'+Math.round(done/mine.length*100)+'"></i></div>'+
-      Object.entries(groups).sort((x,y)=>y[1].n-x[1].n).map(([k,g])=>'<div class="row"><span>'+esc(k)+'</span><span class="sub">'+g.d+" / "+g.n+'</span></div>').join(""),"Work through every article assigned to you; mark each Complete when screened."):"")+queueView(mine);
+    html=(mine.length?'<div class="covcard"><div class="cov-top"><div><b class="cov-n">'+Math.round(done/mine.length*100)+'%</b><span class="sub"> screened · '+done+' of '+mine.length+' articles</span></div><div class="chips">'+Object.entries(groups).sort((x,y)=>y[1].n-x[1].n).slice(0,8).map(([k,g])=>'<span class="badge mol">'+esc(k)+' '+g.d+'/'+g.n+'</span>').join("")+'</div></div><div class="bar"><i data-width="'+Math.round(done/mine.length*100)+'"></i></div></div>':"")+queueView(mine);
   }
   if(tab==="All Assignments") html=queueView(items);
   if(tab==="Watchlists") html='<div id="autobox"><div class="skel"></div></div>'+panel("Product dictionaries",'<div id="dictbox"></div><form class="grid" data-route="dictionary-save" style="margin-top:12px"><label>Portfolio<input id="dictpf" name="portfolio" required list="pfopts"></label><label class="wide">Products, one per line: name | generics | brands | salts | aliases (names separated by commas)<textarea id="dicttext" name="productsText" rows="5" placeholder="aciclovir | acyclovir | Zovirax, Zovir | aciclovir sodium | ACV"></textarea></label><div><button class="btn">Save dictionary</button></div></form>',"A product listed here is searched under all its names. A name can belong to one product only. Saving a dictionary does not change a watchlist until you preview and apply a new query version.")+
