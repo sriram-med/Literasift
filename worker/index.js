@@ -5825,6 +5825,7 @@ dialog.cwin[open]{display:grid;grid-template-rows:auto auto minmax(0,1fr)}
 .flow-screening{border-left:4px solid var(--blue)}.flow-qc{border-left:4px solid var(--amber)}.flow-medical_review{border-left:4px solid var(--green)}
 #navtip{position:fixed;z-index:60;background:#0d1512;color:#fff;border:1px solid #ffffff26;padding:5px 11px;border-radius:8px;font-size:12.5px;font-weight:500;pointer-events:none;opacity:0;transform:translateX(-4px);transition:opacity .08s,transform .08s;box-shadow:0 8px 22px -8px #000a;white-space:nowrap}#navtip.on{opacity:1;transform:none}
 .labgrid{display:flex;flex-direction:column;gap:6px}.labrow{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.labrow input,.labrow select{padding:5px 8px;font-size:13px}
+.synsearch{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--card);border:1px solid var(--border);border-radius:99px;padding:6px 14px;margin:2px 0 12px;box-shadow:var(--shadow)}.synsearch>.ic{color:var(--muted)}.synsearch input{flex:1;min-width:220px;border:0;box-shadow:none;background:none;padding:6px 4px;outline:none}.synsearch input:focus{box-shadow:none}.synq-help{position:relative}.synq-help summary{cursor:pointer}.synq-help>div{position:absolute;z-index:6;right:0;top:130%;width:min(520px,80vw);background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;box-shadow:0 14px 34px -10px #0d151266;line-height:1.7}.synq-help code{background:var(--accent);border-radius:5px;padding:0 5px}
 .roban{background:var(--amber-soft);color:var(--amber);border:1px solid var(--amber);border-radius:9px;padding:8px 12px;margin-bottom:12px;font-weight:500}
 .serieslayout{display:grid;gap:22px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.serieslayout h3{font-size:13px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
 .sbar{margin-bottom:9px}.sbar-h{display:flex;justify-content:space-between;gap:10px;font-size:13px}.sbar-k{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sbar-t{height:6px;border-radius:99px;background:var(--accent);margin-top:3px;overflow:hidden}.sbar-t i{display:block;height:100%;background:var(--brand);border-radius:99px}
@@ -7265,7 +7266,36 @@ function userPermsHtml(){
   const rows=people.map(p=>'<div class="row"><span><b>'+esc(p.name||p.email)+'</b><div class="sub">'+esc(p.email)+'</div></span><span style="display:flex;gap:10px;align-items:center">'+(p.canManageClients?badge("Can manage clients","green"):badge("Standard","")) +'<form data-route="client-permission" style="margin:0"><input type="hidden" name="email" value="'+esc(p.email)+'"><input type="hidden" name="allowed" value="'+(p.canManageClients?"false":"true")+'"><button class="btn outline sm">'+(p.canManageClients?"Revoke":"Allow")+'</button></form></span></div>').join("");
   return panel("User permissions",people.length?rows:'<div class="empty">No team members yet. Add people in Team.</div>',"Only managers can add clients and group molecules under them. Allow a team member here to let them add clients and assign molecules too. They still cannot change watchlists, users or settings.");
 }
-let deskTab="", synShownIds=[];
+let deskTab="", synShownIds=[], synQuery="", synTimer=null;
+const synBlobs=new Map();
+function synFields(c){
+  const key=c.id+"|"+(c.updatedAt||""), hit=synBlobs.get(key);if(hit)return hit;
+  const d=c.data||{}, art=data.articles[c.pmid]||{}, val=f=>String((f&&f.value)||""), people=data.people||[], who=(people.find(p=>p.email===c.assignee)||{}).name||c.assignee||"";
+  const folder=((data.caseFolders||[]).find(f=>f.id===c.folderId)||{}).name||"", ev=d.events||[], pr=d.products||[];
+  const F={
+    case:[c.number], pmid:[c.pmid], title:[art.title||""], journal:[art.journal||""], author:[(art.authors||[]).join(" "),val((d.reporter||{}).identifier),(d.other_reporters||[]).map(r=>r.name).join(" ")],
+    drug:[pr.map(p=>val(p.name)).join(" "),c.molecule||""], molecule:[c.molecule||"",c.portfolio||""], indication:[pr.map(p=>val(p.indication)).join(" ")],
+    event:[ev.map(e=>[val(e.verbatim),val(e.pt),val(e.llt),val(e.soc)].join(" ")).join(" ")], pt:[ev.map(e=>val(e.pt)).join(" ")], soc:[ev.map(e=>val(e.soc)).join(" ")],
+    outcome:[ev.map(e=>val(e.outcome)).join(" ")], lab:[(d.labs||[]).map(l=>l.test+" "+l.result).join(" ")], test:[(d.labs||[]).map(l=>l.test+" "+l.result).join(" ")],
+    assignee:[who,c.assignee||""], status:[c.status||""], stage:[c.stage||"medical_review",(data.stages||{})[c.stage||"medical_review"]||""], folder:[folder], tag:[(c.tags||[]).map(t=>t.tag).join(" ")],
+    country:[val((d.patient||{}).country)], sex:[val((d.patient||{}).sex)], age:[val((d.patient||{}).age)],
+    text:[((d.narrative||{}).text)||"",d.reporter_comments||"",d.general_comments||"",d.sender_comments||"",c.notes||"",d.source_summary||""]
+  };
+  Object.keys(F).forEach(k=>{F[k]=F[k].join(" ").toLowerCase();});
+  F.all=Object.values(F).join(" ");
+  if(synBlobs.size>3000)synBlobs.clear();
+  synBlobs.set(key,F);return F;
+}
+function synTerms(q){
+  const out=[],re=/(-?)(?:([a-z]+):)?(?:"([^"]+)"|([^ ]+))/gi;let m;
+  while((m=re.exec(String(q||"").slice(0,300)))){const text=(m[3]||m[4]||"").toLowerCase();if(!text)continue;out.push({neg:m[1]==="-",field:m[2]?m[2].toLowerCase():"",text});}
+  return out.slice(0,12);
+}
+function synMatch(c){
+  if(!synQuery.trim())return true;
+  const F=synFields(c);
+  return synTerms(synQuery).every(t=>{const hay=t.field&&F[t.field]!==undefined?F[t.field]:F.all, hit=hay.indexOf(t.text)>=0;return t.neg?!hit:hit;});
+}
 function deskHtml(){
   const me=data.viewer.email, mgr=data.viewer.role==="manager", roles=data.viewerRoles||[], cases=(data.cases||[]).filter(c=>!c.archived&&c.status!=="Sent to PV Nexus"&&c.status!=="Closed: not a valid ICSR");
   const flows=[["screening","Screener","Data entry",true,"Complete the case from the article with the AI's help, then submit it to QC."],["qc","QC","Quality check",mgr||roles.includes("qc"),"Check each case. Approve it for medical review, or return it to the screener with what to fix."],["medical_review","Medical reviewer","Medical review",mgr||roles.includes("medical_reviewer"),"Confirm seriousness, causality and listedness, then approve and sign."]].filter(f=>f[3]);
@@ -7350,9 +7380,10 @@ function render() {
     const signed=c=>(c.signatures||[]).some(x=>!x.superseded);
     const filters={all:["Open",openCases],mine:["Mine",openCases.filter(c=>c.assignee===me)],unassigned:["Unassigned",openCases.filter(c=>!c.assignee)],serious:["Serious",openCases.filter(c=>caseCls(c).serious)],nonserious:["Non-serious",openCases.filter(c=>!caseCls(c).serious)],listed:["Listed",openCases.filter(c=>caseCls(c).listed==="listed")],unlisted:["Unlisted",openCases.filter(c=>caseCls(c).listed==="unlisted")],overdue:["Overdue",openCases.filter(c=>left(c)!==null&&left(c)<0)],soon:["Due in 3 days",openCases.filter(c=>left(c)!==null&&left(c)>=0&&left(c)<=3)],review:["Ready for review",openCases.filter(c=>c.status==="Ready for medical review")],signed:["Signed",all.filter(signed)],done:["Closed or sent",all.filter(closed)]};
     if(!filters[synFilter])synFilter="all";
-    const shown=filters[synFilter][1].filter(c=>!synFolder||(synFolder==="__none"?!c.folderId:c.folderId===synFolder)).filter(c=>{if(!synCat)return true;const [sv,ls]=synCat.split("|"),k=caseCls(c);return (sv==="serious")===k.serious&&k.listed===ls;}), stColor={"Ready for medical review":"blue","Sent to PV Nexus":"green"}, manager=data.viewer.role==="manager";
+    const base=filters[synFilter][1], shown=base.filter(synMatch).filter(c=>!synFolder||(synFolder==="__none"?!c.folderId:c.folderId===synFolder)).filter(c=>{if(!synCat)return true;const [sv,ls]=synCat.split("|"),k=caseCls(c);return (sv==="serious")===k.serious&&k.listed===ls;}), stColor={"Ready for medical review":"blue","Sent to PV Nexus":"green"}, manager=data.viewer.role==="manager";
     synShownIds=shown.map(c=>c.id);
     const people=(data.profiles||[]).filter(p=>p.active);
+    const searchBar='<div class="synsearch"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg><input id="synq" type="search" autocomplete="off" placeholder="Search cases: number, PMID, title, drug, event, reporter, narrative…" aria-label="Search Synchrony" value="'+esc(synQuery)+'">'+(synQuery?'<button type="button" class="btn outline sm" data-synqclear="1">Clear</button><span class="sub">'+shown.length+' of '+base.length+' case'+(base.length===1?"":"s")+'</span>':'<details class="synq-help"><summary class="sub">Search tips</summary><div class="sub">Words must all match. Use quotes for a phrase and a minus to exclude. Narrow with <code>drug:</code> <code>event:</code> <code>pt:</code> <code>soc:</code> <code>lab:</code> <code>author:</code> <code>assignee:</code> <code>status:</code> <code>stage:</code> <code>tag:</code> <code>folder:</code> <code>country:</code> <code>case:</code> <code>pmid:</code> <code>text:</code>. Example: <code>drug:aripiprazole event:akathisia -stage:qc</code></div></details>')+'</div>';
     const tiles='<div class="fbar" role="tablist" aria-label="Case filters">'+Object.entries(filters).map(([k,f])=>'<button type="button" class="fchip'+(k===synFilter?" on":"")+(k==="overdue"&&f[1].length?" hot":"")+'" data-synfilter="'+k+'">'+esc(f[0])+'<b>'+f[1].length+'</b></button>').join("")+'</div>';
     const selectedIds=new Set(data.assignments.filter(x=>x.disposition&&x.disposition.value==="potential_icsr"&&((x.qc&&x.qc.status==="approved")||x.routedToMedical||(!x.qc&&x.status==="Complete"))).map(x=>x.pmid)), ready=Object.values(data.articles).filter(a=>selectedIds.has(a.id)&&a.fullTextStatus==="Captured"&&a.fullTextKey&&(a.events||[]).length&&!(data.cases||[]).some(c=>c.pmid===a.id)).length;
     const intake='<div class="row"><span>'+ready+' article'+(ready===1?"":"s")+' selected by QC with stored full text and detected events '+(ready===1?"is":"are")+' not in Synchrony yet.'+(data.config.autoIcsr?' New ones are added automatically.':' Automatic adding is off (Settings).')+'</span><button class="btn" data-icsrintake="1"'+(ready?"":" disabled")+'>Add to Synchrony</button></div>'+
@@ -7374,7 +7405,7 @@ function render() {
     const bars=(list)=>{if(!list.length)return '<div class="empty" style="padding:14px">No data yet.</div>';const top=list.slice(0,8),max=Math.max(...top.map(x=>x.count));return top.map(x=>'<div class="sbar" title="'+esc(x.cases.join(", "))+'"><div class="sbar-h"><span class="sbar-k">'+esc(x.key)+'</span><b>'+x.count+'</b></div><div class="sbar-t"><i style="width:'+Math.round(x.count/max*100)+'%"></i></div></div>').join("")+(list.length>8?'<div class="sub">+'+(list.length-8)+' more</div>':"");};
     const months=S.monthly.map(m=>'<span class="badge'+((S.trend.hikes||[]).includes(m.month)?" red":"")+'" title="'+esc(m.cases.join(", "))+'">'+esc(m.month)+': '+m.count+'</span>').join(" ");
     const fl=data.caseFolders||[],folderBar=panel("Folders",'<div class="chips"><button type="button" class="btn sm '+(synFolder?"outline":"")+'" data-synfolder="">All cases</button><button type="button" class="btn sm '+(synFolder==="__none"?"":"outline")+'" data-synfolder="__none">Not in a folder</button>'+fl.map(f=>'<span style="display:inline-flex;gap:2px"><button type="button" class="btn sm '+(synFolder===f.id?"":"outline")+'" data-synfolder="'+esc(f.id)+'">'+esc(f.name)+' ('+openCases.filter(c=>c.folderId===f.id).length+')</button>'+(manager?'<button type="button" class="btn outline sm" data-p5="delfolder|'+esc(f.id)+'" title="Delete folder" aria-label="Delete folder">x</button>':"")+'</span>').join("")+(canMedical()?'<button type="button" class="btn outline sm" data-p5="newfolder">+ New folder</button>':"")+'</div>');
-    html=tiles+'<div class="sumrow">'+categoryMatrix(openCases)+folderBar+panel("Intake and assignment",intake)+'</div>'+'<div class="trkhead"><h2>Case tracker</h2><span class="sub">Seriousness, listedness and folder are dropdowns on each case.</span><span style="margin-left:auto">'+groupSelect(synGroup,["none","soc","triage","sercat","clock","stage","status","seriousness","listedness","folder","portfolio","owner"],"syn_group")+'</span></div>'+bulkBar("syn_c")+groupedTables(shown,synGroup,["","Case","Article · product · event","Classification","Reporting clock","Assignment","Status",""],rowOf,"No cases in this view.")+
+    html=searchBar+tiles+'<div class="sumrow">'+categoryMatrix(openCases)+folderBar+panel("Intake and assignment",intake)+'</div>'+'<div class="trkhead"><h2>Case tracker</h2><span class="sub">Seriousness, listedness and folder are dropdowns on each case.</span><span style="margin-left:auto">'+groupSelect(synGroup,["none","soc","triage","sercat","clock","stage","status","seriousness","listedness","folder","portfolio","owner"],"syn_group")+'</span></div>'+bulkBar("syn_c")+groupedTables(shown,synGroup,["","Case","Article · product · event","Classification","Reporting clock","Assignment","Status",""],rowOf,"No cases in this view.")+
       panel("Case series summary",'<div class="row"><span><b>'+S.total+'</b> case'+(S.total===1?'':'s')+' · <b>'+S.serious.length+'</b> serious · <b>'+S.fatal.length+'</b> fatal</span><span class="sub">Counted from the case fields. Hover a line to see which cases it counts.</span></div>'+
         '<div class="serieslayout"><div><h3 style="margin:8px 0">Events</h3>'+bars(S.events)+'</div><div><h3 style="margin:8px 0">Suspect products</h3>'+bars(S.products)+'</div><div><h3 style="margin:8px 0">Countries</h3>'+bars(S.countries)+'</div><div><h3 style="margin:8px 0">Age and sex</h3>'+bars(S.ages)+bars(S.sex)+'</div></div>'+
         '<h3 style="margin:14px 0 6px">Cases received per month</h3><div class="chips">'+(months||'<span class="sub">No cases yet.</span>')+'</div><p class="sub" style="margin-top:8px">'+esc(S.trend.basis||"")+(S.monthly.length?" Median "+S.trend.median+", spread "+S.trend.mad+", upper limit "+S.trend.upper+" cases per month (median + 2 x scaled MAD).":"")+(S.trend.hikes&&S.trend.hikes.length&&S.monthly.length>=4?' <b style="color:var(--red)">Above the limit: '+esc(S.trend.hikes.join(", "))+'.</b>':"")+'</p>',"Deterministic: no model writes these figures.")+
@@ -7587,7 +7618,13 @@ document.addEventListener("input",event=>{
   filt[key]=event.target.value;
   $("qtable").innerHTML=queueBody(applyFilter(shown));
 });
+document.addEventListener("input",event=>{
+  if(!event.target||event.target.id!=="synq")return;
+  synQuery=event.target.value;const pos=event.target.selectionStart;clearTimeout(synTimer);
+  synTimer=setTimeout(()=>{render();const el=$("synq");if(el){el.focus();try{el.setSelectionRange(pos,pos);}catch(e){}}},200);
+});
 document.addEventListener("click",event=>{
+  const qc=event.target.closest&&event.target.closest("[data-synqclear]");if(qc){synQuery="";render();const el=$("synq");if(el)el.focus();return;}
   const dt=event.target.closest&&event.target.closest("[data-desktab]");if(dt){deskTab=dt.dataset.desktab;render();return;}
   const ks=event.target.closest&&event.target.closest("[data-aikeysave]");
   if(ks){const key=($("aikeyinline")||{}).value||"",lim=Number(($("ailimitinline")||{}).value)||0;if(!key.trim()){message("Paste the key first.",true);return;}ks.disabled=true;api("settings",{openaiKey:key.trim(),aiEnabled:"on",aiMonthlyTokens:lim}).then(()=>refresh()).then(()=>{if(curCase){const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}}message("AI is on. Monthly limit "+lim.toLocaleString()+" tokens.");}).catch(e=>{message(e.message,true);ks.disabled=false;});return;}
