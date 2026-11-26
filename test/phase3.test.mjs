@@ -210,3 +210,24 @@ test("restricted full text stays in the workbench and out of case packages and b
   assert.ok(files.has("E2B-R3-DRAFT.xml") && files.has("CIOMS-I-DRAFT.pdf") && files.has("narrative.txt")); assert.ok(![...files.keys()].some(n => /source_PMID_1\.pdf/.test(n)), "the restricted PDF is not packaged");
   assert.equal((await t.get(SCREENER, "/api/full-text/1")).status, 200, "an authorised reviewer can still read it in the workbench");
 });
+
+const WEIGHT_CASE = `Case presentation
+A 62 kg Asian woman received aciclovir 400 mg orally twice daily for herpes simplex. On day 3 she developed confusion and aciclovir was stopped.
+Discussion
+We suggest the confusion was probably due to aciclovir neurotoxicity in the setting of renal impairment.`;
+test("literature minimum criteria: no name needed, descriptors are listed, every author is a reporter, and the authors' conclusions fill the reporter comment", async () => {
+  const t = await scenario(WEIGHT_CASE);
+  const crit = (await t.call(SCREENER, "/api/criteria", { id: "a1" })).body;
+  const p = crit.patients[0];   assert.equal(p.criteria.patient.status, "supported");
+  const kinds = p.criteria.patient.descriptors.map(x => x.kind); for (const k of ["sex", "weight", "ethnicity"]) assert.ok(kinds.includes(k), k + " in " + kinds);
+  assert.ok(["moderate", "strong"].includes(p.criteria.patient.strength));
+  assert.ok(p.completeness.total >= 15 && p.completeness.score > 30 && p.completeness.groups.some(g => g.key === "reporter"));
+  assert.equal(p.completeness.groups.find(g => g.key === "reporter").items.find(i => i.label === "More than one author").present, true);
+  await t.call(SCREENER, "/api/drafts-create", { id: "a1" });
+  const c = (await t.cases())[0];
+  assert.ok(c.data.other_reporters.length >= 1 && c.data.other_reporters.every(r => r.name), "every other author is carried as an additional reporter");
+  assert.match(c.data.reporter_comments, /probably due to aciclovir neurotoxicity/, "the authors' own sentence, verbatim");
+  const xml = await (await t.raw(MEDICAL, "/api/case-export", { id: c.id, format: "e2b", profile: "EU" })).text();
+  assert.ok((xml.match(/displayName="sourceReport"/g) || []).length >= 2, "more than one primary source in the E2B file");
+  assert.match(xml, /reportersComments/);
+});
