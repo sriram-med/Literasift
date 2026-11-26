@@ -4521,9 +4521,22 @@ async function apiCore(request, env, path) {
   if (path === "/api/cases-export" && viewer) {
     const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null, list = (state.cases || []).filter(c => caseVisible(state, viewer, c) && (!wanted || wanted.has(c.id)));
     if (!list.length) return json({ error:"No cases to export." }, 404);
-    const format = body.format === "e2b" ? "e2b" : "csv", stamp = new Date().toISOString().slice(0, 10);
+    const format = ["e2b", "package"].includes(body.format) ? body.format : "csv", stamp = new Date().toISOString().slice(0, 10);
     await audit(env, { by:email, action:"case.export", target:list.length + " cases", detail:"batch " + format });
     if (format === "e2b") return new Response(e2bBatch(list, state.articles, { sender:state.settings?.senderId, receiver:state.settings?.receiverId }), { headers:{ "Content-Type":"application/xml", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-E2B-R3-' + stamp + '.xml"' } });
+    if (format === "package") {
+      // One ZIP for the whole selection: per case an E2B(R3) file, a CIOMS I PDF and the narrative, plus the line listing, a combined E2B batch and a manifest. A case with a current medical-reviewer approval is exported as FINAL, every other case is labelled DRAFT.
+      const enc = new TextEncoder(), files = [], manifest = [["Case", "PMID", "Status", "Stage", "Assignee", "Approval", "Folder"]], profileName = ["ICH", "EU", "FDA"].includes(body.profile) ? body.profile : "ICH", picked = list.slice(0, 300);
+      for (const c of picked) {
+        const art = state.articles[c.pmid] || {}, ok = await approvalValid(c), watermark = ok ? "FINAL: approved by " + c.approval.by + " " + c.approval.at + " (content sha256 " + c.approval.hash + "). Not transmitted." : "DRAFT: not approved for submission", dir = safeName(c.number) + "/";
+        files.push({ name:dir + "E2B-R3" + (ok ? "" : "-DRAFT") + ".xml", data:enc.encode(e2bBatch([c], state.articles, { profile:profileName, watermark, sender:state.settings?.senderId, receiver:state.settings?.receiverId })) });
+        files.push({ name:dir + "CIOMS-I" + (ok ? "" : "-DRAFT") + ".pdf", data:ciomsPdf(c, art, ok ? { final:true, approval:c.approval } : {}) });
+        files.push({ name:dir + "narrative.txt", data:enc.encode((c.data?.narrative?.text || buildNarrative(c).text || "") + "\r\n") });
+        manifest.push([c.number, c.pmid, c.status, STAGE_LABEL[c.stage || "medical_review"] || "", c.assignee || "", ok ? "approved " + c.approval.at : "not approved", dir]);
+      }
+      files.unshift({ name:"manifest.csv", data:enc.encode(manifest.map(r => r.map(csvCell).join(",")).join("\r\n") + "\r\n") }, { name:"line-listing.csv", data:enc.encode(lineListing(picked, state.articles, state)) }, { name:"E2B-R3-batch-DRAFT.xml", data:enc.encode(e2bBatch(picked, state.articles, { profile:profileName, watermark:"DRAFT: not approved for submission", sender:state.settings?.senderId, receiver:state.settings?.receiverId })) });
+      return new Response(zipFiles(files), { headers:{ "Content-Type":"application/zip", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-cases-' + stamp + '.zip"' } });
+    }
     return new Response(lineListing(list, state.articles, state), { headers:{ "Content-Type":"text/csv; charset=utf-8", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-line-listing-' + stamp + '.csv"' } });
   }
   if (path === "/api/library-delete" && viewer) {
@@ -6461,7 +6474,7 @@ function userPermsHtml(){
   const rows=people.map(p=>'<div class="row"><span><b>'+esc(p.name||p.email)+'</b><div class="sub">'+esc(p.email)+'</div></span><span style="display:flex;gap:10px;align-items:center">'+(p.canManageClients?badge("Can manage clients","green"):badge("Standard","")) +'<form data-route="client-permission" style="margin:0"><input type="hidden" name="email" value="'+esc(p.email)+'"><input type="hidden" name="allowed" value="'+(p.canManageClients?"false":"true")+'"><button class="btn outline sm">'+(p.canManageClients?"Revoke":"Allow")+'</button></form></span></div>').join("");
   return panel("User permissions",people.length?rows:'<div class="empty">No team members yet. Add people in Team.</div>',"Only managers can add clients and group molecules under them. Allow a team member here to let them add clients and assign molecules too. They still cannot change watchlists, users or settings.");
 }
-let deskTab="";
+let deskTab="", synShownIds=[];
 function deskHtml(){
   const me=data.viewer.email, mgr=data.viewer.role==="manager", roles=data.viewerRoles||[], cases=(data.cases||[]).filter(c=>!c.archived&&c.status!=="Sent to PV Nexus"&&c.status!=="Closed: not a valid ICSR");
   const flows=[["screening","Screener","Data entry",true,"Complete the case from the article with the AI's help, then submit it to QC."],["qc","QC","Quality check",mgr||roles.includes("qc"),"Check each case. Approve it for medical review, or return it to the screener with what to fix."],["medical_review","Medical reviewer","Medical review",mgr||roles.includes("medical_reviewer"),"Confirm seriousness, causality and listedness, then approve and sign."]].filter(f=>f[3]);
@@ -6547,12 +6560,13 @@ function render() {
     const filters={all:["Open",openCases],mine:["Mine",openCases.filter(c=>c.assignee===me)],unassigned:["Unassigned",openCases.filter(c=>!c.assignee)],serious:["Serious",openCases.filter(c=>caseCls(c).serious)],nonserious:["Non-serious",openCases.filter(c=>!caseCls(c).serious)],listed:["Listed",openCases.filter(c=>caseCls(c).listed==="listed")],unlisted:["Unlisted",openCases.filter(c=>caseCls(c).listed==="unlisted")],overdue:["Overdue",openCases.filter(c=>left(c)!==null&&left(c)<0)],soon:["Due in 3 days",openCases.filter(c=>left(c)!==null&&left(c)>=0&&left(c)<=3)],review:["Ready for review",openCases.filter(c=>c.status==="Ready for medical review")],signed:["Signed",all.filter(signed)],done:["Closed or sent",all.filter(closed)]};
     if(!filters[synFilter])synFilter="all";
     const shown=filters[synFilter][1].filter(c=>!synFolder||(synFolder==="__none"?!c.folderId:c.folderId===synFolder)).filter(c=>{if(!synCat)return true;const [sv,ls]=synCat.split("|"),k=caseCls(c);return (sv==="serious")===k.serious&&k.listed===ls;}), stColor={"Ready for medical review":"blue","Sent to PV Nexus":"green"}, manager=data.viewer.role==="manager";
+    synShownIds=shown.map(c=>c.id);
     const people=(data.profiles||[]).filter(p=>p.active);
     const tiles='<div class="fbar" role="tablist" aria-label="Case filters">'+Object.entries(filters).map(([k,f])=>'<button type="button" class="fchip'+(k===synFilter?" on":"")+(k==="overdue"&&f[1].length?" hot":"")+'" data-synfilter="'+k+'">'+esc(f[0])+'<b>'+f[1].length+'</b></button>').join("")+'</div>';
     const selectedIds=new Set(data.assignments.filter(x=>x.disposition&&x.disposition.value==="potential_icsr"&&((x.qc&&x.qc.status==="approved")||x.routedToMedical||(!x.qc&&x.status==="Complete"))).map(x=>x.pmid)), ready=Object.values(data.articles).filter(a=>selectedIds.has(a.id)&&a.fullTextStatus==="Captured"&&a.fullTextKey&&(a.events||[]).length&&!(data.cases||[]).some(c=>c.pmid===a.id)).length;
     const intake='<div class="row"><span>'+ready+' article'+(ready===1?"":"s")+' selected by QC with stored full text and detected events '+(ready===1?"is":"are")+' not in Synchrony yet.'+(data.config.autoIcsr?' New ones are added automatically.':' Automatic adding is off (Settings).')+'</span><button class="btn" data-icsrintake="1"'+(ready?"":" disabled")+'>Add to Synchrony</button></div>'+
       '<div class="row"><span>'+openCases.filter(c=>!c.assignee).length+' open case'+(openCases.filter(c=>!c.assignee).length===1?"":"s")+' without an assignee.'+(data.config.autoAssignCases?' New cases are assigned automatically to the reviewer with the fewest open cases.':' Automatic assignment is off (Settings).')+'</span>'+(manager?'<button class="btn outline" data-autoassign="1">Assign unassigned now</button>':"")+'</div>'+
-      '<div class="row"><span>Export the cases shown in this list.</span><span style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn outline sm" data-synexport="csv">Line listing (CSV)</button><button class="btn outline sm" data-synexport="e2b">E2B(R3) batch (XML)</button></span></div>';
+      '<div class="row"><span>Export the cases ticked in the tracker, or every case shown when none is ticked ('+shown.length+' now).</span><span style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn outline sm" data-synexport="csv">Line listing (CSV)</button><button class="btn outline sm" data-synexport="e2b">E2B(R3) batch (XML)</button><button class="btn sm" data-synexport="package">Full package (ZIP)</button></span></div>';
     const rowOf=c=>{
       const a=c.assessment||{},d=c.data,sp=(d.products.find(p=>p.role==="suspect")||{name:{}}).name.value||"—",ev=((d.events[0]||{}).verbatim||{}).value||"—",art=data.articles[c.pmid]||{},dl=left(c);
       const who=manager?'<select data-assignsel="'+esc(c.id)+'" aria-label="Assignee"><option value="">Unassigned</option>'+people.map(p=>'<option value="'+esc(p.email)+'"'+(p.email===c.assignee?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select>':esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||"Unassigned");
@@ -6877,7 +6891,8 @@ document.addEventListener("click",event=>{
   if(target.dataset.synfilter){synFilter=target.dataset.synfilter;render();return;}
   if(target.dataset.autoassign){target.disabled=true;api("cases-autoassign",{}).then(async r=>{await refresh();message(r.moved+" case"+(r.moved===1?"":"s")+" assigned.");}).catch(e=>{message(e.message,true);target.disabled=false;});return;}
   if(target.dataset.synexport){
-    const ids=(data.cases||[]).filter(c=>{const s=synFilter;return s==="all"?!["Sent to PV Nexus","Closed: not a valid ICSR"].includes(c.status):s==="mine"?c.assignee===data.viewer.email:s==="unassigned"?!c.assignee:true;}).map(c=>c.id);
+    const ticked=[...document.querySelectorAll(".syn_c:checked")].map(x=>x.value), ids=ticked.length?ticked:synShownIds;
+    if(!ids.length){message("No cases to export.",true);return;}
     target.disabled=true;
     fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:target.dataset.synexport,ids:ids.length?ids:undefined})}).then(async res=>{if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||"Export failed.");}const name=(/filename="([^"]+)"/.exec(res.headers.get("Content-Disposition")||"")||[])[1]||"export";const link=document.createElement("a");link.href=URL.createObjectURL(await res.blob());link.download=name;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
     return;

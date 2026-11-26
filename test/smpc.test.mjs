@@ -41,3 +41,13 @@ test("case assist: seriousness is detected from the case's own sentences, with i
   assert.ok(e0.seriousness.basis.length >= 2); assert.equal(r.body.events[2].seriousness.flags.serious, false);
   assert.deepEqual(r.body.suspects, ["aciclovir"]); assert.equal(r.body.textSource, "citation and abstract"); assert.equal(r.body.meddraLoaded, false); assert.ok(r.body.textSource);
 });
+
+import { readZip } from "./helpers.mjs";
+test("Synchrony export: a full package of the selected cases (E2B per case, CIOMS PDF, narrative, line listing, batch XML, manifest), drafts labelled", async () => {
+  const t = await setup();
+  const r = await t.raw(MANAGER, "/api/cases-export", { format: "package", ids: ["c1"] }); assert.equal(r.status, 200); assert.match(r.headers.get("content-disposition"), /literasift-cases-.*\.zip/);
+  const z = readZip(Buffer.from(await r.arrayBuffer())), names = [...z.keys()];
+  for (const n of ["manifest.csv", "line-listing.csv", "E2B-R3-batch-DRAFT.xml", "LS-1/E2B-R3-DRAFT.xml", "LS-1/CIOMS-I-DRAFT.pdf", "LS-1/narrative.txt"]) assert.ok(names.includes(n), n + " in " + names);
+  assert.match(z.get("manifest.csv").toString(), /LS-1.*not approved/); assert.match(z.get("LS-1/E2B-R3-DRAFT.xml").toString(), /DRAFT: not approved/); assert.match(z.get("line-listing.csv").toString(), /^"Case","PMID"/);
+  assert.equal((await t.raw(MANAGER, "/api/cases-export", { format: "package", ids: ["nope"] })).status, 404);
+});
