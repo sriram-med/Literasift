@@ -5200,6 +5200,8 @@ dialog.cwin[open]{display:grid;grid-template-rows:auto auto minmax(0,1fr)}
 .as-lis{display:flex;flex-direction:column;gap:6px;align-items:flex-start}
 @media(max-width:1250px){.cw-body{grid-template-columns:minmax(0,1fr) 360px}.cw-nav{display:none}}
 @media(max-width:900px){dialog.cwin{height:98vh}.cw-body{grid-template-columns:minmax(0,1fr);overflow:auto}.cw-assist{border-left:0;border-top:1px solid var(--border)}.cw-main,.cw-assist{overflow:visible}}
+.fl-item{display:flex;gap:10px;align-items:flex-start;padding:5px 0;border-top:1px solid var(--border)}.fl-item:first-of-type{border-top:0}.fl-item i{flex:none;display:grid;place-items:center;width:18px;height:18px;border-radius:50%;border:1px solid var(--border);font-style:normal;font-size:11px;color:var(--green)}.fl-item.ok i{background:var(--green-soft);border-color:transparent}
+.flow-screening{border-left:4px solid var(--blue)}.flow-qc{border-left:4px solid var(--amber)}.flow-medical_review{border-left:4px solid var(--green)}
 .roban{background:var(--amber-soft);color:var(--amber);border:1px solid var(--amber);border-radius:9px;padding:8px 12px;margin-bottom:12px;font-weight:500}
 .serieslayout{display:grid;gap:22px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.serieslayout h3{font-size:13px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
 .sbar{margin-bottom:9px}.sbar-h{display:flex;justify-content:space-between;gap:10px;font-size:13px}.sbar-k{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sbar-t{height:6px;border-radius:99px;background:var(--accent);margin-top:3px;overflow:hidden}.sbar-t i{display:block;height:100%;background:var(--brand);border-radius:99px}
@@ -5292,12 +5294,12 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 <div><div class="top"><button type="button" class="btn outline icon-btn" id="sidetoggle" aria-label="Collapse the side panel" title="Collapse or expand the side panel"></button><div style="margin-right:auto"><h1 id="heading">LiteraSift</h1><p id="subhead"></p></div><input id="gsearch" type="search" placeholder="Search drugs, brands, cases, citations…" aria-label="Search everything" style="margin-left:auto;margin-right:8px;width:min(340px,40vw);border-radius:999px;padding:9px 16px"><span class="sub" style="margin-right:8px;white-space:nowrap">v0.01 · Dr Sriram</span><button class="btn outline icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button></div>
 <main id="content"><div class="skel"></div><div class="skel"></div><div class="skel"></div></main><footer class="sub" style="margin:28px 0 12px;text-align:center">LiteraSift v0.01 · Developed by Dr Sriram</footer></div></div>
 <div id="toast" role="status"></div>
-<dialog id="casedlg" class="cwin"><div class="cw-top"><div id="casehead" class="cw-head"></div><div class="cw-actions"><button type="button" class="btn" data-caseact="save" id="casesave">Save</button><button type="button" class="btn outline" data-caseact="routecase" id="caseroutebtn">Route…</button><button type="button" class="btn outline" data-scan="CASEPMID" id="casescanbtn">Scan full text</button><button type="button" class="btn outline" data-caseact="assess">Assess</button>
+<dialog id="casedlg" class="cwin"><div class="cw-top"><div id="casehead" class="cw-head"></div><div class="cw-actions"><button type="button" class="btn" data-caseact="save" id="casesave">Save</button><button type="button" class="btn" data-caseact="aifill" id="caseaifill">Fill with AI</button><button type="button" class="btn" data-caseact="submitqc" id="casesubmit">Submit to QC</button><button type="button" class="btn" data-caseact="qcapprove" id="caseqcok">Approve → medical review</button><button type="button" class="btn outline" data-caseact="qcreturn" id="caseqcback">Return to screener</button><button type="button" class="btn outline" data-caseact="routecase" id="caseroutebtn">Route…</button><button type="button" class="btn outline" data-scan="CASEPMID" id="casescanbtn">Scan full text</button><button type="button" class="btn outline" data-caseact="assess">Assess</button>
 <details class="cw-more"><summary class="btn outline">Export</summary><div class="cw-menu"><button type="button" data-caseact="e2b">E2B(R3) XML</button><button type="button" data-caseact="cioms">CIOMS I (PDF)</button><button type="button" data-caseact="fhir">FHIR JSON</button><button type="button" data-caseact="json">ICSR JSON</button><button type="button" data-caseact="csv">Line listing (CSV)</button><button type="button" data-caseact="package">Full package (ZIP)</button></div></details>
 <button type="button" class="btn outline" data-signopen="case" id="casesign">Signature…</button><button type="button" class="btn outline" data-caseact="delete" id="casedel">Delete</button><button type="button" class="btn outline" data-caseact="close">Close</button></div></div>
 <div id="casesteps" class="cw-steps"></div>
 <div class="cw-body"><nav id="casenav" class="cw-nav" aria-label="Case sections"></nav><div class="cw-main"><div id="casebody"></div><div id="casereview" style="margin-top:12px"></div><p id="caseerr" class="msg" style="color:var(--red)" role="alert"></p><p class="sub" style="margin:10px 0 30px">Human-in-the-loop: values pre-filled from the article are only proposals. Detection, coding, listedness and causality are aids; a qualified reviewer decides.</p></div>
-<div class="cw-assist"><div class="cw-tabs" id="caseatabs"></div><div id="caseassist"></div><div id="caseassess" style="display:none"></div></div></div></dialog>
+<div class="cw-assist"><div class="cw-tabs" id="caseatabs"></div><div id="caseflow"></div><div id="caseassist" style="display:none"></div><div id="caseassess" style="display:none"></div></div></div></dialog>
 <dialog id="signdlg" style="width:min(640px,94vw)"><h2 id="signtitle">Electronic signature</h2><div id="signbody"></div><p id="signerr" class="msg" style="color:var(--red)" role="alert"></p></dialog>
 <dialog id="linkdlg"><h2 id="linktitle"></h2><p id="linknote" class="sub"></p><div style="display:grid;gap:12px"><input id="linkvalue" readonly aria-label="Link"><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" id="linkcopy">Copy link</button><button type="button" class="btn outline" id="linkshare">Share…</button><button type="button" class="btn outline" id="linkclose">Done</button></div></div></dialog>
 <dialog id="dialog" style="width:min(1180px,96vw);max-height:94vh;overflow:auto"><h2>Screen citation</h2><p id="citation" class="sub"></p><div style="display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));align-items:start"><div><div id="detail" style="max-height:64vh;overflow:auto;margin-bottom:12px"></div><div id="extractbox"></div></div><div><div id="dispo"></div><form id="review"><label>Status<select name="status"><option>Pending</option><option>In review</option><option>Full text needed</option><option>Complete</option></select></label><label>Decision notes<textarea name="note" rows="4"></textarea></label><div style="display:flex;gap:8px"><button class="btn">Save decision</button><button type="button" class="btn outline" id="close">Cancel</button><button type="button" class="btn outline" data-signopen="screening" id="screensign">Signature…</button></div></form></div></div></dialog>
@@ -5320,6 +5322,7 @@ const paths = {
   Discover:'<circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2 5-5 2 2-5z"/>',
   Search:'<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
   Clients:'<path d="M3 21h18M5 21V7l7-4 7 4v14M9 21v-6h6v6M9 10h.01M15 10h.01"/>',
+  "My Desk":'<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>',
   "Line Listing":'<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/><path d="M3 3v18" opacity=".0"/>',
   Admin:'<rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
   Archive:'<path d="M3 4h18v4H3zM5 8v12h14V8M10 12h4"/>',
@@ -5328,7 +5331,7 @@ const paths = {
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {"Line Listing":"Every case in one table, built automatically from the cases and kept up to date. Download it any time.",Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
+const subtitles = {"My Desk":"Your work in three steps: data entry, QC, medical review. Each has its own list and its own actions.","Line Listing":"Every case in one table, built automatically from the cases and kept up to date. Download it any time.",Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -5431,7 +5434,7 @@ function caseForm(){
     '</section><section class="csec" id="cs-comments"><h3>Comments</h3><label>Reporter comments (the authors’ own conclusions, e.g. their view on causality)<textarea id="casereportercomment" rows="3">'+esc(d.reporter_comments||"")+'</textarea></label><label style="margin-top:10px">General comments (case handling notes)<textarea id="casegeneral" rows="3">'+esc(d.general_comments||"")+'</textarea></label><label style="margin-top:10px">Sender comments (your company assessment)<textarea id="casesendercomment" rows="3">'+esc(d.sender_comments||"")+'</textarea></label>'+
     '</section><section class="csec" id="cs-source"><h3>Source and notes</h3><label>Source and abstract<textarea id="casesummary" rows="5">'+esc(d.source_summary)+'</textarea></label><label style="margin-top:10px">Reviewer notes<textarea id="casenotes" rows="2">'+esc(curCase.notes||"")+'</textarea></label></section>';
 }
-let assistCase="", assistTab="events", assistData=null, smpcRes={}, smpcInfo=null, assistBusy="", smpcPaste="";
+let assistCase="", assistTab="flow", aiFillRes=null, assistTab0="flow", assistData=null, smpcRes={}, smpcInfo=null, assistBusy="", smpcPaste="";
 const CASE_SECTIONS=[["cs-patient","Patient"],["cs-reporter","Reporter"],["cs-sender","Sender"],["cs-products","Products"],["cs-events","Events"],["cs-special","Special situations"],["cs-treat","Treatment and confounders"],["cs-authors","Authors"],["cs-comments","Comments"],["cs-source","Source and notes"]];
 function caseNav(){
   const d=curCase.data, cnt={"cs-products":d.products.length,"cs-events":d.events.length,"cs-authors":(d.other_reporters||[]).length+1};
@@ -5443,8 +5446,55 @@ function caseSteps(){
   $("casesteps").innerHTML=steps.map((x,i)=>'<span class="cw-step'+(i<idx?" done":i===idx?" now":"")+'"><i>'+(i<idx?"✓":i+1)+'</i>'+esc(x[0])+'</span>').join('<span class="cw-sep"></span>');
 }
 function assistTabs(){
-  $("caseatabs").innerHTML=[["events","Events"],["checks","Checks"]].map(t=>'<button type="button" class="cw-tab'+(assistTab===t[0]?" on":"")+'" data-assisttab="'+t[0]+'">'+t[1]+'</button>').join("");
-  $("caseassist").style.display=assistTab==="events"?"":"none";$("caseassess").style.display=assistTab==="checks"?"":"none";
+  $("caseatabs").innerHTML=[["flow","Workflow"],["events","Events"],["checks","Checks"]].map(t=>'<button type="button" class="cw-tab'+(assistTab===t[0]?" on":"")+'" data-assisttab="'+t[0]+'">'+t[1]+'</button>').join("");
+  $("caseassist").style.display=assistTab==="events"?"":"none";$("caseflow").style.display=assistTab==="flow"?"":"none";$("caseassess").style.display=assistTab==="checks"?"":"none";
+}
+const STAGE_ACT={screening:["Data entry","Complete every field, use the AI for the gaps, then submit to QC."],qc:["Quality check","Check the case against the article. Approve it for medical review or return it to the screener with what to fix."],medical_review:["Medical review","Confirm seriousness, causality and listedness, then approve and sign."]};
+function caseStageUi(){
+  const st=caseStage(curCase), ed=curCase.canEdit!==false, show=(id,on)=>{const el=$(id);if(el)el.style.display=on?"":"none";};
+  show("caseaifill",st==="screening"&&ed);show("casesubmit",st==="screening"&&ed);show("caseqcok",st==="qc"&&ed);show("caseqcback",st==="qc"&&ed);
+}
+const FLOW_CHECKS=[["Patient identified","age, sex or other descriptor",d=>Boolean(d.patient.age.value||d.patient.sex.value||d.patient.identifier.value)],["Reporter","name or organisation",d=>Boolean(d.reporter.identifier.value||d.reporter.organisation.value)],["Suspect product","name",d=>d.products.some(p=>p.role==="suspect"&&p.name.value)],["Dose, route, frequency","of the suspect product",d=>d.products.some(p=>p.role==="suspect"&&(p.dose.value||p.route.value))],["Start and stop dates","or marked not reported",d=>d.products.some(p=>p.role==="suspect"&&(p.start_date.value||p.start_day!=null||p.start_not_reported))],["Event","verbatim term",d=>d.events.some(e=>e.verbatim.value)],["Onset and outcome","or marked not reported",d=>d.events.some(e=>e.verbatim.value&&(e.onset_date.value||e.onset_not_reported||e.time_to_onset.value)&&e.outcome.value)],["MedDRA coding","LLT or PT for every event",d=>d.events.filter(e=>e.verbatim.value).every(e=>e.pt_code.value||e.llt_code.value)],["Listedness","set on every event",d=>d.events.filter(e=>e.verbatim.value).every(e=>e.listedness.value)],["Reporter comments","the authors view",d=>Boolean(d.reporter_comments)]];
+function flowHtml(){
+  const st=caseStage(curCase), info=STAGE_ACT[st]||STAGE_ACT.medical_review, d=curCase.data, q=curCase.qc||{}, ed=curCase.canEdit!==false;
+  const head='<div class="as-card flow-'+st+'"><div class="as-row"><b>'+esc(info[0])+'</b>'+badge(st==="screening"?"Screener":st==="qc"?"QC":"Medical reviewer",st==="screening"?"blue":st==="qc"?"amber":"green")+'</div><div class="sub">'+esc(info[1])+'</div>'+
+    (st==="screening"&&q.status==="returned"?'<div class="roban" style="margin:10px 0 0">Returned by QC'+(q.rounds?' (round '+q.rounds+')':"")+': '+esc(q.note||"")+'</div>':"")+(q.status==="approved"&&st==="medical_review"?'<div class="sub" style="margin-top:8px">'+badge("QC approved","green")+' '+esc(q.note||"")+'</div>':"")+'</div>';
+  const checks=FLOW_CHECKS.map(c=>{let ok=false;try{ok=c[2](d);}catch(e){ok=false;}return {l:c[0],h:c[1],ok};});
+  const done=checks.filter(c=>c.ok).length, pct=Math.round(done/checks.length*100);
+  const list='<div class="as-card"><div class="as-row"><b>Checklist</b><span class="sub">'+done+' of '+checks.length+'</span></div><div class="bar"><i style="width:'+pct+'%"></i></div>'+checks.map(c=>'<div class="fl-item'+(c.ok?" ok":"")+'"><i>'+(c.ok?"✓":"")+'</i><span>'+esc(c.l)+'<div class="sub">'+esc(c.h)+'</div></span></div>').join("")+'</div>';
+  let body="";
+  if(st==="screening"&&ed){
+    const a=data.config.ai||{};
+    body='<div class="as-card"><div class="as-row"><b>Fill the gaps with AI</b>'+(a.available?badge("on","green"):badge("off","amber"))+'</div><div class="sub">Rules and the dictionaries already did the free part. The AI is asked only about fields that are still empty, from at most 14 short sentences (about 600 tokens), and every answer must be a word-for-word match from the article.</div>'+
+      '<div class="as-btns"><button type="button" class="btn sm" data-caseact="aifill"'+(a.available?"":" disabled")+'>Fill empty fields</button></div>'+(a.available?"":'<div class="sub" style="margin-top:6px">AI is off, so no tokens are used.'+(data.viewer.role==="manager"?" Turn it on in Settings.":" A manager can turn it on in Settings.")+'</div>')+aiFillHtml()+'</div>'+
+      '<div class="as-card"><b>When it is complete</b><div class="sub" style="margin:4px 0 8px">Submit to QC. You will not be able to edit it again unless QC returns it.</div><button type="button" class="btn sm" data-caseact="submitqc">Submit to QC</button></div>';
+  }else if(st==="qc"&&ed){
+    body='<div class="as-card"><b>QC decision</b><div class="sub" style="margin:4px 0 8px">Approving sends the case to a medical reviewer. Returning sends it back to the screener who did the data entry, with your note.</div><div class="as-btns"><button type="button" class="btn sm" data-caseact="qcapprove">Approve → medical review</button><button type="button" class="btn outline sm" data-caseact="qcreturn">Return to screener</button></div></div>'+
+      '<div class="as-card"><b>Automatic findings</b>'+(curAssess?'<div style="margin-top:6px">'+assessmentHtml(curAssess)+'</div>':'<div class="sub">Open the Checks tab for the assessment.</div>')+'</div>';
+  }else if(st==="medical_review"){
+    body='<div class="as-card"><b>Medical review</b><div class="sub" style="margin:4px 0 8px">Confirm the proposals (coding, seriousness, listedness), set causality for each event, then approve and sign. Route the case to QC or the screener if something is wrong.</div><div class="as-btns"><button type="button" class="btn outline sm" data-caseact="routecase">Route…</button></div></div>';
+  }else body='<div class="as-card"><div class="sub">This case is with someone else. You can read it but not change it.</div></div>';
+  return head+list+body;
+}
+function aiFillHtml(){
+  const r=aiFillRes;if(!r)return "";
+  if(r.message&&!(r.proposals||[]).length)return '<div class="sub" style="margin-top:8px">'+esc(r.message)+'</div>';
+  return '<div style="margin-top:8px"><div class="sub">'+(r.cached?"Earlier answer (no tokens used). ":"")+(r.tokens?r.tokens+" tokens used"+(r.limit?" · "+r.used+" of "+r.limit+" this month":"")+". ":"")+(r.proposals||[]).length+" proposal"+((r.proposals||[]).length===1?"":"s")+(r.dropped&&r.dropped.length?" · "+r.dropped.length+" dropped (not word for word in the article)":"")+'</div>'+
+    (r.proposals||[]).map((p,i)=>'<div class="as-sug"><span><b>'+esc(p.label)+'</b>: '+esc(p.value)+'<div class="sub">“'+esc(p.sentence)+'”</div></span><button type="button" class="btn outline sm" data-aiapply="'+i+'">Use</button></div>').join("")+
+    ((r.proposals||[]).length>1?'<button type="button" class="btn sm" data-aiapply="all" style="margin-top:8px">Use all</button>':"")+'</div>';
+}
+function aiApply(which){
+  collectCase();const list=which==="all"?(aiFillRes.proposals||[]):[aiFillRes.proposals[Number(which)]];
+  list.filter(Boolean).forEach(p=>{const parts=p.path.split("."),last=parts.pop(),t=parts.reduce((x,k)=>x&&x[k],curCase.data);if(t&&t[last]){t[last]={value:p.value,normalized_value:null,state:"proposed",evidence:[{excerpt:p.sentence,source:"AI-proposed; the value is quoted from this sentence"}]};}});
+  aiFillRes.proposals=which==="all"?[]:aiFillRes.proposals.filter((x,i)=>i!==Number(which));renderCase();message("Applied as proposals. Check them, then save.");
+}
+async function caseFlowAct(act){
+  try{
+    if(act==="aifill"){collectCase();message("Asking the AI about the empty fields…");aiFillRes=await api("case-ai-fill",{id:curCase.id});assistTab="flow";assistTabs();$("caseflow").innerHTML=flowHtml();message(aiFillRes.message||(aiFillRes.tokens?aiFillRes.tokens+" tokens used.":"Done."));return;}
+    if(act==="submitqc"){collectCase();await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes});const r=await api("case-submit",{id:curCase.id});await refresh();message("Submitted to QC ("+r.toName+").");$("casedlg").close();if(tab==="My Desk")render();return;}
+    if(act==="qcapprove"){collectCase();await api("case-save",{id:curCase.id,status:curCase.status,data:curCase.data,notes:curCase.notes});const note=prompt("Note for the medical reviewer (optional)","")||"";const r=await api("case-qc",{id:curCase.id,decision:"approve",note});await refresh();message("Approved. Sent to "+r.toName+" for medical review.");$("casedlg").close();if(tab==="My Desk")render();return;}
+    if(act==="qcreturn"){const note=prompt("What must the screener fix? (recorded)","");if(!note)return;const r=await api("case-qc",{id:curCase.id,decision:"return",note});await refresh();message("Returned to "+r.toName+".");$("casedlg").close();if(tab==="My Desk")render();return;}
+  }catch(e){message(e.message,true);}
 }
 const SERFLAGS=["death","life_threatening","hospitalization","disability","congenital_anomaly","other_medically_important"];
 function assistHtml(){
@@ -5513,7 +5563,7 @@ function renderCase(){
   $("casehead").innerHTML='<div style="min-width:0"><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b style="font-size:20px;letter-spacing:-.02em">'+esc(curCase.number)+'</b>'+stageBadge(caseStage(curCase))+triageBadge(curCase)+'<span class="sub">PMID '+esc(curCase.pmid)+'</span><button type="button" class="btn outline sm" data-backtolit="1" title="Open the article in LiteraSift">Open article</button></div><div class="cw-title">'+esc(art.title||"")+'</div></div><label style="min-width:230px">Status<select id="casestatus">'+data.config.caseStatuses.map(s=>'<option'+(s===curCase.status?" selected":"")+'>'+esc(s)+'</option>').join("")+'</select></label>';
   $("casebody").innerHTML=serBar()+caseForm();
   $("caseassess").innerHTML=assessmentHtml(curAssess);
-  caseNav();caseSteps();assistTabs();
+  caseNav();caseSteps();caseStageUi();assistTabs();$("caseflow").innerHTML=flowHtml();
   if(assistData&&assistCase===curCase.id)$("caseassist").innerHTML=assistHtml();
   assistCase=curCase.id;loadAssist();
   loadReview();
@@ -5633,6 +5683,12 @@ async function loadReview(){
   if(data.viewer.role==="manager"||(data.memberships||[]).some(m=>m.email===data.viewer.email&&m.role==="medical_reviewer"))h+='<div class="card" style="padding:10px;margin-bottom:10px"><b>Route this case</b><div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px"><button type="button" class="btn outline sm" data-p4="caseroute|draft">Send back to Draft (clears approval)</button><select id="routeto" aria-label="Person">'+(data.profiles||[]).filter(p=>p.active).map(p=>'<option value="'+esc(p.email)+'"'+(p.email===curCase.assignee?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("")+'</select><button type="button" class="btn outline sm" data-p4="caseroute|person">Reassign case</button><button type="button" class="btn outline sm" data-p4="routecase">Route to a stage or person…</button></div></div>';
   h+='<div class="card" style="padding:10px"><b>Version history</b>'+versions.map(v=>'<div class="sub">v'+v.n+" · "+esc(v.action)+" · "+esc(v.by||"")+" · "+esc(String(v.at||"").slice(0,16).replace("T"," "))+(v.note?" · "+esc(v.note):"")+'</div>').join("")+'</div>';
   box.innerHTML=h;
+}
+async function autoDraft(id){
+  try{const r=await api("drafts-create",{id});await refresh();
+    if(r.created.length){const c=(data.cases||[]).find(x=>x.id===r.created[0].id);message("Case "+r.created[0].number+" created for data entry.");if(c){const a=await api("case-assess",{id:c.id}).catch(()=>({assessment:null}));if($("dialog").open)$("dialog").close();openCaseData(c,a.assessment);}}
+    else if(r.skipped&&r.skipped[0])message(r.skipped[0].reason,true);}
+  catch(e){message(e.message,true);}
 }
 async function p3action(target){
   const [act,a1,a2]=target.dataset.p3.split("|"), res=m=>{const el=$("e2bresult");if(el)el.textContent=m;};
@@ -6152,7 +6208,7 @@ async function openSign(kind,id){
     const sel=$("signmeaning");if(sel)sel.onchange=async()=>{const p2=await api("sign-preview",{kind,id,meaning:sel.value});signCtx.pre=p2;$("signstatement").textContent=p2.statement;};
   }catch(e){message(e.message,true);}
 }
-function openCaseData(c,a){if(!curCase||curCase.id!==c.id){assistData=null;smpcRes={};smpcInfo=null;assistTab="events";assistCase="";}curCase=JSON.parse(JSON.stringify(c));curAssess=a;renderCase();if(!$("casedlg").open)$("casedlg").showModal();}
+function openCaseData(c,a){if(!curCase||curCase.id!==c.id){assistData=null;smpcRes={};smpcInfo=null;assistTab="flow";aiFillRes=null;assistCase="";}curCase=JSON.parse(JSON.stringify(c));curAssess=a;renderCase();if(!$("casedlg").open)$("casedlg").showModal();}
 async function downloadCase(format){
   collectCase();
   const res=await fetch("/api/case-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:curCase.id,format})});
@@ -6405,6 +6461,23 @@ function userPermsHtml(){
   const rows=people.map(p=>'<div class="row"><span><b>'+esc(p.name||p.email)+'</b><div class="sub">'+esc(p.email)+'</div></span><span style="display:flex;gap:10px;align-items:center">'+(p.canManageClients?badge("Can manage clients","green"):badge("Standard","")) +'<form data-route="client-permission" style="margin:0"><input type="hidden" name="email" value="'+esc(p.email)+'"><input type="hidden" name="allowed" value="'+(p.canManageClients?"false":"true")+'"><button class="btn outline sm">'+(p.canManageClients?"Revoke":"Allow")+'</button></form></span></div>').join("");
   return panel("User permissions",people.length?rows:'<div class="empty">No team members yet. Add people in Team.</div>',"Only managers can add clients and group molecules under them. Allow a team member here to let them add clients and assign molecules too. They still cannot change watchlists, users or settings.");
 }
+let deskTab="";
+function deskHtml(){
+  const me=data.viewer.email, mgr=data.viewer.role==="manager", roles=data.viewerRoles||[], cases=(data.cases||[]).filter(c=>!c.archived&&c.status!=="Sent to PV Nexus"&&c.status!=="Closed: not a valid ICSR");
+  const flows=[["screening","Screener","Data entry",true,"Complete the case from the article with the AI's help, then submit it to QC."],["qc","QC","Quality check",mgr||roles.includes("qc"),"Check each case. Approve it for medical review, or return it to the screener with what to fix."],["medical_review","Medical reviewer","Medical review",mgr||roles.includes("medical_reviewer"),"Confirm seriousness, causality and listedness, then approve and sign."]].filter(f=>f[3]);
+  if(!flows.some(f=>f[0]===deskTab))deskTab=flows[0][0];
+  const mine=st=>cases.filter(c=>caseStage(c)===st&&(mgr||c.assignee===me)), tabsBar='<div class="fbar" role="tablist">'+flows.map(f=>'<button type="button" class="fchip'+(f[0]===deskTab?" on":"")+(f[0]==="screening"&&cases.some(c=>caseStage(c)==="screening"&&c.assignee===me&&c.qc&&c.qc.status==="returned")?" hot":"")+'" data-desktab="'+f[0]+'">'+esc(f[1])+'<b>'+mine(f[0]).length+'</b></button>').join("")+'</div>';
+  const f=flows.find(x=>x[0]===deskTab), list=mine(deskTab);
+  const steps='<div class="cw-steps" style="border-radius:12px;border:1px solid var(--border);margin-bottom:14px">'+[["Screener","Data entry"],["QC","Quality check"],["Medical reviewer","Medical review and sign"]].map((x,i)=>'<span class="cw-step'+(["screening","qc","medical_review"][i]===deskTab?" now":"")+'"><i>'+(i+1)+'</i>'+esc(x[0])+': '+esc(x[1])+'</span>').join('<span class="cw-sep"></span>')+'</div>';
+  const rows=list.sort((a,b)=>String(a.dueAt||"9").localeCompare(String(b.dueAt||"9"))).map(c=>{
+    const art=data.articles[c.pmid]||{}, who=((data.people||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||"";
+    const flag=deskTab==="screening"&&c.qc&&c.qc.status==="returned"?'<div class="roban" style="margin:6px 0 0;padding:4px 8px;font-size:12px">Returned by QC: '+esc(c.qc.note||"")+'</div>':"";
+    return ['<b>'+esc(c.number)+'</b>','<a class="arttitle" href="#" data-opencase="'+esc(c.id)+'">'+esc((art.title||"PMID "+c.pmid).slice(0,120))+'</a><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.molecule||c.portfolio||"")+'</div>'+flag,esc(c.dueAt||"—"),mgr?esc(who):"",'<button type="button" class="btn sm" data-opencase="'+esc(c.id)+'">'+(deskTab==="screening"?"Enter data":deskTab==="qc"?"Review":"Open")+'</button>'];
+  });
+  let articles="";
+  if(deskTab==="screening"){const todo=data.assignments.filter(a=>a.reviewer===me&&a.status!=="Complete"&&!a.disposition);articles=panel("Articles waiting for your screening ("+todo.length+")",todo.length?table(["Article","Due",""],todo.slice(0,12).map(a=>{const ar=data.articles[a.pmid]||{};return ['<b>'+esc((ar.title||"PMID "+a.pmid).slice(0,110))+'</b><div class="sub">PMID '+esc(a.pmid)+' · '+esc((a.molecules||[]).join(", "))+'</div>',esc(a.dueAt||"—"),'<button type="button" class="btn outline sm" data-review="'+esc(a.id)+'">Screen</button>'];}),"",true)+(todo.length>12?'<div class="sub" style="padding:8px 14px">Showing 12 of '+todo.length+'. Open My Queue for all.</div>':""):'<div class="empty">Nothing waiting. New articles appear here when they are assigned to you.</div>',"Mark an article Potential ICSR and its case opens straight away for data entry.",true);}
+  return tabsBar+steps+panel(f[2]+" · "+f[1],(rows.length?table(["Case","Article","Due",mgr?"With":"",""],rows,"",true):'<div class="empty">No cases here right now.</div>'),f[4],true)+articles;
+}
 function clientsHtml(){
   const clients=data.clients||[], items=data.assignments, wk=w=>encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||"");
   const free=data.watches.filter(w=>!w.client);
@@ -6424,13 +6497,13 @@ function clientsHtml(){
 function stat(label,value,icon,warn){return '<div class="card tilt'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=(manager?["Overview","Search & Pull","Library","My Queue","All Assignments","Clients","Synchrony","Line Listing","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Queue","Synchrony","Line Listing"].concat(data.clientAdmin?["Clients"]:[])).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
+  const tabs=(manager?["Overview","My Desk","Search & Pull","Library","My Queue","All Assignments","Clients","Synchrony","Line Listing","Batches","Watchlists","Team","Admin","Audit","Settings"]:["My Desk","My Queue","Synchrony","Line Listing"].concat(data.clientAdmin?["Clients"]:[])).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   libNumbers=null;
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
   const open=mine.filter(a=>a.status!=="Complete").length;
   $("identity").innerHTML="<b>"+esc(data.viewer.name)+"</b><small>"+esc(data.viewer.email)+" · "+esc(data.viewer.role)+"</small>";
-  const NAVG={Overview:0,"My Queue":0,"All Assignments":0,Clients:0,Synchrony:0,"Line Listing":0,"Search & Pull":1,Search:1,Discover:1,Library:1,Batches:1,Watchlists:1,Archive:1,Team:2,Admin:2,Audit:2,Settings:2,Account:2}, NAVL=["Work","Sources","Team"];
+  const NAVG={Overview:0,"My Desk":0,"My Queue":0,"All Assignments":0,Clients:0,Synchrony:0,"Line Listing":0,"Search & Pull":1,Search:1,Discover:1,Library:1,Batches:1,Watchlists:1,Archive:1,Team:2,Admin:2,Audit:2,Settings:2,Account:2}, NAVL=["Work","Sources","Team"];
   const navTabs=tabs.map((x,i)=>[x,i]).sort((a,b)=>(NAVG[a[0]]||0)-(NAVG[b[0]]||0)||a[1]-b[1]).map(x=>x[0]);
   let lastG=-1;
   $("nav").innerHTML=navTabs.map(x=>{const g=NAVG[x]||0,head=g!==lastG?'<div class="navlabel">'+NAVL[g]+'</div>':"";lastG=g;return head+'<button class="navbtn" title="'+x+'" data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+ic(x)+'<span class="nl">'+x+'</span>'+(x==="My Queue"&&open?'<span class="n">'+open+"</span>":"")+'</button>';}).join("");
@@ -6594,6 +6667,7 @@ function render() {
   if(tab==="Discover")html=discoverHtml();
   if(tab==="Archive")html=archiveHtml();
   if(tab==="Clients")html=clientsHtml();
+  if(tab==="My Desk")html=deskHtml();
   if(tab==="Line Listing")html='<div id="llbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Team"){
     const hosted=data.config.accounts, accts=data.accounts.users;
@@ -6703,6 +6777,8 @@ document.addEventListener("input",event=>{
   $("qtable").innerHTML=queueBody(applyFilter(shown));
 });
 document.addEventListener("click",event=>{
+  const dt=event.target.closest&&event.target.closest("[data-desktab]");if(dt){deskTab=dt.dataset.desktab;render();return;}
+  const aa=event.target.closest&&event.target.closest("[data-aiapply]");if(aa){aiApply(aa.dataset.aiapply);return;}
   const cj=event.target.closest&&event.target.closest("[data-casejump],[data-assisttab],[data-assistact],[data-assistuse],[data-assistlis],[data-assistser]");
   if(cj){
     if(cj.dataset.casejump){const el=$(cj.dataset.casejump);if(el)el.scrollIntoView({behavior:"smooth",block:"start"});return;}
@@ -6820,6 +6896,7 @@ document.addEventListener("click",event=>{
     if(act==="close"){$("casedlg").close();return;}
     if(act==="addprod"){collectCase();curCase.data.products.push(blankProduct());renderCase();return;}
     if(act==="addevent"){collectCase();curCase.data.events.push(blankEvent());renderCase();return;}
+    if(act==="aifill"||act==="submitqc"||act==="qcapprove"||act==="qcreturn"){caseFlowAct(act);return;}
     if(act==="routecase"){(async()=>{await routeItems("case",[curCase.id]);const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}else $("casedlg").close();})();return;}
     target.disabled=true;
     (async()=>{
@@ -6912,7 +6989,7 @@ document.addEventListener("click",event=>{
   if(target.dataset.memremove){const [em,pf,rl]=target.dataset.memremove.split("|");api("membership-save",{email:em,portfolio:pf,role:rl,remove:true}).then(()=>refresh()).catch(e=>message(e.message,true));return;}
   if(target.dataset.monitor){const [t2,sp]=target.dataset.monitor.split("|");tab=t2;filt.special=sp;render();return;}
   if(target.dataset.clearspecial){filt.special="";render();return;}
-  if(target.dataset.dispsave){const val=(document.querySelector('input[name="dispo"]:checked')||{}).value;if(!val){message("Choose a disposition.",true);return;}target.disabled=true;api("disposition",{id:active.id,value:val,reason:$("dispreason").value,note:$("dispnote").value}).then(async r=>{await refresh();message("Disposition saved"+(r.qc?(r.qc.reviewer?"; sent to QC ("+r.qc.reviewer+")":"; waiting for a QC reviewer"):"")+".");active=data.assignments.find(x=>x.id===active.id)||active;renderDispo();}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}
+  if(target.dataset.dispsave){const val=(document.querySelector('input[name="dispo"]:checked')||{}).value;if(!val){message("Choose a disposition.",true);return;}target.disabled=true;api("disposition",{id:active.id,value:val,reason:$("dispreason").value,note:$("dispnote").value}).then(async r=>{await refresh();if(val==="potential_icsr"&&!r.qc){await autoDraft(active.id);}message("Disposition saved"+(r.qc?(r.qc.reviewer?"; sent to QC ("+r.qc.reviewer+")":"; waiting for a QC reviewer"):"")+".");active=data.assignments.find(x=>x.id===active.id)||active;renderDispo();}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}
   if(target.dataset.qcdec){target.disabled=true;api("qc-decision",{id:active.id,decision:target.dataset.qcdec,note:$("qcnote")?$("qcnote").value:""}).then(async()=>{await refresh();message("QC decision recorded.");active=data.assignments.find(x=>x.id===active.id)||active;renderDispo();}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});return;}
   if(target.dataset.reassign){api("reassign",{ids:[active.id],to:$("reassignto").value,reason:$("reassignreason").value}).then(async()=>{await refresh();message("Reassigned.");$("dialog").close();}).catch(e=>message(e.message,true));return;}
   if(target.dataset.p3){p3action(target);return;}

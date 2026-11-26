@@ -103,3 +103,13 @@ The assist panel, per event, with no cost and no outside call unless noted:
 - **Listedness (SmPC)**, online: the product's label is read through openFDA (cached 30 days) and each event is searched in the adverse reactions, warnings, precautions, contraindications and overdosage sections. A hit is "Listed" with the quoted sentence; a miss is "Not found" (never "Unlisted" automatically) and a missing label is "Unknown". The US label is a proxy for the EU SmPC, so EU reporting should check section 4.8: paste it into the panel to check against it, or follow the EMA, UK eMC and DailyMed links. Applying a result sets listedness and the reference safety information as proposals.
 - **Text source**: shows whether the full text came from a structured XML, a PDF text layer, or OCR of a scanned PDF (OCR is on when `deploy/enable-ocr.sh` has been run).
 - The full-article scanner and the optional AI event check open from the "Scan full text" button.
+
+## Three workflows (screener, QC, medical reviewer)
+
+The QC check now happens on the **finished case**, not on the article (set `qcPotentialIcsr` to true in settings to bring back the old article-level QC). My Desk has one tab per role, each with its own list and actions.
+
+1. **Screener, data entry.** Marking an article "Potential ICSR" creates the draft case straight away, assigned to the screener. The workspace shows a checklist and **Fill with AI**: rules and dictionaries fill what they can for free; the AI is asked only about fields still empty, from at most 14 short sentences (about 600 tokens), and each answer is kept only if the value appears word for word in the sentence it cites. An identical request is answered from the saved result with no tokens, and a monthly limit of 0 means nothing is ever sent. **Submit to QC** checks the case is a valid ICSR with no major findings, picks the least-loaded QC reviewer, and hands the case over; the screener can no longer edit it.
+2. **QC.** Reviews the case with the automatic findings. **Approve** sends it to a medical reviewer; **Return to screener** needs a note and sends it back to the screener who did the data entry (round count kept). A QC reviewer can also use Route to send it anywhere.
+3. **Medical review.** Confirms coding, seriousness and listedness, sets causality, approves and signs. Route sends it to QC or the screener if something is wrong.
+
+Every hand-off is recorded in the case history and the audit trail. All times printed on screenshots, snapshot cards and PDF snapshot lines are IST (UTC+05:30); the capture browser also runs in Asia/Kolkata. Stored timestamps and signatures stay UTC.
