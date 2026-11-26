@@ -65,4 +65,31 @@ test("two suspects with different causality: narrative, CIOMS I, E2B(R3) and lin
   const pair = n => rows.slice(1).find(r => r[who] === n); assert.equal(pair("aciclovir")[cz], "Probable/Likely"); assert.equal(pair("ibuprofen")[cz], "Unlikely");
   assert.equal((e2b.match(/Reviewer: Probable\/Likely/g) || []).length, 1); assert.equal((e2b.match(/Reviewer: Unlikely/g) || []).length, 1);
   assert.match(cioms, /Probable\/Likely/); assert.match(cioms, /Unlikely/);
+  // Phase 2: one matrix row per suspect and reaction, blank when unassessed
+  const mx = (await t.call(MEDICAL, "/api/synchrony", { action: "matrix", id: c.id })).body, mrow = n => mx.rows.find(r => r.product === n);
+  assert.equal(mx.rows.length, 2); assert.equal(mrow("aciclovir").causality, "Probable/Likely"); assert.equal(mrow("ibuprofen").causality, "Unlikely"); assert.equal(mx.deadline.awarenessConfirmed, true);
+  // Phase 3: the four formats agree, and the package manifest records the case version, hashes and signer
+  const view = (await t.call(MEDICAL, "/api/synchrony", { action: "view", id: c.id })).body; assert.deepEqual(view.agreement, [], JSON.stringify(view.agreement));
+  const manifest = JSON.parse(text("manifest.json")); assert.equal(manifest.agreement.discrepancies, 0); assert.ok(manifest.evidenceSha256 && manifest.contentSha256 && manifest.signer, "bound to hashes and signer");
+  const again = await t.call(MANAGER, "/api/synchrony", { action: "run" }); assert.equal(again.body.packages, 0, "regenerating the same version creates no new package");
+  // delivery: handoff, rejection, corrected delivery against the same package; a second correction of the same rejection is refused
+  const ho = await t.call(MEDICAL, "/api/synchrony", { action: "handoff", id: c.id, recipient: "Partner safety desk", note: "Sent by secure transfer, ref 1" }); assert.equal(ho.status, 200, JSON.stringify(ho.body));
+  const hid = (await t.state()).cases.find(x => x.id === c.id).handoffs[0].id;
+  assert.equal((await t.call(MEDICAL, "/api/synchrony", { action: "reject", id: c.id, taskId: hid, note: "Gateway rejected the file: bad receiver id" })).status, 200);
+  assert.equal((await t.call(MEDICAL, "/api/synchrony", { action: "acknowledge", id: c.id, taskId: hid, note: "Acknowledged after rejection" })).status, 409, "a rejected delivery cannot be acknowledged");
+  const fix = await t.call(MEDICAL, "/api/synchrony", { action: "handoff", id: c.id, recipient: "Partner safety desk", note: "Corrected delivery, ref 2", correctsId: hid }); assert.equal(fix.status, 200, JSON.stringify(fix.body));
+  const hs = (await t.state()).cases.find(x => x.id === c.id).handoffs; assert.equal(hs.length, 2); assert.equal(hs[1].correctsId, hid); assert.equal(hs[0].correctedBy, hs[1].id); assert.equal(hs[1].approvalHash, hs[0].approvalHash, "the corrected delivery is bound to the same package");
+  assert.equal((await t.call(MEDICAL, "/api/synchrony", { action: "handoff", id: c.id, recipient: "Partner safety desk", note: "Corrected again, ref 3", correctsId: hid })).status, 409);
+  // Phase 4: manager dashboard
+  const jobs = (await t.call(MANAGER, "/api/synchrony", { action: "jobs" })).body; assert.ok(jobs.counts.completed >= 1); assert.equal(jobs.preparedCases, 2); assert.equal((await t.call(SCREENER, "/api/synchrony", { action: "jobs" })).status, 403);
+});
+
+test("each draft carries an ordered chronology from the patient's own passages, labelled with its source", async () => {
+  const t = await scenario(); await t.call(MANAGER, "/api/synchrony", { action: "run" });
+  const cs = (await t.state()).cases, p1 = cs.find(c => /rash/i.test(c.data.events.map(e => e.verbatim.value).join())), p2 = cs.find(c => c !== p1);
+  const view = (await t.call(MEDICAL, "/api/synchrony", { action: "view", id: p1.id })).body, kinds = view.chronology.map(i => i.kind);
+  assert.ok(kinds.includes("exposure") && kinds.includes("onset") && kinds.includes("action"), JSON.stringify(kinds));
+  const onsets = view.chronology.filter(i => i.kind === "onset"); assert.ok(onsets.some(i => i.negated && /day 1/i.test(i.text)), "the early denial stays visible"); assert.ok(onsets.some(i => !i.negated && /day 4/i.test(i.text)), "the later onset stays visible");
+  assert.ok(view.chronology.every(i => i.source), "every item says where it came from");
+  assert.ok(!view.chronology.some(i => /Stevens|blister/i.test(i.text)), "the other patient's passages are not in this chronology");
 });

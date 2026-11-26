@@ -4113,7 +4113,7 @@ async function prepareSynchrony(env, limit = 2) {
         applyMeddraProposals(data,dict);
         const already = (state.cases || []).some(c=>syncSameCase(c,assignment,p));
         const ai = !already && prepared.length < 2 ? await syncPrepareAi(env,state,assignment,source,ex,p.patient,data) : { status:"not_requested", proposals:[] };
-        prepared.push({ ...p, data, ai });
+        prepared.push({ ...p, data, ai, chronology:extractChronology(ex, p.patient) });
       }
       const out = await write(env, data => {
         const a = data.assignments.find(x=>x.id===assignment.id), fresh = a && data.articles[a.pmid];
@@ -4125,7 +4125,7 @@ async function prepareSynchrony(env, limit = 2) {
           const at = new Date().toISOString(), number = allocateCaseNumber(data);
           const caseRecord = { id:crypto.randomUUID(), number, pmid:a.pmid, portfolio:a.portfolio, molecule:a.molecules?.[0] || "", status:"Draft", stage:"screening", createdAt:at, updatedAt:at, createdBy:"system", assignee:a.reviewer || pickCaseAssignee(data,{ portfolio:a.portfolio, molecule:a.molecules?.[0] }), notes:"",
             data:{ ...p.data, case_id:number }, intake:"synchrony-automation",
-            preparation:{ ai:p.ai, at, articleRevision:ex.source.articleRevision },
+            preparation:{ ai:p.ai, chronology:p.chronology || [], at, articleRevision:ex.source.articleRevision },
             provenance:{ idempotencyKey:syncKey(a,p.id), patientId:p.id, patientLabel:p.label, assignmentId:a.id, evidence:evidenceRef(fresh), extractionVersion:ex.version },
             history:[{ at, by:"system", action:"Prepared from patient-specific article evidence" }] };
           caseRecord.provenance.sourceSnapshot = caseEvidenceSnapshot(data,caseRecord);
@@ -4133,7 +4133,7 @@ async function prepareSynchrony(env, limit = 2) {
           data.cases.push(caseRecord);
           numbers.push(number);
         }
-        a.synchrony = { status:issues.length ? "needs_review" : "prepared", mode:syncModeFor(data, a.portfolio), fingerprint, at:new Date().toISOString(), issues,
+        a.synchrony = { retries:a.synchrony?.retries || [], status:issues.length ? "needs_review" : "prepared", mode:syncModeFor(data, a.portfolio), fingerprint, at:new Date().toISOString(), issues,
           patients:patients.map(p=>({ id:p.id, label:p.label, overall:p.assessment.overall, reactions:uniq(p.patient.events.filter(e => e.category === "ae" && !e.negated && !e.hypothetical).map(e => String(e.verbatim || "").toLowerCase())).slice(0, 20) })), created:numbers, ai:prepared.map(p=>p.ai.status).join(", ") || "not_requested", shadowCount:prepared.reduce((n,p)=>n+p.ai.proposals.length,0) };
         return numbers;
       });
@@ -4150,6 +4150,7 @@ async function prepareSynchrony(env, limit = 2) {
         job.status = job.attempts>=3 ? "failed" : "retry";
         job.until = Date.now()+60000*job.attempts;
         job.error = String(error.message || error).slice(0,200);
+        job.retries = [...(job.retries || []), { at:new Date().toISOString(), attempt:job.attempts, error:job.error }].slice(-5);
       });
     }
   }
@@ -4231,10 +4232,11 @@ async function synchronyPackage(env, state, c) {
     const xml = e2bBatch([prepared],state.articles,{profile,watermark:"FINAL: approved and signed in Synchrony",sender:state.settings?.senderId,receiver:state.settings?.receiverId});
     const schema = await structuralXsd(env,xml);
     if (schema.errors.length) return null;
-    const manifest = { case:c.number, approvalHash:hash, signature:sig.id, profile, generatedAt:new Date().toISOString(), validation, schema };
+    const csv = lineListing([prepared],state.articles,state), cioms = ciomsPdf(prepared,article,{final:true,approval:c.approval}), agreement = formatAgreement(c,{ "narrative":narrative, "E2B(R3)":xml, "CIOMS I":new TextDecoder("latin1").decode(cioms), "line listing":csv });
+    const manifest = { case:c.number, approvalHash:hash, signature:sig.id, profile, generatedAt:new Date().toISOString(), validation, schema, caseVersion:c.editRevision || c.updatedAt || "", contentSha256:sig.content_sha256 || "", evidenceSha256:sig.evidence_sha256 || "", signer:sig.signer_id || "", agreement:{ discrepancies:agreement.length, items:agreement.slice(0,40) } };
     const bytes = zipFiles([
-      { name:"E2B-R3.xml", data:enc.encode(xml) }, { name:"CIOMS-I.pdf", data:ciomsPdf(prepared,article,{final:true,approval:c.approval}) },
-      { name:"narrative.txt", data:enc.encode(narrative) }, { name:"line-listing.csv", data:enc.encode(lineListing([prepared],state.articles,state)) },
+      { name:"E2B-R3.xml", data:enc.encode(xml) }, { name:"CIOMS-I.pdf", data:cioms },
+      { name:"narrative.txt", data:enc.encode(narrative) }, { name:"line-listing.csv", data:enc.encode(csv) },
       { name:"manifest.json", data:enc.encode(JSON.stringify(manifest,null,2)) }, { name:"signature.json", data:enc.encode(JSON.stringify(sig,null,2)) }
     ]);
     await env.BUCKET.put(key,bytes,{onlyIf:{etagDoesNotMatch:"*"},httpMetadata:{contentType:"application/zip"}});
@@ -4262,6 +4264,100 @@ async function prepareSynchronyExports(env) {
   return ready;
 }
 
+// An ordered account of one patient taken from their own passages: exposure, onset, action, dechallenge, rechallenge, treatment, tests and outcome, each with its source.
+const CHRONO = [["rechallenge", /\b(rechalleng|re-?introduc|re-?started|re-?exposure|re-?administ)/i], ["dechallenge", /\b(dechalleng|resolved (after|on|following)|improved (after|on|following) (stopp|discontinu|withdraw)|abated after|subsided after)/i], ["action", /\b(discontinu|stopped|withdrawn|withdrew|interrupted|dose (was )?(reduced|lowered)|ceased)/i],
+  ["onset", /\b(develop|onset|presented with|experienced|complained of|noted|appeared|diagnosed with|admitted)/i], ["exposure", /\b(received|started|initiated|commenced|treated with|prescribed|administered|given|took|taking)\b/i], ["treatment", /\b(treated with|managed with|given (steroid|antihistamine|antibiotic|fluids)|prednisolone|hydrocortisone|adrenaline|epinephrine|intubat|dialysis)/i],
+  ["test", /\b(laboratory|biopsy|serum|ALT|AST|creatinine|CT scan|MRI|X-ray|ultrasound|ECG|blood test|investigations?)\b/i], ["outcome", /\b(recovered|resolved|died|death|fatal|discharged|sequelae|persist|improved)/i]];
+function extractChronology(ex, patient) {
+  const items = [], seen = new Set();
+  for (const u of patientUnitList(ex, patient)) {
+    const text = String(u.text || ""), when = (/\b(?:on |at |from |since )?day\s*(\d+)\b/i.exec(text) || [])[0] || (/\b(\d{4}-\d{2}-\d{2}|\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{4})\b/i.exec(text) || [])[1] || (/\b(?:after|within|for) (\d+|a|one|two|three|four) (days?|weeks?|months?|hours?|years?)\b/i.exec(text) || [])[0] || "";
+    const kinds = CHRONO.filter(([, re]) => re.test(text)).map(([k]) => k), denies = /\b(no|denied|without|absence of|free of|not)\b/i.test(text) && (patient.events || []).some(e => e.verbatim && text.toLowerCase().includes(String(e.verbatim).toLowerCase()));
+    if (denies && !kinds.includes("onset")) kinds.unshift("onset"); if (!kinds.length) continue;
+    const kind = kinds.includes("rechallenge") ? "rechallenge" : kinds.includes("dechallenge") ? "dechallenge" : kinds[0], key = kind + "|" + text.slice(0, 80); if (seen.has(key)) continue; seen.add(key);
+    const dayNo = Number((/day\s*(\d+)/i.exec(when) || [])[1]);
+    items.push({ kind, when:when.trim(), sort:Number.isFinite(dayNo) ? dayNo : null, text:text.slice(0, 280), unit:u.id, section:u.section || "", negated:denies && kind === "onset" });
+  }
+  return items.sort((a, b) => (a.sort ?? 1e9) - (b.sort ?? 1e9)).slice(0, 40);
+}
+// Where a finding came from: the abstract, a table, the full text, or text read by OCR.
+function evidenceKind(article, ev) {
+  const sec = String(ev?.section || ""), method = article?.evidence?.fulltext?.extraction?.method || article?.evidence?.fulltext?.method || "";
+  if (!sec && !ev?.excerpt) return "";
+  if (/^(title|abstract)\b/i.test(sec)) return "abstract";
+  if (ev?.cell || /^table/i.test(sec)) return "table";
+  if (!sec) return "text";
+  return method === "ocr" ? "OCR" : "full text";
+}
+const fieldSource = (article, f) => { const ev = (f?.evidence || []).find(e => e && (e.section || e.excerpt)); return ev ? evidenceKind(article, ev) : ""; };
+// The reporting clock and what it is counted from; an unconfirmed awareness date is flagged because it moves the deadline.
+function deadlineBasis(state, c) {
+  const d = normalizeCase(c.data), ctx = regulatoryContext(state.settings?.marketAuth || [], d, c.molecule), aware = v(d.dates?.awareness);
+  return { due:c.dueAt || ctx.due || "", days:ctx.days, serious:ctx.serious, awarenessConfirmed:Boolean(aware), basis:aware ? "awareness date " + aware : ctx.day0 ? "receipt date " + ctx.day0 + " (awareness date not confirmed)" : "no start date: confirm the awareness date" };
+}
+// One row per suspect product and reaction. Manifestations stay with their parent reaction; a pair nobody has assessed stays blank.
+function assessmentMatrix(state, c) {
+  const d = normalizeCase(c.data), article = state.articles[c.pmid] || {}, suspects = d.products.filter(p => p.role === "suspect" && hasVal(p.name)), rows = [];
+  for (const e of d.events) {
+    if (!hasVal(e.verbatim)) continue;
+    for (const p of suspects) {
+      const z = causalityForPair(e, p, suspects) || {}, serious = Object.entries(e.seriousness || {}).filter(([, on]) => on === true).map(([k]) => k.replace(/_/g, " "));
+      const assessed = hasVal(z.causality_reviewer) || hasVal(z.causality_reporter);
+      rows.push({ product:v(p.name), pairId:p.pair_id || "", reaction:v(e.verbatim), pt:v(e.pt), ptCode:v(e.pt_code), ime:Boolean(e.ime_flag) || e.ime === true, serious, listedness:v(e.listedness), reference:v(e.rsi),
+        causality:assessed ? v(z.causality_reviewer) || v(z.causality_reporter) : "", method:assessed ? v(z.causality_method) : "", rationale:assessed ? v(z.causality_rationale) : "", assessed,
+        manifestations:(e.manifestations || []).map(m => v(m.verbatim) || m.verbatim).filter(Boolean), source:fieldSource(article, e.verbatim) });
+    }
+  }
+  return rows;
+}
+// The same case in four formats must say the same thing about the patient, products, reactions, outcomes and causality.
+function formatAgreement(c, files) {
+  const d = normalizeCase(c.data), out = [], has = (text, needle) => String(text).toLowerCase().includes(String(needle).toLowerCase()), suspects = d.products.filter(p => p.role === "suspect" && hasVal(p.name));
+  const checks = [];
+  if (hasVal(d.patient?.age)) checks.push(["patient age", v(d.patient.age)]);
+  for (const p of suspects) checks.push(["suspect product", v(p.name)]);
+  for (const e of d.events) {
+    if (!hasVal(e.verbatim)) continue;
+    checks.push(["reaction", v(e.verbatim), hasVal(e.pt) ? v(e.pt) : ""]);
+    if (hasVal(e.outcome)) checks.push(["outcome", v(e.outcome).split(/[:;(]/)[0].trim()]);
+    for (const p of suspects) { const z = causalityForPair(e, p, suspects) || {}; if (hasVal(z.causality_reviewer)) checks.push(["causality (" + v(p.name) + ")", v(z.causality_reviewer)]); }
+  }
+  for (const [name, text] of Object.entries(files)) for (const [item, value, alt] of checks) if (!has(text, value) && !(alt && has(text, alt))) out.push({ format:name, item, expected:value });
+  return out;
+}
+async function renderFormats(env, state, c) {
+  const article = state.articles[c.pmid] || {}, prepared = { ...c, data:{ ...c.data, narrative:{ ...c.data.narrative, text:c.data.narrative?.text || buildNarrative(c).text } } }, dec = b => new TextDecoder("latin1").decode(b);
+  return { "narrative":prepared.data.narrative.text, "E2B(R3)":e2bBatch([prepared], state.articles, { profile:c.approval?.profile || "ICH" }), "CIOMS I":dec(ciomsPdf(prepared, article, {})), "line listing":lineListing([prepared], state.articles, state) };
+}
+// Work waiting for one person, in five queues. Each item names an owner, the reason and the single next action.
+function deskQueues(state, viewer) {
+  const me = viewer.email, mgr = viewer.role === "manager", today = new Date().toISOString().slice(0, 10), soon = new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10), q = { dueSoon:[], missingEvidence:[], failedJobs:[], qcReturns:[], evidenceChanges:[] };
+  const nameOf = e => state.profiles.find(p => p.email === e)?.name || e || "Unassigned";
+  for (const c of state.cases || []) {
+    if (c.archived || c.locked || !caseVisible(state, viewer, c) || (!mgr && c.assignee !== me) || ["Sent to PV Nexus", "Closed: not a valid ICSR"].includes(c.status)) continue;
+    const base = { id:c.id, number:c.number, pmid:c.pmid, owner:nameOf(c.assignee), stage:stageOf(c) }, dl = deadlineBasis(state, c);
+    if (c.dueAt && c.dueAt <= soon) q.dueSoon.push({ ...base, reason:(c.dueAt < today ? "Overdue since " : "Due ") + c.dueAt + ", counted from " + dl.basis + (dl.awarenessConfirmed ? "" : ". The awareness date is not confirmed."), action:"Open the case and finish the next step", dueAt:c.dueAt });
+    const open = (c.qc?.flags || []).filter(f => f.status === "open");
+    if (stageOf(c) === "screening" && (c.qc?.status === "returned" || open.length)) q.qcReturns.push({ ...base, reason:open.length ? open.length + " field" + (open.length === 1 ? "" : "s") + " returned by QC: " + open.slice(0, 3).map(f => f.label || f.path).join(", ") : "Returned by QC: " + (c.qc?.note || "see the note"), action:"Open the flagged field and correct it" });
+    const delta = caseEvidenceDelta(state, c).changes || [];
+    if (delta.length) q.evidenceChanges.push({ ...base, reason:delta.length + " source change" + (delta.length === 1 ? "" : "s") + " since this draft was prepared", action:"Review the changed fields" });
+  }
+  for (const a of state.assignments) {
+    const j = a.synchrony; if (!j || !mayAccess(state, viewer, a) || (!mgr && a.reviewer !== me)) continue;
+    const base = { id:a.id, number:"", pmid:a.pmid, owner:nameOf(a.reviewer), stage:"preparation" };
+    if (j.status === "failed" || j.status === "retry") q.failedJobs.push({ ...base, reason:"Preparation " + (j.status === "failed" ? "failed after " + (j.attempts || 0) + " attempts" : "will retry") + ": " + (j.error || "no detail"), action:"Run it again from Synchrony" });
+    for (const i of j.issues || []) if (["full_text", "text_quality"].includes(i.code)) q.missingEvidence.push({ ...base, reason:i.text, action:i.action || "Attach the authorised PDF on the case Source tab" });
+  }
+  return q;
+}
+// A manager's view of the preparation pipeline: counts, failures, retries, tokens and the cost of preparing a case.
+function jobsBoard(state) {
+  const jobs = state.assignments.filter(a => a.synchrony), by = s => jobs.filter(a => s.includes(a.synchrony.status)), month = aiMonth(), usage = state.aiUsage?.month === month ? state.aiUsage : { tokens:0, calls:0 }, prepared = (state.cases || []).filter(c => c.intake === "synchrony-automation").length, rate = Number(state.settings?.ai?.usdPer1MTokens) || 0;
+  return { counts:{ pending:state.assignments.filter(a => !a.synchrony && a.disposition?.value === "potential_icsr").length, running:by(["running"]).length, failed:by(["failed"]).length, retrying:by(["retry"]).length, completed:by(["prepared", "needs_review"]).length },
+    failures:by(["failed", "retry"]).slice(0, 50).map(a => ({ id:a.id, pmid:a.pmid, portfolio:a.portfolio, status:a.synchrony.status, attempts:a.synchrony.attempts || 0, error:a.synchrony.error || "", history:a.synchrony.retries || [] })),
+    sourceFailures:jobs.flatMap(a => (a.synchrony.issues || []).filter(i => ["full_text", "text_quality"].includes(i.code)).map(i => ({ pmid:a.pmid, portfolio:a.portfolio, code:i.code, text:i.text }))).slice(0, 50),
+    ai:{ month, tokens:Number(usage.tokens) || 0, calls:Number(usage.calls) || 0, tokensPerPreparedCase:prepared ? Math.round((Number(usage.tokens) || 0) / prepared) : 0, costPerPreparedCaseUsd:prepared && rate ? Math.round((Number(usage.tokens) || 0) / 1e6 * rate / prepared * 10000) / 10000 : null }, preparedCases:prepared };
+}
 async function synchronyApi(env, state, viewer, body) {
   const action = String(body.action || "view"), email = viewer.email;
   if (action === "shadow_report") {
@@ -4283,6 +4379,8 @@ async function synchronyApi(env, state, viewer, body) {
     const minutes = state.cases.map(c => { const done = (c.history || []).find(h => /approved|signed/i.test(h.action || "")); return done ? Math.max(0, (Date.parse(done.at) - Date.parse(c.createdAt)) / 60000) : null; }).filter(x => x !== null), tokens = state.aiUsage?.month === aiMonth() ? Number(state.aiUsage.tokens) || 0 : 0;
     return json({ mode:syncMode(state), totals, articles, reviewerMinutesAverage:minutes.length ? Math.round(minutes.reduce((a, b) => a + b, 0) / minutes.length) : null, tokensPerCase:Math.round(tokens / Math.max(1, state.cases.length)), cases:state.cases.length });
   }
+  if (action === "desk") return json({ queues:deskQueues(state, viewer) });
+  if (action === "jobs") { if (viewer.role !== "manager") return json({error:"Manager access required."},403); return json(jobsBoard(state)); }
   if (action === "run") {
     if (viewer.role !== "manager") return json({error:"Manager access required."},403);
     return json({ ...(await prepareSynchrony(env)), packages:await prepareSynchronyExports(env) });
@@ -4290,13 +4388,15 @@ async function synchronyApi(env, state, viewer, body) {
   const c = (state.cases || []).find(x=>x.id===body.id && caseVisible(state,viewer,x));
   if (!c) return json({error:"Case not found."},404);
   const edit = canEditCase(state,viewer,c), by = c.provenance?.assignmentId, a = state.assignments.find(x=>x.id===by);
+  if (action === "matrix") return json({ rows:assessmentMatrix(state,c), deadline:deadlineBasis(state,c) });
   if (action === "view") {
     const article = state.articles[c.pmid] || {};
+    let agreement = []; try { agreement = formatAgreement(c, await renderFormats(env,state,c)); } catch { agreement = []; }
     const draft = c.data.narrative?.text || buildNarrative(c).text;
     const local = localAssessment(normalizeCase(c.data));
     return json({ mode:syncMode(state), checks:synchronyChecks(state,c), narrative:draft, validation:validateE2b(c,article,c.approval?.profile || "ICH",await loadMeddra(env)),
-      ai:c.preparation?.ai || null, timeline:caseChronology(normalizeCase(c.data)), qcFlags:c.qc?.flags || [], followups:c.followups || [], suggestedFollowups:(local.follow_up?.questions || []).slice(0,10),
-      handoffs:c.handoffs || [], release:c.preparedRelease || null,
+      ai:c.preparation?.ai || null, timeline:caseChronology(normalizeCase(c.data)), chronology:(c.preparation?.chronology || []).map(i => ({ ...i, source:evidenceKind(article, i) })), qcFlags:c.qc?.flags || [], followups:c.followups || [], suggestedFollowups:(local.follow_up?.questions || []).slice(0,10),
+      handoffs:c.handoffs || [], release:c.preparedRelease || null, agreement, matrix:assessmentMatrix(state,c), deadline:deadlineBasis(state,c),
       canEdit:edit && !c.locked && !c.archived, assignment:a?.synchrony ? { status:a.synchrony.status, issues:a.synchrony.issues || [], mode:a.synchrony.mode } : null });
   }
   if (action === "package") {
@@ -4332,7 +4432,7 @@ async function synchronyApi(env, state, viewer, body) {
     }
     return json({ applied:saved.applied });
   }
-  if (!["followup_add","followup_resolve","handoff","acknowledge"].includes(action)) return json({error:"Unknown Synchrony action."},400);
+  if (!["followup_add","followup_resolve","handoff","acknowledge","reject"].includes(action)) return json({error:"Unknown Synchrony action."},400);
   const note = String(body.note || "").trim().slice(0,1200), recipient = String(body.recipient || "").trim().slice(0,160);
   if (note.length<5 || (action==="handoff" && !recipient)) return json({error:"Enter a note and include a recipient for handoffs."},400);
   const pack = action==="handoff" ? await synchronyPackage(env,state,c) : null;
@@ -4362,13 +4462,16 @@ async function synchronyApi(env, state, viewer, body) {
       const old = rows.find(h=>h.approvalHash===pack.hash && h.signatureId===signature.id && h.recipient===recipient && h.reference===note);
       if(old)return {id:old.id,replayed:true};
       if(rows.length>=150)return null;
-      const h={id:crypto.randomUUID(),recipient,reference:note,approvalHash:pack.hash,signatureId:signature.id,by:email,at};
+      const prev = body.correctsId ? rows.find(h=>h.id===body.correctsId) : null;
+      if (body.correctsId && (!prev || !prev.rejection || prev.correctedBy)) return null;
+      const h={id:crypto.randomUUID(),recipient,reference:note,approvalHash:pack.hash,signatureId:signature.id,by:email,at,...(prev?{correctsId:prev.id}:{})};
       rows.push(h);
+      if (prev) prev.correctedBy = h.id;
       return h;
     }
-    const h=(x.handoffs || []).find(h=>h.id===body.taskId && !h.acknowledgement);
+    const h=(x.handoffs || []).find(h=>h.id===body.taskId && !h.acknowledgement && !h.rejection);
     if(!h)return null;
-    h.acknowledgement={note,by:email,at};
+    if(action==="reject") h.rejection={note,by:email,at}; else h.acknowledgement={note,by:email,at};
     return h;
   });
   if (!saved) return json({error:"The task changed or cannot be recorded for this version."},409);
@@ -6080,7 +6183,7 @@ input,select,textarea{background:var(--card);border:1px solid var(--border);bord
 input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px #0e6a5d33}input[type=checkbox]{width:auto}
 .filters input{flex:1;min-width:200px}
 .filters.slim{align-items:end;gap:12px}.fl{display:grid;gap:3px;min-width:140px}.fl .sub{font-size:11px}
-details.menu{position:relative}details.menu>summary{list-style:none;cursor:pointer}details.menu>summary::-webkit-details-marker{display:none}.menubox{position:absolute;right:0;top:calc(100% + 6px);z-index:30;background:var(--card);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 32px #0003;padding:8px;display:grid;gap:2px;min-width:230px}.menubox button{background:none;border:0;text-align:left;padding:8px 10px;border-radius:8px;cursor:pointer;color:inherit;font:inherit}.menubox button:hover{background:var(--hover,#0e6a5d14)}.menubox.wide2{grid-template-columns:repeat(2,minmax(160px,1fr));gap:12px;padding:14px;min-width:360px}
+details.menu{position:relative}details.menu>summary{list-style:none;cursor:pointer}details.menu>summary::-webkit-details-marker{display:none}.menubox{position:absolute;right:0;top:calc(100% + 6px);z-index:30;background:var(--card);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 32px #0003;padding:8px;display:grid;gap:2px;min-width:230px}.menubox button{background:none;border:0;text-align:left;padding:8px 10px;border-radius:8px;cursor:pointer;color:inherit;font:inherit}.menubox button:hover{background:var(--hover,#0e6a5d14)}.dq{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin-bottom:14px}.menubox.wide2{grid-template-columns:repeat(2,minmax(160px,1fr));gap:12px;padding:14px;min-width:360px}
 form.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));align-items:end}form.grid .wide{grid-column:1/-1}
 label{display:flex;flex-direction:column;gap:5px;font-weight:500;font-size:13px}label.check{flex-direction:row;align-items:center;font-weight:400}
 .empty{text-align:center;color:var(--muted);padding:34px 10px}
@@ -6328,6 +6431,27 @@ function assistTabs(ref){
   if(assistTab==="automation") renderSynchronyPanel();
 }
 let syncPanelRequest=0;
+async function loadDeskQueues(){
+  const box=$("deskq"); if(!box)return;
+  try{
+    const r=await api("synchrony",{action:"desk"}), q=r.queues, L=[["dueSoon","Due soon"],["missingEvidence","Missing evidence"],["failedJobs","Failed jobs"],["qcReturns","QC returns"],["evidenceChanges","Evidence changes"]];
+    if(!$("deskq"))return;
+    const total=L.reduce((n,x)=>n+q[x[0]].length,0);
+    if(!total){box.innerHTML="";return;}
+    box.innerHTML='<section><h2>Needs attention ('+total+')</h2><div class="dq">'+L.filter(x=>q[x[0]].length).map(x=>'<div class="as-card"><h3>'+x[1]+' <span class="badge">'+q[x[0]].length+'</span></h3>'+q[x[0]].slice(0,6).map(i=>'<div class="fl-item"><i>!</i><span>'+(i.number?'<a href="#" data-opencase="'+esc(i.id)+'"><b>'+esc(i.number)+'</b></a> · ':"")+'PMID '+esc(i.pmid)+'<div class="sub">'+esc(i.reason)+'</div><div class="sub"><b>Next:</b> '+esc(i.action)+' · '+esc(i.owner)+'</div></span></div>').join("")+'</div>').join("")+'</div></section>';
+  }catch(e){box.textContent="";}
+}
+async function loadSynJobs(){
+  const box=$("synjobs"); if(!box)return;
+  try{
+    const r=await api("synchrony",{action:"jobs"}); if(!$("synjobs"))return;
+    const c=r.counts, tile=(l,n,t)=>'<div class="qstat"><span class="sub">'+l+'</span><b'+(t&&n?' style="color:var(--'+t+')"':"")+'>'+n+'</b></div>';
+    box.innerHTML='<details class="clientgrp"><summary><b>Preparation jobs</b><span class="sub">'+c.pending+' pending · '+c.running+' running · '+c.failed+' failed · '+c.completed+' completed</span></summary><div class="qstrip">'+tile("Pending",c.pending,"")+tile("Running",c.running,"")+tile("Retrying",c.retrying,"amber")+tile("Failed",c.failed,"red")+tile("Completed",c.completed,"green")+'</div>'+
+      '<div class="sub" style="margin:8px 0">OpenAI this month: '+r.ai.tokens+' tokens in '+r.ai.calls+' calls · '+r.ai.tokensPerPreparedCase+' tokens per prepared case'+(r.ai.costPerPreparedCaseUsd!==null?' · about $'+r.ai.costPerPreparedCaseUsd+' per case':"")+'</div>'+
+      (r.failures.length?r.failures.map(f=>'<div class="row"><span>PMID '+esc(f.pmid)+' · '+esc(f.portfolio)+' · '+esc(f.status)+' after '+f.attempts+' attempt'+(f.attempts===1?"":"s")+'<div class="sub">'+esc(f.error)+(f.history.length?" · history: "+f.history.map(h=>esc(h.error)).join(" / "):"")+'</div></span></div>').join(""):"")+
+      (r.sourceFailures.length?'<div class="sub" style="margin-top:8px">Source problems: '+r.sourceFailures.length+' (missing or unreadable full text)</div>':"")+'</details>';
+  }catch(e){box.textContent="";}
+}
 async function renderSynchronyPanel(){
   const box=$("caseautomation"), id=curCase.id, request=++syncPanelRequest;
   box.textContent="Loading preparation and release checks…";
@@ -6339,10 +6463,15 @@ async function renderSynchronyPanel(){
     const button=(action,label,id="")=>'<button type="button" class="btn outline sm" data-sync-act="'+action+'" data-sync-id="'+esc(id)+'">'+label+'</button>';
     const follow=r.followups.map(x=>'<div class="row"><span><b>'+esc(x.question)+'</b> '+badge(x.status,x.status==="open"?"amber":"green")+(x.resolution?'<br><small>'+esc(x.resolution)+'</small>':"")+'</span>'+(x.status==="open"?button("followup_resolve","Resolve",x.id):"")+'</div>').join("");
     const suggested=r.suggestedFollowups.map(x=>'<div class="row"><span>'+esc(x.question)+'</span>'+button("suggested","Track",x.question)+'</div>').join("");
-    const handoffs=r.handoffs.map(x=>'<div class="row"><span>'+esc(x.recipient+" · "+x.reference)+(x.acknowledgement?'<br><small>'+esc(x.acknowledgement.note)+'</small>':"")+'</span>'+(x.acknowledgement?"":button("acknowledge","Acknowledge",x.id))+'</div>').join("");
+    const handoffs=r.handoffs.map(x=>'<div class="row"><span>'+esc(x.recipient+" · "+x.reference)+' '+(x.acknowledgement?badge("Acknowledged","green"):x.rejection?badge(x.correctedBy?"Rejected, corrected":"Rejected","red"):badge("Awaiting receipt","amber"))+(x.correctsId?' <small>corrected delivery</small>':"")+(x.acknowledgement?'<br><small>'+esc(x.acknowledgement.note)+'</small>':"")+(x.rejection?'<br><small>'+esc(x.rejection.note)+'</small>':"")+'</span>'+(x.acknowledgement||x.rejection?(x.rejection&&!x.correctedBy&&r.canEdit?button("correct","Send corrected delivery",x.id):""):button("acknowledge","Acknowledge",x.id)+button("reject","Rejected",x.id))+'</div>').join("");
+    const kindBadge=k=>k?' <small class="sub">('+esc(k)+')</small>':"";
+    const matrix=(r.matrix||[]).map(m=>'<tr><td>'+esc(m.product)+'</td><td>'+esc(m.reaction)+kindBadge(m.source)+(m.manifestations.length?'<div class="sub">includes '+esc(m.manifestations.join(", "))+'</div>':"")+'</td><td>'+esc(m.pt+(m.ptCode?" ("+m.ptCode+")":""))+(m.ime?" · IME":"")+'</td><td>'+esc(m.serious.join(", ")||"Not serious")+'</td><td>'+esc(m.listedness)+(m.reference?'<div class="sub">'+esc(m.reference)+'</div>':"")+'</td><td>'+(m.assessed?esc(m.causality)+'<div class="sub">'+esc(m.method)+(m.rationale?" · "+esc(m.rationale):"")+'</div>':'<span class="sub">not assessed</span>')+'</td></tr>').join("");
+    const dl=r.deadline||{};
+    const agree=(r.agreement||[]).length?'<div class="roban">'+(r.agreement.length)+' difference'+(r.agreement.length===1?"":"s")+' between formats:</div>'+r.agreement.slice(0,12).map(a=>'<div class="sub">'+esc(a.format+' is missing '+a.item+': '+a.expected)+'</div>').join(""):'<div class="sub">Narrative, E2B(R3), CIOMS I and line listing agree on patient, products, reactions, outcome and causality.</div>';
     const validation=r.validation.map(x=>'<div class="sub">'+esc(x.severity+" · "+x.field+" · "+x.message)+'</div>').join("");
     box.innerHTML='<div class="as-card"><h3>Review exceptions</h3>'+(check||'<p class="sub">No listed findings.</p>')+
-      (r.assignment?.issues?.length?'<details open><summary>Intake exceptions</summary>'+r.assignment.issues.map(x=>'<div class="fl-item"><i>!</i><span>'+esc(x.text)+'<div class="sub">'+esc(x.action||"")+(x.owner?' · owner '+esc(x.owner):"")+'</div></span></div>').join("")+'</details>':"")+'</div>'+(r.timeline&&r.timeline.length?'<div class="as-card"><h3>Timeline</h3>'+r.timeline.map(t=>'<div class="fl-item"><i>'+esc({exposure:"▶",action:"■",dechallenge:"↓",rechallenge:"↻",onset:"!",outcome:"✓",test:"⚗"}[t.kind]||"•")+'</i><span>'+esc(t.label)+'<div class="sub">'+esc(t.when||"time not stated")+'</div></span></div>').join("")+'</div>':"")+
+      (r.assignment?.issues?.length?'<details open><summary>Intake exceptions</summary>'+r.assignment.issues.map(x=>'<div class="fl-item"><i>!</i><span>'+esc(x.text)+'<div class="sub">'+esc(x.action||"")+(x.owner?' · owner '+esc(x.owner):"")+'</div></span></div>').join("")+'</details>':"")+'</div>'+((r.chronology||[]).length?'<div class="as-card"><h3>From the article, in order</h3>'+r.chronology.slice(0,14).map(t=>'<div class="fl-item"><i>'+esc({exposure:"▶",action:"■",dechallenge:"↓",rechallenge:"↻",onset:"!",outcome:"✓",test:"⚗",treatment:"+"}[t.kind]||"•")+'</i><span>'+esc(t.text)+(t.negated?' <span class="badge">denied</span>':"")+'<div class="sub">'+esc((t.when||"time not stated")+" · "+t.kind+" · "+(t.source||"")+" · "+t.section)+'</div></span></div>').join("")+'</div>':"")+(r.timeline&&r.timeline.length?'<div class="as-card"><h3>Timeline</h3>'+r.timeline.map(t=>'<div class="fl-item"><i>'+esc({exposure:"▶",action:"■",dechallenge:"↓",rechallenge:"↻",onset:"!",outcome:"✓",test:"⚗"}[t.kind]||"•")+'</i><span>'+esc(t.label)+'<div class="sub">'+esc(t.when||"time not stated")+'</div></span></div>').join("")+'</div>':"")+
+      '<div class="as-card"><h3>Drug and reaction assessment</h3>'+(matrix?'<div class="tablewrap"><table><thead><tr><th>Product</th><th>Reaction</th><th>MedDRA</th><th>Seriousness</th><th>Listedness</th><th>Causality</th></tr></thead><tbody>'+matrix+'</tbody></table></div>':'<p class="sub">No suspect product and reaction pair yet.</p>')+'<div class="sub" style="margin-top:8px">Reporting clock: '+esc((dl.due||"not set")+(dl.basis?" · counted from "+dl.basis:""))+'</div>'+(dl.awarenessConfirmed===false?'<div class="roban" style="margin-top:6px">Awareness date not confirmed. The deadline may move.</div>':'')+'</div><div class="as-card"><h3>Format check</h3>'+agree+'</div>'+
       (proposals?'<div class="as-card"><h3>Source-backed proposals</h3>'+proposals+(r.canEdit?button("apply_ai","Apply selected as proposals"):"")+'</div>':"")+
       '<div class="as-card"><h3>Follow-up</h3>'+follow+(r.canEdit?suggested+button("followup_add","Add question"):"")+'</div>'+
       '<div class="as-card"><h3>Release package</h3>'+(r.release?badge("Prepared · "+r.release.profile,"green"):"")+
@@ -6373,12 +6502,12 @@ async function synchronyAction(action, taskId){
     await refreshCase();
     return;
   }
-  const recipient=action==="handoff"?prompt("Who received the package?",""):"";
-  if(action==="handoff"&&!recipient)return;
-  const labels={followup_add:"What question needs follow-up?",followup_resolve:"Record the answer or resolution.",handoff:"Record the delivery reference.",acknowledge:"Record the acknowledgement reference and outcome."};
+  const corrected=action==="correct", recipient=action==="handoff"||corrected?prompt("Who received the package?",""):"";
+  if((action==="handoff"||corrected)&&!recipient)return;
+  const labels={followup_add:"What question needs follow-up?",followup_resolve:"Record the answer or resolution.",handoff:"Record the delivery reference.",correct:"Record the corrected delivery reference.",acknowledge:"Record the acknowledgement reference and outcome.",reject:"Record why the delivery was rejected."};
   const note=action==="suggested"?taskId:prompt(labels[action]||"Enter a note.","");
   if(!note)return;
-  await api("synchrony",{id:curCase.id,action:action==="suggested"?"followup_add":action,taskId,note,recipient});
+  await api("synchrony",{id:curCase.id,action:action==="suggested"?"followup_add":corrected?"handoff":action,taskId:corrected?"":taskId,correctsId:corrected?taskId:"",note,recipient});
   await renderSynchronyPanel();
 }
 
@@ -7495,7 +7624,7 @@ function deskHtml(){
   });
   let articles="";
   if(deskTab==="screening"){const todo=data.assignments.filter(a=>a.reviewer===me&&a.status!=="Complete"&&!a.disposition);articles=panel("Articles waiting for your screening ("+todo.length+")",todo.length?table(["Article","Due",""],todo.slice(0,12).map(a=>{const ar=data.articles[a.pmid]||{};return ['<b>'+esc((ar.title||"PMID "+a.pmid).slice(0,110))+'</b><div class="sub">PMID '+esc(a.pmid)+' · '+esc((a.molecules||[]).join(", "))+'</div>',esc(a.dueAt||"—"),'<button type="button" class="btn outline sm" data-review="'+esc(a.id)+'">Screen</button>'];}),"",true)+(todo.length>12?'<div class="sub" style="padding:8px 14px">Showing 12 of '+todo.length+'. Open My Queue for all.</div>':""):'<div class="empty">Nothing waiting. New articles appear here when they are assigned to you.</div>',"Mark an article Potential ICSR and its case opens straight away for data entry.",true);}
-  return tabsBar+steps+panel(f[2]+" · "+f[1],(rows.length?table(["Case","Article","Due",mgr?"With":"",""],rows,"",true):'<div class="empty">No cases here right now.</div>'),f[4],true)+articles;
+  return '<div id="deskq"></div>'+tabsBar+steps+panel(f[2]+" · "+f[1],(rows.length?table(["Case","Article","Due",mgr?"With":"",""],rows,"",true):'<div class="empty">No cases here right now.</div>'),f[4],true)+articles;
 }
 function clientsHtml(){
   const clients=data.clients||[], items=data.assignments, wk=w=>encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||"");
@@ -7588,7 +7717,7 @@ function render() {
     const bars=(list)=>{if(!list.length)return '<div class="empty" style="padding:14px">No data yet.</div>';const top=list.slice(0,8),max=Math.max(...top.map(x=>x.count));return top.map(x=>'<div class="sbar" title="'+esc(x.cases.join(", "))+'"><div class="sbar-h"><span class="sbar-k">'+esc(x.key)+'</span><b>'+x.count+'</b></div><div class="sbar-t"><i style="width:'+Math.round(x.count/max*100)+'%"></i></div></div>').join("")+(list.length>8?'<div class="sub">+'+(list.length-8)+' more</div>':"");};
     const months=S.monthly.map(m=>'<span class="badge'+((S.trend.hikes||[]).includes(m.month)?" red":"")+'" title="'+esc(m.cases.join(", "))+'">'+esc(m.month)+': '+m.count+'</span>').join(" ");
     const fl=data.caseFolders||[],folderBar=panel("Folders",'<div class="chips"><button type="button" class="btn sm '+(synFolder?"outline":"")+'" data-synfolder="">All cases</button><button type="button" class="btn sm '+(synFolder==="__none"?"":"outline")+'" data-synfolder="__none">Not in a folder</button>'+fl.map(f=>'<span style="display:inline-flex;gap:2px"><button type="button" class="btn sm '+(synFolder===f.id?"":"outline")+'" data-synfolder="'+esc(f.id)+'">'+esc(f.name)+' ('+openCases.filter(c=>c.folderId===f.id).length+')</button>'+(manager?'<button type="button" class="btn outline sm" data-p5="delfolder|'+esc(f.id)+'" title="Delete folder" aria-label="Delete folder">x</button>':"")+'</span>').join("")+(canMedical()?'<button type="button" class="btn outline sm" data-p5="newfolder">+ New folder</button>':"")+'</div>');
-    html=searchBar+tiles+'<div class="sumrow">'+categoryMatrix(openCases)+folderBar+panel("Intake and assignment",intake)+'</div>'+'<div class="trkhead"><h2>Case tracker</h2><span class="sub">Seriousness, listedness and folder are dropdowns on each case.</span><span style="margin-left:auto">'+groupSelect(synGroup,["none","soc","triage","sercat","clock","stage","status","seriousness","listedness","folder","portfolio","owner"],"syn_group")+'</span></div>'+bulkBar("syn_c")+groupedTables(shown,synGroup,["","Case","Article · product · event","Classification","Clock and status","Assignment"],rowOf,"No cases in this view.")+
+    html=(data.viewer.role==="manager"?'<div id="synjobs"></div>':"")+searchBar+tiles+'<div class="sumrow">'+categoryMatrix(openCases)+folderBar+panel("Intake and assignment",intake)+'</div>'+'<div class="trkhead"><h2>Case tracker</h2><span class="sub">Seriousness, listedness and folder are dropdowns on each case.</span><span style="margin-left:auto">'+groupSelect(synGroup,["none","soc","triage","sercat","clock","stage","status","seriousness","listedness","folder","portfolio","owner"],"syn_group")+'</span></div>'+bulkBar("syn_c")+groupedTables(shown,synGroup,["","Case","Article · product · event","Classification","Clock and status","Assignment"],rowOf,"No cases in this view.")+
       panel("Case series summary",'<div class="row"><span><b>'+S.total+'</b> case'+(S.total===1?'':'s')+' · <b>'+S.serious.length+'</b> serious · <b>'+S.fatal.length+'</b> fatal</span><span class="sub">Counted from the case fields. Hover a line to see which cases it counts.</span></div>'+
         '<div class="serieslayout"><div><h3 style="margin:8px 0">Events</h3>'+bars(S.events)+'</div><div><h3 style="margin:8px 0">Suspect products</h3>'+bars(S.products)+'</div><div><h3 style="margin:8px 0">Countries</h3>'+bars(S.countries)+'</div><div><h3 style="margin:8px 0">Age and sex</h3>'+bars(S.ages)+bars(S.sex)+'</div></div>'+
         '<h3 style="margin:14px 0 6px">Cases received per month</h3><div class="chips">'+(months||'<span class="sub">No cases yet.</span>')+'</div><p class="sub" style="margin-top:8px">'+esc(S.trend.basis||"")+(S.monthly.length?" Median "+S.trend.median+", spread "+S.trend.mad+", upper limit "+S.trend.upper+" cases per month (median + 2 x scaled MAD).":"")+(S.trend.hikes&&S.trend.hikes.length&&S.monthly.length>=4?' <b style="color:var(--red)">Above the limit: '+esc(S.trend.hikes.join(", "))+'.</b>':"")+'</p>',"Deterministic: no model writes these figures.")+
@@ -7731,6 +7860,8 @@ function render() {
   if(tab==="Watchlists"&&$("autobox"))loadAutoPull();
   if(tab==="Admin"&&$("kbstatus"))loadKbStatus();
   if(tab==="Watchlists"&&$("dictbox"))loadDictionaries();
+  if(tab==="My Desk")loadDeskQueues();
+  if(tab==="Synchrony")loadSynJobs();
   if(tab==="Synchrony"){
     document.querySelectorAll("[data-assignsel]").forEach(el=>{el.onchange=()=>api("case-assign",{ids:[el.dataset.assignsel],assignee:el.value}).then(()=>{message(el.value?"Case assigned.":"Case unassigned.");return refresh();}).catch(e=>message(e.message,true));});
   }
@@ -8256,7 +8387,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  pdfToText, buildFullTextEvidence, autoAdvance, istStamp, extractInvestigations, extractClinical, zipFiles, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  pdfToText, buildFullTextEvidence, autoAdvance, deskQueues, assessmentMatrix, formatAgreement, jobsBoard, evidenceKind, deadlineBasis, istStamp, extractInvestigations, extractClinical, zipFiles, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);

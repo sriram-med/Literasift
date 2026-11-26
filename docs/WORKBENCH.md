@@ -145,3 +145,13 @@ A search bar sits at the top of Synchrony and filters the tracker live. All word
 
 - All Assignments and My Queue show one search box, a status filter, a "More filters" menu (access, full text, country, events, source, client, portfolio, sort) and one Export menu. Filters still update the table in place.
 - Settings > Case workflow > Case automation has "Send clean drafts to QC". In Active mode, a prepared draft with no exceptions, no missing required fields, no major QC or expectedness findings, no date conflicts and no open QC flags goes to QC by itself and the history records it. Anything else stays with the screener and shows on the review desk. QC approval, medical review, signing and transmission remain human.
+
+### Phases 1-4 additions
+
+- **Source labels:** evidence is labelled abstract, table, full text or OCR (`evidenceKind`). The case workspace shows the label beside each reaction in the assessment matrix and each chronology item.
+- **Chronology:** every prepared draft stores an ordered account from that patient's own passages (exposure, onset including a denial such as "no rash on day 1", action, dechallenge, rechallenge, treatment, tests, outcome), shown in the Synchrony panel as "From the article, in order".
+- **My Desk** opens with up to five queues (due soon, missing evidence, failed jobs, QC returns, evidence changes). Each item has an owner, a reason and one next action. Managers see everyone's; others see their own.
+- **Assessment matrix:** one row per suspect product and reaction with MedDRA, IME, seriousness, listedness and its reference text, causality, method and rationale. Manifestations show under their parent reaction. An unassessed pair stays blank. The reporting clock names its basis and warns when the awareness date is unconfirmed.
+- **Format check:** the narrative, E2B(R3), CIOMS I and line listing are compared for patient age, suspect products, reactions, outcomes and per-pair causality. Differences show before release and are recorded in the package manifest, which also records the case version, content and evidence hashes and the signer.
+- **Delivery:** a handoff can be acknowledged or rejected; a rejected one can be followed by a corrected delivery bound to the same package. Nothing is sent externally by the application.
+- **Jobs dashboard** (managers, top of Synchrony): pending, running, retrying, failed and completed preparation jobs, retry history, source problems, OpenAI tokens, and tokens per prepared case. Set `settings.ai.usdPer1MTokens` to see a cost per case.

@@ -38,3 +38,23 @@ test("a draft with every required field and no exceptions is sent to QC; one wit
   console.log("ADV", done, after.stage, after.assignee, after.history.at(-1).action);
   assert.equal(done, true); { assert.equal(after.stage, "qc"); assert.equal(after.assignee, QC); assert.equal(after.screener, SCREENER); assert.match(after.history.at(-1).action, /auto-submitted/); }
 });
+
+test("My Desk queues, source labels, deadline basis and the jobs board", async () => {
+  const t = await env(); await t.call(MANAGER, "/api/synchrony", { action: "run" });
+  const st = await t.state(), c = st.cases.find(x => /rash/i.test(x.data.events.map(e => e.verbatim.value).join()));
+  // each finding says where it came from
+  const art = st.articles["1"]; assert.equal(worker.evidenceKind(art, { section: "Abstract", excerpt: "x" }), "abstract"); assert.equal(worker.evidenceKind(art, { section: "Table 2", excerpt: "x" }), "table");
+  assert.equal(worker.evidenceKind(art, { section: "Case presentation", excerpt: "x" }), "full text"); assert.equal(worker.evidenceKind({ evidence: { fulltext: { extraction: { method: "ocr" } } } }, { section: "Body", excerpt: "x" }), "OCR");
+  assert.ok(["abstract", "full text", "table", "OCR"].includes(worker.assessmentMatrix(st, c)[0].source), "matrix rows carry a source label");
+  // an unconfirmed awareness date is named as the basis of the clock
+  const dl = worker.deadlineBasis(st, c); assert.equal(dl.awarenessConfirmed, false); assert.match(dl.basis, /not confirmed|confirm the awareness/);
+  // the five queues, one next action each
+  const me = { email: SCREENER, role: "reviewer" }, fake = JSON.parse(JSON.stringify(st));
+  const fc = fake.cases.find(x => x.id === c.id); fc.dueAt = "2000-01-01"; fc.qc = { status: "returned", flags: [{ path: "events.0.verbatim", label: "Reaction", status: "open", was: "x" }] };
+  fake.assignments[0].synchrony = { status: "failed", attempts: 3, error: "source timed out", issues: [{ code: "full_text", text: "No authorised full text", action: "Attach the PDF" }] };
+  const q = worker.deskQueues(fake, me);
+  for (const k of ["dueSoon", "qcReturns", "failedJobs", "missingEvidence"]) { assert.ok(q[k].length >= 1, k); for (const i of q[k]) assert.ok(i.owner && i.reason && i.action, k + " item has owner, reason and action"); }
+  assert.match(q.dueSoon[0].reason, /Overdue/); assert.match(q.qcReturns[0].reason, /Reaction/);
+  const board = worker.jobsBoard(fake); assert.equal(board.counts.failed, 1); assert.equal(board.failures[0].attempts, 3); assert.equal(board.sourceFailures.length, 1);
+  assert.deepEqual((await t.call(QC, "/api/synchrony", { action: "desk" })).body.queues.qcReturns, [], "other people's queues stay empty");
+});
