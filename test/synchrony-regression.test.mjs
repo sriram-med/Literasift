@@ -85,7 +85,7 @@ test("background OpenAI: a quote from the other patient or one that is not in th
   assert.ok(asked.some(l => l.length && !l.join(" ").includes("73 kg")), "patient 1 was only sent patient 1's lines");
   assert.ok(!(p1.preparation.ai.proposals || []).some(x => /73 kg|Neverland/.test(x.value)), "no foreign or unsupported quote is accepted for patient 1");
   assert.ok(!(p2.preparation.ai.proposals || []).some(x => /Neverland/.test(x.value)), "an unsupported quote is rejected for patient 2 as well");
-  assert.ok(!p1.data.patient.weight.value && !p2.data.patient.weight.value, "proposals are not applied to the case");
+  assert.ok(!p1.data.patient.weight.value, "patient 2's weight never reaches patient 1"); assert.ok(!p2.data.patient.weight.value || p2.data.patient.weight.value === "73", "patient 2 may carry the weight their own sentence states (read by rules), never the AI quote");
 });
 
 test("AI data entry respects source permissions: restricted-licence full text and automation send only the public abstract", async () => {
