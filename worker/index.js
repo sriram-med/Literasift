@@ -10286,31 +10286,22 @@ function drugWeekHtml(){
     '<label>Client<select id="dwclient">'+opts.map(o=>'<option value="'+esc(o[0])+'"'+(o[0]===dwState.client?" selected":"")+'>'+esc(o[1])+'</option>').join("")+'</select></label>'+
     '<label>Week starting (Monday)<input type="date" id="dwfrom" value="'+esc(dwState.from)+'"></label>'+
     '<button type="button" class="btn outline sm" data-dwshift="-7">Previous week</button><button type="button" class="btn outline sm" data-dwshift="7">Next week</button>'+
-    '<label>PubMed date basis<select id="dwbasis">'+[["crdt","Create date [crdt]"],["pdat","Publication date [dp]"],["any","Created or published"]].map(o=>'<option value="'+o[0]+'"'+(o[0]===dwState.basis?" selected":"")+'>'+o[1]+'</option>').join("")+'</select></label>'+
-    '<button type="button" class="btn sm" data-dwbuild="1">Build table</button><button type="button" class="btn outline sm" data-dwbuild="pubmed">Build with PubMed counts</button><button type="button" class="btn outline sm" data-dwcsv="1">Export CSV</button></div>'+
+    '<button type="button" class="btn sm" data-dwbuild="1">Build table</button><button type="button" class="btn outline sm" data-dwcsv="1">Export CSV</button></div>'+
     '<div id="dwout" style="margin-top:12px">'+(dwState.out?dwTable(dwState.out):'<div class="sub">Choose a week and press Build table.</div>')+'</div>',
-    "One row per drug: the articles that reached the app in that week (Monday to Sunday), and, if you ask, how many PubMed has for the same week with the drug's saved search.");
+    "Each drug with the number of articles that reached the app in that week (Monday to Sunday).");
 }
 function dwTable(r){
-  const pm=r.rows.some(x=>"pubmed" in x),num=v=>v==null?"?":String(v);
-  return '<div class="sub" style="margin-bottom:6px"><b>'+esc(r.client)+'</b> · week '+esc(r.from)+' to '+esc(r.to)+(pm?' · PubMed by '+esc(r.dateBasisLabel):"")+' · '+r.rows.length+' drug'+(r.rows.length===1?"":"s")+'</div>'+
-    table(["Client","Drug","Pulled into the app this week",...(pm?["In PubMed this week",""]:[]),"All articles in the app"],
-      r.rows.map(x=>[esc(x.client),'<b>'+esc(x.molecule)+'</b>'+(x.auto?"":' <span class="sub">(daily pull off)</span>'),x.pulled?'<b>'+x.pulled+'</b>':'<span class="sub">0</span>',
-        ...(pm?[num(x.pubmed)+(x.pubmed!=null&&x.pubmed>x.pulled?" "+badge((x.pubmed-x.pulled)+" more in PubMed","amber"):""),x.pubmedUrl?'<a href="'+esc(x.pubmedUrl)+'" target="_blank" rel="noopener">Open in PubMed</a>':""]:[]),String(x.total)])
-      .concat([['<b>Total</b>',"",'<b>'+r.totals.pulled+'</b>',...(pm?['<b>'+num(r.totals.pubmed)+'</b>',""]:[]),""]]),"No drugs for this client.");
+  return '<div class="sub" style="margin-bottom:6px">'+esc(r.client)+' · '+esc(r.from)+' to '+esc(r.to)+'</div>'+table(["Drug","Articles"],r.rows.map(x=>[esc(x.molecule),String(x.pulled)]),"No drugs for this client.");
 }
 async function dwBuild(btn,pubmed){
-  dwState.client=$("dwclient").value;dwState.from=dwMonday($("dwfrom").value||undefined);dwState.basis=$("dwbasis").value;
+  dwState.client=$("dwclient").value;dwState.from=dwMonday($("dwfrom").value||undefined);
   btn.disabled=true;$("dwout").innerHTML='<div class="sub">'+(pubmed?"Asking PubMed, one drug at a time…":"Counting…")+'</div>';
   try{dwState.out=await api("drug-week-stats",{client:dwState.client,from:dwState.from,to:dwAdd(dwState.from,6),dateField:dwState.basis,pubmed:!!pubmed});$("dwout").innerHTML=dwTable(dwState.out);$("dwfrom").value=dwState.from;}
   catch(err){$("dwout").innerHTML='<div class="sub" style="color:var(--red)">'+esc(err.message)+'</div>';}btn.disabled=false;
 }
 function dwCsv(){
   const r=dwState.out;if(!r)return message("Build the table first.",true);
-  const pm=r.rows.some(x=>"pubmed" in x),q=v=>'"'+String(v==null?"":v).split('"').join('""')+'"',nl=String.fromCharCode(13,10);
-  const head=["Client","Drug","Week from","Week to","Pulled into the app this week",...(pm?["In PubMed this week ("+r.dateBasisLabel+")","PubMed search"]:[]),"All articles in the app"];
-  const lines=[head.map(q).join(",")].concat(r.rows.map(x=>[q(x.client),q(x.molecule),q(r.from),q(r.to),x.pulled,...(pm?[x.pubmed==null?"":x.pubmed,q(x.term||"")]:[]),x.total].join(",")));
-  lines.push([q("Total"),"",q(r.from),q(r.to),r.totals.pulled,...(pm?[r.totals.pubmed==null?"":r.totals.pubmed,""]:[]),""].join(","));
+  const q=v=>'"'+String(v==null?"":v).split('"').join('""')+'"',nl=String.fromCharCode(13,10),lines=[[q("Drug"),q("Articles")].join(",")].concat(r.rows.map(x=>[q(x.molecule),x.pulled].join(",")));
   const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([String.fromCharCode(65279)+lines.join(nl)+nl],{type:"text/csv;charset=utf-8"}));a.download="literasift-drugs-week-"+r.from+".csv";document.body.appendChild(a);a.click();a.remove();
 }
 async function loadPullStats(){
