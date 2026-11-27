@@ -268,3 +268,5 @@ The Watchlists page opens with the global automatic pull, then a **By client | B
 - **Dates…** on a molecule sets its own start and stop dates (they win over the client's, which win over the global start date; an empty date follows the next level up) and can pull any custom range for just that molecule.
 - Days before the start date, and after the stop date, are never pulled or reported as missed. Routes: `/api/client-auto` and `/api/watch-auto` take `on`, `startFrom` and `until`; `/api/pull-client` does the custom-date pulls.
 - The dictionaries, query versions, add-a-watchlist, bulk, assign-by-employee and assign-by-number panels remain below, unchanged.
+
+Every molecule row on the Watchlists page now has a switch for its automatic pull: flip it and the change is saved at once, with no page reload.
