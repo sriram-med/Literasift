@@ -387,3 +387,9 @@ Every molecule has exactly one saved search: its own names (brands, salts, spell
 - *Pull this client* and *Compare with PubMed* send only the dates, the date basis and the PubMed Central option. Each molecule runs its saved search. The daily automatic pull runs the same saved search, so manual and automatic pulls cannot differ.
 - **Own dates per molecule:** on a saved-search card, *Own dates for this molecule* sets From/Through (or Past week, 30 days, 3 months, 12 months) for that molecule only. Count, Compare and Pull use them; the other molecules use the shared dates. *Use the dates above* removes them.
 - Routes: `/api/saved-searches` (list for a client), `/api/saved-search` (preview/count, or `save:true` for managers).
+
+## Automatic pull schedule
+
+- The automatic pull goes by publication date [dp], day by day, with a daily 60-day late-arrival sweep for articles PubMed indexes after their publication date.
+- Each client has a schedule (Clients tab, inside the client): every day, or every week on one weekday, at a time of day (India time). Default: every day at 06:00.
+- A client is pulled at the first scheduler tick (about hourly) after its slot; the pull brings in every day not yet pulled. Each client row shows its next pull. "Run now" (force) ignores the schedule.

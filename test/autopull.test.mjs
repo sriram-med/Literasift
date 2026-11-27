@@ -342,3 +342,27 @@ test("the automatic pull goes by publication date, and the daily late-arrival sw
   ncbi.calls.length = 0; await wf(ncbi.handler, () => t.call(M, "/api/scheduled", { force: true }));
   assert.ok(!ncbi.calls.some(c => c.startsWith("esearch") && c.includes(ago(1 + 60).replaceAll("-", "/"))), "no second sweep the same day");
 });
+
+test("each client is pulled on its own schedule (daily or weekly at a time, India time); the next pull is reported and Run now overrides it", async () => {
+  const { makeEnv: mk, MANAGER: M, fakeNcbi: fk, withFetch: wf } = await import("./helpers.mjs");
+  const ago = n => new Date(Date.now() + 5.5 * 3600000 - n * 864e5).toISOString().slice(0, 10);
+  const t = await mk({ clients: [{ id: "c", name: "Laurus" }], schema: { grouping: "client" }, watches: [{ portfolio: "Laurus", molecule: "metformin", query: "((metformin))", names: [], client: "c" }] });
+  // weekly, on the weekday of three days from now, at 09:00: its last slot was last week, so the first tick is due
+  const wd = ((new Date(ago(-3) + "T00:00:00Z").getUTCDay() + 6) % 7) + 1;
+  const r = await t.call(M, "/api/client-auto", { client: "c", every: "weekly", weekday: wd, time: "09:00" });
+  assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal(r.body.nextPull, ago(-3) + " 09:00"); assert.deepEqual(r.body.schedule, { every: "weekly", weekday: wd, time: "09:00" });
+  assert.equal((await t.call(M, "/api/client-auto", { client: "c", every: "monthly" })).status, 400);
+  assert.equal((await t.call(M, "/api/client-auto", { client: "c", time: "25:00" })).status, 400);
+  const ncbi = fk([{ pmid: "91", date: ago(1) }]);
+  await wf(ncbi.handler, () => t.call(M, "/api/scheduled", {}));
+  let st = await t.state(); assert.ok(st.articles["91"], "pulled at the first tick after its slot"); assert.equal(st.autoSlots.c, ago(4) + " 09:00");
+  // the next tick before the next slot pulls nothing for this client
+  ncbi.calls.length = 0; st.sweeps = {}; await t.BUCKET.put("bench.json", JSON.stringify(st));
+  await wf(ncbi.handler, () => t.call(M, "/api/scheduled", {}));
+  assert.equal(ncbi.calls.filter(c => c.startsWith("esearch")).length, 0, "not due until " + ago(-3) + " 09:00");
+  // Run now pulls whatever is waiting regardless of the schedule
+  await wf(ncbi.handler, () => t.call(M, "/api/scheduled", { force: true }));
+  assert.ok(ncbi.calls.some(c => c.startsWith("esearch")));
+  const s = await t.call(M, "/api/scheduler-status", {}); const pc = s.body.perClient.find(x => x.id === "c");
+  assert.equal(pc.nextPull, ago(-3) + " 09:00"); assert.equal(pc.lastSlotDone, true);
+});
