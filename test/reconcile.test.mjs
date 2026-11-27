@@ -8,8 +8,9 @@ const dAgo = n => new Date(Date.now() + 5.5 * 3600000 - n * 86400000).toISOStrin
 const SQUARE = ["calcium acetate", "omeprazole", "valsartan", "amoxicillin", "cefixime", "esomeprazole", "losartan", "montelukast"];
 const key = w => encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule);
 async function square(extra = {}) {
-  const watches = SQUARE.map((m, i) => ({ id: "w" + i, portfolio: i % 2 ? "Square B" : "Square A", molecule: m, query: '("' + m + '"[tiab])', names: [], client: "sq" }));
-  const t = await makeEnv({ watches }, extra); const s = await t.state(); s.clients = [{ id: "sq", name: "Square" }]; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  // every molecule belongs to its client; the client name is the only grouping
+  const watches = SQUARE.map((m, i) => ({ id: "w" + i, portfolio: "Square", molecule: m, query: '("' + m + '"[tiab])', names: [], client: "sq" }));
+  const t = await makeEnv({ watches, clients: [{ id: "sq", name: "Square" }] }, extra);
   return { t, watches };
 }
 const pull = (t, body, h) => withFetch(h, () => t.call(MANAGER, "/api/pull-client", { client: "sq", searchMode: "precise", ...body }));
@@ -41,7 +42,7 @@ test("same count, different PMID sets: reconciliation reports the missing and th
 test("one PMID found by two Square molecules: one canonical citation, linked to both molecules and both watches", async () => {
   const { t, watches } = await square();
   const ncbi = fakeNcbi([{ pmid: "777", date: dAgo(3) }]);
-  await pull(t, { from: dAgo(10), to: dAgo(0), molecules: [key(watches[0]), key(watches[2])] }, ncbi.handler);   // both in portfolio "Square A"
+  await pull(t, { from: dAgo(10), to: dAgo(0), molecules: [key(watches[0]), key(watches[2])] }, ncbi.handler);   // both molecules of Square
   const st = await t.state();
   assert.equal(Object.keys(st.articles).filter(id => id === "777").length, 1);
   const as = st.assignments.filter(a => a.pmid === "777"); assert.equal(as.length, 1); assert.deepEqual(as[0].molecules.sort(), ["calcium acetate", "valsartan"]);
@@ -99,7 +100,7 @@ test("changing the query, the date basis or a filter makes a new, auditable run 
 test("re-importing an article that was already reviewed repairs its missing link and keeps every review decision", async () => {
   const { t, watches } = await square();
   const s = await t.state(); s.articles["4242"] = { id: "4242", title: "Old" };
-  s.assignments.push({ id: "as1", pmid: "4242", portfolio: "Square A", molecules: [], reviewer: SCREENER, status: "Complete", ird: "2026-01-02", disposition: { value: "potential_icsr", by: SCREENER, at: "2026-01-03T00:00:00Z" }, qc: { status: "approved", decidedBy: MANAGER } });
+  s.assignments.push({ id: "as1", pmid: "4242", portfolio: "Square", molecules: [], reviewer: SCREENER, status: "Complete", ird: "2026-01-02", disposition: { value: "potential_icsr", by: SCREENER, at: "2026-01-03T00:00:00Z" }, qc: { status: "approved", decidedBy: MANAGER } });
   await t.BUCKET.put("bench.json", JSON.stringify(s));
   const ncbi = fakeNcbi([{ pmid: "4242", date: dAgo(3) }]);
   await pull(t, { from: dAgo(10), to: dAgo(0), molecules: [key(watches[0])] }, ncbi.handler);
@@ -127,19 +128,19 @@ test("the search contract: PubMed default, Precise and Custom, approved spelling
   assert.equal(c.mode, "custom"); assert.ok(c.term.startsWith('(("calcium acetate"[nm] OR PhosLo[tiab]) AND humans[mh])'), c.term);
   assert.ok(c.term.includes(dAgo(5).replaceAll("-", "/") + "[crdt]:" + dAgo(0).replaceAll("-", "/") + "[crdt]"), "both end days are in the range");
   // client, portfolio and class never enter a query
-  for (const x of [c]) for (const word of ["Square", "Square A", "Gastro", "Cardiovascular"]) assert.ok(!x.term.includes(word));
+  for (const x of [c]) for (const word of ["Square", "Gastro", "Cardiovascular"]) assert.ok(!x.term.includes(word));
 });
 
 test("approved names: aciclovir/acyclovir and sulfate/sulphate are suggested, never added on their own", async () => {
-  const t = await makeEnv({ watches: [{ portfolio: "P", molecule: "aciclovir", query: '"aciclovir"[tiab]', names: [] }, { portfolio: "P", molecule: "morphine sulphate", query: '"morphine sulphate"[tiab]', names: [] }] });
+  const t = await makeEnv({ clients: [{ id: "p", name: "P" }], watches: [{ portfolio: "P", client: "p", molecule: "aciclovir", query: '"aciclovir"[tiab]', names: [] }, { portfolio: "P", client: "p", molecule: "morphine sulphate", query: '"morphine sulphate"[tiab]', names: [] }] });
   const ncbi = fakeNcbi([{ pmid: "1", date: dAgo(2) }]);
-  await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "none", from: dAgo(5), to: dAgo(0), searchMode: "precise" }));
+  await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "p", from: dAgo(5), to: dAgo(0), searchMode: "precise" }));
   const terms = decodeURIComponent(ncbi.calls.filter(c => c.startsWith("esearch")).join(" ").replace(/\+/g, " "));
   assert.ok(!terms.includes("acyclovir") && !terms.includes("morphine sulfate"), "variants are not searched until approved");
   const sug = (await t.call(MANAGER, "/api/name-variants", { names: ["aciclovir", "morphine sulphate", "Acyclovir sodium"] })).body.variants;
   assert.deepEqual(sug["aciclovir"], ["acyclovir"]); assert.deepEqual(sug["morphine sulphate"], ["morphine sulfate"]); assert.deepEqual(sug["Acyclovir sodium"], ["Aciclovir sodium"]);
   await t.call(MANAGER, "/api/watch-auto", { watch: "P|aciclovir", names: "acyclovir" });
-  ncbi.calls.length = 0; await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "none", from: dAgo(5), to: dAgo(0), searchMode: "precise", molecules: ["P|aciclovir"] }));
+  ncbi.calls.length = 0; await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "p", from: dAgo(5), to: dAgo(0), searchMode: "precise", molecules: ["P|aciclovir"] }));
   assert.ok(decodeURIComponent(ncbi.calls.join(" ").replace(/\+/g, " ")).includes('"acyclovir"[tiab]'), "an approved variant is searched");
 });
 
@@ -149,9 +150,9 @@ test("a scheduled range across a query-version change keeps each window's versio
   const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/import", { watch: "P|x", from: dAgo(30), to: dAgo(0), dateField: "pdat" }));
   const run = r.body; assert.ok(run.windows.some(w => w.queryVersion === 1) && run.windows.some(w => w.queryVersion === 2), JSON.stringify(run.windows.map(w => [w.from, w.queryVersion])));
   // "created or published" is one search with OR, so an article matching both is one PMID
-  const t2 = await makeEnv({ watches: [{ portfolio: "P", molecule: "x", query: '"x"[tiab]', names: [] }] });
+  const t2 = await makeEnv({ clients: [{ id: "p", name: "P" }], watches: [{ portfolio: "P", client: "p", molecule: "x", query: '"x"[tiab]', names: [] }] });
   const both = fakeNcbi([{ pmid: "50", date: dAgo(3) }]);
-  const x = (await withFetch(both.handler, () => t2.call(MANAGER, "/api/pull-client", { client: "none", from: dAgo(5), to: dAgo(0), dateField: "any" }))).body.results[0];
+  const x = (await withFetch(both.handler, () => t2.call(MANAGER, "/api/pull-client", { client: "p", from: dAgo(5), to: dAgo(0), dateField: "any" }))).body.results[0];
   assert.equal(x.withCitation, 1); assert.match(x.term, /\[crdt\]\) OR \(.*\[dp\]\)/);
 });
 

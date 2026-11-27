@@ -4,8 +4,71 @@ const day = () => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" })
 const json = (data, status = 200) => Response.json(data, { status, headers: { "Cache-Control":"no-store" } });
 async function load(env) {
   const object = await env.BUCKET.get(KEY);
-  return { object, state: object ? await object.json() : blank() };
+  return { object, state: migrateToClients(object ? await object.json() : blank()) };
 }
+// ---- Clients replace portfolios. A client is the only grouping: molecules belong to a client, people are given roles per client, queues and the Library are
+// grouped by client, then molecule. Internally the old "portfolio" field now always holds the client's name (or "No client"), so every rule keyed on it keeps working.
+// The migration runs once on old data (it is saved with the next change) and is idempotent:
+//   - a molecule moves to its client; molecules of a former portfolio without a client go to a client of the same name, created for them;
+//   - queue items, cases, pulls, roles, dictionaries and settings follow; two queue items for the same article that now fall in one client are merged,
+//     keeping the most advanced review and every molecule link.
+const NO_CLIENT = "No client";
+// A molecule is found by its client name, or by the portfolio name it had before clients replaced portfolios (old links and saved references keep working).
+const samePf = (w, p) => w.portfolio === p || (Boolean(p) && w.formerPortfolio === p);
+function migrateToClients(state) {
+  if (!state || state.schema?.grouping === "client") return state;
+  state.clients ||= []; state.watches ||= []; state.assignments ||= []; state.cases ||= []; state.runs ||= [];
+  const now = new Date().toISOString(), byName = n => state.clients.find(c => c.name.toLowerCase() === String(n).toLowerCase());
+  const stableId = name => { let h = 0; for (const ch of String(name).toLowerCase()) h = (h * 31 + ch.charCodeAt(0)) >>> 0; return "client-" + String(name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) + "-" + h.toString(36); };
+  const ensure = name => { if (!name || name === NO_CLIENT || name === "*") return null; let c = byName(name); if (!c) { c = { id:stableId(name), name:String(name).slice(0, 80), created:now, note:"Created from a former portfolio" }; state.clients.push(c); } return c; };
+  const exact = new Map(), first = new Map();
+  for (const w of state.watches) {
+    let c = w.client && state.clients.find(x => x.id === w.client);
+    if (!c && w.client !== null) { c = ensure(w.portfolio); if (c) w.client = c.id; }
+    const name = c ? c.name : NO_CLIENT, old = w.portfolio || "";
+    exact.set(old + "\u0000" + (w.molecule || ""), name); if (!first.has(old)) first.set(old, new Set()); first.get(old).add(name);
+    if (old !== name) { w.formerPortfolio = old; w.portfolio = name; }
+  }
+  const to = (pf, mol) => { const pfs = String(pf || ""); if (!pfs || pfs === "*") return pfs; const hit = exact.get(pfs + "\u0000" + (mol || "")); if (hit) return hit; const set = first.get(pfs); if (set && set.size) return set.has(pfs) ? pfs : [...set][0]; ensure(pfs); return pfs; };
+  const toAll = pf => { const set = first.get(String(pf || "")); if (set && set.size) return set.has(String(pf)) ? [String(pf)] : [...set]; if (!pf || pf === "*") return [pf]; ensure(pf); return [pf]; };
+  // queue items, merged per article and client
+  const rank = a => (a.status === "Complete" ? 8 : 0) + (a.qc ? 4 : 0) + (a.disposition ? 2 : 0) + (a.reviewer ? 1 : 0), kept = new Map(), merged = new Map();
+  for (const a of state.assignments) {
+    const name = to(a.portfolio, (a.molecules || [])[0] || ""); if (a.portfolio !== name) { a.formerPortfolio = a.portfolio; a.portfolio = name; }
+    const k = a.pmid + "\u0000" + name, other = kept.get(k);
+    if (!other) { kept.set(k, a); continue; }
+    const [main, gone] = rank(a) > rank(other) ? [a, other] : [other, a];
+    main.molecules = uniq([...(main.molecules || []), ...(gone.molecules || [])]); (main.mergedFrom ||= []).push(gone.id); merged.set(gone.id, main.id); kept.set(k, main);
+  }
+  state.assignments = [...kept.values()];
+  for (const c of state.cases) { const name = to(c.portfolio, c.molecule); if (c.portfolio !== name) { c.formerPortfolio = c.portfolio; c.portfolio = name; } if (c.provenance?.assignmentId && merged.has(c.provenance.assignmentId)) c.provenance.assignmentId = merged.get(c.provenance.assignmentId); }
+  for (const r of state.runs) { const name = to(r.portfolio, r.molecule); if (r.portfolio !== name) { r.formerPortfolio = r.portfolio; r.portfolio = name; } }
+  for (const t of state.deletedCases || []) t.portfolio = to(t.portfolio, t.molecule);
+  // roles per client
+  if (state.memberships) { const seen = new Set(), out = []; for (const m of state.memberships) for (const name of toAll(m.portfolio)) { const k = m.email + "|" + m.role + "|" + name; if (!seen.has(k)) { seen.add(k); out.push({ ...m, portfolio:name }); } } state.memberships = out; }
+  for (const p of state.profiles || []) if (p.portfolio && p.portfolio !== "*") p.portfolio = toAll(p.portfolio)[0];
+  if (state.dictionaries) { const out = {}; for (const [pf, d] of Object.entries(state.dictionaries)) for (const name of toAll(pf)) { const cur = out[name]; out[name] = cur ? { ...cur, products:[...(cur.products || []), ...(d.products || []).filter(p => !(cur.products || []).some(q => q.name === p.name))] } : d; } state.dictionaries = out; }
+  for (const k of ["syncActivePortfolios", "syncAiPortfolios"]) if (Array.isArray(state.settings?.[k])) state.settings[k] = uniq(state.settings[k].flatMap(toAll));
+  state.schema = { ...(state.schema || {}), grouping:"client", migratedAt:now };
+  return state;
+}
+// After any change to clients (rename, delete, a molecule moved), every grouping name is recomputed with the same rules, so nothing points at an old name.
+function regroup(data) { data.schema = { ...(data.schema || {}), grouping:"" }; migrateToClients(data); }
+// A group name typed in an older form (or a PMID list) becomes, or finds, a client of that name.
+function clientByName(data, name) { const n = String(name || "").trim().slice(0, 80); if (!n || n === NO_CLIENT) return null; data.clients ||= []; let c = data.clients.find(x => x.name.toLowerCase() === n.toLowerCase()); if (!c) { c = { id:crypto.randomUUID(), name:n, created:new Date().toISOString() }; data.clients.push(c); } return c; }
+// The client named in a request: by id, or by a typed name (an older form, a PMID list), which finds or creates that client.
+async function resolveGroup(env, state, body) {
+  const byId = body.client && (state.clients || []).find(c => c.id === body.client);
+  if (byId) return { name:byId.name, clientId:byId.id };
+  const typed = String(body.clientName || body.portfolio || "").trim().slice(0, 80);
+  if (!typed || typed === NO_CLIENT) return { name:NO_CLIENT, clientId:"" };
+  const existing = (state.clients || []).find(c => c.name.toLowerCase() === typed.toLowerCase());
+  if (existing) return { name:existing.name, clientId:existing.id };
+  const id = await write(env, data => clientByName(data, typed).id);
+  return { name:typed, clientId:id };
+}
+// The grouping name of a client id ("No client" when there is none).
+const clientGroup = (state, clientId) => (state.clients || []).find(c => c.id === clientId)?.name || NO_CLIENT;
 const writeQueues = new WeakMap();
 // Writers in one process line up instead of racing, so a busy moment cannot starve one of them; the compare-and-swap below still protects against other processes.
 function write(env, mutate) {
@@ -618,6 +681,7 @@ function commitWatch(data, watch, by, note = "query edited") {
   if (!old) versions.push({ version:1, query:watch.query, effectiveFrom:"0000-00-00", createdAt:at, by, note:"created" });
   else if (old.query !== watch.query) versions.push({ version:Math.max(...versions.map(v => v.version)) + 1, query:watch.query, effectiveFrom:day(), createdAt:at, by, note });
   watch.versions = versions; watch.id = old?.id || watch.id || crypto.randomUUID();
+  if (old) for (const k of Object.keys(old)) if (!(k in watch)) watch[k] = old[k];   // client, names, mode, filters, dates, owners and former name are kept
   data.watches = data.watches.filter(w => watchKey(w) !== watchKey(watch)); data.watches.push(watch);
 }
 async function esearchCount(env, query, from, to, dateField) {
@@ -1303,7 +1367,7 @@ async function automateCase(env, state, c, by, lease = null) {
   const revision = crypto.randomUUID();
   const saved = await write(env, d => { const x = d.cases.find(y => y.id === c.id); if (!writable(d,x) || x.locked || (lease && x.editRevision !== c.editRevision)) return false; const fresh = normalizeCase(x.data); applyCaseOps(fresh, ops); x.data = fresh; if (refBasis && !x.referenceBasis) x.referenceBasis = refBasis; x.updatedAt = at; x.editRevision = revision; return true; });
   if (!saved) return { at, steps };
-  if (cfg.ai === true && !(state.settings?.syncAiPortfolios || []).includes(c.portfolio)) note("ai", "AI data entry", false, "The portfolio " + c.portfolio + " is not allowed to use AI (Settings, Synchrony pilot portfolios)");
+  if (cfg.ai === true && !(state.settings?.syncAiPortfolios || []).includes(c.portfolio)) note("ai", "AI data entry", false, "The client " + c.portfolio + " is not allowed to use AI (Settings, Synchrony pilot portfolios)");
   else if (cfg.ai === true) {
     const fresh = (await load(env)).state, cur = fresh.cases.find(y => y.id === c.id), r = writable(fresh,cur) && (!lease || cur.editRevision === revision) ? await aiFillCase(env, fresh, cur, by, at, { abstractOnly:true }) : { error:"Case changed" };
     if (r.error) note("ai", "AI data entry", false, r.error);
@@ -2060,7 +2124,7 @@ function citationFile(articles, format, assignmentFor) {
     const authors = (a.authors || []).map(n => { const [last, ...rest] = oneLine(n).split(" "); return "AU  - " + last + (rest.length ? ", " + rest.join(" ") : ""); });
     return ["TY  - JOUR", "TI  - " + oneLine(a.title), ...authors, "JO  - " + oneLine(a.journal), "DB  - " + (a.source || "PubMed"), "PY  - " + year(a), "DA  - " + oneLine(a.date), "DO  - " + oneLine(a.doi), "AN  - PMID " + a.id,
       "AB  - " + oneLine(a.abstract), ...[...(a.keywords || []), ...(a.meshTerms || [])].map(k => "KW  - " + oneLine(k)), "UR  - " + a.url,
-      "N1  - " + oneLine("Portfolio: " + (item?.portfolio || "") + (item?.molecules?.length ? "; Molecules: " + item.molecules.join(", ") : "")), "ER  - "].filter(l => !/^[A-Z0-9]{2}  - $/.test(l) || l.startsWith("ER")).join("\r\n") + "\r\n";
+      "N1  - " + oneLine("Client: " + (item?.portfolio || "") + (item?.molecules?.length ? "; Molecules: " + item.molecules.join(", ") : "")), "ER  - "].filter(l => !/^[A-Z0-9]{2}  - $/.test(l) || l.startsWith("ER")).join("\r\n") + "\r\n";
   }).join("\r\n");
 }
 async function elink(env, params) {
@@ -2495,7 +2559,7 @@ async function exportPdf(env, state, viewer, manager, body) {
     if (fresh.screenshotKey) { const object = await env.BUCKET.get(fresh.screenshotKey); if (object) png = new Uint8Array(await object.arrayBuffer()); }
     const lines = ["Source: " + articleSource(article) + " · PMID " + id + " · " + [article.journal, article.date].filter(Boolean).join(" · "),
       "DOI: " + (article.doi || "-") + " · " + article.url,
-      "Portfolio: " + item.portfolio + ((item.molecules || []).filter(m => m !== item.portfolio).length ? " · Molecules: " + item.molecules.join(", ") : ""),
+      "Client: " + item.portfolio + ((item.molecules || []).filter(m => m !== item.portfolio).length ? " · Molecules: " + item.molecules.join(", ") : ""),
       "Reviewer: " + (item.reviewer || "Unassigned") + " · Status: " + item.status + (item.note ? " · Note: " + item.note : ""),
       "Retraction check: " + (article.retractionStatus || "Pending") + " · Access: " + (article.oaStatus || "Pending") + " · Full text: " + (article.fullTextStatus || "Pending") +
         (article.citedBy !== undefined ? " · Cited by: " + article.citedBy : "")];
@@ -4048,7 +4112,7 @@ function fhirBundle(rec, article) {
 }
 // Line listing: one row per case and event (the layout used for periodic reports and spreadsheets).
 const LINE_HEAD = ["Case", "PMID", "Status", "Assignee", "Due", "Country", "Age", "Age group", "Sex", "Suspect product", "Event (verbatim)", "PT", "PT code", "SOC", "Serious", "Onset", "Outcome", "Causality (WHO-UMC)", "Action taken", "Reference",
-  "Client", "Portfolio", "Stage", "Seriousness criteria", "Listedness", "LLT code", "Dechallenge", "Rechallenge", "Reporter", "Other authors", "Reporter comments", "Awareness date", "Clock (days)", "Clock due", "Clock status", "Citation", "DOI", "Investigations", "IRD", "Stage due"];
+  "Client", "Client", "Stage", "Seriousness criteria", "Listedness", "LLT code", "Dechallenge", "Rechallenge", "Reporter", "Other authors", "Reporter comments", "Awareness date", "Clock (days)", "Clock due", "Clock status", "Citation", "DOI", "Investigations", "IRD", "Stage due"];
 function lineListingRows(records, articles, state) {
   const rows = [];
   for (const r of records) {
@@ -5611,29 +5675,29 @@ async function apiCore(request, env, path) {
       if (!molecule) continue;
       // From Search & Pull a molecule that is already watched is reused wherever it lives (same client, or no client yet), and the new names are added to its search.
       if (body.reuse === true) { const ex = state.watches.find(w => String(w.molecule || "").toLowerCase() === molecule.toLowerCase() && (!body.client ? true : (w.client === body.client || !w.client)));
-        if (ex) { toUpdate.push({ key:watchKey(ex), synonyms }); results.push({ molecule:ex.molecule, portfolio:ex.portfolio, status:"exists", watch:keyOf(ex), client:body.client || ex.client || "" }); continue; } }
-      // Automatic portfolio: the drug class (an existing matching portfolio is reused), else the client's usual portfolio, the client's name, or "General".
-      let portfolio = String(body.portfolio || "").trim().slice(0, 100), auto = false, area = null;
-      if (!portfolio) { auto = true; area = await therapeuticArea(cfg, [molecule, ...synonyms]); if (area) portfolio = portfolioForArea(state, area.letter); }
-      if (!portfolio) { const counts = new Map(); for (const w of state.watches) if (body.client && w.client === body.client) counts.set(w.portfolio, (counts.get(w.portfolio) || 0) + 1);
-        portfolio = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || (state.clients || []).find(c => c.id === body.client)?.name?.slice(0, 100) || "General"; }
+        if (ex) { const moved = body.client && !ex.client, group = moved ? clientGroup(state, body.client) : ex.portfolio; toUpdate.push({ key:watchKey(ex), synonyms }); results.push({ molecule:ex.molecule, portfolio:group, status:"exists", watch:keyOf({ portfolio:group, molecule:ex.molecule }), client:body.client || ex.client || "" }); continue; } }
+
+      // The molecule belongs to its client: the client is its only grouping. The drug class is kept as information about the molecule, never as a group or a search term.
+      const portfolio = body.client ? clientGroup(state, body.client) : NO_CLIENT, auto = true, area = await therapeuticArea(cfg, [molecule, ...synonyms]).catch(() => null);
       const key = watchKey({ portfolio, molecule }), info = { molecule, portfolio, auto, classification:area ? { area:ATC_AREAS[area.letter], atc:area.atc || "", class:area.class || "", source:area.source } : null };
       if (state.watches.some(w => watchKey(w) === key) || seen.has(key)) { results.push({ ...info, status:"exists", error:molecule + " is already in " + portfolio + "." }); continue; }
       const custom = items.length === 1 && String(body.query || "").trim();
       const mode = (state.clients || []).find(c => c.id === body.client)?.searchMode;
       const query = custom || searchSpec(state, { molecule, names:synonyms, client:body.client || "", query:"" }, { filters:{ safety:body.safetyOnly === true } }).base;
       if (!query || query.length > 1500) { results.push({ ...info, status:"error", error:"The names could not be turned into a search. Shorten them." }); continue; }
-      seen.add(key); const watch = { portfolio, molecule, query, names:synonyms, ...(custom ? { customQuery:true } : {}) }; if (body.client) watch.client = String(body.client); if (owner) watch.owner = owner;
+      seen.add(key); const watch = { portfolio, molecule, query, names:synonyms, ...(custom ? { customQuery:true } : {}), ...(area ? { drugClass:{ area:ATC_AREAS[area.letter], atc:area.atc || "", class:area.class || "" } } : {}) }; if (body.client) watch.client = String(body.client); if (owner) watch.owner = owner;
       state.watches.push(watch); toSave.push({ watch, names:[molecule, ...synonyms] }); results.push({ ...info, status:"added", watch:keyOf(watch), client:body.client || "" });
     }
     if (!toSave.length && !toUpdate.length) { const first = results[0]; return json({ error:first ? first.error : "Enter the molecule name.", results }, first?.status === "exists" ? 409 : 400); }
     await write(env, data => {
+      let regrouped = false;
       for (const { watch } of toSave) { keepOwner(data, watch); commitWatch(data, watch, email, "molecule added"); }
       for (const { key, synonyms } of toUpdate) { const cur = data.watches.find(x => watchKey(x) === key); if (!cur) continue;
-        if (body.client && !cur.client) cur.client = String(body.client); if (owner) cur.owner = owner;
+        if (body.client && !cur.client) { cur.client = String(body.client); regrouped = true; } if (owner) cur.owner = owner;
         if (handQuery(cur) || !synonyms.length) continue;
         const merged = uniq([...ownNames(cur).slice(1), ...synonyms]), next = { ...cur, names:merged }, broadStyle = (data.clients || []).find(c => c.id === cur.client)?.searchMode === "broad", q = styledQuery(next, broadStyle, String(cur.query || "").includes(safetyFilter));
         if (q && q !== cur.query) commitWatch(data, { ...next, query:q }, email, "names added from Search & Pull"); else cur.names = merged; }
+      if (regrouped) regroup(data);
     });
     if (!toSave.length) return json({ ok:true, added:0, updated:toUpdate.length, results, portfolio:results[0].portfolio, molecule:results[0].molecule });
     for (const { watch, names } of toSave) await audit(env, { by:email, action:"molecule.added", target:watch.portfolio + " · " + watch.molecule, detail:{ client:body.client || "", names:names.slice(0, 20).join(", ") } });
@@ -5655,7 +5719,7 @@ async function apiCore(request, env, path) {
     }
     if (path === "/api/watch-config") {
       const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
-      const out = await write(env, d => { const w = d.watches.find(x => x.portfolio === portfolio && (x.molecule || "") === molecule); if (!w) return null;
+      const out = await write(env, d => { const w = d.watches.find(x => samePf(x, portfolio) && (x.molecule || "") === molecule); if (!w) return null;
         const ok = (e, role) => !e || d.profiles.some(p => p.email === e && p.active);
         for (const [k, f] of [["owner", "screener"], ["qcOwner", "qc"], ["medicalOwner", "medical"]]) if (f in body) { if (!ok(body[f])) return "person"; w[k] = String(body[f] || ""); }
         if ("priority" in body) w.priority = ["high", "normal", "low"].includes(body.priority) ? body.priority : "normal";
@@ -5707,7 +5771,7 @@ async function apiCore(request, env, path) {
   if (path === "/api/sources-add" && viewer) {
     // Results found in other sources become articles in the queue: one article per record, one assignment per portfolio, nothing duplicated. A person adds to their own queue in their own portfolios; a manager's go through normal routing.
     const portfolio = String(body.portfolio || "").trim().slice(0, 100), molecule = String(body.molecule || "").trim().slice(0, 100), recs = (Array.isArray(body.records) ? body.records : []).slice(0, 100), allowed = myPortfolios(state, viewer);
-    if (!portfolio || !(viewer.role === "manager" ? true : allowed.includes(portfolio))) return json({ error:"Choose one of your own portfolios." }, 403);
+    if (!portfolio || !(viewer.role === "manager" ? true : allowed.includes(portfolio))) return json({ error:"Choose one of your own clients." }, 403);
     if (!recs.length) return json({ error:"Choose at least one result." }, 400);
     const LABEL = { pubmed:"PubMed", pmc:"PubMed Central", europepmc:"Europe PMC", openalex:"OpenAlex", crossref:"Crossref", doaj:"DOAJ", core:"CORE", clinicaltrials:"ClinicalTrials.gov", mhra:"MHRA", fdarecall:"FDA" }, at = new Date().toISOString(), added = [], skipped = [], ime = await loadIme(env), made = [];
     for (const r of recs) {
@@ -5737,7 +5801,7 @@ async function apiCore(request, env, path) {
     // translation of that search, any PubMed warnings, the PubMed-default and Precise counts side by side, the count with no date limit, and what is stored and linked here.
     // Anyone may compare; people who are not managers see only the molecules in their own portfolios.
     const mineOnly = viewer.role !== "manager" && viewer.canManageClients !== true, mine = myPortfolios(state, viewer), only = new Set((Array.isArray(body.molecules) ? body.molecules : []).map(String));
-    const clientId = String(body.client || ""), list = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule && (!mineOnly || mine.includes(w.portfolio)) && (!only.size || only.has(encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || "")))).slice(0, 25);
+    const clientId = String(body.client || ""), list = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule && (!mineOnly || mine.includes(w.portfolio)) && (!only.size || (only.has(encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || "")) || (w.formerPortfolio && only.has(encodeURIComponent(w.formerPortfolio) + "|" + encodeURIComponent(w.molecule || "")))))).slice(0, 25);
     if (!list.length) return json({ error:"This client has no molecules." }, 400);
     const allDates = body.allDates === true || (!body.from && !body.to), basis = basisOf(body.dateField), from = isDate(body.from) ? body.from : addDays(day(), -30), to = isDate(body.to) ? body.to : day(), cfg = withSettings(env, state), rows = [];
     const filters = { humans:body.humans === true, caseReports:body.caseReports === true, english:body.english === true, noReviews:body.noReviews === true }, termOf = q => allDates ? q : searchTerm(q, from, to, basis);
@@ -5771,7 +5835,7 @@ async function apiCore(request, env, path) {
     const ids = (Array.isArray(body.runIds) ? body.runIds : [body.runId]).map(String).filter(Boolean).slice(0, 60), runs = state.runs.filter(r => ids.includes(r.id));
     if (!runs.length) return json({ error:"Choose at least one pull." }, 400);
     if (viewer.role !== "manager" && runs.some(r => r.snapshot?.by !== email && !myPortfolios(state, viewer).includes(r.portfolio))) return json({ error:"Not your pull." }, 403);
-    const q = v => '"' + String(v ?? "").replace(/"/g, '""') + '"', rows = [["Client", "Molecule", "Portfolio", "Watch", "Run", "Run started", "PMID", "Match status", "Citation status", "Linked to molecule", "Full text", "Reason", "Search mode", "Date basis", "From", "To", "Query version", "Executed term"].map(q).join(",")];
+    const q = v => '"' + String(v ?? "").replace(/"/g, '""') + '"', rows = [["Client", "Molecule", "Client", "Watch", "Run", "Run started", "PMID", "Match status", "Citation status", "Linked to molecule", "Full text", "Reason", "Search mode", "Date basis", "From", "To", "Query version", "Executed term"].map(q).join(",")];
     for (const run of runs) {
       let sets = null; try { const o = await env.BUCKET.get("runs/" + run.id + "/recon.json"); if (o) sets = JSON.parse(await o.text()); } catch { /* recomputed below */ }
       if (!sets) sets = (await reconcileRun(withSettings(env, state), run.id, { fill:false }))?.sets;
@@ -5790,8 +5854,12 @@ async function apiCore(request, env, path) {
     // Pull with an exact PubMed expression (or one built from authors and Title/Abstract topics), through the same engine: date windows, retries, the run snapshot,
     // and the PMID-by-PMID reconciliation. A manager pulls into any portfolio (a new name creates it); everyone else into a portfolio they work in, into their own queue.
     const valid = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
-    const isMgr = viewer.role === "manager", allowed = myPortfolios(state, viewer), portfolio = String(body.portfolio || "").trim().slice(0, 100), label = String(body.label || "").trim().slice(0, 100) || "PubMed query";
-    if (!portfolio || (!isMgr && !allowed.includes(portfolio))) return json({ error:isMgr ? "Choose or type a portfolio." : "Choose one of your own portfolios." }, 400);
+    const isMgr = viewer.role === "manager", allowed = myPortfolios(state, viewer), label = String(body.label || "").trim().slice(0, 100) || "PubMed query";
+    const typedClient = body.client || String(body.portfolio || body.clientName || "").trim();
+    if (!typedClient) return json({ error:"Choose a client." }, 400);
+    const known = (state.clients || []).find(c => c.id === body.client || c.name.toLowerCase() === String(body.portfolio || body.clientName || "").trim().toLowerCase());
+    if (!isMgr && !(known && allowed.includes(known.name))) return json({ error:"Choose one of your own clients." }, 400);
+    const portfolio = (await resolveGroup(env, state, body)).name;
     const raw = String(body.query || "").trim() || buildAuthorTopicQuery(body.authors, body.topics);
     if (!raw) return json({ error:"Type a PubMed query, or authors and topics." }, 400);
     if (raw.length > 4000) return json({ error:"The query is longer than 4,000 characters." }, 400);
@@ -5842,7 +5910,7 @@ async function apiCore(request, env, path) {
       const a = state.articles[id]; if (!a || seen.has(run.molecule + "|" + id)) continue; seen.add(run.molecule + "|" + id);
       rows.push([id, a.title || "", a.abstract || "", (a.authors || []).join(", "), a.journal || "", (a.meshTerms || []).join(", "), "https://pubmed.ncbi.nlm.nih.gov/" + id + "/", (a.affiliations || (a.affiliation ? [a.affiliation] : [])).join("; "), run.molecule || "", run.portfolio || "", a.date || "", a.doi || ""]);
     }
-    const book = xlsxFile("PubMed results", ["PMID", "Title", "Abstract", "Authors", "Journal", "Keywords", "URL", "Affiliations", "Molecule", "Portfolio", "Publication date", "DOI"], rows);
+    const book = xlsxFile("PubMed results", ["PMID", "Title", "Abstract", "Authors", "Journal", "Keywords", "URL", "Affiliations", "Molecule", "Client", "Publication date", "DOI"], rows);
     await audit(env, { by:email, action:"export.xlsx", target:runs.length + " pull" + (runs.length === 1 ? "" : "s"), detail:{ articles:rows.length } });
     return new Response(book, { headers:{ "Content-Type":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Content-Disposition":'attachment; filename="literasift-pubmed-results-' + day() + '.xlsx"' } });
   }
@@ -5886,8 +5954,8 @@ async function apiCore(request, env, path) {
       if ((Date.parse(body.to) - Date.parse(body.from)) / 864e5 > 366) return json({ error:"Pull one year at a time or less, or pull without dates." }, 400);
     }
     const only = new Set((Array.isArray(body.molecules) ? body.molecules : []).map(String));
-    let watches = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule && (isMgr || allowed.includes(w.portfolio)) && (!only.size || only.has(encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || ""))));
-    if (!watches.length) return json({ error:isMgr ? "This client has no molecules yet. Add one on the Clients page." : "This client has no molecules in your portfolios." }, 400);
+    let watches = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule && (isMgr || allowed.includes(w.portfolio)) && (!only.size || (only.has(encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || "")) || (w.formerPortfolio && only.has(encodeURIComponent(w.formerPortfolio) + "|" + encodeURIComponent(w.molecule || ""))))));
+    if (!watches.length) return json({ error:isMgr ? "This client has no molecules yet. Add one on the Clients page." : "This client has no molecules that you work on." }, 400);
     if (watches.length > 25) return json({ error:"A client pull covers up to 25 molecules at a time. Choose fewer." }, 400);
     let jobHook = null; const results = new Array(watches.length), progress = watches.map(w => ({ molecule:w.molecule, portfolio:w.portfolio, stage:"waiting", runId:"" })), work = async () => {
     const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
@@ -5957,7 +6025,7 @@ async function apiCore(request, env, path) {
     // Uses the selected date field, or all dates if the range is blank.
     const valid = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
     const molecule = String(body.molecule || "").trim().slice(0, 100), synonyms = String(body.synonyms || "").split(/[,;\n]/).map(x => x.trim()).filter(Boolean), portfolio = String(body.portfolio || "").trim().slice(0, 100), allowed = myPortfolios(state, viewer);
-    if (!portfolio || !allowed.includes(portfolio)) return json({ error:"Choose one of your own portfolios" + (allowed.length ? " (" + allowed.join(", ") + ")." : ". You have none yet; ask a manager.") }, 403);
+    if (!portfolio || !allowed.includes(portfolio)) return json({ error:"Choose one of your own clients" + (allowed.length ? " (" + allowed.join(", ") + ")." : ". You have none yet; ask a manager.") }, 403);
     if (!molecule) return json({ error:"Enter a molecule name." }, 400);
     const allDates = body.allDates === true || (!body.from && !body.to), field = requestedDateField(body);
     if (allDates) { body.from = "1900-01-01"; body.to = day(); }
@@ -6005,10 +6073,10 @@ async function apiCore(request, env, path) {
   if (path === "/api/portfolio-change" && viewer) {
     // A manager moves articles, cases or a whole molecule watchlist to another portfolio. Holders who have no role in the new portfolio are replaced by the usual routing; nothing is duplicated.
     if (viewer.role !== "manager") return json({ error:"Manager access required." }, 403);
-    const to = String(body.to || "").trim().slice(0, 100), kind = ["assignment", "case", "watch"].includes(body.kind) ? body.kind : ""; if (!to || !kind) return json({ error:"Choose what to move and the new portfolio." }, 400);
+    const to = String(body.to || "").trim().slice(0, 100), kind = ["assignment", "case", "watch"].includes(body.kind) ? body.kind : ""; if (!to || !kind) return json({ error:"Choose what to move and the new client." }, 400);
     const ids = (Array.isArray(body.ids) ? body.ids : []).map(String).slice(0, 300), at = new Date().toISOString(), moved = [], skipped = [];
     const eligible = (d, e, pf) => { const p = d.profiles.find(x => x.email === e && x.active); return Boolean(p) && (p.role === "manager" || rolesIn(d, e, pf).size > 0); };
-    const note = (rec, from) => (rec.history ||= []).push({ at, by:email, status:rec.status, action:"Portfolio changed from " + from + " to " + to, note:"Portfolio changed from " + from + " to " + to });
+    const note = (rec, from) => (rec.history ||= []).push({ at, by:email, status:rec.status, action:"Client changed from " + from + " to " + to, note:"Client changed from " + from + " to " + to });
     const moveAssignment = (d, a) => {
       const from = a.portfolio; if (from === to) return;
       if (d.assignments.some(x => x !== a && x.pmid === a.pmid && x.portfolio === to)) { skipped.push({ id:a.id, reason:"This article is already in " + to }); return; }
@@ -6025,17 +6093,17 @@ async function apiCore(request, env, path) {
     };
     const out = await write(env, d => {
       if (kind === "assignment") for (const id of ids) { const a = d.assignments.find(x => x.id === id); if (a) moveAssignment(d, a); }
-      else if (kind === "case") for (const id of ids) { const c = d.cases.find(x => x.id === id); if (c && !c.locked) moveCase(d, c); else if (c) skipped.push({ id, reason:"A signed case cannot change portfolio" }); }
+      else if (kind === "case") for (const id of ids) { const c = d.cases.find(x => x.id === id); if (c && !c.locked) moveCase(d, c); else if (c) skipped.push({ id, reason:"A signed case cannot change client" }); }
       else {
-        const [pf, mol = ""] = String(body.watch || "").split("|").map(decodeURIComponent), w = d.watches.find(x => x.portfolio === pf && (x.molecule || "") === mol); if (!w) return "missing";
-        if (pf === to) return "same"; if (d.watches.some(x => x.portfolio === to && (x.molecule || "") === mol)) return "exists";
+        const [pf, mol = ""] = String(body.watch || "").split("|").map(decodeURIComponent), w = d.watches.find(x => samePf(x, pf) && (x.molecule || "") === mol); if (!w) return "missing";
+        if (w.portfolio === to) return "same"; if (d.watches.some(x => x.portfolio === to && (x.molecule || "") === mol)) return "exists";
         for (const a of d.assignments) if (a.portfolio === pf && (!mol || (a.molecules || []).includes(mol))) moveAssignment(d, a);
         for (const c of d.cases || []) if (c.portfolio === pf && (!mol || c.molecule === mol) && !c.locked) moveCase(d, c, true);
-        w.portfolio = to; moved.push("watch");
+        w.portfolio = to; const target = clientByName(d, to); w.client = target ? target.id : null; moved.push("watch");   // moving a molecule means moving it to another client
       }
       return "ok";
     });
-    if (out === "missing") return json({ error:"Watchlist not found." }, 404); if (out === "same") return json({ error:"It is already in that portfolio." }, 400); if (out === "exists") return json({ error:"That portfolio already has a watchlist for this molecule." }, 409);
+    if (out === "missing") return json({ error:"Watchlist not found." }, 404); if (out === "same") return json({ error:"It is already in that client." }, 400); if (out === "exists") return json({ error:"That client already has a watchlist for this molecule." }, 409);
     await audit(env, { by:email, action:"portfolio.changed", entityType:kind === "case" ? "Case" : kind === "watch" ? "Watchlist" : "Assignment", entityId:kind === "watch" ? String(body.watch) : moved.length + " item(s)", detail:{ to, moved:moved.length, skipped:skipped.length } });
     return json({ ok:true, moved:moved.length, skipped });
   }
@@ -6081,7 +6149,7 @@ async function apiCore(request, env, path) {
   if (path === "/api/synchrony-import" && viewer) {
     // A document goes straight into Synchrony: a Discover result, a PDF or XML, or pasted OCR text. It becomes an article, a "potential ICSR" assignment in the chosen portfolio, stored full text, and a prepared draft.
     const portfolio = String(body.portfolio || "").trim().slice(0, 100), molecule = String(body.molecule || "").trim().slice(0, 100), rec = body.record && typeof body.record === "object" ? body.record : {};
-    if (!portfolio) return json({ error:"Choose a portfolio." }, 400);
+    if (!portfolio) return json({ error:"Choose a client." }, 400);
     const title = String(body.title || rec.title || "").trim().slice(0, 300), doi = String(body.doi || rec.doi || "").trim().slice(0, 200), pmid = String(body.pmid || rec.pmid || "").replace(/\D/g, "").slice(0, 12);
     const hasDoc = Boolean(body.base64) || String(body.text || "").trim().length >= 200;
     if (!title && !pmid && !hasDoc) return json({ error:"Give a title or PMID, or add the document text." }, 400);
@@ -6142,7 +6210,7 @@ async function apiCore(request, env, path) {
     if (!manager) return json({ error:"Manager access required." }, 403);
     if (path === "/api/dictionary-from-kb") {
       const portfolio = String(body.portfolio || "").trim(), names = (Array.isArray(body.names) ? body.names : []).map(x => String(x).trim()).filter(Boolean).slice(0, 50);
-      if (!portfolio || !names.length) return json({ error:"Choose a portfolio and at least one drug name." }, 400);
+      if (!portfolio || !names.length) return json({ error:"Choose a client and at least one drug name." }, 400);
       const products = [], missing = [];
       for (const n of names) { const hit = kbLookup(kb, n); if (!hit) { missing.push(n); continue; } products.push({ name:hit.name, generics:[hit.name], brands:hit.brands.slice(0, 60), salts:hit.salts.slice(0, 30), aliases:hit.synonyms.slice(0, 30) }); }
       if (!products.length) return json({ error:"None of those names is in the drug name list yet. Pull them first.", missing }, 404);
@@ -6521,7 +6589,7 @@ async function apiCore(request, env, path) {
     if (target === undefined && status === undefined) return json({ error:"Choose a person or a status to route to." }, 400);
     if (target && !state.profiles.some(p => p.email === target && p.active)) return json({ error:"Choose an active team member." }, 400);
     if (status !== undefined && !caseStatuses.includes(status)) return json({ error:"Unknown status." }, 400);
-    if (picked.some(c => !(isPortfolioManager(state, viewer, c.portfolio) || rolesIn(state, email, c.portfolio).has("medical_reviewer")))) return json({ error:"Only a manager or medical reviewer of the portfolio can route cases." }, 403);
+    if (picked.some(c => !(isPortfolioManager(state, viewer, c.portfolio) || rolesIn(state, email, c.portfolio).has("medical_reviewer")))) return json({ error:"Only a manager or medical reviewer of the client can route cases." }, 403);
     const moved = [];
     await write(env, data => { for (const id of ids) { const c = (data.cases || []).find(x => x.id === id); if (!c || !picked.some(p => p.id === id)) continue;
       const parts = []; if (target !== undefined && (c.assignee || "") !== target) { c.assignee = target || undefined; c.assignedAt = target ? at : undefined; parts.push("assigned to " + (target || "nobody")); }
@@ -6533,7 +6601,7 @@ async function apiCore(request, env, path) {
   }
   if (["/api/disposition", "/api/qc-decision", "/api/reassign", "/api/membership-save", "/api/extract", "/api/extraction-decide", "/api/patient-passage", "/api/allocate-bulk"].includes(path) && viewer) {
     const today = day(), at = new Date().toISOString();
-    const EXCLUSION_REASONS = ["No individual patient (aggregate or study data only)", "No adverse event", "No suspect product", "Not a drug safety report (review, background, or editorial)", "Duplicate of another record", "Outside the portfolio scope", "Other (explain in the note)"];
+    const EXCLUSION_REASONS = ["No individual patient (aggregate or study data only)", "No adverse event", "No suspect product", "Not a drug safety report (review, background, or editorial)", "Duplicate of another record", "Outside the client scope", "Other (explain in the note)"];
     if (path === "/api/membership-save") {
       if (!manager) return json({ error:"Manager access required." }, 403);
       const target = String(body.email || "").trim().toLowerCase(), portfolio = String(body.portfolio || "*").trim() || "*", role = String(body.role || "");
@@ -6547,7 +6615,7 @@ async function apiCore(request, env, path) {
       const ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), reason = String(body.reason || "").trim();
       const wanted = path === "/api/allocate-bulk" ? state.assignments.filter(a => !a.reviewer && (!body.portfolio || a.portfolio === body.portfolio)) : state.assignments.filter(a => ids.has(a.id));
       if (!wanted.length) return json({ error:"Nothing to allocate." }, 400);
-      if (wanted.some(a => !isPortfolioManager(state, viewer, a.portfolio))) return json({ error:"Manager access required for this portfolio." }, 403);
+      if (wanted.some(a => !isPortfolioManager(state, viewer, a.portfolio))) return json({ error:"Manager access required for this client." }, 403);
       if (path === "/api/reassign") {
         const to = String(body.to || "").trim().toLowerCase();
         if (reason.length < 5) return json({ error:"Give a reason of at least 5 characters for the reassignment." }, 400);
@@ -7313,7 +7381,8 @@ async function apiCore(request, env, path) {
       data.clients ||= [];
       let c = id && data.clients.find(x => x.id === id);
       if (!c) { c = { id:crypto.randomUUID(), created:new Date().toISOString() }; data.clients.push(c); }
-      c.name = name; c.contact = String(body.contact || "").trim().slice(0, 120); c.note = String(body.note || "").trim().slice(0, 400);
+      const renamed = c.name && c.name !== name; c.name = name; c.contact = String(body.contact || "").trim().slice(0, 120); c.note = String(body.note || "").trim().slice(0, 400);
+      if (renamed) regroup(data);
       return c.id;
     });
     return json({ ok:true, id:saved });
@@ -7321,14 +7390,14 @@ async function apiCore(request, env, path) {
   if (path === "/api/client-delete") {
     const id = String(body.id || "");
     if (!(state.clients || []).some(c => c.id === id)) return json({error:"Client not found."},404);
-    await write(env, data => { data.clients = data.clients.filter(c => c.id !== id); data.watches.forEach(w => { if (w.client === id) delete w.client; }); });
+    await write(env, data => { data.clients = data.clients.filter(c => c.id !== id); data.watches.forEach(w => { if (w.client === id) w.client = null; }); regroup(data); });
     return json({ ok:true });
   }
   if (path === "/api/client-assign") {
     const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent), client = String(body.client || "");
-    if (!state.watches.some(w => w.portfolio === portfolio && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
+    if (!state.watches.some(w => samePf(w, portfolio) && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
     if (client && !(state.clients || []).some(c => c.id === client)) return json({error:"Choose a client."},400);
-    await write(env, data => { const w = data.watches.find(x => x.portfolio === portfolio && (x.molecule || "") === molecule); if (client) w.client = client; else delete w.client; });
+    await write(env, data => { const w = data.watches.find(x => samePf(x, portfolio) && (x.molecule || "") === molecule); w.client = client || null; regroup(data); });
     return json({ ok:true });
   }
   }
@@ -7374,9 +7443,9 @@ async function apiCore(request, env, path) {
   }
   if (path === "/api/watch-auto") {
     const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
-    if (!state.watches.some(w => w.portfolio === portfolio && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
+    if (!state.watches.some(w => samePf(w, portfolio) && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
     for (const k of ["startFrom", "until"]) if (k in body && String(body[k] || "").trim() && !isDate(String(body[k]).trim())) return json({ error:"Enter the date as a calendar date." }, 400);
-    await write(env, data => { const w = data.watches.find(x => x.portfolio === portfolio && (x.molecule || "") === molecule);
+    await write(env, data => { const w = data.watches.find(x => samePf(x, portfolio) && (x.molecule || "") === molecule);
       if ("on" in body) { if (body.on === false) w.auto = false; else delete w.auto; }
       for (const k of ["startFrom", "until"]) if (k in body) { const v = String(body[k] || "").trim(); if (v) w[k] = v; else delete w[k]; }
       // The other names the molecule is searched by; its search is rebuilt from them (a new query version from today).
@@ -7489,7 +7558,7 @@ async function apiCore(request, env, path) {
   }
   if (path === "/api/rank-list" || path === "/api/assign-ranges") {
     const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(v => { try { return decodeURIComponent(v); } catch { return v; } });
-    if (!state.watches.some(w => w.portfolio === portfolio && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
+    if (!state.watches.some(w => samePf(w, portfolio) && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
     const order = ["relevance", "newest", "oldest"].includes(body.order) ? body.order : "relevance", pool = body.pool === "unassigned" ? "unassigned" : "open";
     if (path === "/api/rank-list") {
       const ranked = rankedList(state, portfolio, molecule, order, pool);
@@ -7514,9 +7583,9 @@ async function apiCore(request, env, path) {
   }
   if (path === "/api/delete-watch") {
     const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
-    if (!state.watches.some(w => w.portfolio === portfolio && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
+    if (!state.watches.some(w => samePf(w, portfolio) && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
     // Only the watchlist stops; imported articles, assignments, files and past pulls are kept.
-    await write(env, data => { data.watches = data.watches.filter(w => !(w.portfolio === portfolio && (w.molecule || "") === molecule)); });
+    await write(env, data => { data.watches = data.watches.filter(w => !(samePf(w, portfolio) && (w.molecule || "") === molecule)); });
     return json({ ok:true });
   }
   if (path === "/api/suggest-synonyms") return json(await suggestSynonyms(body.name));
@@ -7527,10 +7596,10 @@ async function apiCore(request, env, path) {
   if (path === "/api/assign-molecule") {
     const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
     const owner = String(body.owner || "").trim().toLowerCase();
-    if (!state.watches.some(w => w.portfolio === portfolio && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
+    if (!state.watches.some(w => samePf(w, portfolio) && (w.molecule || "") === molecule)) return json({error:"Choose a saved watchlist."},400);
     if (owner && !state.profiles.some(p => p.email === owner && p.active)) return json({error:"Choose an active team member."},400);
     const moved = await write(env, data => {
-      const watch = data.watches.find(w => w.portfolio === portfolio && (w.molecule || "") === molecule);
+      const watch = data.watches.find(w => samePf(w, portfolio) && (w.molecule || "") === molecule);
       if (owner) watch.owner = owner; else delete watch.owner;
       let count = 0;
       for (const a of data.assignments) {
@@ -7567,7 +7636,7 @@ async function apiCore(request, env, path) {
     });
   } else if (path === "/api/dictionary-save") {
     const portfolio = String(body.portfolio || "").trim().slice(0, 100);
-    if (!portfolio || !Array.isArray(body.products) || body.products.length > 300) return json({ error:"Enter a portfolio and up to 300 products." }, 400);
+    if (!portfolio || !Array.isArray(body.products) || body.products.length > 300) return json({ error:"Enter a client and up to 300 products." }, 400);
     const products = body.products.map(p => ({ name:String(p?.name || "").trim().slice(0, 100), generics:splitNames(p?.generics), brands:splitNames(p?.brands), salts:splitNames(p?.salts), aliases:splitNames(p?.aliases) })).filter(p => p.name);
     if (!products.length) return json({ error:"Each product needs a name." }, 400);
     const seen = new Map();
@@ -7577,7 +7646,7 @@ async function apiCore(request, env, path) {
     return json({ ok:true, version:saved.version });
   } else if (path === "/api/watch-preview" || path === "/api/watch-version") {
     const portfolio = String(body.portfolio || "").trim(), molecule = String(body.molecule || "").trim();
-    const watch = state.watches.find(w => w.portfolio === portfolio && (w.molecule || "") === molecule);
+    const watch = state.watches.find(w => samePf(w, portfolio) && (w.molecule || "") === molecule);
     const entry = dictionaryFor(state, portfolio, molecule), names = body.useDictionary !== false && entry ? dictNames(entry) : [molecule, ...splitNames(body.synonyms)].filter(Boolean);
     const proposed = String(body.query || "").trim() || (names.length ? buildQuery(names, body.safetyOnly === true) : "");
     if (!portfolio || !proposed || proposed.length > 1500) return json({ error:"Enter a portfolio and a molecule or a query (up to 1,500 characters)." }, 400);
@@ -7609,14 +7678,16 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"import.resumed", target:run.portfolio + (run.molecule ? " · " + run.molecule : ""), detail:{ run:run.id, coverage:resumed.coverage, gaps:resumed.gaps.length } });
     return json(resumed);
   } else if (path === "/api/watch") {
-    const watch = { portfolio:String(body.portfolio || "").trim(), molecule:String(body.molecule || "").trim().slice(0,100), query:String(body.query || "").trim() };
-    if (body.client && (state.clients || []).some(c => c.id === body.client)) watch.client = body.client;
-    if (!watch.portfolio || !watch.query || watch.query.length > 1500) return json({error:"Enter a portfolio and a PubMed query."},400);
+    if (!String(body.query || "").trim() || String(body.query).length > 1500) return json({error:"Enter a client and a PubMed query."},400);
+    // Editing a molecule's saved search keeps the molecule with its client; a new molecule goes to the client named (or typed).
+    const existing = !body.client && state.watches.find(w => samePf(w, String(body.portfolio || "").trim()) && (w.molecule || "") === String(body.molecule || "").trim());
+    const g = existing ? { name:existing.portfolio, clientId:existing.client || "" } : await resolveGroup(env, state, body);
+    const watch = { portfolio:g.name, molecule:String(body.molecule || "").trim().slice(0,100), query:String(body.query || "").trim(), customQuery:String(body.query || "").trim(), ...(g.clientId ? { client:g.clientId } : {}) };
     await write(env, data => { keepOwner(data, watch); commitWatch(data, watch, email); });
     await audit(env, { by:email, action:"watch.save", target:watch.portfolio + (watch.molecule ? " · " + watch.molecule : ""), detail:{ version:watch.versions.at(-1).version } });
   } else if (path === "/api/watches") {
-    const portfolio = String(body.portfolio || "").trim();
-    if (!portfolio || !Array.isArray(body.rows) || !body.rows.length || body.rows.length > 500) return json({error:"Enter a portfolio and 1 to 500 molecules."},400);
+    if (!Array.isArray(body.rows) || !body.rows.length || body.rows.length > 500) return json({error:"Enter 1 to 500 molecules."},400);
+    const g = await resolveGroup(env, state, body), portfolio = g.name;
     const created = [], skipped = [];
     const bulkOwner = String(body.owner || "").trim().toLowerCase();
     if (bulkOwner && !state.profiles.some(p => p.email === bulkOwner && p.active)) return json({error:"Choose an active team member."},400);
@@ -7624,7 +7695,7 @@ async function apiCore(request, env, path) {
       const given = splitNames(Array.isArray(row?.synonyms) ? row.synonyms : []), names = [row?.molecule, ...given].filter(Boolean);
       const molecule = String(row?.molecule || "").trim().slice(0,100);
       const query = molecule && buildQuery(names, body.safetyOnly === true);
-      if (query) created.push({ portfolio, molecule, query, names:given, ...(bulkOwner ? { owner:bulkOwner } : {}), ...(body.client && (state.clients || []).some(c => c.id === body.client) ? { client:body.client } : {}) }); else skipped.push(molecule || "(blank)");
+      if (query) created.push({ portfolio, molecule, query, names:given, ...(bulkOwner ? { owner:bulkOwner } : {}), ...(g.clientId ? { client:g.clientId } : {}) }); else skipped.push(molecule || "(blank)");
     }
     await write(env, data => {
       created.forEach(w => { keepOwner(data, w); commitWatch(data, w, email); });
@@ -7636,9 +7707,9 @@ async function apiCore(request, env, path) {
       !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0,10) === value;
     const molecule = String(body.molecule || "").trim().slice(0,100);
     const synonyms = String(body.synonyms || "").split(/[,;\n]/).map(x => x.trim()).filter(Boolean);
-    const portfolio = String(body.portfolio || "").trim().slice(0,100) || molecule;
     let query = molecule && buildQuery([molecule, ...synonyms], body.safetyOnly === true);
     if (!query) return json({error:"Enter a molecule name (up to 30 names, 100 characters each)."},400);
+    const g = await resolveGroup(env, state, body), portfolio = g.name;
     // Optional PubMed filters, written in PubMed's own field syntax.
     const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
     if (narrow.length || body.noReviews === true) query = "(" + query + ")" + narrow.map(f => " AND " + f).join("") + (body.noReviews === true ? " NOT review[pt]" : "");
@@ -7648,7 +7719,7 @@ async function apiCore(request, env, path) {
     }
     const owner = String(body.owner || "").trim().toLowerCase();
     if (owner && !state.profiles.some(p => p.email === owner && p.active)) return json({error:"Choose an active team member."},400);
-    const clientId = (state.clients || []).some(c => c.id === body.client) ? String(body.client) : "";
+    const clientId = g.clientId;
     const watch = { portfolio, molecule, query, names:splitNames(synonyms), ...(owner ? { owner } : {}), ...(clientId ? { client:clientId } : {}) };
     await write(env, data => { keepOwner(data, watch); commitWatch(data, watch, email); });
     const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField, force:true, budget:600 });
@@ -7656,26 +7727,28 @@ async function apiCore(request, env, path) {
     return json(run);
   } else if (path === "/api/social-add") {
     const posts = String(body.text || "").split(/\r?\n\s*-{3,}\s*\r?\n/).map(t => t.trim()).filter(t => t.length >= 20).slice(0, 50).map(text => ({ text:text.slice(0, 6000), url:String(body.url || "").trim(), postedAt:/^\d{4}-\d{2}-\d{2}$/.test(body.postedAt || "") ? body.postedAt : "" }));
-    const portfolio = String(body.portfolio || "").trim().slice(0, 80), molecule = String(body.molecule || "").trim().slice(0, 100), platform = ["Reddit", "X (Twitter)", "Facebook", "Patient forum", "Other"].includes(body.platform) ? body.platform : "Other";
+    const molecule = String(body.molecule || "").trim().slice(0, 100), platform = ["Reddit", "X (Twitter)", "Facebook", "Patient forum", "Other"].includes(body.platform) ? body.platform : "Other";
     if (!posts.length) return json({ error:"Paste at least one post (20 or more characters). Separate several posts with a line of three dashes." }, 400);
-    if (!portfolio) return json({ error:"Choose or type a portfolio." }, 400);
+    if (!body.client && !String(body.portfolio || body.clientName || "").trim()) return json({ error:"Choose or type a client." }, 400);
+    const portfolio = (await resolveGroup(env, state, body)).name;
     const ids = await addSocialPosts(env, posts, portfolio, molecule, platform, email);
     await audit(env, { by:email, action:"import.social", target:portfolio + (molecule ? " · " + molecule : ""), detail:{ posts:ids.length, platform } });
     return json({ added:ids.length });
   } else if (path === "/api/pmid-batch") {
-    const list = parsePmidList(body.text), portfolio = String(body.portfolio || "").trim().slice(0, 80), molecule = String(body.molecule || "").trim().slice(0, 100);
+    const list = parsePmidList(body.text), molecule = String(body.molecule || "").trim().slice(0, 100);
     if (!list.length) return json({ error:"Paste at least one PMID (digits), one per line, or comma separated." }, 400);
-    if (!portfolio) return json({ error:"Choose or type a portfolio for these articles." }, 400);
+    if (!body.client && !String(body.portfolio || body.clientName || "").trim()) return json({ error:"Choose or type a client for these articles." }, 400);
+    const portfolio = (await resolveGroup(env, state, body)).name;
     const { run, missing } = await importPmidList(env, list, portfolio, molecule);
     await audit(env, { by:email, action:"import.pmids", target:portfolio + (molecule ? " · " + molecule : ""), detail:{ requested:list.length, found:run.count, not_found:missing.length } });
     return json({ run, requested:list.length, missing });
   } else if (path === "/api/import") {
     const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
-    const watch = state.watches.find(w => w.portfolio === portfolio && (w.molecule || "") === molecule);
+    const watch = state.watches.find(w => samePf(w, portfolio) && (w.molecule || "") === molecule);
     const valid = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) &&
       !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0,10) === value;
     if (!watch || !valid(body.from) || !valid(body.to) || body.from > body.to || body.to > day()) {
-      return json({error:"Choose a saved portfolio and a valid date range through today."},400);
+      return json({error:"Choose a saved molecule and a valid date range through today."},400);
     }
     const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField, budget:600 });
     await settleEvidence(env, run.ids);
@@ -7994,7 +8067,7 @@ const paths = {
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Dashboard:"Your workload by workflow: what is open, late and coming up, and for which clients and molecules.",Planner:"A calendar of what to screen, check or review, and when each is due. Dates run from the IRD.","My Desk":"Your work in three steps: data entry, QC, medical review. Each has its own list and its own actions.","Line Listing":"Every case in one table, built automatically from the cases and kept up to date. Download it any time.",Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Pull by client or by molecule from PubMed and PubMed Central, with or without dates.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"People, their roles and portfolios, availability and sign-in access.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
+const subtitles = {Dashboard:"Your workload by workflow: what is open, late and coming up, and for which clients and molecules.",Planner:"A calendar of what to screen, check or review, and when each is due. Dates run from the IRD.","My Desk":"Your work in three steps: data entry, QC, medical review. Each has its own list and its own actions.","Line Listing":"Every case in one table, built automatically from the cases and kept up to date. Download it any time.",Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across clients.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Pull by client or by molecule from PubMed and PubMed Central, with or without dates.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"People, their roles and clients, availability and sign-in access.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -8242,7 +8315,7 @@ function wsResultsHtml(){
   const r=wsState.res;if(!r)return "";const status=r.sources.map(s=>'<span class="badge '+(s.ok?"green":"red")+'" title="'+esc(s.error||"")+'">'+esc(SRC_NAME[s.source]||s.source)+': '+(s.ok?s.count:"failed")+'</span>').join(" ");
   const mine=(data.config&&data.config.myPortfolios)||[],pfs=data.viewer.role==="manager"?allPortfolios():mine;
   const rows=r.results.map((x,i)=>'<label class="wsrow"><input type="checkbox" data-wssel="'+i+'"'+(wsState.sel.has(i)?" checked":"")+'><span class="ws-b"><b>'+esc(x.title)+'</b><span class="sub">'+esc((x.authors||[]).slice(0,3).join(", ")+((x.authors||[]).length>3?" et al.":""))+(x.journal?' · '+esc(x.journal):"")+(x.year?' · '+esc(x.year):"")+'</span><span class="chips">'+(x.sources||[]).map(k=>'<span class="badge blue">'+esc(SRC_NAME[k]||k)+'</span>').join("")+((x.countries||[]).length?'<span class="badge">'+esc(x.countries.join(", "))+'</span>':"")+(x.language&&x.language!=="en"?'<span class="badge">'+esc(x.language)+'</span>':"")+(x.library?'<span class="badge green">in LiteraSift</span>':"")+(x.url?'<a class="badge" href="'+esc(x.url)+'" target="_blank" rel="noopener">Open</a>':"")+'</span>'+(x.abstract?'<details class="abs"><summary>Abstract</summary><div class="sub">'+esc(x.abstract.slice(0,700))+'</div></details>':"")+'</span></label>').join("");
-  return '<div style="margin:12px 0">'+status+'</div>'+(r.results.length?'<div class="wsbar"><button type="button" class="btn outline sm" data-wsall="1">Select all</button><label class="fl"><span class="sub">Portfolio</span><select id="wspf">'+pfs.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label><label class="fl"><span class="sub">Molecule (INN)</span><input id="wsmol" value="'+esc((($("wterms")||{}).value||"").split(",")[0].trim())+'"></label><button type="button" class="btn" data-wsadd="1">Add selected to the queue</button></div><div class="wslist">'+rows+'</div>':'<div class="empty">No results.</div>');
+  return '<div style="margin:12px 0">'+status+'</div>'+(r.results.length?'<div class="wsbar"><button type="button" class="btn outline sm" data-wsall="1">Select all</button><label class="fl"><span class="sub">Client</span><select id="wspf">'+pfs.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label><label class="fl"><span class="sub">Molecule (INN)</span><input id="wsmol" value="'+esc((($("wterms")||{}).value||"").split(",")[0].trim())+'"></label><button type="button" class="btn" data-wsadd="1">Add selected to the queue</button></div><div class="wslist">'+rows+'</div>':'<div class="empty">No results.</div>');
 }
 async function runWorld(){
   const terms=$("wterms").value.split(/[,;]/).map(x=>x.trim()).filter(Boolean);if(!terms.length)return message("Enter at least one drug name.",true);
@@ -8534,7 +8607,7 @@ function renderCase(){
   $("casesign").dataset.id=curCase.id;$("casesign").textContent=(curCase.signatures||[]).some(x=>!x.superseded)?(curCase.signature_intact===false?"Signature: changed after signing":"Signed · view signature"):"Signature…";
 }
 let signCtx=null, codeSug={};
-const EXCLUSION_REASONS=["No individual patient (aggregate or study data only)","No adverse event","No suspect product","Not a drug safety report (review, background, or editorial)","Duplicate of another record","Outside the portfolio scope","Other (explain in the note)"];
+const EXCLUSION_REASONS=["No individual patient (aggregate or study data only)","No adverse event","No suspect product","Not a drug safety report (review, background, or editorial)","Duplicate of another record","Outside the client scope","Other (explain in the note)"];
 function completenessHtml(c){
   if(!c)return "";
   return '<div style="margin-top:8px"><div class="row" style="padding:2px 0"><b>Information in the article</b><b>'+c.found+' of '+c.total+' items · '+c.score+'%</b></div><div class="bar"><i style="width:'+c.score+'%"></i></div>'+
@@ -8688,13 +8761,13 @@ function adminHtml(){
   const tiles='<div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:14px">'+stat("Active people",act.length)+stat("Unassigned citations",unassigned.length,1)+stat("Overdue citations",openA.filter(a=>a.dueAt&&a.dueAt<today).length,1)+stat("Open cases",openC.length)+stat("Cases without owner",openC.filter(c=>!c.assignee).length,1)+stat("Ready for medical review",openC.filter(c=>c.status==="Ready for medical review").length)+'</div>';
   const personOpts=sel=>'<option value="">Nobody</option>'+act.map(p=>'<option value="'+esc(p.email)+'"'+(p.email===sel?" selected":"")+'>'+esc(p.name||p.email)+'</option>').join("");
   const roleOf=p=>[...new Set(mem.filter(m=>m.email===p.email).map(m=>m.role.replace("_"," ")+(m.portfolio==="*"?"":" ("+m.portfolio+")")))].join(", ")||(p.role==="manager"?"owner":"screener");
-  const addUsers=panel("Add several people at once",'<div class="sub" style="margin-bottom:6px">One person per line: <b>name, email, role, portfolio, open limit, starting password</b>. Roles: screener, medical_reviewer, qc, manager. Portfolio, limit and password are optional (blank portfolio means all; a password is at least 12 characters and people can change it under Account). Existing people are updated.</div><textarea id="adm_rows" rows="6" style="width:100%" placeholder="Meera Rao, meera@example.org, medical_reviewer, Antivirals, 30"></textarea><div style="margin-top:8px"><button type="button" class="btn" data-p4="bulkusers">Create people</button></div><div id="adm_result" class="sub" style="margin-top:8px"></div><div class="sub" style="margin-top:6px">Passwords can also be set or reset per person in the Team tab.</div>');
+  const addUsers=panel("Add several people at once",'<div class="sub" style="margin-bottom:6px">One person per line: <b>name, email, role, portfolio, open limit, starting password</b>. Roles: screener, medical_reviewer, qc, manager. Client, limit and password are optional (blank portfolio means all; a password is at least 12 characters and people can change it under Account). Existing people are updated.</div><textarea id="adm_rows" rows="6" style="width:100%" placeholder="Meera Rao, meera@example.org, medical_reviewer, Antivirals, 30"></textarea><div style="margin-top:8px"><button type="button" class="btn" data-p4="bulkusers">Create people</button></div><div id="adm_result" class="sub" style="margin-top:8px"></div><div class="sub" style="margin-top:6px">Passwords can also be set or reset per person in the Team tab.</div>');
   const peopleRows=people.map(p=>{const own=openA.filter(a=>a.reviewer===p.email).length, cs=openC.filter(c=>c.assignee===p.email).length;
     return [esc(p.name||"")+'<div class="sub">'+esc(p.email)+'</div>',esc(roleOf(p)),esc(p.portfolio||"All"),own+" citations · "+cs+" cases",'<input type="number" min="1" max="500" value="'+esc(p.capacity||"")+'" style="width:76px" id="adm_cap_'+esc(p.email)+'" aria-label="Open limit">',p.active?badge("Active","green"):badge("Inactive",""),p.role==="manager"?"":'<button type="button" class="btn outline sm" data-p4="usersave|'+esc(p.email)+'">Save limit</button> <button type="button" class="btn outline sm" data-p4="useractive|'+esc(p.email)+'|'+(p.active?"0":"1")+'">'+(p.active?"Deactivate":"Activate")+'</button>'];});
-  const peoplePanel=panel("People and workload",table(["Person","Roles","Portfolio","Open work","Limit","Status",""],peopleRows,"No people yet."),"Deactivated people keep their history but receive no new work.",true);
+  const peoplePanel=panel("People and workload",table(["Person","Roles","Client","Open work","Limit","Status",""],peopleRows,"No people yet."),"Deactivated people keep their history but receive no new work.",true);
   const alloc=panel("Allocate citations",'<div class="row"><span><b>'+unassigned.length+'</b> citation'+(unassigned.length===1?"":"s")+' unassigned. Automatic allocation uses availability, open workload against each limit, and overdue work.</span><button type="button" class="btn" data-p4="autoalloc"'+(unassigned.length?"":" disabled")+'>Allocate all automatically</button></div>'+
     '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0"><select id="adm_to" aria-label="Move to">'+personOpts("").replace("Nobody","Move selected to…")+'</select><input id="adm_reason" placeholder="Reason (required)" style="min-width:220px"><button type="button" class="btn outline" data-p4="reassign">Reassign selected</button><button type="button" class="btn outline" data-p4="routeA">Route selected to a stage…</button><button type="button" class="btn outline" data-p4="selall|adm_a">Select all shown</button></div>'+
-    table(["","Citation","Portfolio","Assigned to","Stage","Due","Status"],openA.slice(0,200).map(a=>{const art=data.articles[a.pmid]||{};return ['<input type="checkbox" class="adm_a" value="'+esc(a.id)+'" aria-label="Select">',esc((art.title||"PMID "+a.pmid).slice(0,90))+'<div class="sub">PMID '+esc(a.pmid)+'</div>',esc(a.portfolio),a.reviewer?esc(((people.find(p=>p.email===a.reviewer)||{}).name)||a.reviewer):badge("Unassigned","red"),stageBadge((data.assignmentStages||{})[a.id]),esc(a.dueAt||""),esc(a.status)];}),"No open citations."),"",false);
+    table(["","Citation","Client","Assigned to","Stage","Due","Status"],openA.slice(0,200).map(a=>{const art=data.articles[a.pmid]||{};return ['<input type="checkbox" class="adm_a" value="'+esc(a.id)+'" aria-label="Select">',esc((art.title||"PMID "+a.pmid).slice(0,90))+'<div class="sub">PMID '+esc(a.pmid)+'</div>',esc(a.portfolio),a.reviewer?esc(((people.find(p=>p.email===a.reviewer)||{}).name)||a.reviewer):badge("Unassigned","red"),stageBadge((data.assignmentStages||{})[a.id]),esc(a.dueAt||""),esc(a.status)];}),"No open citations."),"",false);
   const route=panel("Cases: reassign or route back",'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"><select id="adm_cto" aria-label="Person"><option value="__keep">Keep owner</option>'+personOpts("").replace("Nobody","Unassigned")+'</select><select id="adm_cstatus" aria-label="Status"><option value="">Keep status</option><option>Draft</option><option>Ready for medical review</option></select><input id="adm_creason" placeholder="Reason (required)" style="min-width:220px"><button type="button" class="btn outline" data-p4="routecases">Route selected</button><button type="button" class="btn outline" data-p4="routeC">Route to a stage…</button><button type="button" class="btn outline" data-p4="selall|adm_c">Select all shown</button></div><div class="sub" style="margin-bottom:6px">Choosing Draft sends a case back to its owner for rework and clears any approval.</div>'+
     table(["","Case","Event","Owner","Stage","Status","Serious"],openC.slice(0,200).map(c=>{const ser=(c.data.events||[]).some(e=>Object.values(e.seriousness||{}).some(Boolean));return ['<input type="checkbox" class="adm_c" value="'+esc(c.id)+'" aria-label="Select">','<b>'+esc(c.number)+'</b><div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.portfolio||"")+'</div>',esc((((c.data.events||[])[0]||{}).verbatim||{}).value||"—"),c.assignee?esc(((people.find(p=>p.email===c.assignee)||{}).name)||c.assignee):badge("Unassigned","red"),stageBadge(caseStage(c)),badge(c.status,c.status==="Ready for medical review"?"blue":""),ser?badge("Serious","red"):""];}),"No open cases."),"",false);
   const sys=panel("System",'<div class="row"><span>LiteraSift v0.01 · Developed by Dr Sriram</span><span class="sub">Audit trail is in the Audit tab; backups and migration: docs/WORKBENCH.md</span></div>');
@@ -8753,7 +8826,7 @@ function bulkBar(cls,opts){
     grp("Classify",'<select id="bk_ser" aria-label="Set seriousness"><option value="__">Seriousness…</option><option value="serious">Serious</option><option value="nonserious">Non-serious</option><option value="">From case data</option></select><select id="bk_lis" aria-label="Set listedness"><option value="__">Listedness…</option><option value="listed">Listed</option><option value="unlisted">Unlisted</option><option value="unknown">Unknown</option><option value="">From case data</option></select>'+b("classify","Apply"))+
     grp("Tags",'<select id="bk_tag" aria-label="Tag">'+(data.standardTags||[]).map(t=>'<option>'+esc(t)+'</option>').join("")+'</select><input id="bk_custom" placeholder="own tag" style="width:90px">'+b("tag","Add")+b("untag","Remove"))+
     grp("Folder",'<select id="bk_folder" aria-label="Folder"><option value="">No folder</option>'+fl.map(f=>'<option value="'+esc(f.id)+'">'+esc(f.name)+'</option>').join("")+'</select>'+b("folder","Move"))+
-    (!opts.archive||canMedical()||mgr?grp("More",(!opts.archive?b("route","Route…"):"")+(mgr&&!opts.archive?b("chportfolio","Portfolio…"):"")+(canMedical()&&!opts.archive?b("archive","Archive"):"")+(opts.archive&&canMedical()?b("restore","Restore"):"")+(mgr?b("delcase","Delete…",' style="color:var(--red)"'):"")):"")+'</div>';
+    (!opts.archive||canMedical()||mgr?grp("More",(!opts.archive?b("route","Route…"):"")+(mgr&&!opts.archive?b("chportfolio","Client…"):"")+(canMedical()&&!opts.archive?b("archive","Archive"):"")+(opts.archive&&canMedical()?b("restore","Restore"):"")+(mgr?b("delcase","Delete…",' style="color:var(--red)"'):"")):"")+'</div>';
 }
 const canEditCase=c=>{const me=data.viewer.email;return canMedical()||c.assignee===me||c.createdBy===me;};
 function rowSelects(c){
@@ -8770,7 +8843,7 @@ function caseRowCells(c){
   return ['<input type="checkbox" class="'+(tab==="Search"?"srch_c":tab==="Archive"?"arc_c":"syn_c")+'" value="'+esc(c.id)+'" aria-label="Select case">','<a href="#" data-opencase="'+esc(c.id)+'"><b>'+esc(c.number)+'</b></a>',esc((art.title||"PMID "+c.pmid).slice(0,70))+'<div class="sub">PMID '+esc(c.pmid)+' · '+esc(c.portfolio||"")+'</div>',x.ser+x.crit,x.lis,x.fold,tagChips(c),stageBadge(caseStage(c))+" "+badge(c.status,""),esc(((data.profiles||[]).find(p=>p.email===c.assignee)||{}).name||c.assignee||""),clockHtml(c),clinHtml(c),x.act];
 }
 const CASEHEAD=["","Case","Article","Seriousness","Listedness","Folder","Tags","Stage · status","Owner","Reporting timeline","Indication · action · DC · RC","Actions"];
-const GROUPS={soc:"MedDRA SOC (first event)",triage:"Triage priority",sercat:"Seriousness × listedness",clock:"Reporting status",stage:"Stage",none:"No grouping",status:"Status",seriousness:"Seriousness",listedness:"Listedness",folder:"Folder",portfolio:"Portfolio",owner:"Owner",category:"Archive category"};
+const GROUPS={soc:"MedDRA SOC (first event)",triage:"Triage priority",sercat:"Seriousness × listedness",clock:"Reporting status",stage:"Stage",none:"No grouping",status:"Status",seriousness:"Seriousness",listedness:"Listedness",folder:"Folder",portfolio:"Client",owner:"Owner",category:"Archive category"};
 function groupKey(c,by){
   const cl=caseCls(c);
   if(by==="soc"){const e=(c.data.events||[])[0]||{};return(e.soc&&e.soc.value)||"Not coded";}
@@ -8823,21 +8896,21 @@ function openAddMolecule(presetClient){
   const pfs=(typeof allPortfolios==="function"?allPortfolios():[]),cls=data.clients||[];
   document.body.insertAdjacentHTML("beforeend",'<dialog id="moldlg" style="width:min(520px,96vw)"><h3 style="margin:0 0 4px">Add molecules</h3><p class="sub" style="margin:0 0 12px">Add one or many to this client. Each is searched in PubMed automatically from now on, and its articles appear in the queue.</p>'+
     '<form id="molform" data-own="1" class="impgrid"><label class="wide">Client<select name="client"><option value="">No client</option>'+cls.map(c=>'<option value="'+esc(c.id)+'"'+(c.id===presetClient?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select></label>'+
-    '<label>Portfolio<select name="portfolio"><option value="">Auto: by drug class (recommended)</option>'+pfs.map(x=>'<option>'+esc(x)+'</option>').join("")+'<option value="__new">New portfolio…</option></select></label><label id="molnewpf" style="display:none">New portfolio name<input name="newpf" maxlength="100"></label>'+
+    ''+
     '<label class="wide">Molecules, one per line (add brands and other names after commas)<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;valsartan, Diovan&#10;warfarin"></textarea></label><div class="sub wide" id="molcount">Paste or type as many as you need. Each one is filed under its own drug-class portfolio when the portfolio is Auto.</div>'+
     '<label class="check wide"><input type="checkbox" name="safety">&nbsp;Safety articles only (adverse events, toxicity, case reports)</label><div class="wide" id="molerr" style="color:#b3261e"></div>'+
     '<div class="wide" style="display:flex;gap:8px;justify-content:flex-end"><button type="button" class="btn outline" id="molno">Cancel</button><button class="btn" id="molgo">Add molecule</button></div></form></dialog>');
   const d=$("moldlg"),f=$("molform");d.showModal();
-  f.elements.list.oninput=()=>{const n=f.elements.list.value.split(String.fromCharCode(10)).filter(x=>x.trim()).length;$("molcount").textContent=n>1?n+" molecules will be added.":"Paste or type as many as you need. Each one is filed under its own drug-class portfolio when the portfolio is Auto.";$("molgo").textContent=n>1?"Add "+n+" molecules":"Add molecule";};f.elements.portfolio.onchange=()=>{$("molnewpf").style.display=f.elements.portfolio.value==="__new"?"":"none";};$("molno").onclick=()=>{d.close();d.remove();};
-  f.onsubmit=async e=>{e.preventDefault();$("molgo").disabled=true;$("molerr").textContent="";const pf=f.elements.portfolio.value==="__new"?f.elements.newpf.value:f.elements.portfolio.value;
-    try{const r=await api("molecule-add",{client:f.elements.client.value,portfolio:pf,list:f.elements.list.value,safetyOnly:f.elements.safety.checked});d.close();d.remove();await refresh();render();const skipped=r.results.filter(x=>x.status!=="added");message(r.added===1&&r.results.length===1?r.molecule+" added to "+r.portfolio+(r.auto?(r.classification?" (classified as "+(r.classification.class||r.classification.area)+")":" (automatic)"):"")+". Its articles will be pulled automatically.":r.added+" molecules added"+(skipped.length?", "+skipped.length+" skipped ("+skipped.map(x=>x.molecule).slice(0,4).join(", ")+")":"")+": "+[...new Set(r.results.filter(x=>x.status==="added").map(x=>x.portfolio))].join(", ")+".");}
+  f.elements.list.oninput=()=>{const n=f.elements.list.value.split(String.fromCharCode(10)).filter(x=>x.trim()).length;$("molcount").textContent=n>1?n+" molecules will be added.":"Paste or type as many as you need. All of them are added to this client.";$("molgo").textContent=n>1?"Add "+n+" molecules":"Add molecule";};$("molno").onclick=()=>{d.close();d.remove();};
+  f.onsubmit=async e=>{e.preventDefault();$("molgo").disabled=true;$("molerr").textContent="";
+    try{const r=await api("molecule-add",{client:f.elements.client.value,list:f.elements.list.value,safetyOnly:f.elements.safety.checked});d.close();d.remove();await refresh();render();const skipped=r.results.filter(x=>x.status!=="added");message(r.added===1&&r.results.length===1?r.molecule+" added to "+r.portfolio+(r.classification?" ("+(r.classification.class||r.classification.area)+")":"")+". Its articles will be pulled automatically.":r.added+" molecules added"+(skipped.length?", "+skipped.length+" skipped ("+skipped.map(x=>x.molecule).slice(0,4).join(", ")+")":"")+": "+[...new Set(r.results.filter(x=>x.status==="added").map(x=>x.portfolio))].join(", ")+".");}
     catch(err){$("molerr").textContent=err.message;$("molgo").disabled=false;}};
 }
 async function clearPulled(){
   const old=$("pulldlg");if(old)old.remove();
   const pfs=(typeof allPortfolios==="function"?allPortfolios():[]);
   document.body.insertAdjacentHTML("beforeend",'<dialog id="pulldlg" style="width:min(560px,96vw)"><h3 style="margin:0 0 4px">Clear pulled articles</h3><p class="sub" style="margin:0 0 12px">Removes pulled articles, their full texts and screenshots, and their queue items. Tick the cases box to remove cases as well; otherwise cases are kept, and so is any article a case was made from.</p>'+
-    '<form id="pullform" data-own="1" class="impgrid"><label>Portfolio<select name="portfolio"><option value="">All portfolios</option>'+pfs.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label><label>Molecule (optional)<input name="molecule" placeholder="all molecules"></label>'+
+    '<form id="pullform" data-own="1" class="impgrid"><label>Client<select name="portfolio"><option value="">All portfolios</option>'+pfs.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label><label>Molecule (optional)<input name="molecule" placeholder="all molecules"></label>'+
     '<label class="wide">Only articles pulled before (optional)<input type="date" name="before"></label><div class="wide purgesum" id="pullsum"><span class="sub">Checking…</span></div>'+
     '<label class="check wide"><input type="checkbox" name="cases">&nbsp;Also delete the cases (every case when no portfolio, molecule or date is chosen)</label><label class="check wide" id="pullackrow" style="display:none"><input type="checkbox" name="ack">&nbsp;<span id="pullacktxt"></span></label><label class="check wide"><input type="checkbox" name="forget">&nbsp;Also forget which days were covered, so the automatic pull fetches them again</label>'+
     '<label class="wide">Reason (recorded in the audit log)<textarea name="reason" rows="2" required></textarea></label><label class="wide"><span id="pullcf">Type DELETE and the number shown</span><input name="confirm" autocomplete="off"></label><div class="wide" id="pullerr" style="color:#b3261e"></div>'+
@@ -8872,7 +8945,7 @@ function searchHtml(){
     '<div style="display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-top:10px">'+
     sel("sf_scope","Look in",[["all","Citations and cases"],["articles","Citations only"],["cases","Cases only"]])+
     sel("sf_serious","Seriousness",[["","Any"],["serious","Serious"],["nonserious","Non-serious"]])+sel("sf_listed","Listedness",[["","Any"],["listed","Listed"],["unlisted","Unlisted"],["unknown","Unknown"]])+
-    sel("sf_status","Case status",[["","Any"]].concat((data.config.caseStatuses||[]).map(s=>[s,s])))+sel("sf_portfolio","Portfolio",[["","Any"]].concat(pf.map(x=>[x,x])))+
+    sel("sf_status","Case status",[["","Any"]].concat((data.config.caseStatuses||[]).map(s=>[s,s])))+sel("sf_portfolio","Client",[["","Any"]].concat(pf.map(x=>[x,x])))+
     sel("sf_folder","Folder",[["","Any"],["__none","Not in a folder"]].concat((data.caseFolders||[]).map(x=>[x.id,x.name])))+sel("sf_archived","Archive",[["","Working cases"],["yes","Archived only"],["any","Both"]])+
     '<label>Tag<input id="sf_tag" value="'+esc(f.tag||"")+'" placeholder="e.g. serious:death"></label></div>')+'<div id="sres">'+(srch.res?searchResults():"")+'</div>'+drugLookupHtml();
 }
@@ -8965,7 +9038,7 @@ function drugLookupHtml(){
   const r=kbLast;
   const chip=(n,cls)=>'<a href="#" class="badge'+(cls?" "+cls:"")+'" data-p6="search|'+esc(n)+'" style="text-decoration:none">'+esc(n)+'</a>';
   return panel("Drug and brand names",'<div class="sub" style="margin-bottom:6px">Pulled from RxNorm (US National Library of Medicine) and openFDA labels, and interlinked: any generic, brand or salt leads to all the others, and searches use them.</div><div style="display:flex;gap:8px"><input id="kbq" placeholder="e.g. aripiprazole or Abilify" style="flex:1" aria-label="Drug name"><button type="button" class="btn" data-p6="lookup">Look up</button></div>'+
-    '<div id="kbres" style="margin-top:10px">'+(r?(r.found?'<div><b>'+esc(r.name)+'</b> '+badge("generic","green")+(r.matchedAs!=="generic"?' <span class="sub">(you searched the '+esc(r.matchedAs)+' "'+esc(r.query)+'")</span>':"")+'</div><div style="margin-top:6px">Brands: '+((r.brands||[]).length?r.brands.map(b=>chip(b)).join(" "):'<span class="sub">none found</span>')+'</div><div style="margin-top:6px">Salts: '+((r.salts||[]).length?r.salts.map(b=>chip(b)).join(" "):'<span class="sub">none found</span>')+'</div>'+((r.synonyms||[]).length?'<div style="margin-top:6px">Also known as: '+r.synonyms.map(b=>chip(b)).join(" ")+'</div>':"")+'<div class="sub" style="margin-top:6px">Sources: '+esc((r.sources||[]).map(s=>s.name).join(", ")||"stored list")+'</div><div style="margin-top:6px"><a href="#" data-p6="search|'+esc(r.name)+'">Find all cases and citations for '+esc(r.name)+'</a>'+(data.viewer.role==="manager"?' · <select id="kbpf" aria-label="Portfolio">'+[...new Set([...(data.watches||[]).map(w=>w.portfolio),...(data.assignments||[]).map(a=>a.portfolio)])].sort().map(x=>'<option>'+esc(x)+'</option>').join("")+'</select> <button type="button" class="btn outline sm" data-p6="todict|'+esc(r.name)+'">Add to dictionary</button>':"")+'</div>':'<div class="sub">'+esc(r.query)+' was not found in RxNorm or the stored list.</div>'):"")+'</div>');
+    '<div id="kbres" style="margin-top:10px">'+(r?(r.found?'<div><b>'+esc(r.name)+'</b> '+badge("generic","green")+(r.matchedAs!=="generic"?' <span class="sub">(you searched the '+esc(r.matchedAs)+' "'+esc(r.query)+'")</span>':"")+'</div><div style="margin-top:6px">Brands: '+((r.brands||[]).length?r.brands.map(b=>chip(b)).join(" "):'<span class="sub">none found</span>')+'</div><div style="margin-top:6px">Salts: '+((r.salts||[]).length?r.salts.map(b=>chip(b)).join(" "):'<span class="sub">none found</span>')+'</div>'+((r.synonyms||[]).length?'<div style="margin-top:6px">Also known as: '+r.synonyms.map(b=>chip(b)).join(" ")+'</div>':"")+'<div class="sub" style="margin-top:6px">Sources: '+esc((r.sources||[]).map(s=>s.name).join(", ")||"stored list")+'</div><div style="margin-top:6px"><a href="#" data-p6="search|'+esc(r.name)+'">Find all cases and citations for '+esc(r.name)+'</a>'+(data.viewer.role==="manager"?' · <select id="kbpf" aria-label="Client">'+[...new Set([...(data.watches||[]).map(w=>w.portfolio),...(data.assignments||[]).map(a=>a.portfolio)])].sort().map(x=>'<option>'+esc(x)+'</option>').join("")+'</select> <button type="button" class="btn outline sm" data-p6="todict|'+esc(r.name)+'">Add to dictionary</button>':"")+'</div>':'<div class="sub">'+esc(r.query)+' was not found in RxNorm or the stored list.</div>'):"")+'</div>');
 }
 function kbAdminHtml(){
   return panel("Drug and brand name list",'<div id="kbstatus" class="sub">Loading…</div><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"><button type="button" class="btn" data-p6="sync|watchlist">Pull names used by my watchlists, dictionaries and cases</button><button type="button" class="btn outline" data-p6="sync|ingredients">Load all RxNorm ingredients</button><button type="button" class="btn outline" data-p6="sync|enrich">Add brands to the next 100 ingredients</button></div><div class="sub" style="margin-top:6px">Each button works in batches and can be repeated; nothing already pulled is fetched again. The server needs to reach rxnav.nlm.nih.gov and api.fda.gov.</div>');
@@ -9111,11 +9184,11 @@ async function loadLineListing(){
     const tile=(l,n,t)=>'<div class="qstat"><span class="sub">'+l+'</span><b'+(t&&n?' style="color:var(--'+t+')"':"")+'>'+n+'</b></div>';
     const strip='<div class="qstrip">'+tile("Cases",cases,"")+tile("Events",rows.length,"")+tile("Serious",rows.filter(x=>x.ser).length,"red")+tile("Fatal",rows.filter(x=>x.fatal).length,"red")+tile("Unlisted",rows.filter(unl).length,"amber")+tile("Overdue",rows.filter(isLate).length,"red")+'</div>';
     const chips='<div class="fbar">'+Object.entries(F).map(([k,f])=>'<button type="button" class="fchip'+(k===llState.f?" on":"")+'" data-llf="'+k+'">'+f[0]+'<b>'+rows.filter(f[1]).length+'</b></button>').join("")+'</div>';
-    const bar='<div class="filters slim" style="border:0;padding:0 0 12px"><input id="llq" type="search" placeholder="Search case, product, event, person" value="'+esc(llState.q)+'" aria-label="Search line listing"><select id="llpf" aria-label="Portfolio"><option value="">All portfolios</option>'+pf.map(x=>'<option'+(llState.portfolio===x?" selected":"")+'>'+esc(x)+'</option>').join("")+'</select>'+((data.clients||[]).length?'<select id="llcl" aria-label="Client"><option value="">All clients</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'"'+(llState.client===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select>':"")+'<button type="button" class="btn outline" data-synexport="csv" title="Download every case as a CSV">Download CSV</button></div>';
+    const bar='<div class="filters slim" style="border:0;padding:0 0 12px"><input id="llq" type="search" placeholder="Search case, product, event, person" value="'+esc(llState.q)+'" aria-label="Search line listing"><select id="llpf" aria-label="Client"><option value="">All portfolios</option>'+pf.map(x=>'<option'+(llState.portfolio===x?" selected":"")+'>'+esc(x)+'</option>').join("")+'</select>'+((data.clients||[]).length?'<select id="llcl" aria-label="Client"><option value="">All clients</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'"'+(llState.client===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select>':"")+'<button type="button" class="btn outline" data-synexport="csv" title="Download every case as a CSV">Download CSV</button></div>';
     const pill=(t,tone)=>t?'<span class="badge '+tone+'">'+esc(t)+'</span>':'<span class="sub">-</span>';
     const czTone=c=>/certain|probable/i.test(c)?"red":/possible/i.test(c)?"amber":"";
     const body=view.map(x=>{const c=(data.cases||[]).find(k=>k.number===x.case);return '<tr class="llrow'+(x.ser?" ser":"")+'"><td><a href="#"'+(c?' data-opencase="'+esc(c.id)+'"':"")+'><b>'+esc(x.case)+'</b></a><div class="sub">'+esc([x.age&&x.age+" y",x.sex,x.country].filter(Boolean).join(" · "))+'</div></td><td><b>'+esc(x.product||"-")+'</b>'+(x.client?'<div class="sub">'+esc(x.client)+'</div>':"")+'</td><td>'+esc(x.ev||"-")+(x.pt&&x.pt!==x.ev?'<div class="sub">PT '+esc(x.pt)+'</div>':"")+(x.onset?'<div class="sub">onset '+esc(x.onset)+'</div>':"")+'</td><td>'+(x.ser?pill(x.fatal?"Fatal":"Serious","red"):pill("Non-serious",""))+'</td><td>'+pill(x.lis,unl(x)?"amber":/listed|expected/i.test(x.lis)?"green":"")+'</td><td>'+pill(x.cz,czTone(x.cz))+'<div class="sub">'+esc(x.out)+'</div></td><td>'+esc(x.stage)+'<div class="sub">'+esc(x.who)+'</div></td><td>'+(x.ird?'<div class="sub">IRD '+esc(x.ird)+'</div>':"")+(x.sdue?'<div>Stage due '+esc(x.sdue)+'</div>':"")+(x.due?'<div'+(isLate(x)?' style="color:var(--red);font-weight:600"':"")+'>Reporting '+esc(x.due)+'</div>':"")+'<div class="sub">'+esc(x.clock)+'</div></td></tr>';}).join("");
-    const grid=view.length?'<div class="tablewrap"><table class="lltable"><thead><tr><th>Case</th><th>Suspect product</th><th>Event</th><th>Seriousness</th><th>Listedness</th><th>Causality and outcome</th><th>Stage</th><th>IRD and due</th></tr></thead><tbody>'+body+'</tbody></table></div>'+(r.total>r.rows.length?'<p class="sub">Showing '+r.rows.length+' of '+r.total+' rows. Narrow by portfolio or client.</p>':""):'<div class="empty">'+(rows.length?"No events match.":"No cases yet. Cases appear here as soon as QC selects an article for Synchrony.")+'</div>';
+    const grid=view.length?'<div class="tablewrap"><table class="lltable"><thead><tr><th>Case</th><th>Suspect product</th><th>Event</th><th>Seriousness</th><th>Listedness</th><th>Causality and outcome</th><th>Stage</th><th>IRD and due</th></tr></thead><tbody>'+body+'</tbody></table></div>'+(r.total>r.rows.length?'<p class="sub">Showing '+r.rows.length+' of '+r.total+' rows. Narrow by client.</p>':""):'<div class="empty">'+(rows.length?"No events match.":"No cases yet. Cases appear here as soon as QC selects an article for Synchrony.")+'</div>';
     box.innerHTML=strip+chips+'<section>'+'<div class="body">'+bar+grid+'</div></section><p class="sub">One row per event, built from the case fields each time you open this page, so it is never out of date.'+(data.viewer.role==="manager"?" A copy is also saved once a day by the scheduler.":"")+'</p>';
     $("llpf")&&($("llpf").onchange=e=>{llState.portfolio=e.target.value;loadLineListing();});$("llcl")&&($("llcl").onchange=e=>{llState.client=e.target.value;loadLineListing();});
     if($("llq"))$("llq").oninput=e=>{llState.q=e.target.value;const pos=e.target.selectionStart;clearTimeout(llState.t);llState.t=setTimeout(()=>{loadLineListing().then(()=>{const el=$("llq");if(el){el.focus();el.setSelectionRange(pos,pos);}});},200);};
@@ -9213,7 +9286,7 @@ function discoverResults(){
     const links=Object.entries({PubMed:x.links.pubmed,"Europe PMC":x.links.europepmc,DOI:x.links.doi,Unpaywall:x.links.unpaywall,Crossref:x.links.crossref}).filter(e=>e[1]).map(e=>'<a href="'+esc(e[1])+'" target="_blank" rel="noopener">'+esc(e[0])+'</a>').join(" · ");
     return ['<input type="checkbox" class="dsel" value="'+i+'" aria-label="Select result">','<b>'+esc(x.title)+'</b><div class="sub">'+esc((x.authors||[]).slice(0,4).join(", "))+((x.authors||[]).length>4?" et al":"")+' · '+esc(x.journal)+' '+esc(x.year)+'</div><div class="sub" style="margin-top:3px">'+links+'</div>'+(x.abstract?'<details><summary class="sub">Abstract</summary><div class="sub">'+esc(x.abstract.slice(0,900))+'</div></details>':""),(x.sources||[]).map(s=>badge(SRC_NAME[s]||s,"")).join(" "),oaCell(x.unpaywall),lib];
   });
-  return '<div style="margin:10px 0">'+status+'</div><div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px"><button type="button" class="btn outline sm" data-p8="dselall">Select all</button><button type="button" class="btn outline sm" data-p8="dexport|bibtex">BibTeX</button><button type="button" class="btn outline sm" data-p8="dexport|ris">RIS</button><button type="button" class="btn outline sm" data-p8="dexport|csv">CSV</button>'+(mgr?'<input id="dpf" list="pfopts" placeholder="Portfolio for new records" style="width:200px"><button type="button" class="btn outline sm" data-p8="daddsel">Add selected PMIDs to library</button>':"")+'</div>'+table(["","Result","Found in","Open access (Unpaywall)","LiteraSift"],rows,"No results.");
+  return '<div style="margin:10px 0">'+status+'</div><div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px"><button type="button" class="btn outline sm" data-p8="dselall">Select all</button><button type="button" class="btn outline sm" data-p8="dexport|bibtex">BibTeX</button><button type="button" class="btn outline sm" data-p8="dexport|ris">RIS</button><button type="button" class="btn outline sm" data-p8="dexport|csv">CSV</button>'+(mgr?'<input id="dpf" list="pfopts" placeholder="Client for new records" style="width:200px"><button type="button" class="btn outline sm" data-p8="daddsel">Add selected PMIDs to library</button>':"")+'</div>'+table(["","Result","Found in","Open access (Unpaywall)","LiteraSift"],rows,"No results.");
 }
 function discoverHtml(){
   return panel("Discover literature",'<div class="sub" style="margin-bottom:6px">Searches PubMed, Europe PMC, Crossref and DOAJ together, removes duplicates by DOI, PMID and title, and checks open access through Unpaywall. Results link to records already in LiteraSift, and records link back here. Open-access copies are only linked from Unpaywall and the publisher.</div><div style="display:flex;gap:8px"><input id="dq" value="'+esc(dsc.q)+'" placeholder="e.g. aripiprazole akathisia case report" style="flex:1" aria-label="Discover search"><select id="dlimit" aria-label="Results per source">'+[10,20,30,50].map(n=>'<option'+(n===dsc.limit?" selected":"")+'>'+n+'</option>').join("")+'</select><button type="button" class="btn" data-p8="dsearch">Search</button></div><div class="chips" style="margin-top:8px">'+Object.keys(SRC_NAME).map(k=>'<label class="check"><input type="checkbox" class="dsrc" value="'+k+'"'+(dsc.sources.includes(k)?" checked":"")+'>&nbsp;'+SRC_NAME[k]+'</label>').join("")+'</div><div id="dres">'+(dsc.res?discoverResults():"")+'</div>');
@@ -9265,7 +9338,7 @@ async function p8action(target){
     if(act==="dselall"){document.querySelectorAll(".dsel").forEach(x=>{x.checked=true;});return;}
     if(act==="dexport"){const idx=[...document.querySelectorAll(".dsel:checked")].map(x=>Number(x.value)),items=(idx.length?idx.map(i=>dsc.res.results[i]):dsc.res.results);await downloadPost("/api/discover-export",{format:a1,items},"literasift-discover");return;}
     if(act==="addlib"||act==="daddsel"){const pm=act==="addlib"?[dsc.res.results[Number(a1)].pmid]:[...document.querySelectorAll(".dsel:checked")].map(x=>dsc.res.results[Number(x.value)].pmid).filter(Boolean);
-      const pf=act==="addlib"?(prompt("Portfolio for this record:","")||""):$("dpf").value;if(!pm.length)return message("Tick results that have a PMID.",true);if(!pf)return message("Enter the portfolio.",true);
+      const pf=act==="addlib"?(prompt("Client for this record:","")||""):$("dpf").value;if(!pm.length)return message("Tick results that have a PMID.",true);if(!pf)return message("Enter the client.",true);
       const r=await api("pmid-batch",{text:pm.join(NL),portfolio:pf,molecule:""});await refresh();await runDiscover();message(r.run.count+" record"+(r.run.count===1?"":"s")+" added to "+pf+(r.missing.length?"; not found: "+r.missing.join(", "):"")+".");return;}
     if(act==="openlib"){const item=(data.assignments||[]).find(x=>x.pmid===a1);if(!item)return message("That article is not in your queue.",true);const b=document.querySelector('[data-review="'+item.id+'"]');if(b){b.click();return;}tab=data.viewer.role==="manager"?"All Assignments":"My Queue";render();setTimeout(()=>{const b2=document.querySelector('[data-review="'+item.id+'"]');if(b2)b2.click();},300);return;}
     if(act==="similar"){dsc.q=a1;dsc.res=null;tab="Discover";render();await runDiscover();return;}
@@ -9540,7 +9613,7 @@ function queueRows(items){
       '<div class="ac-side">'+badge(a.status,statusColor[a.status]||(a.status==="QC returned"?"red":a.status==="Awaiting QC"?"blue":""))+
       '<div class="ac-who">'+(rev?'<span class="av" aria-hidden="true">'+esc(rev.slice(0,1).toUpperCase())+'</span><span>'+esc(rev)+'</span>':badge("Unassigned","amber"))+'</div>'+
       (a.dueAt?'<div class="sub"'+(late?' style="color:var(--red);font-weight:600"':"")+'>'+(late?"Overdue · ":"Due ")+esc(a.dueAt)+'</div>':"")+
-      (data.viewer.role==="manager"?'<button type="button" class="btn outline sm" data-chpf="assignment|'+esc(a.id)+'|" title="Move to another portfolio">Portfolio</button>':"")+'<button class="btn sm" data-review="'+esc(a.id)+'">Review</button></div></article>';
+      (data.viewer.role==="manager"?'<button type="button" class="btn outline sm" data-chpf="assignment|'+esc(a.id)+'|" title="Move to another client">Client</button>':"")+'<button class="btn sm" data-review="'+esc(a.id)+'">Review</button></div></article>';
   }).join("");
   return '<div class="acards">'+cards+'</div>'+(items.length>200?'<p class="sub" style="padding:10px 14px">Showing 200 of '+items.length+". Refine the filters to narrow the list.</p>":"");
 }
@@ -9565,7 +9638,7 @@ function queueView(items){
   const portfolios=[...new Set(items.map(a=>a.portfolio))].sort();
   const sel=(key,label,opts)=>'<label class="fl"><span class="sub">'+label+'</span><select data-filter="'+key+'" aria-label="'+label+'">'+opts.map(o=>{const v=Array.isArray(o)?o[0]:o,l=Array.isArray(o)?o[1]:o;return '<option value="'+esc(v)+'"'+(filt[key]===v?" selected":"")+'>'+esc(l)+'</option>';}).join("")+'</select></label>';
   const countries=[...new Set(items.map(a=>artCountry(data.articles[a.pmid])||"Unknown"))].sort();
-  const more=sel("oa","Access",[["","Any"],["open","Open access"],["closed","Closed access"],["unchecked","Not yet checked"]])+sel("ft","Full text",[["","Any"],["stored","Stored"],["link","Open-access link only"],["none","None"]])+sel("country","Country",[["","Any"]].concat(countries))+sel("ime","Events",[["","Any"],["ime","Important medical events"],["icsr","ICSR candidates"]])+sel("source","Source",[["","Any"],["pubmed","PubMed"],["agency","Government agencies"]])+((data.clients||[]).length?sel("client","Client",[["","Any"]].concat(data.clients.map(c=>[c.id,c.name]),[["none","No client"]])):"")+sel("portfolio","Portfolio",[["","Any"]].concat(portfolios))+sel("sort","Sort",[["likely","Likely cases first"],["relevance","Most relevant"],["newest","Newest"],["oldest","Oldest"]].concat(libNumbers?[["number","Library number"]]:[]));
+  const more=sel("oa","Access",[["","Any"],["open","Open access"],["closed","Closed access"],["unchecked","Not yet checked"]])+sel("ft","Full text",[["","Any"],["stored","Stored"],["link","Open-access link only"],["none","None"]])+sel("country","Country",[["","Any"]].concat(countries))+sel("ime","Events",[["","Any"],["ime","Important medical events"],["icsr","ICSR candidates"]])+sel("source","Source",[["","Any"],["pubmed","PubMed"],["agency","Government agencies"]])+((data.clients||[]).length?sel("client","Client",[["","Any"]].concat(data.clients.map(c=>[c.id,c.name]),[["none","No client"]])):"")+sel("portfolio","Client",[["","Any"]].concat(portfolios))+sel("sort","Sort",[["likely","Likely cases first"],["relevance","Most relevant"],["newest","Newest"],["oldest","Oldest"]].concat(libNumbers?[["number","Library number"]]:[]));
   const exp='<details class="menu"><summary class="btn outline">Export</summary><div class="menubox"><button data-pdf="queue" title="The filtered list as a PDF with a snapshot of each article">PDF with snapshots</button><button data-zip="queue" title="Stored full texts for the filtered list">Full texts (ZIP)</button><button data-cite="ris" data-scope="queue" title="EndNote, Zotero, Mendeley">Citations (RIS)</button><button data-retrieval="csv" title="Articles without stored full text, with DOI links">Retrieval list (CSV)</button><button data-retrieval="flag" title="Mark the listed articles without stored full text as Full text needed">Flag for manual retrieval</button></div></details>';
   const chip=filt.special?'<button type="button" class="badge blue" data-clearspecial="1" style="cursor:pointer" title="Clear this filter">'+esc({unassigned:"Unassigned",overdue:"Overdue",qcreturned:"QC returned",qcpending:"Waiting for QC",pendingevidence:"Evidence pending"}[filt.special]||filt.special)+' ×</button>':"";
   return queueStrip(items)+'<section class="qwrap"><div class="filters slim"><input data-filter="q" placeholder="Search title, PMID or molecule" value="'+esc(filt.q)+'" aria-label="Search">'+chip+sel("status","Status",[["","All"]].concat(["Pending","In review","Full text needed","Awaiting QC","QC returned","Complete"]))+'<details class="menu"><summary class="btn outline">More filters</summary><div class="menubox wide2">'+more+'</div></details>'+exp+'</div><div id="qtable">'+queueBody(applyFilter(items))+"</div></section>";
@@ -9607,16 +9680,16 @@ function aiSteps(a){
 function syncSettingsHtml(){
   const c=data.config,a=c.ai||{},au=c.automation||{auto:true,smpc:true,ai:false,submit:true},mode=c.syncMode||"off",st=aiSteps(a),pct=a.monthlyTokens?Math.min(100,Math.round((a.used||0)/a.monthlyTokens*100)):0,snd=c.sender||{};
   const modes=[["off","Off","Nothing is prepared"],["shadow","Shadow","Prepares and compares, creates no cases"],["active","Active","Creates evidence-backed patient drafts"]];
-  const hero='<div class="syn-hero"><div><b>Synchrony is '+({off:"off",shadow:"in Shadow mode",active:"active"})[mode]+'</b><div class="sub">'+(mode==="active"?((c.syncActivePortfolios||[]).length?"for "+esc(c.syncActivePortfolios.join(", ")):"for every portfolio"):mode==="shadow"?"It prepares and measures, and creates no cases yet.":"Switch it on below to start.")+' · AI '+(st.ready?'<b style="color:var(--green)">connected</b>':'<b style="color:var(--amber)">not ready</b>')+' · '+[au.auto,au.smpc,au.submit,c.syncAutoScreen,c.autoIcsr,c.autoAssignCases].filter(Boolean).length+' of 6 automation steps on</div></div><div class="syn-run"><button type="button" class="btn outline sm" data-sync-act="run">Run preparation now</button>'+(au.smpc?'<button type="button" class="btn outline sm" data-sync-act="reference_check">Check safety references</button>':"")+'</div></div>';
+  const hero='<div class="syn-hero"><div><b>Synchrony is '+({off:"off",shadow:"in Shadow mode",active:"active"})[mode]+'</b><div class="sub">'+(mode==="active"?((c.syncActivePortfolios||[]).length?"for "+esc(c.syncActivePortfolios.join(", ")):"for every client"):mode==="shadow"?"It prepares and measures, and creates no cases yet.":"Switch it on below to start.")+' · AI '+(st.ready?'<b style="color:var(--green)">connected</b>':'<b style="color:var(--amber)">not ready</b>')+' · '+[au.auto,au.smpc,au.submit,c.syncAutoScreen,c.autoIcsr,c.autoAssignCases].filter(Boolean).length+' of 6 automation steps on</div></div><div class="syn-run"><button type="button" class="btn outline sm" data-sync-act="run">Run preparation now</button>'+(au.smpc?'<button type="button" class="btn outline sm" data-sync-act="reference_check">Check safety references</button>':"")+'</div></div>';
   const modeSel='<div class="modecards">'+modes.map(m=>'<button type="button" class="modecard'+(mode===m[0]?" on":"")+'" data-syncmode="'+m[0]+'"><b>'+m[1]+'</b><span class="sub">'+m[2]+'</span></button>').join("")+'</div>';
   const step=(n,t,sub,body)=>'<div class="synstep"><div class="ss-h"><span class="ss-n">'+n+'</span><div><b>'+t+'</b><div class="sub">'+sub+'</div></div></div>'+body+'</div>';
   const s1=step(1,"Intake","Which articles reach Synchrony",tog("autoIcsr",c.autoIcsr,"Add full-text articles automatically","When QC selects an article with stored full text and detected events")+tog("syncAutoScreen",c.syncAutoScreen,"Screen articles automatically in Active mode","Flag evidence-backed potential ICSRs without waiting for a decision"));
-  const s2=step(2,"Prepare drafts","One draft per patient and portfolio",'<div class="sub" style="margin-bottom:6px">Mode</div>'+modeSel+'<form data-route="settings" class="pfrow"><b>Pilot portfolios for Active mode</b><div class="sub">Only these create drafts; the rest stay in Shadow. Choose none for every portfolio.</div>'+pfPicker("syncActivePortfolios",c.syncActivePortfolios)+'<button class="btn sm">Save pilot portfolios</button></form>'+tog("autoAssignCases",c.autoAssignCases,"Assign new cases automatically","Molecule owner first, then the person with the fewest open cases"));
+  const s2=step(2,"Prepare drafts","One draft per patient and client",'<div class="sub" style="margin-bottom:6px">Mode</div>'+modeSel+'<form data-route="settings" class="pfrow"><b>Pilot portfolios for Active mode</b><div class="sub">Only these create drafts; the rest stay in Shadow. Choose none for every portfolio.</div>'+pfPicker("syncActivePortfolios",c.syncActivePortfolios)+'<button class="btn sm">Save pilot portfolios</button></form>'+tog("autoAssignCases",c.autoAssignCases,"Assign new cases automatically","Molecule owner first, then the person with the fewest open cases"));
   const s3=step(3,"Enrich","What the rules fill in, with no tokens",tog("autoRun",au.auto,"Run on every new case","Events, IME flags, MedDRA matches, seriousness and the narrative")+tog("autoSmpc",au.smpc,"Look up the product label online","Listedness from the FDA label, with follow-up when the label changes"));
   const s4=step(4,"AI","Optional, capped, redacted",'<div class="ai-card">'+st.html+(st.ready?'<div class="ai-ok">Ready. Background AI also needs a portfolio ticked under Limits and portfolios.</div>':'<div class="ai-missing"><b>Not ready:</b> '+esc(st.missing?st.missing[0]+" - "+st.missing[2]:"")+'</div>')+
     '<form data-route="settings" data-aiconnect="1" class="ai-form"><label>OpenAI API key<span class="keyrow"><input type="password" name="openaiKey" id="aikeyfield" autocomplete="off" spellcheck="false" placeholder="'+(a.hasKey?"A key is saved. Paste a new one to replace it":"sk-...")+'"><button type="button" class="btn outline sm" data-showkey="1">Show</button></span></label><input type="hidden" name="aiEnabled" value="on"><input type="hidden" name="aiPaused" value="off"><label>Monthly token limit<input type="number" name="aiMonthlyTokens" min="1000" max="5000000" step="1000" value="'+((a.monthlyTokens||0)>0?a.monthlyTokens:500000)+'"></label><div class="ai-btns"><button class="btn">'+(a.hasKey?"Save and test":"Connect and turn on")+'</button><button type="button" class="btn outline" data-aismoke="1">Test connection</button>'+(a.hasKey&&a.keySource==="settings"?'<button type="button" class="btn outline" data-aikeyremove="1" style="color:var(--red)">Remove key</button>':"")+'</div><div id="aismokeout" class="sub" role="status"></div></form>'+
     '<div class="usage"><div class="sub">Used this month: <b>'+(a.used||0).toLocaleString()+'</b> of '+(a.monthlyTokens||0).toLocaleString()+' tokens</div><div class="bar"><i style="width:'+pct+'%"></i></div></div>'+
-    '<details class="more"><summary>Limits and portfolios</summary><form data-route="settings" class="grid" style="margin-top:10px"><label>Model<input name="aiModel" value="'+esc(a.model||"gpt-4o-mini")+'"></label><label>Per-case token limit<input type="number" name="aiPerCase" min="0" max="200000" step="500" value="'+(a.perCaseTokens===undefined?4000:a.perCaseTokens)+'"></label><label>Pause<select name="aiPaused"><option value="off"'+(a.paused?"":" selected")+'>Running</option><option value="on"'+(a.paused?" selected":"")+'>Paused: rules only</option></select></label><div class="wide"><b>Portfolios allowed to use background AI</b><div class="sub">AI screens redacted public abstracts and permitted full text within the monthly budget.</div>'+pfPicker("syncAiPortfolios",c.syncAiPortfolios)+'</div><label>Other stored full text<select name="syncAiAuthorizedText"><option value="off"'+(!c.syncAiAuthorizedText?" selected":"")+'>Keep within LiteraSift</option><option value="on"'+(c.syncAiAuthorizedText?" selected":"")+'>Allow redacted passages when authorised for OpenAI processing</option></select></label><div><button class="btn">Save limits</button></div></form></details>'+tog("autoAi",au.ai,"AI data entry on new cases","Ask the AI about empty fields, using the limits above")+'</div>');
+    '<details class="more"><summary>Limits and portfolios</summary><form data-route="settings" class="grid" style="margin-top:10px"><label>Model<input name="aiModel" value="'+esc(a.model||"gpt-4o-mini")+'"></label><label>Per-case token limit<input type="number" name="aiPerCase" min="0" max="200000" step="500" value="'+(a.perCaseTokens===undefined?4000:a.perCaseTokens)+'"></label><label>Pause<select name="aiPaused"><option value="off"'+(a.paused?"":" selected")+'>Running</option><option value="on"'+(a.paused?" selected":"")+'>Paused: rules only</option></select></label><div class="wide"><b>Clients allowed to use background AI</b><div class="sub">AI screens redacted public abstracts and permitted full text within the monthly budget.</div>'+pfPicker("syncAiPortfolios",c.syncAiPortfolios)+'</div><label>Other stored full text<select name="syncAiAuthorizedText"><option value="off"'+(!c.syncAiAuthorizedText?" selected":"")+'>Keep within LiteraSift</option><option value="on"'+(c.syncAiAuthorizedText?" selected":"")+'>Allow redacted passages when authorised for OpenAI processing</option></select></label><div><button class="btn">Save limits</button></div></form></details>'+tog("autoAi",au.ai,"AI data entry on new cases","Ask the AI about empty fields, using the limits above")+'</div>');
   const s5=step(5,"Route","From draft to QC",tog("autoSubmit",au.submit!==false,"Send clean drafts to QC","No exceptions, no missing fields, no open AI findings: straight to QC"));
   const s6=step(6,"Release","Sender details in exports",'<details class="more"><summary>Sender and E2B identifiers</summary><form class="grid" data-route="settings" style="margin-top:10px"><label>Sender organisation<input name="senderOrg" value="'+esc(snd.org||"")+'" placeholder="Your company"></label><label>Sender contact name<input name="senderName" value="'+esc(snd.name||"")+'"></label><label>Sender e-mail<input name="senderEmail" value="'+esc(snd.email||"")+'"></label><label>Sender phone<input name="senderPhone" value="'+esc(snd.phone||"")+'"></label><label>Sender country<input name="senderCountry" value="'+esc(snd.country||"")+'"></label><label>E2B sender identifier<input name="senderId" value="'+esc((c.e2b||{}).sender||"")+'" placeholder="N.2.r.2"></label><label>E2B receiver identifier<input name="receiverId" value="'+esc((c.e2b||{}).receiver||"")+'" placeholder="N.2.r.3"></label><div><button class="btn">Save</button></div></form></details><div class="sub" style="margin-top:8px">Timelines, owners and priorities per molecule are under Clients.</div>');
   return panel("Synchrony automation",hero+'<div class="synflow">'+s1+s2+s3+s4+s5+s6+'</div>',"Everything that moves a case from an article to a signed release, in the order it happens. Switches save as you flip them. Clinical decisions, signing and any external transmission stay with people.");
@@ -9683,7 +9756,7 @@ function openImport(pre){
   document.body.insertAdjacentHTML("beforeend",'<dialog id="impdlg" style="width:min(720px,96vw)"><h3 style="margin:0 0 4px">Add to Synchrony</h3><p class="sub" style="margin:0 0 14px">Upload a PDF or XML, or paste the article or its OCR text. It becomes a potential ICSR in the portfolio you choose, is read for patients, events and authors, and a draft is prepared.</p><form id="impform" data-own="1" class="impgrid">'+
     '<label class="wide">Title'+'<input name="title" value="'+esc(rec.title||"")+'" placeholder="Article or report title"></label>'+
     '<label>PMID or DOI<input name="id" value="'+esc(rec.pmid||rec.doi||"")+'" placeholder="Optional"></label><label>Molecule<input name="molecule" value="'+esc(pre.molecule||"")+'" placeholder="e.g. aciclovir"></label>'+
-    '<label>Portfolio<input name="portfolio" list="pfopts" autocomplete="off" required value="'+esc(pre.portfolio||(pfs.length===1?pfs[0]:""))+'" placeholder="Choose, or type a new one"></label><label>Authors (optional, comma separated)<input name="authors" placeholder="Read from the text when empty"></label>'+
+    '<label>Client<input name="portfolio" list="pfopts" autocomplete="off" required value="'+esc(pre.portfolio||(pfs.length===1?pfs[0]:""))+'" placeholder="Choose, or type a new one"></label><label>Authors (optional, comma separated)<input name="authors" placeholder="Read from the text when empty"></label>'+
     '<label class="wide">Upload PDF, XML or text file<input type="file" name="file" accept=".pdf,.xml,.txt,.md,text/plain,application/pdf,application/xml"></label>'+
     '<label class="wide">Or paste the text or OCR output<textarea name="text" rows="7" placeholder="Paste the article text. For a scanned image, run OCR first and paste the result here."></textarea></label>'+
     (rec.abstract?'<div class="wide sub">The abstract from the search result is used when no text is added.</div>':"")+
@@ -9742,7 +9815,7 @@ function caseCard(c, o){
     (clockHtml(c)||(c.dueAt?'<div class="sub"'+(late?' style="color:var(--red);font-weight:600"':"")+'>'+(late?Math.abs(left)+" d overdue":left===0?"Due today":left+" d left")+' · '+esc(c.dueAt)+'</div>':'<div class="sub">no date</div>'))+
     (o.noWho?"":'<div class="ac-who">'+(who?'<span class="av" aria-hidden="true">'+esc(who.slice(0,1).toUpperCase())+'</span><span>'+esc(who)+'</span>':badge("Unassigned","amber"))+'</div>')+
     (o.valid?(a.valid?badge("Valid ICSR","green"):'<span class="badge amber" title="'+esc((a.missing||[]).join(", "))+'">Missing '+((a.missing||[]).length)+'</span>'):"")+
-    (data.viewer.role==="manager"&&!c.locked?'<button type="button" class="btn outline sm" data-chpf="case|'+esc(c.id)+'|" title="Move to another portfolio">Portfolio</button>':"")+'<button type="button" class="btn sm" data-opencase="'+esc(c.id)+'">'+esc(o.action||"Open")+'</button></div></article>';
+    (data.viewer.role==="manager"&&!c.locked?'<button type="button" class="btn outline sm" data-chpf="case|'+esc(c.id)+'|" title="Move to another client">Client</button>':"")+'<button type="button" class="btn sm" data-opencase="'+esc(c.id)+'">'+esc(o.action||"Open")+'</button></div></article>';
 }
 function groupedCards(list,by,cardOf,empty){
   const wrap=(title,items)=>'<section class="cgroup">'+(title?'<h3 class="cg-title">'+title+' <span class="sub">'+items.length+'</span></h3>':"")+'<div class="acards flat">'+items.map(cardOf).join("")+'</div></section>';
@@ -9850,12 +9923,12 @@ function spClientHtml(){
   if(!opts.length)return panel("Pull for a client",'<div class="empty">No client has molecules yet.'+(mgr?" Add a client and its molecules on the Clients page.":" Ask a manager to add clients and molecules.")+'</div>');
   return panel("Pull for a client",'<div class="grid"><label>Client<select id="cpclient">'+opts.map(x=>'<option value="'+esc(x[0])+'"'+(x[0]===cpState.client?" selected":"")+'>'+esc(x[1])+' ('+clientMols(x[0]).length+')</option>').join("")+'</select></label>'+
     '<div class="wide"><span class="sub">Molecules to pull (tap to leave one out)</span><div class="pfpick" id="cpmols"></div></div>'+
-    '<div class="wide" style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" data-cppull="1">Pull this client</button><button type="button" class="btn outline" data-cpcompare="1">Compare with PubMed</button></div></div><div id="cpout">'+(cpState.out||"")+'</div>',mgr?"Every ticked molecule is pulled with the settings above, one at a time, and each row compares the stored PMIDs with the exact set PubMed returns.":"The molecules of the client that are in your portfolios are pulled into your own queue.");
+    '<div class="wide" style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" data-cppull="1">Pull this client</button><button type="button" class="btn outline" data-cpcompare="1">Compare with PubMed</button></div></div><div id="cpout">'+(cpState.out||"")+'</div>',mgr?"Every ticked molecule is pulled with the settings above, one at a time, and each row compares the stored PMIDs with the exact set PubMed returns.":"The molecules of this client that you work on are pulled into your own queue.");
 }
 function spMoleculeHtml(){
   return panel("Pull one molecule",'<form class="grid" id="molpullform" data-own="1" data-pull="1">'+drugFinderHtml()+'<label>Molecule (INN)<input name="molecule" required placeholder="Filled by the lookup, or type it"></label><label>Other names, optional (brands, salts)<input name="synonyms" placeholder="Zovirax, acyclovir"></label>'+
     ((data.clients||[]).length?'<label>Client<select name="client"><option value="">No client</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'"'+(cpState.client===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select></label>':"")+
-    '<label>Portfolio<input name="portfolio" list="pfopts" autocomplete="off" placeholder="Auto: by drug class"></label><label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label>'+
+    '<label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label>'+
     '<div class="wide" style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="molpullgo">Pull articles</button><button type="button" class="btn outline" data-suggest="1">Suggest synonyms &amp; brands</button></div></form><div id="suggest"></div><div id="cpout">'+(cpState.out||"")+'</div>',
     "The molecule is saved to its client (or reused if it is already watched), so new articles keep arriving daily, and the articles are pulled now with the settings above.");
 }
@@ -9864,16 +9937,16 @@ function spQueryHtml(mgr){
   if(!mgr&&!mine.length)return panel("Pull with a PubMed query",'<div class="empty">You are not in a portfolio yet. Ask a manager to add you under Team.</div>');
   return panel("Pull with a PubMed query",'<form class="grid" id="qpullform" data-own="1"><label class="wide">PubMed query, exactly as on the PubMed website<textarea name="query" rows="3" placeholder="e.g. (&quot;calcium acetate&quot;[tiab] OR PhosLo[tiab]) AND hyperphosphatemia"></textarea></label>'+
     '<details class="wide"><summary>Or build it from authors and topics</summary><div class="grid" style="margin-top:8px"><label>Authors (one per line or separated by commas)<textarea name="authors" rows="2" placeholder="Anthony Fauci"></textarea></label><label>Topics, searched in title and abstract<textarea name="topics" rows="2" placeholder="RNA, cardiovascular"></textarea></label><div><button type="button" class="btn outline sm" data-qbuild="1">Build the query</button></div></div></details>'+
-    (mgr?'<label>Portfolio<input name="portfolio" list="pfopts" required autocomplete="off" placeholder="Choose, or type a new one"></label>':'<label>Portfolio<select name="portfolio">'+mine.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label>')+
+    (mgr?'<label>Client<input name="portfolio" list="pfopts" required autocomplete="off" placeholder="Choose, or type a new one"></label>':'<label>Client<select name="portfolio">'+mine.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label>')+
     '<label>Label for this pull<input name="label" maxlength="100" placeholder="e.g. Phosphate binders review"></label>'+
     '<div class="wide"><button class="btn" id="qpullgo">Pull these articles</button> <span class="sub">The query runs exactly as written; the dates, date basis and filters above are added.</span></div></form><div id="cpout">'+(cpState.out||"")+'</div>',
-    "The search is run by PubMed itself, checked PMID by PMID, and the articles go into the portfolio's queue"+(mgr?"":", in your own queue")+". Excel export with the results.");
+    "The search is run by PubMed itself, checked PMID by PMID, and the articles go into the client's queue"+(mgr?"":", in your own queue")+". Excel export with the results.");
 }
 function spMineHtml(){
   const mine=(data.config&&data.config.myPortfolios)||[];
   if(!mine.length)return panel("Pull one molecule",'<div class="empty">You are not in a portfolio yet. Ask a manager to add you under Team.</div>');
-  return panel("Pull one molecule into my queue",'<form class="grid" id="minepullform" data-own="1" data-pull="1">'+drugFinderHtml()+'<label>Molecule (INN)<input name="molecule" required placeholder="Filled by the lookup, or type it"></label><label>Other names, optional (brands, salts)<input name="synonyms" placeholder="Zovirax, acyclovir"></label><label>Portfolio<select name="portfolio">'+mine.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label>'+
-    '<div class="wide"><button class="btn" id="minepullgo">Pull into my queue</button></div></form><div id="cpout">'+(cpState.out||"")+'</div>',"The articles go to your own queue in the portfolio you choose. Nothing is added to the watchlists, and other people's work is not changed.");
+  return panel("Pull one molecule into my queue",'<form class="grid" id="minepullform" data-own="1" data-pull="1">'+drugFinderHtml()+'<label>Molecule (INN)<input name="molecule" required placeholder="Filled by the lookup, or type it"></label><label>Other names, optional (brands, salts)<input name="synonyms" placeholder="Zovirax, acyclovir"></label><label>Client<select name="portfolio">'+mine.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label>'+
+    '<div class="wide"><button class="btn" id="minepullgo">Pull into my queue</button></div></form><div id="cpout">'+(cpState.out||"")+'</div>',"The articles go to your own queue in the client you choose. Nothing is added to the watchlists, and other people's work is not changed.");
 }
 function cpSettings(){
   const f=$("cpform");
@@ -9938,7 +10011,7 @@ async function runMoleculePull(f){
   const e=f.elements,btn=$("molpullgo"),st=cpSettings();if(st._lim&&(!st.from||!st.to))return message("Choose both dates, or clear both to pull all dates.",true);delete st._lim;
   const molecule=e.molecule.value.trim();if(!molecule)return message("Enter the molecule.",true);
   btn.disabled=true;let saved;
-  try{saved=await api("molecule-add",{list:molecule+(e.synonyms.value.trim()?", "+e.synonyms.value.trim():""),client:e.client?e.client.value:"",portfolio:e.portfolio.value.trim(),owner:e.owner.value,safetyOnly:spState.safety,reuse:true});}catch(err){btn.disabled=false;return message(err.message,true);}
+  try{saved=await api("molecule-add",{list:molecule+(e.synonyms.value.trim()?", "+e.synonyms.value.trim():""),client:e.client?e.client.value:"",owner:e.owner.value,safetyOnly:spState.safety,reuse:true});}catch(err){btn.disabled=false;return message(err.message,true);}
   const x=saved.results.find(r=>r.watch);if(!x){btn.disabled=false;return message((saved.results[0]||{}).error||"The molecule could not be saved.",true);}
   await runPullJobs(btn,[{key:x.watch,name:x.molecule}],it=>({...st,client:x.client||"none",molecules:[it.key]}),"pull-client");
 }
@@ -9951,7 +10024,7 @@ function cpMolsFill(){const box=$("cpmols");if(!box)return;const c=$("cpclient")
 function minePullHtml(){
   const today=new Date().toISOString().slice(0,10), start=new Date(Date.now()-30*864e5).toISOString().slice(0,10), mine=(data.config&&data.config.myPortfolios)||[];
   if(!mine.length)return panel("Search and pull articles",'<div class="empty">You are not in a portfolio yet. Ask a manager to add you under Team.</div>');
-  return panel("Search and pull articles",'<form class="grid" data-route="pull-mine" data-pull="1">'+drugFinderHtml()+'<label>Molecule (INN)<input name="molecule" required placeholder="Filled by the lookup, or type it"></label><label>Generic names and brands, searched with it<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio<select name="portfolio">'+mine.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div class="wide" style="display:flex;gap:16px;flex-wrap:wrap;grid-column:1/-1"><span class="sub">Narrow with PubMed filters:</span><label class="check"><input type="checkbox" name="humans">&nbsp;Humans only</label><label class="check"><input type="checkbox" name="caseReports">&nbsp;Case reports only</label><label class="check"><input type="checkbox" name="english">&nbsp;English only</label><label class="check"><input type="checkbox" name="noReviews">&nbsp;Exclude reviews</label></div><div><button class="btn">Pull into my queue</button></div></form>',"The articles go to your own queue in the portfolio you choose, with the usual two working days from today. Nothing is added to the watchlists, and other people's work is not changed.")+worldPanelHtml();
+  return panel("Search and pull articles",'<form class="grid" data-route="pull-mine" data-pull="1">'+drugFinderHtml()+'<label>Molecule (INN)<input name="molecule" required placeholder="Filled by the lookup, or type it"></label><label>Generic names and brands, searched with it<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Client<select name="portfolio">'+mine.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div class="wide" style="display:flex;gap:16px;flex-wrap:wrap;grid-column:1/-1"><span class="sub">Narrow with PubMed filters:</span><label class="check"><input type="checkbox" name="humans">&nbsp;Humans only</label><label class="check"><input type="checkbox" name="caseReports">&nbsp;Case reports only</label><label class="check"><input type="checkbox" name="english">&nbsp;English only</label><label class="check"><input type="checkbox" name="noReviews">&nbsp;Exclude reviews</label></div><div><button class="btn">Pull into my queue</button></div></form>',"The articles go to your own queue in the client you choose, with the usual two working days from today. Nothing is added to the watchlists, and other people's work is not changed.")+worldPanelHtml();
 }
 let teamState={role:"",q:""};
 const ROLE_META={manager:["Manager","blue","Everything: people, clients, timelines, settings"],screener:["Screener","teal","Screens articles and enters cases"],qc:["QC","violet","Checks screening and cases, routes them on"],medical_reviewer:["Medical reviewer","amber","Reviews, approves and signs cases"]};
@@ -9964,7 +10037,7 @@ function personRoles(p){
   const pm=mem.filter(m=>m.role==="manager").map(scope);if(pm.length)out.push({r:"portfolio",scope:[...new Set(pm)].join(", ")});
   return out;
 }
-const roleChip=c=>{const m=c.r==="portfolio"?["Portfolio manager","blue"]:ROLE_META[c.r];return '<span class="rchip rc-'+m[1]+'"><b>'+m[0]+'</b><i>'+esc(c.scope)+'</i></span>';};
+const roleChip=c=>{const m=c.r==="portfolio"?["Client manager","blue"]:ROLE_META[c.r];return '<span class="rchip rc-'+m[1]+'"><b>'+m[0]+'</b><i>'+esc(c.scope)+'</i></span>';};
 function teamHtml(){
   const hosted=data.config.accounts,accts=(data.accounts||{}).users||{},today=todayStr(),away=p=>p.awayFrom&&p.awayFrom<=today&&(!p.awayUntil||p.awayUntil>=today);
   const all=data.profiles||[],has=(p,r)=>personRoles(p).some(c=>c.r===r),count=r=>all.filter(p=>p.active&&has(p,r)).length;
@@ -9992,7 +10065,7 @@ function openPersonDialog(email){
   document.body.insertAdjacentHTML("beforeend",'<dialog id="pdlg" style="width:min(640px,96vw)"><h3 style="margin:0 0 4px">'+(p?"Edit "+esc(p.name||p.email):"Add a person")+'</h3><p class="sub" style="margin:0 0 12px">Choose what they do and where. Roles apply to every portfolio you tick.</p><form id="pform" data-own="1" class="impgrid">'+
     '<label>Name<input name="name" required value="'+esc(p?p.name:"")+'"></label><label>Sign-in email<input type="email" name="email" required value="'+esc(p?p.email:"")+'"'+(p?" readonly":"")+'></label>'+
     '<div class="wide"><span class="sub">Roles</span><div class="roleboxes">'+["screener","qc","medical_reviewer","manager"].map(rbox).join("")+'</div></div>'+
-    '<div class="wide"><span class="sub">Portfolios (for screener, QC and medical reviewer)</span><div class="pfpick" id="pfx"><label class="pfchip"><input type="checkbox" data-pfx="*"'+(allOn?" checked":"")+'><span>All portfolios</span></label>'+pfs.map(x=>'<label class="pfchip"><input type="checkbox" data-pfx="'+esc(x)+'"'+(!allOn&&pfSel.has(x)?" checked":"")+'><span>'+esc(x)+'</span></label>').join("")+'</div></div>'+
+    '<div class="wide"><span class="sub">Clients (for screener, QC and medical reviewer)</span><div class="pfpick" id="pfx"><label class="pfchip"><input type="checkbox" data-pfx="*"'+(allOn?" checked":"")+'><span>All portfolios</span></label>'+pfs.map(x=>'<label class="pfchip"><input type="checkbox" data-pfx="'+esc(x)+'"'+(!allOn&&pfSel.has(x)?" checked":"")+'><span>'+esc(x)+'</span></label>').join("")+'</div></div>'+
     '<label>Open work limit (screeners)<input type="number" name="capacity" min="1" max="500" value="'+esc(p?p.capacity||25:25)+'"></label><label>Availability<select name="active"><option value="true"'+(!p||p.active?" selected":"")+'>Available</option><option value="false"'+(p&&!p.active?" selected":"")+'>Unavailable (work goes back to routing)</option></select></label>'+
     '<label>Away from<input type="date" name="awayFrom" value="'+esc(p&&p.awayFrom||"")+'"></label><label>Away until<input type="date" name="awayUntil" value="'+esc(p&&p.awayUntil||"")+'"></label>'+
     '<label class="check wide"><input type="checkbox" name="canManageClients"'+(p&&p.canManageClients?" checked":"")+'>&nbsp;May add clients and group molecules (managers can always)</label>'+
@@ -10086,8 +10159,8 @@ function render() {
     if(sp==="client")body=spSettingsHtml(false)+spClientHtml();
     else if(sp==="molecule")body=spSettingsHtml(true)+(manager?spMoleculeHtml():spMineHtml());
     else if(sp==="query")body=spSettingsHtml(false)+spQueryHtml(manager);
-    else if(sp==="pmids"&&manager)body=panel("Batch by PMID list",'<form class="grid" data-route="pmid-batch"><label class="wide">PMIDs (one per line, optionally followed by a name; or comma separated)<textarea name="text" rows="5" required placeholder="123456  Smith_2020&#10;789012  Jones_2021&#10;345678,901234"></textarea></label><label>Portfolio<input name="portfolio" required list="pfopts" placeholder="Choose, or type a new one" autocomplete="off"><datalist id="pfopts">'+[...new Set((data.watches||[]).map(w=>w.portfolio))].map(p=>'<option value="'+esc(p)+'">').join("")+'</datalist></label><label>Molecule (optional)<input name="molecule"></label><div><button class="btn">Add and fetch full texts</button></div></form>',"For lists of articles you already have: each PMID is read from PubMed, enters the screening queue and Synchrony like any other article, and its full text is looked up in every open source. Afterwards, Recent pulls offers a list of the PMIDs that could not be fetched, in the same format, to try again once you have the files.");
-    else if(sp==="posts"&&manager)body=panel("Patient-reported posts",'<form class="grid" data-route="social-add"><label class="wide">Post text (several posts: separate with a line of three dashes)<textarea name="text" rows="5" required placeholder="Paste a patient or forum post that mentions a medicine and a problem"></textarea></label><label>Platform<select name="platform"><option>Reddit</option><option>X (Twitter)</option><option>Facebook</option><option>Patient forum</option><option>Other</option></select></label><label>Link to the post (optional)<input name="url" placeholder="https://"></label><label>Posted on (optional)<input name="postedAt" type="date"></label><label>Portfolio<input name="portfolio" required list="pfopts" placeholder="Choose, or type a new one" autocomplete="off"></label><label>Molecule (optional)<input name="molecule"></label><div><button class="btn">Add posts</button></div></form>',"Names, e-mail addresses, phone numbers, handles, links and ID numbers are masked before anything is stored. Posts are added by hand, never collected automatically: platform terms and privacy law restrict that. Each post is screened for events like an article, with a confidence and the reasons for it, and can become a Synchrony case marked as a patient report. Social reports are unverified and the reporter cannot be contacted.");
+    else if(sp==="pmids"&&manager)body=panel("Batch by PMID list",'<form class="grid" data-route="pmid-batch"><label class="wide">PMIDs (one per line, optionally followed by a name; or comma separated)<textarea name="text" rows="5" required placeholder="123456  Smith_2020&#10;789012  Jones_2021&#10;345678,901234"></textarea></label><label>Client<input name="portfolio" required list="pfopts" placeholder="Choose, or type a new one" autocomplete="off"><datalist id="pfopts">'+[...new Set((data.watches||[]).map(w=>w.portfolio))].map(p=>'<option value="'+esc(p)+'">').join("")+'</datalist></label><label>Molecule (optional)<input name="molecule"></label><div><button class="btn">Add and fetch full texts</button></div></form>',"For lists of articles you already have: each PMID is read from PubMed, enters the screening queue and Synchrony like any other article, and its full text is looked up in every open source. Afterwards, Recent pulls offers a list of the PMIDs that could not be fetched, in the same format, to try again once you have the files.");
+    else if(sp==="posts"&&manager)body=panel("Patient-reported posts",'<form class="grid" data-route="social-add"><label class="wide">Post text (several posts: separate with a line of three dashes)<textarea name="text" rows="5" required placeholder="Paste a patient or forum post that mentions a medicine and a problem"></textarea></label><label>Platform<select name="platform"><option>Reddit</option><option>X (Twitter)</option><option>Facebook</option><option>Patient forum</option><option>Other</option></select></label><label>Link to the post (optional)<input name="url" placeholder="https://"></label><label>Posted on (optional)<input name="postedAt" type="date"></label><label>Client<input name="portfolio" required list="pfopts" placeholder="Choose, or type a new one" autocomplete="off"></label><label>Molecule (optional)<input name="molecule"></label><div><button class="btn">Add posts</button></div></form>',"Names, e-mail addresses, phone numbers, handles, links and ID numbers are masked before anything is stored. Posts are added by hand, never collected automatically: platform terms and privacy law restrict that. Each post is screened for events like an article, with a confidence and the reasons for it, and can become a Synchrony case marked as a patient report. Social reports are unverified and the reporter cannot be contacted.");
     else body=worldPanelHtml();
     html=spTabsHtml(manager)+body+(manager&&(sp==="client"||sp==="molecule")?panel("Recent pulls",table(["Watchlist","Date range","Citations","Status",""],data.runs.slice(0,8).map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF with screenshots</button>'+(String(r.query||"").startsWith("PMID list")?' <button class="btn outline sm" data-unfetched="'+esc(r.id)+'">Unfetched list (TSV)</button>':"")+(data.config.accounts?' <a class="btn outline sm" href="/host/run-tiles?run='+encodeURIComponent(r.id)+'" target="_blank" rel="noopener">Tile screenshot</a>':""):""]),"No pulls yet."),"",true):"");
   }
@@ -10168,15 +10241,15 @@ function render() {
     html=(mine.length?'<div class="covcard"><div class="cov-top"><div><b class="cov-n">'+Math.round(done/mine.length*100)+'%</b><span class="sub"> screened · '+done+' of '+mine.length+' articles</span></div><div class="chips">'+Object.entries(groups).sort((x,y)=>y[1].n-x[1].n).slice(0,8).map(([k,g])=>'<span class="badge mol">'+esc(k)+' '+g.d+'/'+g.n+'</span>').join("")+'</div></div><div class="bar"><i data-width="'+Math.round(done/mine.length*100)+'"></i></div></div>':"")+'<div class="mqtabs"><span class="seg" role="group" aria-label="View"><button type="button" class="segb'+(mqState.view==="timeline"?" on":"")+'" data-mqview="timeline">Timeline</button><button type="button" class="segb'+(mqState.view==="list"?" on":"")+'" data-mqview="list">Full list, filters and exports</button></span></div>'+(mqState.view==="list"?queueView(mine):'<div id="mqbox"><div class="skel"></div><div class="skel"></div></div>');
   }
   if(tab==="All Assignments") html=queueView(items);
-  if(tab==="Watchlists") html='<div id="autobox"><div class="skel"></div></div>'+panel("Product dictionaries",'<div id="dictbox"></div><form class="grid" data-route="dictionary-save" style="margin-top:12px"><label>Portfolio<input id="dictpf" name="portfolio" required list="pfopts"></label><label class="wide">Products, one per line: name | generics | brands | salts | aliases (names separated by commas)<textarea id="dicttext" name="productsText" rows="5" placeholder="aciclovir | acyclovir | Zovirax, Zovir | aciclovir sodium | ACV"></textarea></label><div><button class="btn">Save dictionary</button></div></form>',"A product listed here is searched under all its names. A name can belong to one product only. Saving a dictionary does not change a watchlist until you preview and apply a new query version.")+
+  if(tab==="Watchlists") html='<div id="autobox"><div class="skel"></div></div>'+panel("Product dictionaries",'<div id="dictbox"></div><form class="grid" data-route="dictionary-save" style="margin-top:12px"><label>Client<input id="dictpf" name="portfolio" required list="pfopts"></label><label class="wide">Products, one per line: name | generics | brands | salts | aliases (names separated by commas)<textarea id="dicttext" name="productsText" rows="5" placeholder="aciclovir | acyclovir | Zovirax, Zovir | aciclovir sodium | ACV"></textarea></label><div><button class="btn">Save dictionary</button></div></form>',"A product listed here is searched under all its names. A name can belong to one product only. Saving a dictionary does not change a watchlist until you preview and apply a new query version.")+
     panel("Query versions",(data.watches.length?'<div class="grid" style="margin-bottom:10px"><label>Watchlist<select id="wsel">'+watchOptions+'</select></label><label>Effective from<input id="wefrom" type="date"></label><label class="wide">Note<input id="wnote" placeholder="Why the query changes"></label><div><button type="button" class="btn outline" id="wprevbtn" data-wpreview="1">Preview change from dictionary</button></div></div><div id="wprev"></div>':'<div class="empty">Save a watchlist first.</div>')+table(["Watchlist","Version","Effective from","By","Note"],data.watches.flatMap(w=>(w.versions||[{version:1,query:w.query,effectiveFrom:"initial",by:"",note:""}]).slice().reverse().slice(0,3).map(v=>[esc(w.portfolio+(w.molecule?" · "+w.molecule:"")),"v"+v.version,esc(v.effectiveFrom==="0000-00-00"?"start":v.effectiveFrom),esc(v.by||""),esc(v.note||"")])),"No versions yet."),"Versions apply prospectively. An import records the version and the exact query it ran with.")+
-    panel("Add a watchlist",'<form class="grid" data-route="watch">'+((data.clients||[]).length?'<label>Client<select name="client"><option value="">No client</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>').join("")+'</select></label>':"")+'<label>Portfolio<input name="portfolio" required list="pfopts" autocomplete="off" placeholder="Choose, or type a new one"></label><label>Molecule<input name="molecule" placeholder="Optional"></label>'+'<label class="wide">PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><div><button class="btn">Save watchlist</button></div></form>')+
-    panel("Add molecules in bulk",'<form class="grid" data-route="watches">'+((data.clients||[]).length?'<label>Client<select name="client"><option value="">No client</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>').join("")+'</select></label>':"")+'<label>Portfolio<input name="portfolio" required list="pfopts" autocomplete="off" placeholder="Choose, or type a new one"></label>'+'<label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label>Assign all to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Save molecules</button></div></form>',"One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs.")+
+    panel("Add a watchlist",'<form class="grid" data-route="watch">'+((data.clients||[]).length?'<label>Client<select name="client"><option value="">No client</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>').join("")+'</select></label>':"")+'<label>Client<input name="portfolio" required list="pfopts" autocomplete="off" placeholder="Choose, or type a new one"></label><label>Molecule<input name="molecule" placeholder="Optional"></label>'+'<label class="wide">PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><div><button class="btn">Save watchlist</button></div></form>')+
+    panel("Add molecules in bulk",'<form class="grid" data-route="watches">'+((data.clients||[]).length?'<label>Client<select name="client"><option value="">No client</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.name)+'</option>').join("")+'</select></label>':"")+'<label>Client<input name="portfolio" required list="pfopts" autocomplete="off" placeholder="Choose, or type a new one"></label>'+'<label class="wide">Molecules<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;metformin, Glucophage"></textarea></label><label>Assign all to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div><button class="btn">Save molecules</button></div></form>',"One molecule per line: the molecule first, then synonyms, brands or salts, separated by commas or tabs.")+
     panel("Assign a molecule to an employee",watchOptions?'<form class="grid" data-route="assign-molecule"><label>Molecule<select name="watch">'+watchOptions+'</select></label><label>Employee<select name="owner">'+peopleOptions("","Unassign (auto)")+'</select></label><label class="check"><input type="checkbox" name="reassign">&nbsp;Also move articles already assigned to someone else</label><div><button class="btn">Assign</button></div></form>':'<div class="empty">Save a watchlist first.</div>',
       "The employee receives every pulled article for the molecule that is not yet complete, and every article pulled for it from now on. Their open-article limit does not apply to owned molecules.")+
     panel("Assign by number",watchOptions?'<div class="grid"><label>Molecule<select id="rkwatch">'+watchOptions+'</select></label><label>Order<select id="rkorder"><option value="relevance">Most relevant first</option><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></label><label>Articles<select id="rkpool"><option value="open">All not yet complete</option><option value="unassigned">Unassigned only</option></select></label></div><div id="rkrows" style="margin-top:12px"></div><div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0"><button type="button" class="btn outline" data-rkadd="1">Add range</button><button type="button" class="btn outline" data-rkpreview="1">Preview ranked list</button><button type="button" class="btn" data-rkapply="1">Assign</button></div><div id="rkpreview"></div>':'<div class="empty">Save a watchlist first.</div>',
       "Number the articles in the order you choose (#1 is the top) and give each range to a person, for example 1 to 20 to one person and 21 to 30 to another. Articles outside the ranges stay as they are.")+
-    panel("Saved watchlists ("+data.watches.length+")",table(["Portfolio","Molecule","Owner","Query",""],data.watches.map(w=>[esc(w.portfolio),esc(w.molecule||"—"),w.owner?esc((data.profiles.find(p=>p.email===w.owner)||{name:w.owner}).name):'<span class="sub">Auto</span>','<span class="sub">'+esc(w.query)+"</span>",'<button class="btn outline sm" data-delwatch="'+esc(encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||""))+'">Delete</button>']),"Add a molecule or portfolio watchlist to start."),"",true);
+    panel("Saved watchlists ("+data.watches.length+")",table(["Client","Molecule","Owner","Query",""],data.watches.map(w=>[esc(w.portfolio),esc(w.molecule||"—"),w.owner?esc((data.profiles.find(p=>p.email===w.owner)||{name:w.owner}).name):'<span class="sub">Auto</span>','<span class="sub">'+esc(w.query)+"</span>",'<button class="btn outline sm" data-delwatch="'+esc(encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||""))+'">Delete</button>']),"Add a molecule or client watchlist to start."),"",true);
   if(tab==="Settings") html=userPermsHtml()+panel("Unpaywall (open access)",'<form class="grid" data-route="settings"><label class="wide">Contact email for Unpaywall<input type="email" name="unpaywallEmail" value="'+esc(data.config.unpaywallEmail)+'" placeholder="you@example.com"'+(data.config.unpaywallFromEnv?' disabled':'')+'></label><div><button class="btn"'+(data.config.unpaywallFromEnv?' disabled':'')+'>Save</button></div></form>'+
       '<div class="row"><span>Status</span>'+(data.config.unpaywall?badge("Active","green"):badge("Not configured","amber"))+'</div>'+
       '<form data-route="recheck-access" style="margin-top:10px"><button class="btn outline">Re-check open access for all articles</button></form>',
@@ -10238,7 +10311,7 @@ function render() {
   if($("molpullform"))$("molpullform").onsubmit=ev=>{ev.preventDefault();runMoleculePull(ev.target);};
   if($("minepullform"))$("minepullform").onsubmit=ev=>{ev.preventDefault();runMinePull(ev.target);};
   if($("qpullform"))$("qpullform").onsubmit=ev=>{ev.preventDefault();const f=ev.target,e=f.elements,st=cpSettings();if(st._lim&&(!st.from||!st.to))return message("Choose both dates, or clear both to pull all dates.",true);delete st._lim;
-    const query=e.query.value.trim(),authors=e.authors.value,topics=e.topics.value;if(!query&&!authors.trim()&&!topics.trim())return message("Type a PubMed query, or authors and topics.",true);if(!e.portfolio.value.trim())return message("Choose a portfolio.",true);
+    const query=e.query.value.trim(),authors=e.authors.value,topics=e.topics.value;if(!query&&!authors.trim()&&!topics.trim())return message("Type a PubMed query, or authors and topics.",true);if(!e.portfolio.value.trim())return message("Choose a client.",true);
     const label=e.label.value.trim()||"PubMed query";runPullJobs($("qpullgo"),[{key:"q",name:label}],()=>({...st,query,authors,topics,portfolio:e.portfolio.value.trim(),label}),"pull-query");};
   if(tab==="Clients"&&$("pullstats"))loadPullStats();
   if(tab==="Batches"&&$("batchcov"))loadBatches();
@@ -10286,7 +10359,7 @@ function showLink(title,note,link){
 function download(id) {
   const run=data.runs.find(r=>r.id===id);
   const cell=value=>'"'+String(value??"").replace(/^[=+@\\-]/,"'$&").replaceAll('"','""')+'"';
-  const rows=[["Source","PMID","Title","Journal","Date","DOI","PubMed URL","Portfolio","Molecules","Reviewer","Status","Full text","Screenshot","Retraction check","OA status","OA licence","OA link","Cited by","Abstract","Key passages"]];
+  const rows=[["Source","PMID","Title","Journal","Date","DOI","PubMed URL","Client","Molecules","Reviewer","Status","Full text","Screenshot","Retraction check","OA status","OA licence","OA link","Cited by","Abstract","Key passages"]];
   run.ids.forEach(pmid=>{
     const a=data.articles[pmid], item=data.assignments.find(x=>x.pmid===pmid&&x.portfolio===run.portfolio);
     rows.push([sourceOf(a),pmid,a.title,a.journal,a.date,a.doi,a.url,run.portfolio,(item?.molecules||[]).join("; "),item?.reviewer,item?.status,a.fullTextStatus||"Pending",a.screenshotStatus||"Pending",a.retractionStatus||"Pending",a.oaStatus||"Pending",a.oaLicense||"",a.oaUrl||"",a.citedBy??"",a.abstract||"",(a.keyPassages||[]).join(" | ")]);
@@ -10701,7 +10774,7 @@ document.addEventListener("click",event=>{
       return;
     }
     const cell=v=>'"'+String(v??"").replace(/^[=+@\\-]/,"'$&").replaceAll('"','""')+'"';
-    const rows=[["Source","PMID","Title","Journal","Date","DOI","DOI link","PubMed link","Access","Full-text status","Free LinkOut link","Portfolio","Molecules","Reviewer"]].concat(list.map(a=>{const x=data.articles[a.pmid]||{};
+    const rows=[["Source","PMID","Title","Journal","Date","DOI","DOI link","PubMed link","Access","Full-text status","Free LinkOut link","Client","Molecules","Reviewer"]].concat(list.map(a=>{const x=data.articles[a.pmid]||{};
       return [sourceOf(x),a.pmid,x.title,x.journal,x.date,x.doi,x.doi?"https://doi.org/"+x.doi:"",x.url,x.oaStatus||"",x.fullTextStatus||"",((x.linkOut||[]).find(l=>l.free)||{}).url||"",a.portfolio,(a.molecules||[]).join("; "),a.reviewer||""];}));
     const link=document.createElement("a");link.href=URL.createObjectURL(new Blob([rows.map(r=>r.map(cell).join(",")).join("\\r\\n")],{type:"text/csv"}));
     link.download="literasift-retrieval-list.csv";link.click();setTimeout(()=>URL.revokeObjectURL(link.href),4000);

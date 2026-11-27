@@ -101,7 +101,7 @@ test("a manager changes the portfolio of articles, cases and a whole watchlist; 
     cases: [{ id: "c1", number: "LS-1", pmid: "1", portfolio: "Antivirals", molecule: "aciclovir", status: "Draft", stage: "screening", assignee: SCREENER, createdAt: dAgo(2) + "T09:00:00Z", updatedAt: dAgo(2), history: [], versions: [], data: worker.normalizeCase({ products: [{ role: "suspect", name: f("aciclovir") }], events: [{ verbatim: f("rash") }] }) }, { id: "c2", number: "LS-2", pmid: "2", portfolio: "Antivirals", molecule: "aciclovir", status: "Draft", stage: "screening", locked: true, assignee: SCREENER, createdAt: dAgo(2) + "T09:00:00Z", updatedAt: dAgo(2), history: [], versions: [], data: worker.normalizeCase({}) }] });
   assert.equal((await t.call(SCREENER, "/api/portfolio-change", { kind: "assignment", ids: ["a1"], to: "Oncology" })).status, 403, "managers only");
   const r = await t.call(MANAGER, "/api/portfolio-change", { kind: "assignment", ids: ["a1", "a2"], to: "Oncology" }); assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal(r.body.moved, 1); assert.equal(r.body.skipped[0].id, "a2", "already in Oncology, not duplicated");
-  const s = await t.state(), a1 = s.assignments.find(x => x.id === "a1"); assert.equal(a1.portfolio, "Oncology"); assert.notEqual(a1.reviewer, SCREENER, "the screener has no role in Oncology, so routing picked someone eligible"); assert.ok(a1.history.some(h => /Portfolio changed from Antivirals to Oncology/.test(h.action)));
+  const s = await t.state(), a1 = s.assignments.find(x => x.id === "a1"); assert.equal(a1.portfolio, "Oncology"); assert.notEqual(a1.reviewer, SCREENER, "the screener has no role in Oncology, so routing picked someone eligible"); assert.ok(a1.history.some(h => /Client changed from Antivirals to Oncology/.test(h.action)));
   assert.equal(s.cases.find(x => x.id === "c1").portfolio, "Oncology", "the case made from the article moved with it"); assert.equal(s.assignments.filter(x => x.pmid === "2").length, 2);
   const c = await t.call(MANAGER, "/api/portfolio-change", { kind: "case", ids: ["c2"], to: "Oncology" }); assert.equal(c.body.moved, 0); assert.match(c.body.skipped[0].reason, /signed/);
   assert.equal((await t.call(MANAGER, "/api/portfolio-change", { kind: "watch", watch: "Antivirals|aciclovir", to: "Oncology" })).status, 200); const s2 = await t.state(); assert.ok(s2.watches.some(w => w.portfolio === "Oncology" && w.molecule === "aciclovir"));
@@ -246,58 +246,51 @@ test("add molecule: builds the watch for a client, refuses duplicates and non-ma
   const d = (await t.call(MANAGER, "/api/dashboard", { workflow: "screening", client: "k1" })).body; assert.ok(Array.isArray(d.clientCards)); assert.ok(d.clients.some(c => c.id === "k1"));
 });
 
-test("add molecule: the portfolio is automatic (the client's own, else its name, else General)", async () => {
-  const t = await makeEnv({ watches: [{ portfolio: "CNS", molecule: "a", query: "a", client: "k1" }, { portfolio: "CNS", molecule: "b", query: "b", client: "k1" }] });
-  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }, { id: "k2", name: "Beta Bio" }]; s.watches.forEach(w => { w.client = "k1"; }); await t.BUCKET.put("bench.json", JSON.stringify(s));
-  const a = (await t.call(MANAGER, "/api/molecule-add", { client: "k1", molecule: "c" })).body; assert.equal(a.portfolio, "CNS"); assert.equal(a.auto, true);
-  assert.equal((await t.call(MANAGER, "/api/molecule-add", { client: "k2", molecule: "d" })).body.portfolio, "Beta Bio");
-  assert.equal((await t.call(MANAGER, "/api/molecule-add", { molecule: "e" })).body.portfolio, "General");
-  assert.equal((await t.call(MANAGER, "/api/molecule-add", { client: "k2", portfolio: "Own", molecule: "f" })).body.auto, false);
+test("add molecule: a molecule belongs to its client (the client is its only group); without a client it goes to No client", async () => {
+  const t = await makeEnv({ clients: [{ id: "k1", name: "Acme" }, { id: "k2", name: "Beta Bio" }], watches: [{ portfolio: "Acme", molecule: "a", query: "a", client: "k1" }] });
+  const none = async () => new Response("{}", { status: 404 });
+  const a = (await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { client: "k1", molecule: "c" }))).body; assert.equal(a.portfolio, "Acme");
+  assert.equal((await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { client: "k2", molecule: "d" }))).body.portfolio, "Beta Bio");
+  assert.equal((await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { molecule: "e" }))).body.portfolio, "No client");
+  assert.equal((await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { client: "k2", portfolio: "Own", molecule: "f" }))).body.portfolio, "Beta Bio", "a portfolio name is no longer used");
 });
 
-test("add molecule: the portfolio follows the drug class (valsartan joins Cardiovascular) and reuses a matching portfolio", async () => {
-  const t = await makeEnv({ watches: [{ portfolio: "Hypertension Products", molecule: "x", query: "x" }, { portfolio: "CNS", molecule: "y", query: "y" }] });
+test("add molecule: the drug class is kept as information about the molecule, never as its group", async () => {
+  const t = await makeEnv({ clients: [{ id: "k1", name: "Acme" }] });
   const none = async () => new Response("{}", { status: 404 });
   const add = body => withFetch(none, () => t.call(MANAGER, "/api/molecule-add", body)).then(r => r.body);
-  const v = await add({ molecule: "valsartan" }); assert.equal(v.portfolio, "Hypertension Products"); assert.equal(v.classification.class, "Angiotensin II receptor blocker");
-  assert.equal((await add({ molecule: "sertraline" })).portfolio, "CNS");
-  assert.equal((await add({ molecule: "amoxicillin" })).portfolio, "Anti-infectives");
+  const v = await add({ molecule: "valsartan", client: "k1" }); assert.equal(v.portfolio, "Acme"); assert.equal(v.classification.class, "Angiotensin II receptor blocker");
+  const w = (await t.state()).watches.find(x => x.molecule === "valsartan"); assert.equal(w.drugClass.area, "Cardiovascular"); assert.equal(w.portfolio, "Acme"); assert.ok(!/Cardiovascular|Acme/.test(w.query));
   const rx = async url => String(url).includes("rxclass") ? Response.json({ rxclassDrugInfoList: { rxclassDrugInfo: [{ rxclassMinConceptItem: { classId: "L01XE01", className: "Protein kinase inhibitors" } }] } }) : new Response("{}", { status: 404 });
-  const q = await withFetch(rx, () => t.call(MANAGER, "/api/molecule-add", { molecule: "zzzquine" })).then(r => r.body); assert.equal(q.portfolio, "Oncology and immunology"); assert.equal(q.classification.source, "RxNorm ATC");
-  assert.equal((await add({ molecule: "valsartan2x", portfolio: "Mine" })).portfolio, "Mine", "an explicit portfolio always wins");
+  const q = await withFetch(rx, () => t.call(MANAGER, "/api/molecule-add", { molecule: "zzzquine", client: "k1" })).then(r => r.body); assert.equal(q.portfolio, "Acme"); assert.equal(q.classification.source, "RxNorm ATC");
 });
 
 test("pull by client: pulls every molecule of a client (or a chosen subset); non-managers only in their portfolios; molecule pull can set the client", async () => {
-  const t = await makeEnv({ watches: [{ portfolio: "CNS", molecule: "aripiprazole", query: "a" }, { portfolio: "CNS", molecule: "sertraline", query: "b" }, { portfolio: "Other", molecule: "metformin", query: "c" }] });
-  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; s.watches.forEach(w => { w.client = "k1"; }); await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const t = await makeEnv({ clients: [{ id: "k1", name: "Acme" }], watches: [{ portfolio: "Acme", client: "k1", molecule: "aripiprazole", query: "a" }, { portfolio: "Acme", client: "k1", molecule: "sertraline", query: "b" }, { portfolio: "Acme", client: "k1", molecule: "metformin", query: "c" }] });
   const today = new Date(Date.now() + 5.5 * 3600000).toISOString().slice(0, 10), from = new Date(Date.now() + 5.5 * 3600000 - 5 * 86400000).toISOString().slice(0, 10);
   const ncbi = fakeNcbi([{ pmid: "11", date: from }]);
   assert.equal((await t.call(MANAGER, "/api/pull-client", { client: "nope", from, to: today })).status, 400);
   assert.equal((await t.call(MANAGER, "/api/pull-client", { client: "k1", from: today, to: from })).status, 400);
   const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from, to: today, dateField: "pdat" })); assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.equal(r.body.results.length, 3); assert.ok(r.body.results.every(x => !x.error), JSON.stringify(r.body.results));
-  const one = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from, to: today, molecules: [encodeURIComponent("CNS") + "|" + encodeURIComponent("sertraline")] })); assert.equal(one.body.results.length, 1);
+  const one = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from, to: today, molecules: [encodeURIComponent("Acme") + "|" + encodeURIComponent("sertraline")] })); assert.equal(one.body.results.length, 1);
   const none = await withFetch(ncbi.handler, () => t.call(SCREENER, "/api/pull-client", { client: "k1", from, to: today })); assert.ok(none.status === 200 || none.status === 400);
   const mol = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull", { molecule: "warfarin", portfolio: "Blood", client: "k1", from, to: today })); assert.equal(mol.status, 200, JSON.stringify(mol.body));
   assert.equal((await t.state()).watches.find(w => w.molecule === "warfarin").client, "k1");
 });
 
-test("add several molecules to one client at once: each gets its own drug-class portfolio, duplicates are skipped, and one bad line does not stop the rest", async () => {
-  const t = await makeEnv({ watches: [{ portfolio: "CNS", molecule: "y", query: "y" }] });
-  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; await t.BUCKET.put("bench.json", JSON.stringify(s));
+test("add several molecules to one client at once: all go to that client, duplicates are skipped, and one bad line does not stop the rest", async () => {
+  const t = await makeEnv({ clients: [{ id: "k1", name: "Acme" }], watches: [{ portfolio: "Acme", client: "k1", molecule: "y", query: "y" }] });
   const none = async () => new Response("{}", { status: 404 });
   const list = "valsartan, Diovan\nsertraline\n\namoxicillin, Amoxil\nvalsartan\nzzzunknown";
   const r = await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { client: "k1", list })); assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.equal(r.body.added, 4, JSON.stringify(r.body.results.map(x => x.molecule + ":" + x.status)));
   assert.equal(r.body.results.filter(x => x.status === "exists").length, 1, "the repeated valsartan is skipped");
   const w = (await t.state()).watches, by = m => w.find(x => x.molecule === m);
-  assert.equal(by("valsartan").portfolio, "Cardiovascular"); assert.equal(by("sertraline").portfolio, "CNS"); assert.equal(by("amoxicillin").portfolio, "Anti-infectives"); assert.ok(["Cardiovascular", "CNS", "Anti-infectives"].includes(by("zzzunknown").portfolio), "an unclassified molecule joins one of the client portfolios");
-  assert.ok([by("valsartan"), by("sertraline"), by("amoxicillin"), by("zzzunknown")].every(x => x.client === "k1"));
-  assert.ok(/Diovan/.test(by("valsartan").query));
+  assert.ok(["valsartan", "sertraline", "amoxicillin", "zzzunknown"].every(m => by(m).portfolio === "Acme" && by(m).client === "k1"));
+  assert.equal(by("valsartan").drugClass.area, "Cardiovascular"); assert.ok(/Diovan/.test(by("valsartan").query));
   assert.equal((await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { client: "k1", list: "valsartan" }))).status, 409, "only duplicates: nothing added");
   assert.equal((await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { client: "k1", list: "x\n".repeat(101) + "y" }))).status, 400);
-  assert.equal((await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { client: "k1", portfolio: "Mine", list: "heparin\nenoxaparin" }))).body.added, 2);
-  assert.ok((await t.state()).watches.filter(x => x.portfolio === "Mine").length === 2, "an explicit portfolio applies to all of them");
 });
 
 test("client pull figures: articles per client per week, totals, and a CSV with the client name and the number side by side", async () => {
@@ -318,18 +311,18 @@ test("client pull figures: articles per client per week, totals, and a CSV with 
 });
 
 test("search and pull rework: one molecule is reused when already watched, takes an owner, and a personal pull runs without dates in the background", async () => {
-  const t = await makeEnv({ watches: [{ portfolio: "Renal", molecule: "calcium acetate", query: '"calcium acetate"[tiab]' }] }, { DEFER_EVIDENCE: "1" });
-  const s = await t.state(); s.clients = [{ id: "k1", name: "Square" }]; s.memberships = [{ email: SCREENER, portfolio: "Renal", role: "screener" }]; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  // a molecule with no client yet is taken by the client it is pulled for
+  const t = await makeEnv({ clients: [{ id: "k1", name: "Square" }], watches: [{ portfolio: "No client", client: null, molecule: "calcium acetate", query: '"calcium acetate"[tiab]' }], memberships: [{ email: SCREENER, portfolio: "Square", role: "screener" }] }, { DEFER_EVIDENCE: "1" });
   const none = async () => new Response("{}", { status: 404 });
   const r = await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { list: "Calcium Acetate, PhosLo", client: "k1", owner: SCREENER, reuse: true })); assert.equal(r.status, 200, JSON.stringify(r.body));
-  assert.equal(r.body.results[0].status, "exists"); assert.equal(r.body.results[0].watch, "Renal|calcium%20acetate"); assert.equal(r.body.results[0].client, "k1");
+  assert.equal(r.body.results[0].status, "exists"); assert.equal(r.body.results[0].watch, "Square|calcium%20acetate"); assert.equal(r.body.results[0].client, "k1");
   const w = (await t.state()).watches[0]; assert.equal(w.client, "k1", "the client is set on a molecule that had none"); assert.equal(w.owner, SCREENER); assert.ok(/PhosLo/.test(w.query), "the new name is added to its search");
   assert.equal((await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { list: "x", owner: "nobody@x.org", reuse: true }))).status, 400);
   const ncbi = fakeNcbi([{ pmid: "31", date: "2004-02-02" }, { pmid: "32", date: dAgo(1) }]);
   await withFetch(ncbi.handler, async () => {
-    const start = await t.call(SCREENER, "/api/pull-mine", { molecule: "calcium acetate", portfolio: "Renal", background: true, online: false }); assert.ok(start.body.job, JSON.stringify(start.body));
+    const start = await t.call(SCREENER, "/api/pull-mine", { molecule: "calcium acetate", portfolio: "Square", background: true, online: false }); assert.ok(start.body.job, JSON.stringify(start.body));
     let p; for (let i = 0; i < 200; i++) { p = (await t.call(SCREENER, "/api/pull-job", { id: start.body.job })).body; if (p.state !== "running") break; await new Promise(x => setTimeout(x, 25)); }
     assert.equal(p.state, "done", JSON.stringify(p)); assert.equal(p.payload.allDates, true); assert.equal(p.payload.results[0].count, 2, "articles of every date"); assert.ok(p.payload.results[0].complete);
   });
-  assert.ok((await t.state()).assignments.filter(a => a.portfolio === "Renal").every(a => a.reviewer === SCREENER || a.pulledBy === SCREENER));
+  assert.ok((await t.state()).assignments.filter(a => a.portfolio === "Square").every(a => a.reviewer === SCREENER || a.pulledBy === SCREENER));
 });
