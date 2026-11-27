@@ -156,3 +156,19 @@ test("a molecule's countries narrow its saved search for pulls, the daily pull a
   const clear = await t.call(MANAGER, "/api/saved-search", { key: "Laurus|atorvastatin", countries: "", save: true });
   assert.equal(clear.body.search.query, "((atorvastatin) OR (atorvastatin calcium))");
 });
+
+test("pasted settings update several saved searches at once, line by line (Laurus block)", async () => {
+  const { readFileSync } = await import("node:fs");
+  const mols = ["atorvastatin", "hydroxychloroquine", "metformin", "trientine", "sodium phenylbutyrate", "bictegravir and emtricitabine and tenofovir alafenamide"];
+  const watches = mols.map((m, i) => ({ id: "w" + i, portfolio: "Laurus", molecule: m, query: "((" + m + "))", names: [], client: "l", countries: ["India"] }));
+  const t = await makeEnv({ watches, clients: [{ id: "l", name: "Laurus" }] });
+  const text = readFileSync(new URL("./fixtures/laurus-paste.txt", import.meta.url), "utf8") + "\nunknown drug | countries:";
+  const r = await t.call(MANAGER, "/api/saved-search-bulk", { client: "l", text });
+  assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal(r.body.saved, 6); assert.equal(r.body.failed, 1);
+  const st = await t.state(), w = m => st.watches.find(x => x.molecule === m);
+  for (const m of mols) assert.deepEqual(w(m).countries, [], m + " has no country");
+  assert.equal(w("metformin").searchMode, "custom"); assert.ok(w("metformin").query.startsWith('("Metformin"[All Fields]'));
+  assert.equal(w("trientine").query, "((trientine))");
+  assert.equal(w("bictegravir and emtricitabine and tenofovir alafenamide").query, "((bictegravir AND emtricitabine AND tenofovir alafenamide))");
+  assert.equal((await t.call(SCREENER, "/api/saved-search-bulk", { client: "l", text })).status, 403);
+});
