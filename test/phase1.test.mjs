@@ -153,9 +153,10 @@ test("batch readiness is exposed and a targeted retry recovers only what is miss
   const t = await makeEnv({ watches: [WATCH] }), records = recs(["2026-09-02", "2026-09-03"]);
   let ncbi = fakeNcbi(records, { dropDetails: ["1001"] });
   const run = (await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/import", { watch: "Antivirals|aciclovir", from: "2026-09-01", to: "2026-09-10" }))).body;
-  assert.equal(run.coverage, "partial");
+  // the citation of 1001 is stored, so the import is complete; its detail XML is evidence, reported and retried separately
+  assert.equal(run.coverage, "reconciled");
   let ready = (await t.call(MANAGER, "/api/batch-readiness", {})).body.batches.find(b => b.id === run.id);
-  assert.equal(ready.ready, false); assert.ok(ready.pending >= 1); assert.equal(ready.counts.citation.failed, 1); assert.equal(ready.importCoverage, "partial");
+  assert.equal(ready.ready, false); assert.ok(ready.pending >= 1); assert.equal(ready.counts.citation.failed, 1); assert.equal(ready.importCoverage, "reconciled");
   ncbi = fakeNcbi(records);
   const retry = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/evidence-retry", { runId: run.id }));
   assert.equal(retry.status, 200, JSON.stringify(retry.body));

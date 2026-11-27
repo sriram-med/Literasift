@@ -150,13 +150,13 @@ test("broad search style: bare names like the PubMed website, a client switch th
   const ncbi = fakeNcbi([{ pmid: "1", date: dAgo(2) }, { pmid: "2", date: dAgo(3) }]);
   const term = () => decodeURIComponent(ncbi.calls.filter(c => c.startsWith("esearch")).join(" ").replace(/\+/g, " "));
   const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(6), to: dAgo(0), dateField: "crdt", searchMode: "broad", online: false })); assert.equal(r.status, 200, JSON.stringify(r.body));
-  assert.equal(r.body.results[0].mode, "broad"); assert.ok(/\(\(sertraline OR /.test(term()) && term().includes("Zoloft") && term().includes('"sertraline hydrochloride"') && !term().includes("Lustral") && !term().includes("[tiab]"), term().slice(0, 300));
-  assert.equal(typeof r.body.results[0].siteCount, "number", "the website-style count is reported");
+  assert.equal(r.body.results[0].mode, "pubmed"); assert.ok(term().includes("((sertraline) OR (Zoloft) OR (sertraline hydrochloride))") && !term().includes("Lustral") && !term().includes("[tiab]"), term().slice(0, 300));
+  assert.equal(typeof r.body.results[0].expected, "number", "in PubMed default mode the count is the website count"); assert.ok(r.body.results[0].term.includes("[crdt]"), "the executed term is reported");
   assert.equal((await t.call(MANAGER, "/api/client-auto", { client: "k1", searchMode: "nope" })).status, 400);
-  const sw = await t.call(MANAGER, "/api/client-auto", { client: "k1", searchMode: "broad" }); assert.equal(sw.status, 200); assert.equal(sw.body.restyled, 1);
-  let st = await t.state(); assert.equal(st.clients[0].searchMode, "broad"); assert.ok(!/\[tiab\]/.test(st.watches[0].query) && /Zoloft/.test(st.watches[0].query), st.watches[0].query);
-  assert.equal((await status(t)).perClient.find(c => c.id === "k1").searchMode, "broad");
-  await t.call(MANAGER, "/api/client-auto", { client: "k1", searchMode: "precise" }); st = await t.state(); assert.ok(/\[tiab\]/.test(st.watches[0].query) && st.clients[0].searchMode === undefined);
+  const sw = await t.call(MANAGER, "/api/client-auto", { client: "k1", searchMode: "broad" }); assert.equal(sw.status, 200); assert.ok(sw.body.restyled <= 1, "PubMed default is already the default style");
+  let st = await t.state(); assert.equal(st.clients[0].searchMode, "pubmed"); assert.ok(!/\[tiab\]/.test(st.watches[0].query) && /Zoloft/.test(st.watches[0].query), st.watches[0].query);
+  assert.equal((await status(t)).perClient.find(c => c.id === "k1").searchMode, "pubmed");
+  await t.call(MANAGER, "/api/client-auto", { client: "k1", searchMode: "precise" }); st = await t.state(); assert.ok(/\[tiab\]/.test(st.watches[0].query) && st.clients[0].searchMode === "precise");
   const cmp = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/client-compare", { client: "k1", from: dAgo(6), to: dAgo(0) })); assert.equal(cmp.status, 200, JSON.stringify(cmp.body));
   const row = cmp.body.rows[0]; assert.equal(row.molecule, "sertraline"); assert.equal(row.site, 2); assert.ok(row.allTime === null || row.allTime === 2, "the undated count is asked for"); assert.ok(row.link.startsWith("https://pubmed.ncbi.nlm.nih.gov/?term="));
   const sc = await t.call(SCREENER, "/api/compare-client", { client: "k1" }); assert.ok(sc.status === 400 || sc.body.rows.every(r => r.portfolio === "CNS"), "others compare only the molecules of their own portfolios");
@@ -193,7 +193,7 @@ test("pull without dates: everything PubMed has for the molecule, whatever its d
   const huge = await withFetch(bigHandler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", allDates: true, online: false })); assert.ok(/more than the 25000/.test(huge.body.results[0].error), JSON.stringify(huge.body.results));
 });
 
-test("calcium acetate (a two-word name) gets a field-tagged broad search, and NCBI PubMed Central adds articles found only in full texts", async () => {
+test("calcium acetate (a two-word name) is given to PubMed unquoted for its automatic term mapping, never reduced to calcium, and NCBI PubMed Central adds articles found only in full texts", async () => {
   const t = await makeEnv({ watches: [{ portfolio: "Renal", molecule: "calcium acetate", query: '"calcium acetate"[tiab]' }] });
   const s = await t.state(); s.clients = [{ id: "k1", name: "Square" }]; s.watches[0].client = "k1"; await t.BUCKET.put("bench.json", JSON.stringify(s));
   const pm = fakeNcbi([{ pmid: "1", date: dAgo(2) }]), seen = [];
@@ -203,7 +203,7 @@ test("calcium acetate (a two-word name) gets a field-tagged broad search, and NC
     if (url.pathname.endsWith("esummary.fcgi") && (url.searchParams.get("id") || "").includes("77")) return new Response(JSON.stringify({ result: { uids: ["77"], 77: { title: "Calcium acetate in full text only", fulljournalname: "J Renal", pubdate: "2024", articleids: [{ idtype: "pubmed", value: "77" }] } } }));
     return pm.handler(u, i); };
   const r = await withFetch(handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", allDates: true, searchMode: "broad", includePmc: true, online: false })); assert.equal(r.status, 200, JSON.stringify(r.body));
-  const term = decodeURIComponent(pm.calls.filter(c => c.startsWith("esearch")).join(" ").replace(/\+/g, " ")); assert.ok(term.includes('"calcium acetate"[All Fields]') && term.includes('"calcium acetate"[MeSH Terms]'), term.slice(0, 300));
+  const term = decodeURIComponent(pm.calls.filter(c => c.startsWith("esearch")).join(" ").replace(/\+/g, " ")); assert.ok(term.includes("((calcium acetate))") && !/\(calcium\)|"calcium"/.test(term), term.slice(0, 300));
   assert.ok(seen.some(x => x.startsWith("esearch") && x.includes('"calcium acetate"[All Fields]')), "PubMed Central is searched with the names");
   assert.equal(r.body.results[0].pmc.found, 2, JSON.stringify(r.body.results[0])); assert.ok(!r.body.results[0].pmc.error);
   // the Discover sources include PubMed Central
