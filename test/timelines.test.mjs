@@ -233,3 +233,15 @@ test("case deletion is quick for unsigned cases (no typing, many at once) and st
   const sig = await t.call(MANAGER, "/api/cases-purge", { ids: ["c4"], quick: true }); assert.equal(sig.status, 400, "a signed case is never quick-deleted");
   assert.equal((await t.state()).cases.length, 1);
 });
+
+test("add molecule: builds the watch for a client, refuses duplicates and non-managers; dashboard filters and cards by client", async () => {
+  const t = await makeEnv({ watches: [] });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  assert.equal((await t.call(SCREENER, "/api/molecule-add", { portfolio: "P1", molecule: "aciclovir" })).status, 403);
+  assert.equal((await t.call(MANAGER, "/api/molecule-add", { portfolio: "P1" })).status, 400);
+  const r = await t.call(MANAGER, "/api/molecule-add", { client: "k1", portfolio: "P1", molecule: "aciclovir", synonyms: "Zovirax, acyclovir" }); assert.equal(r.status, 200, JSON.stringify(r.body));
+  const w = (await t.state()).watches.find(x => x.molecule === "aciclovir"); assert.equal(w.client, "k1"); assert.ok(/Zovirax/.test(w.query) && /acyclovir/.test(w.query));
+  assert.equal((await t.call(MANAGER, "/api/molecule-add", { client: "k1", portfolio: "P1", molecule: "aciclovir" })).status, 409);
+  assert.equal((await t.call(MANAGER, "/api/molecule-add", { client: "nope", portfolio: "P1", molecule: "x" })).status, 400);
+  const d = (await t.call(MANAGER, "/api/dashboard", { workflow: "screening", client: "k1" })).body; assert.ok(Array.isArray(d.clientCards)); assert.ok(d.clients.some(c => c.id === "k1"));
+});
