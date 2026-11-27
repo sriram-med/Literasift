@@ -89,6 +89,10 @@ MIT License. Copyright (c) 2026 Dr. Raj Akil Nomani. Permission is hereby grante
 
 The Naranjo scale scoring and categories, the WHO-UMC rule set (`naranjoScore`, `whoUmcCategory`) and the optional BioBERT inference service in `services/causality/` follow https://github.com/PrashantRGore/drug-causality-bert-v2 (Copyright its authors). The model weights are not included; the service loads them from the Hugging Face model named in the project. Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0). Changes: the scoring was re-implemented in JavaScript and extended with "unknown" answers as in the published Naranjo scale; the service is a new, smaller wrapper.
 
+## PubmedAPI (TLDWTutorials/PubmedAPI, MIT per its README)
+
+Ideas adopted, not code: the author + Title/Abstract topic query shape (authors ORed with `[Author]`, topics ORed with `[Title/Abstract]`, the two groups ANDed) in `buildAuthorTopicQuery`, and the Excel export columns (PMID, Title, Abstract, Authors, Journal, Keywords, URL, Affiliations) in `/api/pull-xlsx`. The repository is a Python tutorial script using Biopython and pandas; LiteraSift implements these in its own JavaScript, with its own search engine (date windows, retries, PMID-by-PMID reconciliation) instead of the script's single 11-result search. The repository has no LICENSE file; its README states the MIT License. Source: https://github.com/TLDWTutorials/PubmedAPI
+
 ## Not incorporated
 
 https://github.com/Nidhish-Balasubramanya/AI-Powered-Pharmacovigilance-via-Literature-Monitoring is licensed CC BY-NC-ND 4.0 (non-commercial, no derivatives). Its code and text are not used in LiteraSift.

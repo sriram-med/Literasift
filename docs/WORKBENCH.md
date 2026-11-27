@@ -366,3 +366,10 @@ Pulls are deliberately careful now; they take longer and are checked to the PMID
 - **One stream at a time.** A pull works on one molecule and one search window at a time, at a pace a little under what PubMed allows (2.5 requests a second without a key, 8 with one), so PubMed has no reason to refuse requests. Citations are fetched 100 at a time, and every request is tried up to seven times.
 - **Checked PMID by PMID.** After every window matches PubMed's count, the app asks PubMed for the exact list of PMIDs for the whole search and compares it with what was stored. Anything missing is fetched there and then, added to the same pull and the same queue, and the row says "Checked PMID by PMID against PubMed" (and how many the check filled in). Searches of up to 9,999 articles are checked this way; above that, the per-window counts are the check.
 - The progress line shows each stage, including "Checking every PMID against PubMed…".
+
+
+## PubMed query tab and Excel export (ideas from TLDWTutorials/PubmedAPI)
+
+- **Search & Pull > PubMed query**: paste any PubMed expression, exactly as on the PubMed website, or build one from **authors** (`[Author]`) and **topics** searched in title and abstract (`[Title/Abstract]`). Choose a portfolio and a label. The dates, date basis and filters of the settings card are added; nothing else changes the expression. It runs through the same engine as every other pull: date windows, retries, the run snapshot and the PMID-by-PMID check. Managers pull into any portfolio; others into their own portfolios and own queue.
+- **Excel (.xlsx)** next to Reconciliation (CSV) on every pull result: one row per stored article with PMID, Title, Abstract, Authors, Journal, Keywords (MeSH), URL, Affiliations (now every author's, not only the first), then molecule, portfolio, publication date and DOI.
+- Routes: `/api/pull-query`, `/api/build-query`, `/api/pull-xlsx`.

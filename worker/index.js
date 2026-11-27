@@ -1912,7 +1912,8 @@ function parsePubmedXml(xml) {
       if (descriptor && qualifiers.some(q => /^(chemically induced|poisoning|toxicity)$/.test(q))) aeMesh.push(xmlText(descriptor));
       if (descriptor && qualifiers.includes("adverse effects")) aeIndexed = true;
     }
-    out[pmid] = { journalCountry:xmlText(/<MedlineJournalInfo>[\s\S]*?<Country>([^<]*)<\/Country>/.exec(block)?.[1] || ""), affiliation:xmlText(/<Affiliation>([\s\S]*?)<\/Affiliation>/.exec(firstAuthor)?.[1] || "").slice(0, 400),
+    const affiliations = uniq([...block.matchAll(/<Affiliation>([\s\S]*?)<\/Affiliation>/g)].map(m => xmlText(m[1]).slice(0, 300)).filter(Boolean)).slice(0, 20);
+    out[pmid] = { affiliations, journalCountry:xmlText(/<MedlineJournalInfo>[\s\S]*?<Country>([^<]*)<\/Country>/.exec(block)?.[1] || ""), affiliation:xmlText(/<Affiliation>([\s\S]*?)<\/Affiliation>/.exec(firstAuthor)?.[1] || "").slice(0, 400),
       aeMesh:[...new Set(aeMesh)].slice(0, 10), aeIndexed, abstract, authors, meshTerms:[...new Set(list(/<DescriptorName[^>]*>([^<]+)</g))].slice(0, 30),
       keywords:[...new Set(list(/<Keyword[^>]*>([\s\S]*?)<\/Keyword>/g))].slice(0, 20), pubTypes:[...new Set(list(/<PublicationType[^>]*>([^<]+)</g))].slice(0, 8) };
   }
@@ -4199,6 +4200,31 @@ const libTag = e => String(e.n).padStart(e.width, "0");
 // ---- ZIP (stored, no compression) for bulk full-text download ----
 const crcTable = (() => { const table = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; table[n] = c >>> 0; } return table; })();
 const crc32 = bytes => { let c = 0xffffffff; for (let i = 0; i < bytes.length; i++) c = crcTable[(c ^ bytes[i]) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+// Author and Title/Abstract topic search, the way the PubmedAPI tutorial builds it (TLDWTutorials/PubmedAPI, MIT): authors ORed with [Author], topics ORed with
+// [Title/Abstract], the two groups ANDed. Names of several words are quoted so PubMed reads them as one author or one phrase.
+function buildAuthorTopicQuery(authors, topics) {
+  const clean = v => (Array.isArray(v) ? v : String(v || "").split(/[,;\n]/)).map(x => String(x).replace(/["\[\]()]/g, " ").replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 40);
+  const tag = (x, field) => (/\s/.test(x) ? '"' + x + '"' : x) + "[" + field + "]", groups = [];
+  const a = clean(authors), t = clean(topics);
+  if (a.length) groups.push("(" + a.map(x => tag(x, "Author")).join(" OR ") + ")");
+  if (t.length) groups.push("(" + t.map(x => tag(x, "Title/Abstract")).join(" OR ") + ")");
+  return groups.join(" AND ");
+}
+// A minimal Excel workbook (Office Open XML): one sheet, inline strings, no dependencies.
+function xlsxFile(sheetName, header, rows) {
+  const x = v => String(v ?? "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").slice(0, 32000).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const col = i => { let n = i + 1, out = ""; while (n) { const m = (n - 1) % 26; out = String.fromCharCode(65 + m) + out; n = Math.floor((n - 1) / 26); } return out; };
+  const row = (cells, r) => '<row r="' + r + '">' + cells.map((v, i) => '<c r="' + col(i) + r + '" t="inlineStr"><is><t xml:space="preserve">' + x(v) + '</t></is></c>').join("") + "</row>";
+  const sheet = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' + [header, ...rows].map((r, i) => row(r, i + 1)).join("") + "</sheetData></worksheet>";
+  const enc = new TextEncoder(), f = (name, text) => ({ name, data:enc.encode(text) });
+  return zipFiles([
+    f("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'),
+    f("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'),
+    f("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="' + x(sheetName).slice(0, 31) + '" sheetId="1" r:id="rId1"/></sheets></workbook>'),
+    f("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'),
+    f("xl/worksheets/sheet1.xml", sheet)
+  ]);
+}
 function zipFiles(files) {
   const encoder = new TextEncoder(), now = new Date(), parts = [], central = [];
   const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1), dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
@@ -5759,6 +5785,70 @@ async function apiCore(request, env, path) {
       }
     }
     return new Response("﻿" + rows.join("\r\n") + "\r\n", { headers:{ "Content-Type":"text/csv; charset=utf-8", "Content-Disposition":'attachment; filename="literasift-reconciliation-' + day() + '.csv"' } });
+  }
+  if (path === "/api/pull-query" && viewer) {
+    // Pull with an exact PubMed expression (or one built from authors and Title/Abstract topics), through the same engine: date windows, retries, the run snapshot,
+    // and the PMID-by-PMID reconciliation. A manager pulls into any portfolio (a new name creates it); everyone else into a portfolio they work in, into their own queue.
+    const valid = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
+    const isMgr = viewer.role === "manager", allowed = myPortfolios(state, viewer), portfolio = String(body.portfolio || "").trim().slice(0, 100), label = String(body.label || "").trim().slice(0, 100) || "PubMed query";
+    if (!portfolio || (!isMgr && !allowed.includes(portfolio))) return json({ error:isMgr ? "Choose or type a portfolio." : "Choose one of your own portfolios." }, 400);
+    const raw = String(body.query || "").trim() || buildAuthorTopicQuery(body.authors, body.topics);
+    if (!raw) return json({ error:"Type a PubMed query, or authors and topics." }, 400);
+    if (raw.length > 4000) return json({ error:"The query is longer than 4,000 characters." }, 400);
+    const allDates = body.allDates === true || (!body.from && !body.to), basis = basisOf(body.dateField);
+    if (allDates) { body.from = "1900-01-01"; body.to = day(); }
+    else if (!valid(body.from) || !valid(body.to) || body.from > body.to || body.to > day()) return json({ error:"Choose a valid date range through today, or leave both dates empty for all dates." }, 400);
+    const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
+    const query = narrow.length || body.noReviews === true ? "(" + raw + ")" + narrow.map(f => " AND " + f).join("") + (body.noReviews === true ? " NOT review[pt]" : "") : raw;
+    const term = allDates ? query : searchTerm(query, body.from, body.to, basis), cfg = withSettings(env, state), progress = [{ molecule:label, portfolio, stage:"counting", runId:"" }];
+    const work = async () => {
+      const info = await esearchInfo(cfg, term); progress[0].expected = info?.count ?? null;
+      if (info == null) return { molecule:label, portfolio, error:"PubMed did not answer this search. Check the query on PubMed with the link, then try again." };
+      if (info.count > 25000) return { molecule:label, portfolio, error:info.count + " articles in PubMed, more than the 25000 one pull takes. Narrow the query or the dates.", term, translation:info.translation, warnings:info.warnings };
+      const before = new Set(state.assignments.filter(a => a.portfolio === portfolio).map(a => a.pmid)); progress[0].stage = "pulling";
+      const snapshot = { mode:"custom", modeLabel:SEARCH_MODES.custom, query, term, names:[], filters:{ humans:body.humans === true, caseReports:body.caseReports === true, english:body.english === true, noReviews:body.noReviews === true, safety:false }, dateBasis:basis, dateBasisLabel:DATE_BASIS_LABEL[basis], from:allDates ? "" : body.from, to:allDates ? "" : body.to, allDates, by:email, label, adHoc:true, at:new Date().toISOString() };
+      let run = await execute(env, { portfolio, molecule:label, query }, body.from, body.to, { mode:"backfill", dateField:basis, force:true, windowDays:allDates ? 40000 : 92, budget:600, snapshot, onRun:id => { progress[0].runId = id; } });
+      run = await completeRun(env, run.id, { total:info.count });
+      progress[0].stage = "checking"; const check = await verifyIds(cfg, run.id, term, info.count).catch(() => ({ checked:false, filled:0 }));
+      run = (await load(env)).state.runs.find(x => x.id === run.id) || run;
+      if (!isMgr) await write(env, d => { for (const a of d.assignments) if (a.portfolio === portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
+      progress[0].stage = "finishing"; await settleEvidence(env, run.ids);
+      await audit(env, { by:email, action:"pull.query", target:portfolio + " · " + label, detail:{ term:term.slice(0, 500), count:info.count, stored:(run.ids || []).length } });
+      const got = uniq(run.ids || []).length, r = check.recon;
+      return { molecule:label, portfolio, runId:run.id, mode:"custom", modeLabel:SEARCH_MODES.custom, dateBasis:basis, dateBasisLabel:DATE_BASIS_LABEL[basis], from:allDates ? "" : body.from, to:allDates ? "" : body.to, translation:info.translation, warnings:info.warnings,
+        names:0, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, expected:info.count, retrieved:got, coverage:run.coverage, idCheck:check.checked, filledByCheck:check.filled || 0,
+        unavailable:(run.unavailable || []).length, notStored:r ? r.missing : Math.max(0, info.count - got - (run.unavailable || []).length), missingSample:(r?.sets?.missing || []).slice(0, 6), unexpected:r ? r.unexpected : 0, unexpectedSample:(r?.sets?.unexpected || []).slice(0, 6),
+        linked:r ? r.linked : null, withCitation:r ? r.withCitation : null, expectedSource:r?.expectedSource || "", storedIds:got <= 5000 ? uniq(run.ids || []) : null, term, pubmedUrl:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(term),
+        complete:["reconciled", "zero_results"].includes(run.coverage) && got + (run.unavailable || []).length >= info.count && !(r && r.missing) };
+    };
+    const wrap = async () => { const r = await work(); return { client:"", allDates, results:[r], total:r.retrieved || 0, added:r.added || 0, complete:!!r.complete }; };
+    if (body.background === true && env.DEFER_EVIDENCE === "1") {
+      const id = crypto.randomUUID(), results = [null], job = { id, by:email, state:"running", total:1, results, progress, startedAt:Date.now() }; pullJobs.set(id, job);
+      const keep = () => env.BUCKET.put("jobs/pull/" + id + ".json", JSON.stringify({ by:email, state:job.state, payload:job.payload || null, error:job.error || "", at:Date.now() })).catch(() => {});
+      await keep(); await recordJob(env, { id, by:email, route:"/api/pull-query", body:{ ...body, background:false }, state:"running", startedAt:new Date().toISOString(), molecules:[label] });
+      wrap().then(async payload => { results[0] = payload.results[0]; job.payload = payload; job.state = "done"; await keep(); await recordJob(env, { id, state:"done", finishedAt:new Date().toISOString() }); }).catch(async error => { job.state = "failed"; job.error = String(error.message || error).slice(0, 200); await keep(); await recordJob(env, { id, state:"failed", error:job.error }); });
+      return json({ job:id, total:1 });
+    }
+    return json(await wrap());
+  }
+  if (path === "/api/pull-xlsx" && viewer) {
+    // The pulled articles of one or more runs as an Excel workbook, with the PubmedAPI tutorial's columns (PMID, Title, Abstract, Authors, Journal, Keywords, URL,
+    // Affiliations) followed by the molecule, portfolio, publication date and DOI.
+    const ids = (Array.isArray(body.runIds) ? body.runIds : [body.runId]).map(String).filter(Boolean).slice(0, 60), runs = state.runs.filter(r => ids.includes(r.id));
+    if (!runs.length) return json({ error:"Choose at least one pull." }, 400);
+    if (viewer.role !== "manager" && runs.some(r => r.snapshot?.by !== email && !myPortfolios(state, viewer).includes(r.portfolio))) return json({ error:"Not your pull." }, 403);
+    const rows = [], seen = new Set();
+    for (const run of runs) for (const id of uniq(run.ids || [])) {
+      const a = state.articles[id]; if (!a || seen.has(run.molecule + "|" + id)) continue; seen.add(run.molecule + "|" + id);
+      rows.push([id, a.title || "", a.abstract || "", (a.authors || []).join(", "), a.journal || "", (a.meshTerms || []).join(", "), "https://pubmed.ncbi.nlm.nih.gov/" + id + "/", (a.affiliations || (a.affiliation ? [a.affiliation] : [])).join("; "), run.molecule || "", run.portfolio || "", a.date || "", a.doi || ""]);
+    }
+    const book = xlsxFile("PubMed results", ["PMID", "Title", "Abstract", "Authors", "Journal", "Keywords", "URL", "Affiliations", "Molecule", "Portfolio", "Publication date", "DOI"], rows);
+    await audit(env, { by:email, action:"export.xlsx", target:runs.length + " pull" + (runs.length === 1 ? "" : "s"), detail:{ articles:rows.length } });
+    return new Response(book, { headers:{ "Content-Type":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Content-Disposition":'attachment; filename="literasift-pubmed-results-' + day() + '.xlsx"' } });
+  }
+  if (path === "/api/build-query" && viewer) {
+    const query = buildAuthorTopicQuery(body.authors, body.topics); if (!query) return json({ error:"Type at least one author or topic." }, 400);
+    return json({ query });
   }
   if (path === "/api/name-variants" && viewer) {
     // Spelling variants (aciclovir/acyclovir, sulphate/sulfate, ...) are only suggested; an operator approves them as names of the molecule.
@@ -9740,7 +9830,7 @@ function clientPullHtml(title,sub,def){
 // NCBI sources and filters are shared and kept while you move between them. There is no date-field choice: an article counts if it was created in PubMed or published in the dates.
 let spState={tab:"client",from:"",to:"",basis:"any",broad:true,pmc:false,humans:false,caseReports:false,english:false,noReviews:false,safety:false};
 function spTabsHtml(mgr){
-  const tabs=[["client","By client","Every molecule of a client"],["molecule","One molecule","Look a drug up and pull it"],...(mgr?[["pmids","PMID list","Articles you already have"]]:[]),["world","Other sources","Europe PMC, OpenAlex, trials, regulators"],...(mgr?[["posts","Patient posts","Forum and social posts, masked"]]:[])];
+  const tabs=[["client","By client","Every molecule of a client"],["molecule","One molecule","Look a drug up and pull it"],["query","PubMed query","Any PubMed search, or authors and topics"],...(mgr?[["pmids","PMID list","Articles you already have"]]:[]),["world","Other sources","Europe PMC, OpenAlex, trials, regulators"],...(mgr?[["posts","Patient posts","Forum and social posts, masked"]]:[])];
   return '<div class="steptiles sptabs">'+tabs.map((x,i)=>'<button type="button" class="steptile'+(spState.tab===x[0]?" on":"")+'" data-sptab="'+x[0]+'"><span class="st-n">'+(i+1)+'</span><span class="st-t"><b>'+x[1]+'</b><span class="sub">'+x[2]+'</span></span></button>').join("")+'</div>';
 }
 function spDateHint(){const b={any:"created in PubMed or published",crdt:"created in PubMed (Create date [crdt])",pdat:"published (Publication date [dp])"}[spState.basis||"any"];return spState.from||spState.to?"Articles "+b+" from "+(spState.from||"…")+" to "+(spState.to||"…")+", both days included.":"Every article PubMed has, whatever its dates.";}
@@ -9769,6 +9859,16 @@ function spMoleculeHtml(){
     '<div class="wide" style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="molpullgo">Pull articles</button><button type="button" class="btn outline" data-suggest="1">Suggest synonyms &amp; brands</button></div></form><div id="suggest"></div><div id="cpout">'+(cpState.out||"")+'</div>',
     "The molecule is saved to its client (or reused if it is already watched), so new articles keep arriving daily, and the articles are pulled now with the settings above.");
 }
+function spQueryHtml(mgr){
+  const mine=(data.config&&data.config.myPortfolios)||[];
+  if(!mgr&&!mine.length)return panel("Pull with a PubMed query",'<div class="empty">You are not in a portfolio yet. Ask a manager to add you under Team.</div>');
+  return panel("Pull with a PubMed query",'<form class="grid" id="qpullform" data-own="1"><label class="wide">PubMed query, exactly as on the PubMed website<textarea name="query" rows="3" placeholder="e.g. (&quot;calcium acetate&quot;[tiab] OR PhosLo[tiab]) AND hyperphosphatemia"></textarea></label>'+
+    '<details class="wide"><summary>Or build it from authors and topics</summary><div class="grid" style="margin-top:8px"><label>Authors (one per line or separated by commas)<textarea name="authors" rows="2" placeholder="Anthony Fauci"></textarea></label><label>Topics, searched in title and abstract<textarea name="topics" rows="2" placeholder="RNA, cardiovascular"></textarea></label><div><button type="button" class="btn outline sm" data-qbuild="1">Build the query</button></div></div></details>'+
+    (mgr?'<label>Portfolio<input name="portfolio" list="pfopts" required autocomplete="off" placeholder="Choose, or type a new one"></label>':'<label>Portfolio<select name="portfolio">'+mine.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label>')+
+    '<label>Label for this pull<input name="label" maxlength="100" placeholder="e.g. Phosphate binders review"></label>'+
+    '<div class="wide"><button class="btn" id="qpullgo">Pull these articles</button> <span class="sub">The query runs exactly as written; the dates, date basis and filters above are added.</span></div></form><div id="cpout">'+(cpState.out||"")+'</div>',
+    "The search is run by PubMed itself, checked PMID by PMID, and the articles go into the portfolio's queue"+(mgr?"":", in your own queue")+". Excel export with the results.");
+}
 function spMineHtml(){
   const mine=(data.config&&data.config.myPortfolios)||[];
   if(!mine.length)return panel("Pull one molecule",'<div class="empty">You are not in a portfolio yet. Ask a manager to add you under Team.</div>');
@@ -9796,7 +9896,7 @@ async function runPullJobs(btn,list,bodyFor,route,done){
   const draw=()=>{const fin=rows.filter(Boolean).length,late=rows.filter(x=>x&&!x.error&&!x.complete).length,bad=rows.filter(x=>x&&x.error).length,ids=new Set(),idsKnown=rows.every(x=>!x||x.error||Array.isArray(x.storedIds));
     rows.forEach(x=>{if(x&&Array.isArray(x.storedIds))x.storedIds.forEach(i=>ids.add(i));});
     const runIds=rows.filter(x=>x&&x.runId).map(x=>x.runId);
-    cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+fin+' of '+list.length+' molecule'+(list.length===1?"":"s")+' done · '+(idsKnown?ids.size+' unique PMID'+(ids.size===1?"":"s")+' across them · ':'')+tot("retrieved")+' stored per molecule, '+tot("added")+' new this time</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(late?' · '+late+' not complete: use Retry missing PMIDs':"")+(bad?' · '+bad+' failed: use Try again':"")+'</span>'+(runIds.length?'<button type="button" class="btn outline sm" data-recocsv="'+esc(runIds.join(","))+'" style="margin-left:auto">Reconciliation (CSV)</button>':"")+'</div>'+
+    cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+fin+' of '+list.length+' molecule'+(list.length===1?"":"s")+' done · '+(idsKnown?ids.size+' unique PMID'+(ids.size===1?"":"s")+' across them · ':'')+tot("retrieved")+' stored per molecule, '+tot("added")+' new this time</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(late?' · '+late+' not complete: use Retry missing PMIDs':"")+(bad?' · '+bad+' failed: use Try again':"")+'</span>'+(runIds.length?'<span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap"><button type="button" class="btn outline sm" data-xlsx="'+esc(runIds.join(","))+'">Excel (.xlsx)</button><button type="button" class="btn outline sm" data-recocsv="'+esc(runIds.join(","))+'">Reconciliation (CSV)</button></span>':"")+'</div>'+
     table(["Molecule","PubMed matched","Citation stored","Linked to molecule","Unavailable","New this time","Check",""],list.map((it,i)=>{const x=rows[i];
       if(x)return ['<b>'+esc(x.molecule||it.name)+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · +'+x.names+' approved name'+(x.names===1?"":"s"):"")+'</div>':"")+(x.modeLabel?'<div class="sub">'+esc(x.modeLabel)+' · '+esc(x.dateBasisLabel||"")+(x.from?' · '+esc(x.from)+' to '+esc(x.to)+' inclusive':' · all dates')+(x.queryVersion?' · query v'+esc(String(x.queryVersion)):"")+'</div>':"")+(x.term?'<details class="sub"><summary>Executed term</summary><code>'+esc(x.term)+'</code>'+(x.translation?'<div><b>PubMed read it as</b> <code>'+esc(x.translation)+'</code></div>':"")+'</details>':"")+(x.pubmedUrl?'<div class="sub"><a href="'+esc(x.pubmedUrl)+'" target="_blank" rel="noopener">Same search on PubMed</a></div>':""),
         x.error?"-":num(x.expected),x.error?"-":num(x.withCitation!=null?x.withCitation:x.retrieved),x.error?"-":num(x.linked),x.error?"-":num(x.unavailable),x.error?"-":String(x.added),
@@ -9985,6 +10085,7 @@ function render() {
     let body="";
     if(sp==="client")body=spSettingsHtml(false)+spClientHtml();
     else if(sp==="molecule")body=spSettingsHtml(true)+(manager?spMoleculeHtml():spMineHtml());
+    else if(sp==="query")body=spSettingsHtml(false)+spQueryHtml(manager);
     else if(sp==="pmids"&&manager)body=panel("Batch by PMID list",'<form class="grid" data-route="pmid-batch"><label class="wide">PMIDs (one per line, optionally followed by a name; or comma separated)<textarea name="text" rows="5" required placeholder="123456  Smith_2020&#10;789012  Jones_2021&#10;345678,901234"></textarea></label><label>Portfolio<input name="portfolio" required list="pfopts" placeholder="Choose, or type a new one" autocomplete="off"><datalist id="pfopts">'+[...new Set((data.watches||[]).map(w=>w.portfolio))].map(p=>'<option value="'+esc(p)+'">').join("")+'</datalist></label><label>Molecule (optional)<input name="molecule"></label><div><button class="btn">Add and fetch full texts</button></div></form>',"For lists of articles you already have: each PMID is read from PubMed, enters the screening queue and Synchrony like any other article, and its full text is looked up in every open source. Afterwards, Recent pulls offers a list of the PMIDs that could not be fetched, in the same format, to try again once you have the files.");
     else if(sp==="posts"&&manager)body=panel("Patient-reported posts",'<form class="grid" data-route="social-add"><label class="wide">Post text (several posts: separate with a line of three dashes)<textarea name="text" rows="5" required placeholder="Paste a patient or forum post that mentions a medicine and a problem"></textarea></label><label>Platform<select name="platform"><option>Reddit</option><option>X (Twitter)</option><option>Facebook</option><option>Patient forum</option><option>Other</option></select></label><label>Link to the post (optional)<input name="url" placeholder="https://"></label><label>Posted on (optional)<input name="postedAt" type="date"></label><label>Portfolio<input name="portfolio" required list="pfopts" placeholder="Choose, or type a new one" autocomplete="off"></label><label>Molecule (optional)<input name="molecule"></label><div><button class="btn">Add posts</button></div></form>',"Names, e-mail addresses, phone numbers, handles, links and ID numbers are masked before anything is stored. Posts are added by hand, never collected automatically: platform terms and privacy law restrict that. Each post is screened for events like an article, with a confidence and the reasons for it, and can become a Synchrony case marked as a patient report. Social reports are unverified and the reporter cannot be contacted.");
     else body=worldPanelHtml();
@@ -10136,6 +10237,9 @@ function render() {
   if($("cpclient"))cpMolsFill();
   if($("molpullform"))$("molpullform").onsubmit=ev=>{ev.preventDefault();runMoleculePull(ev.target);};
   if($("minepullform"))$("minepullform").onsubmit=ev=>{ev.preventDefault();runMinePull(ev.target);};
+  if($("qpullform"))$("qpullform").onsubmit=ev=>{ev.preventDefault();const f=ev.target,e=f.elements,st=cpSettings();if(st._lim&&(!st.from||!st.to))return message("Choose both dates, or clear both to pull all dates.",true);delete st._lim;
+    const query=e.query.value.trim(),authors=e.authors.value,topics=e.topics.value;if(!query&&!authors.trim()&&!topics.trim())return message("Type a PubMed query, or authors and topics.",true);if(!e.portfolio.value.trim())return message("Choose a portfolio.",true);
+    const label=e.label.value.trim()||"PubMed query";runPullJobs($("qpullgo"),[{key:"q",name:label}],()=>({...st,query,authors,topics,portfolio:e.portfolio.value.trim(),label}),"pull-query");};
   if(tab==="Clients"&&$("pullstats"))loadPullStats();
   if(tab==="Batches"&&$("batchcov"))loadBatches();
   if(tab==="Batches"&&$("schedbox"))loadScheduler();
@@ -10298,7 +10402,7 @@ document.addEventListener("click",event=>{
   const lc=event.target.closest&&event.target.closest("[data-llcsv]");
   if(lc){fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:"csv"})}).then(async res=>{if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"Nothing to export.");const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-line-listing-"+new Date().toISOString().slice(0,10)+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}).catch(e=>message(e.message,true));return;}
   const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-syncmode],[data-showkey],[data-wsuse],[data-wsrun],[data-wsall],[data-wsadd],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-mqby],[data-addmol],[data-cpsweeks],[data-cpsexport],[data-moldates],[data-clientrange],[data-wlby],[data-cppull],[data-cpcompare],[data-cpretry],[data-cppullsame],[data-runrepair],[data-recocsv],[data-sptab],[data-sprange],[data-btclient],[data-clientpull],[data-go-clients],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-syncmode],[data-showkey],[data-wsuse],[data-wsrun],[data-wsall],[data-wsadd],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-mqby],[data-addmol],[data-cpsweeks],[data-cpsexport],[data-moldates],[data-clientrange],[data-wlby],[data-cppull],[data-cpcompare],[data-cpretry],[data-cppullsame],[data-runrepair],[data-recocsv],[data-qbuild],[data-xlsx],[data-sptab],[data-sprange],[data-btclient],[data-clientpull],[data-go-clients],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -10394,6 +10498,8 @@ document.addEventListener("click",event=>{
   if(target.dataset.sprange){const k=target.dataset.sprange;if(k==="all"){spState.from="";spState.to="";}else{spState.to=new Date().toISOString().slice(0,10);spState.from=new Date(Date.now()-Number(k)*864e5).toISOString().slice(0,10);}render();return;}
   if(target.dataset.cpretry!==undefined){if(cpState.retry)cpState.retry(Number(target.dataset.cpretry),target);return;}
   if(target.dataset.runrepair){if(cpState.repair)cpState.repair(target.dataset.runrepair,Number(target.dataset.row),target);return;}
+  if(target.dataset.qbuild){const f=$("qpullform");if(!f)return;api("build-query",{authors:f.elements.authors.value,topics:f.elements.topics.value}).then(r=>{f.elements.query.value=r.query;}).catch(e=>message(e.message,true));return;}
+  if(target.dataset.xlsx){downloadPost("/api/pull-xlsx",{runIds:target.dataset.xlsx.split(",")},"literasift-pubmed-results.xlsx").catch(e=>message(e.message,true));return;}
   if(target.dataset.recocsv){downloadPost("/api/reconciliation-csv",{runIds:target.dataset.recocsv.split(",")},"literasift-reconciliation.csv").catch(e=>message(e.message,true));return;}
   if(target.dataset.cppullsame){const c=cpState.compared;if(c&&$("cpclient")&&$("cpclient").value===c.client){document.querySelectorAll("[data-cpmol]").forEach(x=>{x.checked=c.sel.includes(x.dataset.cpmol);});if(JSON.stringify((()=>{const v=cpSettings();delete v._lim;return v;})())!==c.st)return message("The settings changed after the comparison. Compare again, then pull.",true);}runClientPull(target);return;}
   if(target.dataset.cppull){runClientPull(target);return;}
