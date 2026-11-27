@@ -114,3 +114,17 @@ test("migration from portfolios to clients: molecules follow their client, dupli
   const ids = saved.clients.map(c => c.id).join(); await t.call(MANAGER, "/api/client-save", { name: "Delta" });
   assert.ok(JSON.parse(await (await t.env.BUCKET.get("bench.json")).text()).clients.map(c => c.id).join().startsWith(ids), "client ids are stable");
 });
+
+test("a removed client stays removed even when its old articles, pulls and roles still carry its name", async () => {
+  const { MANAGER, makeEnv: mk } = await import("./helpers.mjs");
+  const t = await mk({ clients: [{ id: "u", name: "USV" }], watches: [],
+    assignments: [{ id: "a1", pmid: "1", portfolio: "USV", molecules: ["gone molecule"], status: "New" }], runs: [{ id: "r1", portfolio: "USV", molecule: "gone molecule", ids: ["1"] }],
+    memberships: [{ email: "asha@example.org", portfolio: "USV", role: "reviewer" }], schema: { grouping: "client" } });
+  const r = await t.call(MANAGER, "/api/client-delete", { id: "u" }); assert.equal(r.status, 200);
+  let st = await t.state();
+  assert.deepEqual(st.clients, [], "not re-created");
+  assert.equal(st.assignments[0].portfolio, "No client"); assert.equal(st.runs[0].portfolio, "No client");
+  // a client with the same name can be made again on purpose
+  await t.call(MANAGER, "/api/client-save", { name: "USV" }); st = await t.state();
+  assert.deepEqual(st.clients.map(c => c.name), ["USV"]); assert.deepEqual(st.retiredClients, []);
+});

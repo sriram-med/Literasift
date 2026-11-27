@@ -20,7 +20,9 @@ function migrateToClients(state) {
   state.clients ||= []; state.watches ||= []; state.assignments ||= []; state.cases ||= []; state.runs ||= [];
   const now = new Date().toISOString(), byName = n => state.clients.find(c => c.name.toLowerCase() === String(n).toLowerCase());
   const stableId = name => { let h = 0; for (const ch of String(name).toLowerCase()) h = (h * 31 + ch.charCodeAt(0)) >>> 0; return "client-" + String(name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) + "-" + h.toString(36); };
-  const ensure = name => { if (!name || name === NO_CLIENT || name === "*") return null; let c = byName(name); if (!c) { c = { id:stableId(name), name:String(name).slice(0, 80), created:now, note:"Created from a former portfolio" }; state.clients.push(c); } return c; };
+  // A removed client stays removed: articles, pulls, cases and roles that still carry its name move to "No client" instead of re-creating it.
+  const retired = new Set((state.retiredClients || []).map(n => String(n).toLowerCase())), isRetired = n => retired.has(String(n || "").toLowerCase()) && !byName(n);
+  const ensure = name => { if (!name || name === NO_CLIENT || name === "*" || isRetired(name)) return null; let c = byName(name); if (!c) { c = { id:stableId(name), name:String(name).slice(0, 80), created:now, note:"Created from a former portfolio" }; state.clients.push(c); } return c; };
   const exact = new Map(), first = new Map();
   for (const w of state.watches) {
     let c = w.client && state.clients.find(x => x.id === w.client);
@@ -29,8 +31,8 @@ function migrateToClients(state) {
     exact.set(old + "\u0000" + (w.molecule || ""), name); if (!first.has(old)) first.set(old, new Set()); first.get(old).add(name);
     if (old !== name) { w.formerPortfolio = old; w.portfolio = name; }
   }
-  const to = (pf, mol) => { const pfs = String(pf || ""); if (!pfs || pfs === "*") return pfs; const hit = exact.get(pfs + "\u0000" + (mol || "")); if (hit) return hit; const set = first.get(pfs); if (set && set.size) return set.has(pfs) ? pfs : [...set][0]; ensure(pfs); return pfs; };
-  const toAll = pf => { const set = first.get(String(pf || "")); if (set && set.size) return set.has(String(pf)) ? [String(pf)] : [...set]; if (!pf || pf === "*") return [pf]; ensure(pf); return [pf]; };
+  const to = (pf, mol) => { const pfs = String(pf || ""); if (!pfs || pfs === "*") return pfs; if (isRetired(pfs)) return NO_CLIENT; const hit = exact.get(pfs + "\u0000" + (mol || "")); if (hit) return hit; const set = first.get(pfs); if (set && set.size) return set.has(pfs) ? pfs : [...set][0]; ensure(pfs); return pfs; };
+  const toAll = pf => { if (isRetired(pf)) return [NO_CLIENT]; const set = first.get(String(pf || "")); if (set && set.size) return set.has(String(pf)) ? [String(pf)] : [...set]; if (!pf || pf === "*") return [pf]; ensure(pf); return [pf]; };
   // queue items, merged per article and client
   const rank = a => (a.status === "Complete" ? 8 : 0) + (a.qc ? 4 : 0) + (a.disposition ? 2 : 0) + (a.reviewer ? 1 : 0), kept = new Map(), merged = new Map();
   for (const a of state.assignments) {
@@ -55,7 +57,7 @@ function migrateToClients(state) {
 // After any change to clients (rename, delete, a molecule moved), every grouping name is recomputed with the same rules, so nothing points at an old name.
 function regroup(data) { data.schema = { ...(data.schema || {}), grouping:"" }; migrateToClients(data); }
 // A group name typed in an older form (or a PMID list) becomes, or finds, a client of that name.
-function clientByName(data, name) { const n = String(name || "").trim().slice(0, 80); if (!n || n === NO_CLIENT) return null; data.clients ||= []; let c = data.clients.find(x => x.name.toLowerCase() === n.toLowerCase()); if (!c) { c = { id:crypto.randomUUID(), name:n, created:new Date().toISOString() }; data.clients.push(c); } return c; }
+function clientByName(data, name) { const n = String(name || "").trim().slice(0, 80); if (!n || n === NO_CLIENT) return null; data.clients ||= []; let c = data.clients.find(x => x.name.toLowerCase() === n.toLowerCase()); if (!c) { data.retiredClients = (data.retiredClients || []).filter(x => x.toLowerCase() !== n.toLowerCase()); c = { id:crypto.randomUUID(), name:n, created:new Date().toISOString() }; data.clients.push(c); } return c; }
 // The client named in a request: by id, or by a typed name (an older form, a PMID list), which finds or creates that client.
 async function resolveGroup(env, state, body) {
   const byId = body.client && (state.clients || []).find(c => c.id === body.client);
@@ -7484,7 +7486,7 @@ async function apiCore(request, env, path) {
       data.clients ||= [];
       let c = id && data.clients.find(x => x.id === id);
       if (!c) { c = { id:crypto.randomUUID(), created:new Date().toISOString() }; data.clients.push(c); }
-      const renamed = c.name && c.name !== name; c.name = name; c.contact = String(body.contact || "").trim().slice(0, 120); c.note = String(body.note || "").trim().slice(0, 400);
+      const renamed = c.name && c.name !== name; c.name = name; data.retiredClients = (data.retiredClients || []).filter(n => n.toLowerCase() !== name.toLowerCase()); c.contact = String(body.contact || "").trim().slice(0, 120); c.note = String(body.note || "").trim().slice(0, 400);
       if (renamed) regroup(data);
       return c.id;
     });
@@ -7493,7 +7495,8 @@ async function apiCore(request, env, path) {
   if (path === "/api/client-delete") {
     const id = String(body.id || "");
     if (!(state.clients || []).some(c => c.id === id)) return json({error:"Client not found."},404);
-    await write(env, data => { data.clients = data.clients.filter(c => c.id !== id); data.watches.forEach(w => { if (w.client === id) w.client = null; }); regroup(data); });
+    await write(env, data => { const gone = data.clients.find(c => c.id === id); data.clients = data.clients.filter(c => c.id !== id); data.watches.forEach(w => { if (w.client === id) w.client = null; });
+      if (gone) data.retiredClients = uniq([...(data.retiredClients || []), gone.name]).slice(-500); regroup(data); });
     return json({ ok:true });
   }
   if (path === "/api/client-assign") {
