@@ -40,3 +40,17 @@ test("line listing is built live from visible cases and a copy is saved once a d
   const snap = (await t.state()).lineListingSnapshot; assert.ok(snap && snap.cases === 1);
   assert.match(await (await t.BUCKET.get(snap.key)).text(), /^"Case","PMID"/);
 });
+
+test("automatic pull: a start date makes earlier uncovered days wait, a future date holds everything back, and a bad date is refused", async () => {
+  const t = await makeEnv({ watches: [W1] });
+  const base = (await status(t)).perWatch[0].missing;
+  assert.equal((await t.call(MANAGER, "/api/settings", { autoPullFrom: dAgo(10) })).status, 200);
+  const s = await status(t); assert.equal(s.autoPullFrom, dAgo(10)); assert.equal(s.perWatch[0].missing, 1, "the days since the start date are one waiting range");
+  const ncbi = fakeNcbi([{ pmid: "1", date: dAgo(5) }]);
+  await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/scheduled", {}));
+  assert.equal((await status(t)).perWatch[0].missing, 0, "the range from the start date was pulled");
+  await t.call(MANAGER, "/api/settings", { autoPullFrom: dAgo(-30) });
+  assert.equal((await status(t)).perWatch[0].missing, 0, "a start date in the future waits");
+  assert.equal((await t.call(MANAGER, "/api/settings", { autoPullFrom: "soon" })).status, 400);
+  await t.call(MANAGER, "/api/settings", { autoPullFrom: "" }); assert.equal((await status(t)).autoPullFrom, ""); assert.ok(base >= 1);
+});

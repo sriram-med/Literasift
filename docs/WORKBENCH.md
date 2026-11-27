@@ -220,3 +220,7 @@ A search bar sits at the top of Synchrony and filters the tracker live. All word
 ## AI errors
 
 When OpenAI refuses a request, the app now says why instead of only "HTTP 400". The message names the cause (bad or revoked key, no credit or quota, rate limit, model not available to the key, or a parameter the model does not accept) and quotes OpenAI's own wording with any key text removed. Models that need `max_completion_tokens` and no `temperature` (gpt-5 and o-series) are handled automatically, and an unsupported-parameter reply is retried once with the shape the model wants. `/api/ai-models` (manager only) lists the chat models the key can use; Test connection shows them when the model name is the problem.
+
+## Start pulling from a date
+
+Settings > Automatic PubMed pull has a "Start pulling from" date. From that day on, every day not yet covered is pulled for every molecule (including days before the first pull), in the usual weekly windows. A future date holds the pull back until it arrives. Clearing it restores the default (from the first day already covered, or yesterday for a new molecule). The setting is `autoPullFrom` on `/api/settings`.
