@@ -75,3 +75,18 @@ test("names from the list can be merged into a portfolio dictionary", async () =
   const r = (await t.call(MANAGER, "/api/dictionary-from-kb", { portfolio: "CNS", names: ["Abilify"] })).body; assert.equal(r.merged, 1);
   const d = (await t.state()).dictionaries.CNS.products[0]; assert.equal(d.name, "aripiprazole"); assert.ok(d.brands.includes("Aristada") && d.salts.includes("aripiprazole lauroxil"));
 });
+
+test("search by INN, generic name or brand name resolves to one identity and links the FDA label already used for listedness", async () => {
+  const t = await setup(), src = fakeSources();
+  const label = { results: [{ set_id: "set-abi", version: "7", effective_time: "20240301", openfda: { generic_name: ["aripiprazole"], brand_name: ["Abilify"], manufacturer_name: ["Otsuka"] }, adverse_reactions: ["Akathisia has been reported."], warnings_and_cautions: ["Tardive dyskinesia may occur."] }] };
+  const handler = async (url, init) => { const u = new URL(String(url)); if (u.host === "api.fda.gov" && u.pathname.endsWith("/label.json")) return new Response(JSON.stringify(label), { status: 200 }); return src.handler(url, init); };
+  await withFetch(handler, async () => {
+    const inn = (await t.call(SCREENER, "/api/drug-resolve", { name: "aripiprazole", kind: "inn" })).body;
+    assert.equal(inn.inn, "aripiprazole"); assert.ok(inn.brands.includes("Abilify")); assert.equal(inn.note, ""); assert.equal(inn.label.setId, "set-abi"); assert.equal(inn.label.effective, "20240301"); assert.match(inn.label.dailymed, /dailymed\.nlm\.nih\.gov.*set-abi/); assert.ok(inn.label.sections.some(x => /adverse/i.test(x)));
+    const brand = (await t.call(SCREENER, "/api/drug-resolve", { name: "Abilify", kind: "brand" })).body; assert.equal(brand.inn, "aripiprazole", "a brand leads back to the INN"); assert.equal(brand.matchedAs, "brand"); assert.equal(brand.note, "");
+    const wrong = (await t.call(SCREENER, "/api/drug-resolve", { name: "Abilify", kind: "inn" })).body; assert.match(wrong.note, /is a brand name; the INN is aripiprazole/);
+    const generic = (await t.call(SCREENER, "/api/drug-resolve", { name: "aripiprazole lauroxil", kind: "generic" })).body; assert.ok(generic.inn.length);
+    const none = (await t.call(SCREENER, "/api/drug-resolve", { name: "notadrugxyz", kind: "brand" })).body; assert.equal(none.found, false); assert.equal(none.inn, "notadrugxyz"); assert.match(none.note, /Not found/);
+    assert.equal((await t.call(SCREENER, "/api/drug-resolve", { name: "a" })).status, 400);
+  });
+});
