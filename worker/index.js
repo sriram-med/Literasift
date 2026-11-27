@@ -7570,7 +7570,7 @@ async function apiCore(request, env, path) {
     if (viewer.role !== "manager" && viewer.canManageClients !== true) return json({ error:"Client figures are limited to managers and users a manager has allowed." }, 403);
     if (!isDate(body.from) || !isDate(body.to) || body.from > body.to || (Date.parse(body.to) - Date.parse(body.from)) / 864e5 > 366) return json({ error:"Choose a date range of up to one year." }, 400);
     // By default a week means the articles PubMed dates in that week (as a pull for those dates finds them), not the day they reached the app.
-    const by = ["ird", "any", "crdt", "pdat"].includes(body.by) ? body.by : "any";
+    const by = ["ird", "any", "crdt", "pdat"].includes(body.by) ? body.by : "pdat";
     const clientId = String(body.client || "all"), basis = by === "ird" ? basisOf(body.dateField || "crdt") : by, cname = id => (state.clients || []).find(c => c.id === id)?.name || "No client";
     const watches = state.watches.filter(w => w.molecule && (clientId === "all" || (clientId === "none" ? !w.client : w.client === clientId)))
       .sort((a, b) => cname(a.client).localeCompare(cname(b.client)) || String(a.molecule).localeCompare(String(b.molecule)));
@@ -10344,7 +10344,7 @@ function openPersonDialog(email){
 }
 let cpsState={weeks:8};
 // ---- Articles per drug for one week: a table built on request, with optional PubMed counts and a CSV.
-let dwState={client:"all",from:"",to:"",by:"any",out:null};
+let dwState={client:"all",from:"",to:"",by:"pdat",out:null};
 function dwMonday(d){const t=new Date((d||new Date().toISOString().slice(0,10))+"T00:00:00Z"),dow=(t.getUTCDay()+6)%7;t.setUTCDate(t.getUTCDate()-dow);return t.toISOString().slice(0,10);}
 function dwAdd(d,n){const t=new Date(d+"T00:00:00Z");t.setUTCDate(t.getUTCDate()+n);return t.toISOString().slice(0,10);}
 function drugWeekHtml(){
@@ -10354,7 +10354,7 @@ function drugWeekHtml(){
     '<label>Client<select id="dwclient">'+opts.map(o=>'<option value="'+esc(o[0])+'"'+(o[0]===dwState.client?" selected":"")+'>'+esc(o[1])+'</option>').join("")+'</select></label>'+
     '<label>From<input type="date" id="dwfrom" value="'+esc(dwState.from)+'" max="'+today+'"></label><label>Through<input type="date" id="dwto" value="'+esc(dwState.to)+'" max="'+today+'"></label>'+
     '<span class="fbar" style="margin:0">'+[["lastweek","Last week"],["thisweek","This week"],["30","Last 30 days"],["90","Last 3 months"],["month","Last month"]].map(x=>'<button type="button" class="fchip" data-dwrange="'+x[0]+'">'+x[1]+'</button>').join("")+'</span>'+
-    '<label>Counted by<select id="dwby">'+[["any","PubMed date, as a pull finds it"],["crdt","PubMed create date [crdt]"],["pdat","Publication date [dp]"],["ird","Day it reached the app"]].map(o=>'<option value="'+o[0]+'"'+(o[0]===dwState.by?" selected":"")+'>'+o[1]+'</option>').join("")+'</select></label>'+
+    '<label>Counted by<select id="dwby">'+[["pdat","Publication date [dp]"],["any","Created or published"],["crdt","PubMed create date [crdt]"],["ird","Day it reached the app"]].map(o=>'<option value="'+o[0]+'"'+(o[0]===dwState.by?" selected":"")+'>'+o[1]+'</option>').join("")+'</select></label>'+
     '<button type="button" class="btn sm" data-dwbuild="1">Build table</button><button type="button" class="btn outline sm" data-dwxlsx="1">Excel</button><button type="button" class="btn outline sm" data-dwpng="1">Image</button><button type="button" class="btn outline sm" data-dwcsv="1">CSV</button></div>'+
     '<div id="dwout" style="margin-top:12px">'+(dwState.out?dwTable(dwState.out):'<div class="sub">Choose the dates and press Build table.</div>')+'</div>',
     "Each drug with its number of articles in the app for the chosen dates (both days included). By PubMed date, the app asks PubMed which articles the drug's saved search finds in those dates and counts those stored here.");

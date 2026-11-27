@@ -186,7 +186,7 @@ test("the per-drug week count by PubMed date counts the stored articles PubMed d
   const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/drug-week-stats", { client: "a", from: "2026-11-16", to: "2026-11-22" }));
   assert.equal(r.status, 200, JSON.stringify(r.body));
   const x = r.body.rows[0];
-  assert.equal(r.body.by, "any"); assert.equal(x.pulled, 1); assert.equal(x.pubmed, 2); assert.equal(x.notPulled, 1);
+  assert.equal(r.body.by, "pdat", "publication date is the default"); assert.ok(x.term.includes("[dp]") && !x.term.includes("[crdt]"), x.term); assert.equal(x.pulled, 1); assert.equal(x.pubmed, 2); assert.equal(x.notPulled, 1);
   const ird = await t.call(MANAGER, "/api/drug-week-stats", { client: "a", from: "2026-11-16", to: "2026-11-22", by: "ird" });
   assert.equal(ird.body.rows[0].pulled, 0, "by the day it reached the app, nothing arrived that week");
 });
