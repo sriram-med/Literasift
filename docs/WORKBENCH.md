@@ -323,3 +323,11 @@ One page, one engine. At the top, choose what to pull: **By client**, **One mole
 - **Filters**: humans, case reports, English, no reviews (and safety articles only for one molecule).
 
 **By client** pulls the ticked molecules three at a time in the background, with a per-molecule check against PubMed's count, and **Compare with PubMed** shows the precise, broad and any-date counts. **One molecule** (managers) saves the molecule to its client, reusing it if it is already watched and adding any new names, sets the owner, then pulls it with the same engine; for data-entry and QC people it pulls into their own queue in their portfolio without creating a watchlist. Every pull writes one results table that stays on the page.
+
+## Pulls finish in one go, faster, with live progress
+
+- **No more 12-window stop.** An import used to process at most 12 search windows per request and leave the rest for the scheduler, so a long Search & Pull (or a Batches import of a long range) came back with only part of the articles. Manual pulls (Search & Pull, Batches, single molecule, PMID-free imports) now run every window to the end, and re-run any that did not reconcile.
+- **Fewer requests.** Citations are fetched 200 at a time instead of 100, and a dated pull searches a quarter at a time instead of two weeks (windows still split automatically when PubMed would cut a list short). An NCBI API key in Settings raises PubMed's limit from 3 to 10 requests a second; Search & Pull says so when no key is set.
+- **Live progress.** While a molecule is pulling, its row shows the stage and the running count ("Pulling: 45 articles · 21 of 23 search windows"), then "Complete: N of N" checked against PubMed.
+- **Kept after a restart.** A finished pull's answer is stored, so the page still gets it if the server restarted; a pull interrupted by a restart says so, and everything pulled before is kept.
+- Large literatures: a molecule with more than 25,000 articles is reported with its count; choose Last 12 months or your own dates for it.

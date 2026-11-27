@@ -183,7 +183,7 @@ test("pull without dates: everything PubMed has for the molecule, whatever its d
   // a molecule whose literature is far too large is reported, not pulled whole
   const big = fakeNcbi(Array.from({ length: 30 }, (_, i) => ({ pmid: String(900 + i), date: dAgo(i) })), {});
   const bigHandler = async (u, i) => { const url = new URL(String(u)); if (url.pathname.endsWith("esearch.fcgi") && !/\[(?:crdt|dp)\]/.test(url.searchParams.get("term") || "")) return new Response(JSON.stringify({ esearchresult: { count: "90000", idlist: [] } })); return big.handler(u, i); };
-  const huge = await withFetch(bigHandler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", allDates: true, online: false })); assert.ok(/more than the 10000/.test(huge.body.results[0].error), JSON.stringify(huge.body.results));
+  const huge = await withFetch(bigHandler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", allDates: true, online: false })); assert.ok(/more than the 25000/.test(huge.body.results[0].error), JSON.stringify(huge.body.results));
 });
 
 test("calcium acetate (a two-word name) gets a field-tagged broad search, and NCBI PubMed Central adds articles found only in full texts", async () => {
@@ -201,4 +201,19 @@ test("calcium acetate (a two-word name) gets a field-tagged broad search, and NC
   assert.equal(r.body.results[0].pmc.found, 2, JSON.stringify(r.body.results[0])); assert.ok(!r.body.results[0].pmc.error);
   // the Discover sources include PubMed Central
   const d = await withFetch(handler, () => t.call(MANAGER, "/api/discover", { q: "calcium acetate", sources: ["pmc"], limit: 5 })); assert.equal(d.status, 200, JSON.stringify(d.body)); assert.ok(JSON.stringify(d.body).includes("pmc"));
+});
+
+test("a long pull runs every search window in one go (no 12-window limit), shows its progress, and keeps its answer after it finishes", async () => {
+  const t = await makeEnv({ watches: [W1] }, { DEFER_EVIDENCE: "1" });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; s.watches[0].client = "k1"; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const recs = Array.from({ length: 72 }, (_, i) => ({ pmid: String(3000 + i), date: dAgo(1 + i * 5) })), ncbi = fakeNcbi(recs, { cap: 2 });
+  await withFetch(ncbi.handler, async () => {
+    const start = await t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(365), to: dAgo(0), background: true, searchMode: "precise", online: false }); assert.ok(start.body.job);
+    let p, sawProgress = false; for (let i = 0; i < 400; i++) { p = (await t.call(MANAGER, "/api/pull-job", { id: start.body.job })).body; if (Array.isArray(p.progress) && p.progress[0]?.stage) sawProgress = true; if (p.state !== "running") break; await new Promise(x => setTimeout(x, 25)); }
+    assert.equal(p.state, "done", JSON.stringify(p).slice(0, 400)); assert.ok(sawProgress, "progress is reported while it runs");
+    const x = p.payload.results[0]; assert.equal(x.complete, true, JSON.stringify(x)); assert.equal(x.retrieved, 72); assert.equal(x.count, 72);
+    const run = (await t.state()).runs.find(r => r.windows.length > 12); assert.ok(run, "the pull needed more than 12 windows"); assert.ok(run.windows.every(w => ["reconciled", "zero_results"].includes(w.state)));
+    const kept = await t.BUCKET.get("jobs/pull/" + start.body.job + ".json"); assert.ok(kept, "the answer is stored, so it survives a restart");
+  });
+  assert.equal((await t.call(MANAGER, "/api/pull-job", { id: "00000000-0000-0000-0000-000000000000" })).status, 404);
 });

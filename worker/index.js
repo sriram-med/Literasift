@@ -347,8 +347,9 @@ function summarizeRun(run) {
 }
 async function fetchCitations(env, ids) {
   const articles = {}, missing = [], xml = {};
-  for (let offset = 0; offset < ids.length; offset += 100) {
-    const chunk = ids.slice(offset, offset + 100);
+  // 200 per request (PubMed allows it), so a pull makes half as many calls as before.
+  for (let offset = 0; offset < ids.length; offset += 200) {
+    const chunk = ids.slice(offset, offset + 200);
     const { result: summary } = await withRetry(env, () => pubmed(env, "esummary", { id:chunk.join(","), retmode:"json" }));
     const found = [];
     for (const id of chunk) {
@@ -486,7 +487,7 @@ function missedWindows(state, watch, through, field = "crdt") {
   }
   return out.map(m => ({ ...m, exhausted:m.attempts >= MAX_WINDOW_ATTEMPTS && ["failed", "partial"].includes(m.state) }));
 }
-async function execute(env, watch, from, to, { mode = "monitor", dateField, force = false, windowDays = 0 } = {}) {
+async function execute(env, watch, from, to, { mode = "monitor", dateField, force = false, windowDays = 0, onRun = null, budget = 12 } = {}) {
   env = withSettings(env, (await load(env)).state);
   const field = DATE_FIELDS[dateField] ? dateField : mode === "backfill" ? "pdat" : "crdt", windows = makeWindows(watch, from, to, windowDays || (mode === "backfill" ? 14 : 7), field);
   const key = [watchKey(watch), mode, field, from, to, windows.map(w => w.queryVersion).join(",")].join("|");
@@ -499,7 +500,8 @@ async function execute(env, watch, from, to, { mode = "monitor", dateField, forc
   const cleared = reused && (reused.ids || []).length < (reused.windows || []).reduce((n, w) => n + (w.retrieved || 0), 0);
   if (reused && !cleared && ["reconciled", "zero_results"].includes(reused.coverage)) return { ...reused, replayed:true };
   if (cleared) { await write(env, data => { const r = data.runs.find(x => x.id === target); for (const w of r.windows || []) Object.assign(w, { state:"pending", attempts:0, error:"", claimUntil:undefined }); summarizeRun(r); }); }
-  return runImport(env, target);
+  if (onRun) try { onRun(target); } catch { /* progress only */ }
+  return runImport(env, target, budget);
 }
 // ---- Product dictionaries and watchlist versions. A portfolio dictionary lists, for each product, its generic names, brands, salts and approved aliases; a watchlist query is built from them.
 // Every change to a query is a new version with an effective date, and imports record the version they ran with. ----
@@ -5401,8 +5403,16 @@ async function apiCore(request, env, path) {
     return json({ ok:true, added:added.length, skipped });
   }
   if (path === "/api/pull-job" && viewer) {
-    const job = pullJobs.get(String(body.id || "")); if (!job || (job.by !== email && viewer.role !== "manager")) return json({ error:"That pull is no longer listed. Open Batches to see what was pulled." }, 404);
-    return json({ state:job.state, total:job.total, done:job.results.filter(Boolean).length, results:job.results.map(x => x || null), payload:job.payload || null, error:job.error || "" });
+    const id = String(body.id || ""), job = pullJobs.get(id);
+    if (!job) { // finished before a restart: the answer was kept
+      const o = /^[0-9a-f-]{36}$/.test(id) ? await env.BUCKET.get("jobs/pull/" + id + ".json").catch(() => null) : null, saved = o ? JSON.parse(await o.text()) : null;
+      if (saved && (saved.by === email || viewer.role === "manager")) return json({ state:saved.state, total:(saved.payload?.results || []).length, done:(saved.payload?.results || []).length, results:saved.payload?.results || [], payload:saved.payload, error:saved.error || "" });
+      return json({ error:"The server restarted while this pull was running. Everything pulled so far is kept; press Pull again to finish it." }, 404);
+    }
+    if (job.by !== email && viewer.role !== "manager") return json({ error:"That pull belongs to someone else." }, 404);
+    const runs = new Map((state.runs || []).map(r => [r.id, r]));
+    const live = (job.progress || []).map(p => { const r = p.runId && runs.get(p.runId), wins = r?.windows || []; return { molecule:p.molecule, stage:p.stage, articles:r ? (r.ids || []).length : 0, windowsDone:wins.filter(w => ["reconciled", "zero_results", "partial", "failed"].includes(w.state)).length, windows:wins.length, expected:p.expected ?? null }; });
+    return json({ state:job.state, total:job.total, done:job.results.filter(Boolean).length, results:job.results.map(x => x || null), progress:live, payload:job.payload || null, error:job.error || "" });
   }
   if (path === "/api/pull-client" && viewer) {
     // Pulls the articles of every molecule a client has, for a date range, in one step. A manager pulls any client; everyone else pulls only the molecules in portfolios they work in, into their own queue.
@@ -5420,12 +5430,12 @@ async function apiCore(request, env, path) {
     let watches = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule && (isMgr || allowed.includes(w.portfolio)) && (!only.size || only.has(encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || ""))));
     if (!watches.length) return json({ error:isMgr ? "This client has no molecules yet. Add one on the Clients page." : "This client has no molecules in your portfolios." }, 400);
     if (watches.length > 25) return json({ error:"A client pull covers up to 25 molecules at a time. Choose fewer." }, 400);
-    const results = new Array(watches.length), work = async () => {
+    const results = new Array(watches.length), progress = watches.map(w => ({ molecule:w.molecule, portfolio:w.portfolio, stage:"waiting", runId:"" })), work = async () => {
     const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
     const cfg = withSettings(env, state), kb = await loadKb(env).catch(() => null), grown = new Map();
     const clientRec = (state.clients || []).find(c => c.id === clientId), broad = body.searchMode ? body.searchMode === "broad" : clientRec?.searchMode === "broad";
     const one = async (w, slot) => {
-      let query = queryAt(w, day())?.query || w.query, full = { query, added:[] };
+      progress[slot].stage = "names"; let query = queryAt(w, day())?.query || w.query, full = { query, added:[] };
       const names = await namesFor(cfg, state, kb, w, { online:body.online !== false }).catch(() => [w.molecule]), safety = query.includes(safetyFilter), broadQuery = buildBroadQuery(names, safety);
       if (broad && broadQuery) { full = { query:broadQuery, added:names.slice(1) }; } else { full = await fullSearch(cfg, state, kb, w, query, { online:false }).catch(() => ({ query, added:[] })); }
       query = full.query; if (full.added.length && !broad) grown.set(watchKey(w), query);
@@ -5434,13 +5444,16 @@ async function apiCore(request, env, path) {
       const before = new Set(state.assignments.filter(a => a.portfolio === w.portfolio).map(a => a.pmid));
       try {
         // A molecule with a very large literature is not pulled whole by accident: it is reported, and can be limited with dates.
-        const cap = Math.min(50000, Math.max(100, Number(body.maxPerMolecule) || 10000));
-        if (allDates) { const total = await countAny(cfg, query); if (total != null && total > cap) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, mode:broad ? "broad" : "precise", error:total + " articles in PubMed, more than the " + cap + " a pull takes at once. Pull it with a date range." }; return; } }
-        let run = await execute(env, { portfolio:w.portfolio, molecule:w.molecule, query }, body.from, body.to, { mode:"backfill", dateField:"any", force:true, windowDays:allDates ? 40000 : 0 });
+        const cap = Math.min(50000, Math.max(100, Number(body.maxPerMolecule) || 25000));
+        progress[slot].stage = "counting";
+        if (allDates) { const total = await countAny(cfg, query); progress[slot].expected = total; if (total != null && total > cap) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, mode:broad ? "broad" : "precise", error:total + " articles in PubMed, more than the " + cap + " one pull takes. Choose Last 12 months, or your own dates, for this molecule." }; return; } }
+        progress[slot].stage = "pulling";
+        // Wide windows (a quarter at a time, or everything at once without dates) mean few searches; a window that holds more than PubMed returns in one go is split automatically.
+        let run = await execute(env, { portfolio:w.portfolio, molecule:w.molecule, query }, body.from, body.to, { mode:"backfill", dateField:"any", force:true, windowDays:allDates ? 40000 : 92, budget:600, onRun:id => { progress[slot].runId = id; } });
         // Nothing may be missed: a window that did not reconcile (PubMed's count against what came back) is run again before the answer is given, and it stays on the retry list if it still has gaps.
-        for (let again = 0; again < 2 && !["reconciled", "zero_results"].includes(run.coverage); again++) run = await runImport(env, run.id, 12);
+        for (let again = 0; again < 2 && !["reconciled", "zero_results"].includes(run.coverage); again++) run = await runImport(env, run.id, 600);
         if (!isMgr) await write(env, d => { for (const a of d.assignments) if (a.portfolio === w.portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
-        await settleEvidence(env, run.ids);
+        progress[slot].stage = "finishing"; await settleEvidence(env, run.ids);
         const wins = run.windows || [], expected = run.expected ?? wins.reduce((n, x) => n + (x.expected || 0), 0), got = run.retrieved ?? (run.ids || []).length;
         let pmc = null;
         if (body.includePmc === true) { try { const hit = await pmcSearch(cfg, names, body.from, body.to, "any"), have = new Set([...(run.ids || []), ...Object.keys(state.articles)]), fresh = hit.pmids.filter(id => !have.has(id)).slice(0, 400);
@@ -5460,9 +5473,10 @@ async function apiCore(request, env, path) {
     return ({ client:name, from:allDates ? "" : body.from, to:allDates ? "" : body.to, allDates, results, complete:results.every(r => r.complete), total:results.reduce((n, r) => n + (r.count || 0), 0), added:results.reduce((n, r) => n + (r.added || 0), 0) });
     };
     if (body.background === true && env.DEFER_EVIDENCE === "1") {
-      const id = crypto.randomUUID(), job = { id, by:email, state:"running", total:watches.length, results, startedAt:Date.now() }; pullJobs.set(id, job);
+      const id = crypto.randomUUID(), job = { id, by:email, state:"running", total:watches.length, results, progress, startedAt:Date.now() }; pullJobs.set(id, job);
       for (const [k0, v0] of pullJobs) if (Date.now() - v0.startedAt > 3600000) pullJobs.delete(k0);
-      work().then(payload => { job.payload = payload; job.state = "done"; }).catch(error => { job.state = "failed"; job.error = String(error.message || error).slice(0, 200); });
+      const keep = () => env.BUCKET.put("jobs/pull/" + id + ".json", JSON.stringify({ by:email, state:job.state, payload:job.payload || null, error:job.error || "" })).catch(() => {});
+      work().then(payload => { job.payload = payload; job.state = "done"; return keep(); }).catch(error => { job.state = "failed"; job.error = String(error.message || error).slice(0, 200); return keep(); });
       return json({ job:id, total:watches.length });
     }
     return json(await work());
@@ -5485,11 +5499,12 @@ async function apiCore(request, env, path) {
     const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
     if (narrow.length || body.noReviews === true) query = "(" + query + ")" + narrow.map(f => " AND " + f).join("") + (body.noReviews === true ? " NOT review[pt]" : "");
     if (query.length > 1500) return json({ error:"The search became too long; use fewer synonyms or filters." }, 400);
+    const progress = [{ molecule, portfolio, stage:"counting", runId:"" }];
     const work = async () => {
-      if (allDates) { const total = await countAny(cfg, query); if (total != null && total > 10000) return { molecule, portfolio, error:total + " articles in PubMed, more than the 10000 a pull takes at once. Pull it with a date range." }; }
-      const before = new Set(state.assignments.filter(a => a.portfolio === portfolio).map(a => a.pmid));
-      let run = await execute(env, { portfolio, molecule, query }, body.from, body.to, { mode:"backfill", dateField:"any", force:true, windowDays:allDates ? 40000 : 0 });
-      for (let again = 0; again < 2 && !["reconciled", "zero_results"].includes(run.coverage); again++) run = await runImport(env, run.id, 12);
+      if (allDates) { const total = await countAny(cfg, query); progress[0].expected = total; if (total != null && total > 25000) return { molecule, portfolio, error:total + " articles in PubMed, more than the 25000 one pull takes. Choose Last 12 months, or your own dates." }; }
+      const before = new Set(state.assignments.filter(a => a.portfolio === portfolio).map(a => a.pmid)); progress[0].stage = "pulling";
+      let run = await execute(env, { portfolio, molecule, query }, body.from, body.to, { mode:"backfill", dateField:"any", force:true, windowDays:allDates ? 40000 : 92, budget:600, onRun:id => { progress[0].runId = id; } });
+      for (let again = 0; again < 2 && !["reconciled", "zero_results"].includes(run.coverage); again++) run = await runImport(env, run.id, 600);
       await write(env, d => { for (const a of d.assignments) if (a.portfolio === portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
       await settleEvidence(env, run.ids);
       if (kb?.__dirty) { delete kb.__dirty; await saveKb(env, kb).catch(() => {}); }
@@ -5500,8 +5515,9 @@ async function apiCore(request, env, path) {
     };
     const wrap = async () => { const r = await work(); return { client:"", allDates, results:[r], total:r.count || 0, added:r.added || 0, complete:!!r.complete, ...r }; };
     if (body.background === true && env.DEFER_EVIDENCE === "1") {
-      const id = crypto.randomUUID(), results = [null], job = { id, by:email, state:"running", total:1, results, startedAt:Date.now() }; pullJobs.set(id, job);
-      wrap().then(payload => { results[0] = payload.results[0]; job.payload = payload; job.state = "done"; }).catch(error => { job.state = "failed"; job.error = String(error.message || error).slice(0, 200); });
+      const id = crypto.randomUUID(), results = [null], job = { id, by:email, state:"running", total:1, results, progress, startedAt:Date.now() }; pullJobs.set(id, job);
+      const keep = () => env.BUCKET.put("jobs/pull/" + id + ".json", JSON.stringify({ by:email, state:job.state, payload:job.payload || null, error:job.error || "" })).catch(() => {});
+      wrap().then(payload => { results[0] = payload.results[0]; job.payload = payload; job.state = "done"; return keep(); }).catch(error => { job.state = "failed"; job.error = String(error.message || error).slice(0, 200); return keep(); });
       return json({ job:id, total:1 });
     }
     return json(await wrap());
@@ -7157,7 +7173,7 @@ async function apiCore(request, env, path) {
     const clientId = (state.clients || []).some(c => c.id === body.client) ? String(body.client) : "";
     const watch = { portfolio, molecule, query, ...(owner ? { owner } : {}), ...(clientId ? { client:clientId } : {}) };
     await write(env, data => { keepOwner(data, watch); commitWatch(data, watch, email); });
-    const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField, force:true });
+    const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField, force:true, budget:600 });
     await settleEvidence(env, run.ids);
     return json(run);
   } else if (path === "/api/social-add") {
@@ -7183,7 +7199,7 @@ async function apiCore(request, env, path) {
     if (!watch || !valid(body.from) || !valid(body.to) || body.from > body.to || body.to > day()) {
       return json({error:"Choose a saved portfolio and a valid date range through today."},400);
     }
-    const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField });
+    const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField, budget:600 });
     await settleEvidence(env, run.ids);
     return json(run);
   } else return json({ error:"Route unavailable." },404);
@@ -7344,7 +7360,7 @@ details.tools{margin:0 0 14px}details.tools>summary{cursor:pointer;color:var(--b
 .modecards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.modecard{display:grid;gap:3px;text-align:left;border:1px solid var(--border);border-radius:12px;background:var(--card);padding:10px 12px;cursor:pointer;font:inherit;color:inherit}.modecard.on{border-color:var(--brand);box-shadow:0 0 0 2px #0e6a5d33;background:var(--accent)}@media(max-width:560px){.modecards{grid-template-columns:1fr}}
 .ai-card{display:grid;gap:12px}.aisteps{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}.aistep{display:flex;gap:8px;align-items:center;border:1px solid var(--border);border-radius:12px;padding:8px 10px;background:var(--card)}.aistep i{font-style:normal;width:22px;height:22px;border-radius:50%;display:grid;place-items:center;background:var(--border);font-size:12px;flex:none}.aistep.ok i{background:var(--green);color:#fff}.aistep span{display:grid}.aistep b{font-size:12.5px}
 .ai-ok{background:#d8f1ec;color:#0b5b50;border-radius:10px;padding:8px 12px;font-size:13px}.ai-missing{background:#fbecd0;color:#8a5200;border-radius:10px;padding:8px 12px;font-size:13px}.ai-form{display:grid;gap:10px}.keyrow{display:flex;gap:8px}.keyrow input{flex:1;min-width:0}.ai-btns{display:flex;gap:8px;flex-wrap:wrap}.usage{display:grid;gap:4px}details.more>summary{cursor:pointer;color:var(--brand);font-size:13px}
-.sptabs{margin-bottom:12px}.spset{margin-bottom:12px}.sp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px}.sp-col{display:flex;flex-direction:column;gap:6px}.sp-col .check{margin:0}.sp-h{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted,#6b7280)}.sp-row{display:flex;gap:8px;flex-wrap:wrap}.sp-row label{margin:0;flex:1;min-width:130px}.filtrow{display:flex;gap:16px;flex-wrap:wrap}.swinline{display:inline-flex;align-items:center;gap:8px;margin:0;cursor:pointer}.clientpull{margin-bottom:12px}.optrow{display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin:12px 0}.optrow label{margin:0}.optrow2{margin:4px 0 8px}.optrow2 summary{cursor:pointer;font-weight:600;font-size:13px}.clientpull.paused{opacity:.7}.ccgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}.ccard{border:1px solid var(--line);border-radius:14px;padding:12px 14px;background:var(--card)}.ccard.late{border-color:#e6b4b0}.cc-top{display:flex;justify-content:space-between;gap:8px;align-items:baseline}.cc-bar{height:6px;border-radius:6px;background:var(--accent);margin:8px 0}.cc-bar i{display:block;height:100%;border-radius:6px;background:var(--brand,#3b6ff5)}.cc-nums{display:flex;gap:12px;flex-wrap:wrap;font-size:13px;margin-bottom:6px}.cc-row{display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:4px 0;border-top:1px solid var(--line)}.cc-mol{margin-top:12px}.cc-mh{display:flex;justify-content:space-between;margin-bottom:6px}.purgesum{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin:12px 0;padding:10px 14px;background:var(--accent);border-radius:12px}.purgewarn{background:#fbe3e3;color:#7a1d1d;border-radius:12px;padding:12px 14px;font-size:13px}
+.sp-tip{margin-top:14px;padding:10px 12px;border-radius:12px;background:var(--accent);font-size:13px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.sptabs{margin-bottom:12px}.spset{margin-bottom:12px}.sp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px}.sp-col{display:flex;flex-direction:column;gap:6px}.sp-col .check{margin:0}.sp-h{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted,#6b7280)}.sp-row{display:flex;gap:8px;flex-wrap:wrap}.sp-row label{margin:0;flex:1;min-width:130px}.filtrow{display:flex;gap:16px;flex-wrap:wrap}.swinline{display:inline-flex;align-items:center;gap:8px;margin:0;cursor:pointer}.clientpull{margin-bottom:12px}.optrow{display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin:12px 0}.optrow label{margin:0}.optrow2{margin:4px 0 8px}.optrow2 summary{cursor:pointer;font-weight:600;font-size:13px}.clientpull.paused{opacity:.7}.ccgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}.ccard{border:1px solid var(--line);border-radius:14px;padding:12px 14px;background:var(--card)}.ccard.late{border-color:#e6b4b0}.cc-top{display:flex;justify-content:space-between;gap:8px;align-items:baseline}.cc-bar{height:6px;border-radius:6px;background:var(--accent);margin:8px 0}.cc-bar i{display:block;height:100%;border-radius:6px;background:var(--brand,#3b6ff5)}.cc-nums{display:flex;gap:12px;flex-wrap:wrap;font-size:13px;margin-bottom:6px}.cc-row{display:flex;justify-content:space-between;gap:8px;font-size:13px;padding:4px 0;border-top:1px solid var(--line)}.cc-mol{margin-top:12px}.cc-mh{display:flex;justify-content:space-between;margin-bottom:6px}.purgesum{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin:12px 0;padding:10px 14px;background:var(--accent);border-radius:12px}.purgewarn{background:#fbe3e3;color:#7a1d1d;border-radius:12px;padding:12px 14px;font-size:13px}
 .pbadge{display:inline-block;min-width:62px;text-align:center;padding:3px 10px;border-radius:999px;font-size:11.5px;font-weight:600;border:1px solid var(--border);flex:none;align-self:flex-start}.p-high.pbadge{background:var(--red);border-color:var(--red);color:#fff}.p-medium.pbadge{background:#fbecd0;border-color:#f3d79a;color:#9a5b05}.p-low.pbadge{background:var(--accent);color:var(--muted)}
 .plist{display:grid;gap:10px;margin-bottom:12px}.plitem{display:flex;gap:14px;align-items:flex-start;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:14px;padding:14px 16px}.plitem.late{border-left-color:var(--red)}.pl-main{flex:1;min-width:0}.pl-main b{display:block;font-size:14.5px;line-height:1.35}.pl-side{text-align:right;display:grid;gap:8px;justify-items:end}.pl-btns{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .wf{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600}.wf-teal{background:#d8f1ec;color:#0b5b50}.wf-blue{background:#dbe8fb;color:#1d4f9a}.wf-violet{background:#e9e0fa;color:#58349a}
@@ -9343,7 +9359,7 @@ function spSettingsHtml(withSafety){
     '<div class="sp-col"><span class="sp-h">Search</span><label class="check"><input type="radio" name="spmode" data-sp="mode" value="broad"'+(spState.broad?" checked":"")+'>&nbsp;<b>Broad</b>, like the PubMed website</label><label class="check"><input type="radio" name="spmode" data-sp="mode" value="precise"'+(spState.broad?"":" checked")+'>&nbsp;<b>Precise</b>: title, abstract and MeSH</label><span class="sub">Broad finds several times more. Every known name (INN, salts, brands, dictionary) is searched either way.</span></div>'+
     '<div class="sp-col"><span class="sp-h">NCBI sources</span><label class="check"><input type="checkbox" checked disabled>&nbsp;PubMed</label>'+ck("pmc","PubMed Central (full texts)")+'<span class="sub">PubMed Central finds papers that name the drug only in the body text.</span></div>'+
     '<div class="sp-col"><span class="sp-h">Filters (optional)</span>'+ck("humans","Humans")+ck("caseReports","Case reports")+ck("english","English")+ck("noReviews","No reviews")+(withSafety?ck("safety","Safety articles only"):"")+'</div>'+
-  '</div></div></section>';
+  '</div>'+(((data.config||{}).ncbi||{}).keySet?"":'<div class="sp-tip"><b>Pull about three times faster:</b> PubMed allows 3 requests a second without a key and 10 with a free NCBI API key. <button type="button" class="btn outline sm" data-tab="Settings">Add the key in Settings</button></div>')+'</div></section>';
 }
 function spClientHtml(){
   const mgr=data.viewer.role==="manager",opts=[...(data.clients||[]).map(c=>[c.id,c.name]),["none","No client"]].filter(x=>clientMols(x[0]).length);
@@ -9374,13 +9390,13 @@ function cpSettings(){
 }
 // Runs pulls (three at a time, each in the background on the server) and draws one row per molecule as it finishes.
 async function runPullJobs(btn,list,bodyFor,route,done){
-  btn.disabled=true;const rows=new Array(list.length).fill(null),started=Date.now();let fin=0,found=0,added=0,incomplete=0,failed=0;
+  btn.disabled=true;const rows=new Array(list.length).fill(null),prog=new Array(list.length).fill(null),started=Date.now();let fin=0,found=0,added=0,incomplete=0,failed=0;
   const draw=()=>{cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+fin+' of '+list.length+' molecule'+(list.length===1?"":"s")+' done · '+found+' article'+(found===1?"":"s")+' found, '+added+' new</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(incomplete?' · '+incomplete+' not yet complete, retried automatically':"")+(failed?' · '+failed+' failed':"")+'</span></div>'+
-    table(["Molecule","Found","New","Checked against PubMed"],list.map((it,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||it.name)+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · searched with '+x.names+' more name'+(x.names===1?"":"s"):"")+(x.mode?' · '+(x.mode==="broad"?"broad":"precise"):"")+'</div>':""),x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("Complete: "+x.retrieved+" of "+x.expected,"green"):badge("Incomplete: "+x.retrieved+" of "+x.expected+", will retry","amber"))+(x.pmc?(x.pmc.error?'<div class="sub" style="color:var(--amber)">PubMed Central: '+esc(x.pmc.error)+'</div>':'<div class="sub">PubMed Central: '+x.pmc.found+' found, '+x.pmc.added+' new</div>'):"")+(x.mode==="precise"&&x.siteCount!=null&&x.siteCount>(x.retrieved||0)*1.15?'<div class="sub" style="color:var(--amber)">The broad search finds '+x.siteCount+'. Choose Broad to pull them.</div>':"")]:['<b>'+esc(it.name)+'</b>','','','<span class="sub">Pulling…</span>'];}),"");
+    table(["Molecule","Found","New","Checked against PubMed"],list.map((it,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||it.name)+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · searched with '+x.names+' more name'+(x.names===1?"":"s"):"")+(x.mode?' · '+(x.mode==="broad"?"broad":"precise"):"")+'</div>':""),x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("Complete: "+x.retrieved+" of "+x.expected,"green"):badge("Incomplete: "+x.retrieved+" of "+x.expected+", will retry","amber"))+(x.pmc?(x.pmc.error?'<div class="sub" style="color:var(--amber)">PubMed Central: '+esc(x.pmc.error)+'</div>':'<div class="sub">PubMed Central: '+x.pmc.found+' found, '+x.pmc.added+' new</div>'):"")+(x.mode==="precise"&&x.siteCount!=null&&x.siteCount>(x.retrieved||0)*1.15?'<div class="sub" style="color:var(--amber)">The broad search finds '+x.siteCount+'. Choose Broad to pull them.</div>':"")]:(()=>{const p=prog[i];const st=!p?"Starting…":p.stage==="names"?"Collecting every name…":p.stage==="counting"?"Asking PubMed how many…"+(p.expected!=null?" "+p.expected:""):p.stage==="finishing"?"Storing…":"Pulling: "+p.articles+" article"+(p.articles===1?"":"s")+(p.windows?" · "+p.windowsDone+" of "+p.windows+" search windows":"")+(p.expected!=null?" of about "+p.expected:"");return ['<b>'+esc(it.name)+'</b>',p&&p.articles?String(p.articles):'','','<span class="sub">'+esc(st)+'</span>'];})();}),"");
     if($("cpout"))$("cpout").innerHTML=cpState.out;};
   draw();let next=0;
   const lane=async()=>{while(next<list.length){const i=next++;try{let r=await api(route,{...bodyFor(list[i]),background:true});
-      while(r.job){await new Promise(ok=>setTimeout(ok,1500));const pj=await api("pull-job",{id:r.job});if(pj.state==="failed")throw new Error(pj.error||"The pull failed.");if(pj.state==="done"){r=pj.payload;break;}}
+      while(r.job){await new Promise(ok=>setTimeout(ok,1500));const pj=await api("pull-job",{id:r.job});prog[i]=(pj.progress||[])[0]||null;draw();if(pj.state==="failed")throw new Error(pj.error||"The pull failed.");if(pj.state==="done"){r=pj.payload;break;}}
       const x=r.results[0];rows[i]=x;found+=x.count||0;added+=x.added||0;if(x.error)failed++;else if(!x.complete)incomplete++;}
     catch(err){rows[i]={molecule:list[i].name,error:err.message};failed++;}fin++;draw();}};
   await Promise.all(Array.from({length:Math.min(3,list.length)},lane));
