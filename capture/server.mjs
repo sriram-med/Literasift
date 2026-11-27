@@ -37,7 +37,7 @@ createServer(async (request, response) => {
     const match = typeof body?.url === "string" && pubmed.exec(body.url);
     if (!match) return fail(400, "A canonical PubMed article URL is required");
     if (!browser?.isConnected()) browser = await chromium.launch();
-    context = await browser.newContext({ viewport: { width: 1366, height: 900 }, serviceWorkers: "block" });
+    context = await browser.newContext({ viewport: { width: 1366, height: 900 }, serviceWorkers: "block", timezoneId: "Asia/Kolkata", locale: "en-IN" });
     await context.route("**/*", route => {
       const target = new URL(route.request().url());
       const navigation = route.request().isNavigationRequest();

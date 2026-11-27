@@ -4,6 +4,9 @@
   "type": "module",
   "scripts": {
     "build": "bash scripts/build.sh",
-    "validate": "node scripts/validate-artifact.mjs"
+    "validate": "node scripts/validate-artifact.mjs",
+    "start": "node server/index.mjs",
+    "installer": "bash deploy/build-installer.sh",
+    "test": "node --test test/*.test.mjs"
   }
 }

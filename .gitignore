@@ -2,3 +2,14 @@ dist/
 site.tar.gz
 .env
 node_modules/
+
+# MedDRA-derived content (IME lists) is licensed: never commit it
+*ime-meddra*.json
+ime/
+docs/video/frames*/
+
+# MedDRA release files are licensed: never commit them
+*.asc
+meddra/
+MedAscii/
+MedDRA_*.zip

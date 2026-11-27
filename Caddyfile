@@ -1,0 +1,5 @@
+{$DOMAIN} {
+	encode zstd gzip
+	request_body { max_size 40MB }
+	reverse_proxy literasift:8787
+}
