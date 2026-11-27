@@ -108,3 +108,43 @@ test("a manager changes the portfolio of articles, cases and a whole watchlist; 
   assert.equal((await t.call(MANAGER, "/api/portfolio-change", { kind: "watch", watch: "Oncology|aciclovir", to: "Oncology" })).status, 400);
   assert.equal((await t.call(MANAGER, "/api/portfolio-change", { kind: "assignment", ids: ["a1"], to: "" })).status, 400);
 });
+
+test("people are created with roles and portfolios in one step: a QC-only person is never given screening, a screener gets only their portfolios, guards protect the managers, and deactivating hands work back", async () => {
+  const OWNER = { email: MANAGER, name: "Boss", role: "manager", active: true, owner: true };
+  const t = await makeEnv({ profiles: [OWNER], memberships: [], watches: [{ portfolio: "Antivirals", molecule: "aciclovir", query: "q" }, { portfolio: "Oncology", molecule: "imatinib", query: "q2" }], articles: { 1: { id: "1", title: "A", abstract: "x", authors: ["A"] }, 2: { id: "2", title: "B", abstract: "y", authors: ["B"] } } });
+  const save = (b, who = MANAGER) => t.call(who, "/api/person-save", { capacity: 20, ...b });
+  assert.equal((await save({ email: "x@example.org", name: "X", roles: ["qc"] }, SCREENER)).status, 403, "managers only");
+  assert.equal((await save({ email: "qc@example.org", name: "Quinn", roles: [] })).status, 400, "a role is required");
+  assert.equal((await save({ email: "qc@example.org", name: "Quinn", roles: ["qc"], portfolios: ["Antivirals"] })).status, 200);
+  assert.equal((await save({ email: "asha@example.org", name: "Asha", roles: ["screener"], portfolios: ["Antivirals", "Oncology"] })).status, 200);
+  assert.equal((await save({ email: "sam@example.org", name: "Sam", roles: ["screener", "qc"], portfolios: ["Oncology"] })).status, 200);
+  assert.equal((await save({ email: "meera@example.org", name: "Meera", roles: ["medical_reviewer"], portfolios: ["*"] })).status, 200);
+  let s = await t.state(), by = e => s.profiles.find(p => p.email === e);
+  assert.deepEqual(by("qc@example.org").roles, ["qc"]); assert.equal(by("meera@example.org").portfolio, ""); assert.ok(s.memberships.some(m => m.email === "meera@example.org" && m.role === "medical_reviewer" && m.portfolio === "*"));
+  assert.ok(worker.rolesIn(s, "qc@example.org", "Antivirals").has("qc") && !worker.rolesIn(s, "qc@example.org", "Antivirals").has("screener"), "a QC-only person is not a screener");
+  assert.ok(worker.rolesIn(s, "asha@example.org", "Oncology").has("screener") && worker.rolesIn(s, "asha@example.org", "Antivirals").has("screener")); assert.ok(!worker.rolesIn(s, "sam@example.org", "Antivirals").has("screener"), "Sam screens Oncology only");
+  // routing honours it
+  const D = dAgo(1), ncbi = fakeNcbi([{ pmid: "81", date: D }, { pmid: "82", date: D }, { pmid: "83", date: D }]);
+  await withFetch(ncbi.handler, () => worker.execute(t.env, { portfolio: "Antivirals", molecule: "aciclovir", query: "q" }, D, D));
+  s = await t.state(); const who = new Set(s.assignments.map(a => a.reviewer)); assert.ok(!who.has("qc@example.org") && !who.has("sam@example.org"), "only Asha screens Antivirals: " + [...who]); assert.ok(who.has("asha@example.org"));
+  // the sign-in invite path re-saves the profile and must not flatten roles
+  assert.equal((await t.call(MANAGER, "/api/profile", { email: "qc@example.org", name: "Quinn Q", capacity: 30, portfolio: "" })).status, 200); s = await t.state(); assert.deepEqual(by("qc@example.org").roles, ["qc"]); assert.equal(by("qc@example.org").name, "Quinn Q");
+  // guards
+  assert.equal((await save({ email: MANAGER, name: "Boss", roles: ["qc"] })).status, 409, "the owner stays a manager");
+  assert.equal((await save({ email: "mgr2@example.org", name: "Second", roles: ["manager"] })).status, 200); assert.equal((await t.state()).profiles.find(p => p.email === "mgr2@example.org").role, "manager");
+  assert.equal((await t.call(MANAGER, "/api/person-remove", { email: MANAGER })).status, 409);
+  // deactivating Asha hands her open work back to routing (Sam is the only other screener, in Oncology; Antivirals falls to managers)
+  const before = (await t.state()).assignments.filter(a => a.reviewer === "asha@example.org" && a.portfolio === "Oncology").length;
+  assert.equal((await t.call(MANAGER, "/api/person-remove", { email: "asha@example.org" })).status, 200); s = await t.state();
+  assert.equal(by("asha@example.org").active, false); assert.ok(!s.assignments.some(a => a.reviewer === "asha@example.org" && !["Complete", "Full text needed"].includes(a.status)), "no open work left with a deactivated person"); assert.ok(!s.memberships.some(m => m.email === "asha@example.org"));
+  void before;
+});
+
+test("an older profile that was given QC or medical review is shown, and routed, as that role, not as a screener", async () => {
+  const t = await makeEnv({ profiles: [{ email: MANAGER, name: "Boss", role: "manager", active: true, owner: true }, { email: SCREENER, name: "Asha", role: "reviewer", portfolio: "Antivirals", active: true, capacity: 50 }, { email: QC, name: "Quinn", role: "reviewer", portfolio: "Antivirals", active: true, capacity: 50 }, { email: MEDICAL, name: "Meera", role: "reviewer", active: true, capacity: 50 }],
+    memberships: [{ email: QC, portfolio: "Antivirals", role: "qc" }, { email: MEDICAL, portfolio: "*", role: "medical_reviewer" }], watches: [{ portfolio: "Antivirals", molecule: "aciclovir", query: "q" }] });
+  const s = await t.state(); assert.ok(worker.rolesIn(s, SCREENER, "Antivirals").has("screener")); assert.ok(!worker.rolesIn(s, QC, "Antivirals").has("screener")); assert.ok(!worker.rolesIn(s, MEDICAL, "Antivirals").has("screener"));
+  const D = dAgo(1), ncbi = fakeNcbi([{ pmid: "91", date: D }, { pmid: "92", date: D }]);
+  await withFetch(ncbi.handler, () => worker.execute(t.env, { portfolio: "Antivirals", molecule: "aciclovir", query: "q" }, D, D));
+  assert.deepEqual([...new Set((await t.state()).assignments.map(a => a.reviewer))], [SCREENER], "only the screener is given screening");
+});

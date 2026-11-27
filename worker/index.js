@@ -125,14 +125,21 @@ function dashboardFor(state, viewer, workflow, person) {
   for (const p of Object.values(people)) { const prof = profiles.find(x => x.email === p.email); p.capacity = prof?.capacity || null; p.completed7d = done.filter(d => d.by === p.email).length; }
   return { workflow, label:WORKFLOW_LABEL[workflow], timeline:{ days:{ screening:tl.screenDays, qc:tl.qcDays, medical:tl.medicalDays }[workflow], holidays:tl.holidays.length }, kpi, completed7d:mineDone.length, onTimeRate:mineDone.length ? Math.round(mineDone.filter(d => d.ontime).length / mineDone.length * 100) : null, next:mine.slice(0, 12), days, byClient, people:Object.values(people).sort((a, b) => b.overdue - a.overdue || b.open - a.open) };
 }
+// Who may screen in a portfolio. Profiles made before roles existed screen their one portfolio (or all). Profiles with an explicit role list screen only where they hold the screener role.
+// A profile made before role lists existed screens, unless a manager gave it QC or medical review and no screener role: those are what the person is for.
+const legacyScreens = (state, p) => { const mem = (state.memberships || []).filter(m => m.email === p.email); return !mem.some(m => m.role === "qc" || m.role === "medical_reviewer") || mem.some(m => m.role === "screener"); };
+const isScreenerFor = (state, p, portfolio) => {
+  if (!p.active || p.role !== "reviewer") return false; const pf = String(portfolio || "").toLowerCase();
+  if (!p.roles) return legacyScreens(state, p) && (!p.portfolio || p.portfolio.toLowerCase() === pf);
+  return p.roles.includes("screener") && (state.memberships || []).some(m => m.email === p.email && m.role === "screener" && (m.portfolio === "*" || m.portfolio.toLowerCase() === pf));
+};
 function allocate(state, item) {
   // A molecule owner (set by a manager) receives every article for that molecule, regardless of capacity.
   const owned = state.watches.find(w => w.owner && w.portfolio === item.portfolio && (!w.molecule || (item.molecules || []).includes(w.molecule)));
   if (owned && state.profiles.some(p => p.email === owned.owner && p.active)) { item.reviewer = owned.owner; item.ird ||= day(); item.dueAt ||= screenDueFor(state, item); return; }
-  const matches = p => p.active && (!p.portfolio || p.portfolio.toLowerCase() === item.portfolio.toLowerCase());
-  let candidates = state.profiles.filter(p => p.role === "reviewer" && matches(p));
-  // With no reviewers yet, managers screen their own queue so nothing sits unassigned.
-  if (!state.profiles.some(p => p.role === "reviewer" && p.active)) candidates = state.profiles.filter(p => p.role === "manager" && p.active).map(p => ({ ...p, capacity:Infinity }));
+  let candidates = state.profiles.filter(p => isScreenerFor(state, p, item.portfolio));
+  // With no screeners yet, managers screen their own queue so nothing sits unassigned.
+  if (!state.profiles.some(p => p.active && p.role === "reviewer" && (p.roles ? p.roles.includes("screener") : legacyScreens(state, p)))) candidates = state.profiles.filter(p => p.role === "manager" && p.active).map(p => ({ ...p, capacity:Infinity }));
   // Availability (away dates), workload against capacity, and overdue work decide who gets the next item; every item gets a due date.
   const today = day(), away = p => p.awayFrom && p.awayFrom <= today && (!p.awayUntil || p.awayUntil >= today);
   const isOpen = a => !["Complete", "Full text needed"].includes(a.status);
@@ -249,7 +256,7 @@ function rolesIn(state, email, portfolio) {
   const out = new Set(), p = (state.profiles || []).find(x => x.email === email && x.active);
   if (!p) return out;
   if (p.role === "manager") out.add("manager");
-  if (p.role === "reviewer" && (!p.portfolio || p.portfolio.toLowerCase() === String(portfolio || "").toLowerCase())) out.add("screener");
+  if (isScreenerFor(state, p, portfolio)) out.add("screener");
   for (const m of state.memberships || []) if (m.email === email && (m.portfolio === "*" || m.portfolio.toLowerCase() === String(portfolio || "").toLowerCase())) out.add(m.role);
   return out;
 }
@@ -5004,7 +5011,7 @@ async function apiCore(request, env, path) {
   // The owner initializes the first profile while the Site is owner-private.
   if (email && state.profiles.length === 0) {
     await write(env, data => {
-      if (!data.profiles.length) data.profiles.push({ email, name:email.split("@")[0], role:"manager", active:true });
+      if (!data.profiles.length) data.profiles.push({ email, name:email.split("@")[0], role:"manager", active:true, owner:true });
     });
     state.profiles = (await load(env)).state.profiles;
   }
@@ -5015,7 +5022,7 @@ async function apiCore(request, env, path) {
     const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ird:irdOf(state, a), wdLeft:a.dueAt ? workingDaysBetween(day(), a.dueAt, timelines(state)) : null, ...(a.synchrony ? { synchrony:{ status:a.synchrony.status, mode:a.synchrony.mode, at:a.synchrony.at, issues:a.synchrony.issues, patients:a.synchrony.patients, created:a.synchrony.created, ai:a.synchrony.ai, shadowCount:a.synchrony.shadowCount, error:a.synchrony.error } } : {}), ...scoreArticle(state.articles[a.pmid], a.molecules), client:clientIdFor(state, a) }));
     return json({ viewer, clients:(state.clients || []).map(c => ({ ...c, molecules:state.watches.filter(w => w.client === c.id).map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "" })) })), library:manager ? libraryLayout(state) : [],
       cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, evidenceReviewPending:caseEvidenceDelta(state, c).changes.length>0, canEdit:canEditCase(state, viewer, c), signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
-      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], meddraInfo:state.meddra || null, stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c), triage:triageFor(state, c), ird:caseIrd(state, c), stageDue:caseStageDue(state, c), wdLeft:(() => { const d = caseStageDue(state, c); return d ? workingDaysBetween(day(), d, timelines(state)) : null; })(), client:watchFor(state, c.portfolio, c.molecule || "")?.client || "" }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set((state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role))],
+      dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], meddraInfo:state.meddra || null, stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c), triage:triageFor(state, c), ird:caseIrd(state, c), stageDue:caseStageDue(state, c), wdLeft:(() => { const d = caseStageDue(state, c); return d ? workingDaysBetween(day(), d, timelines(state)) : null; })(), client:watchFor(state, c.portfolio, c.molecule || "")?.client || "" }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set([...(state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role), ...(state.profiles.find(p => p.email === viewer?.email && p.role === "reviewer" && !p.roles && legacyScreens(state, p)) ? ["screener"] : [])])],
       monitoring:monitoringCounts(state, viewer),
       series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ timelines:timelines(state), myPortfolios:myPortfolios(state, viewer), syncAutoScreen:state.settings?.syncAutoScreen !== false, syncActivePortfolios:state.settings?.syncActivePortfolios || [], syncMode:syncMode(state), syncAiPortfolios:manager ? (state.settings?.syncAiPortfolios || []) : [], automation:{ submit:state.settings?.automation?.submit !== false, auto:state.settings?.automation?.auto !== false, smpc:state.settings?.automation?.smpc !== false, ai:state.settings?.automation?.ai === true }, ai:(() => { const c = aiConfig(env, state); return { available:c.enabled && c.hasKey && c.monthlyTokens > 0, paused:c.paused, ...(manager ? { enabled:state.settings?.ai?.enabled === true, model:c.model, monthlyTokens:c.monthlyTokens, perCaseTokens:c.perCaseTokens, hasKey:c.hasKey, keySource:c.keySource, used:aiUsed(state), month:aiMonth() } : {}) }; })(), retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
@@ -5161,6 +5168,45 @@ async function apiCore(request, env, path) {
     if (out === "missing") return json({ error:"Watchlist not found." }, 404); if (out === "same") return json({ error:"It is already in that portfolio." }, 400); if (out === "exists") return json({ error:"That portfolio already has a watchlist for this molecule." }, 409);
     await audit(env, { by:email, action:"portfolio.changed", entityType:kind === "case" ? "Case" : kind === "watch" ? "Watchlist" : "Assignment", entityId:kind === "watch" ? String(body.watch) : moved.length + " item(s)", detail:{ to, moved:moved.length, skipped:skipped.length } });
     return json({ ok:true, moved:moved.length, skipped });
+  }
+  if (["/api/person-save", "/api/person-remove"].includes(path) && viewer) {
+    // One place to create or change a person: who they are, what they do, where, how much, and whether they are available. Roles and portfolios become the memberships routing uses.
+    if (viewer.role !== "manager") return json({ error:"Manager access required." }, 403);
+    const target = String(body.email || "").trim().toLowerCase(), at = new Date().toISOString(); if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(target)) return json({ error:"Enter a valid email address." }, 400);
+    const release = (d, em) => { // the person's open work goes back to routing
+      for (const a of d.assignments) { if (a.reviewer === em && !["Complete", "Full text needed"].includes(a.status) && !a.disposition) { a.reviewer = ""; allocate(d, a); }
+        if (a.qc?.reviewer === em && a.qc.status === "pending") { const q = pickArticleQc(d, { ...a, reviewer:"" }); if (q && q !== em) a.qc.reviewer = q; }
+        if (a.medicalReviewer === em && stageOf(a) === "medical_review") a.medicalReviewer = pickMedical(d, a.portfolio, em, (a.molecules || [])[0] || "") || undefined; }
+      for (const c of d.cases || []) if (c.assignee === em && !c.locked && !c.archived && !caseClosed(c)) { const st = stageOf(c), next = pickRole(d, c.portfolio, st === "qc" ? "qc" : st === "medical_review" ? "medical_reviewer" : "screener", em, c.molecule || ""); if (next && next !== em) { c.assignee = next; c.assignedAt = at; (c.history ||= []).push({ at, by:email, action:"Reassigned to " + next + " because " + em + " is no longer available" }); } }
+    };
+    if (path === "/api/person-remove") {
+      const err = await write(env, d => { const p = d.profiles.find(x => x.email === target); if (!p) return "missing"; if (p.owner) return "owner"; if (p.email === email) return "self";
+        if (p.role === "manager" && d.profiles.filter(x => x.role === "manager" && x.active && x.email !== target).length === 0) return "last";
+        p.active = false; release(d, target); d.memberships = (d.memberships || []).filter(m => m.email !== target); return ""; });
+      if (err) return json({ error:({ missing:"No such person.", owner:"The owner cannot be removed.", self:"You cannot remove yourself.", last:"There must be at least one active manager." })[err] }, err === "missing" ? 404 : 409);
+      await audit(env, { by:email, action:"person.deactivated", target, detail:{} }); return json({ ok:true });
+    }
+    const name = String(body.name || "").trim().slice(0, 120), roles = uniq((Array.isArray(body.roles) ? body.roles : []).map(String).filter(r => ["manager", "screener", "qc", "medical_reviewer"].includes(r)));
+    const cap = Math.round(Number(body.capacity ?? 25)), active = body.active !== false && body.active !== "false";
+    let pfs = uniq((Array.isArray(body.portfolios) ? body.portfolios : []).map(x => String(x).trim()).filter(Boolean)).slice(0, 100); if (!pfs.length || pfs.includes("*")) pfs = ["*"];
+    if (!name) return json({ error:"Enter a name." }, 400); if (!roles.length) return json({ error:"Choose at least one role." }, 400); if (!(cap >= 1 && cap <= 500)) return json({ error:"The open assignment limit must be between 1 and 500." }, 400);
+    const out = await write(env, d => {
+      const cur = d.profiles.find(x => x.email === target), isMgr = roles.includes("manager");
+      if (cur?.owner && !isMgr) return "owner"; if (cur && cur.role === "manager" && !isMgr && d.profiles.filter(x => x.role === "manager" && x.active && x.email !== target).length === 0) return "last";
+      if (cur && cur.email === email && (!isMgr || !active)) return "self";
+      const sub = roles.filter(r => r !== "manager"), rec = { ...(cur || {}), email:target, name, role:isMgr ? "manager" : "reviewer", roles:sub, portfolio:pfs.length === 1 && pfs[0] !== "*" ? pfs[0] : "", capacity:cap, active };
+      for (const k of ["awayFrom", "awayUntil"]) { if (/^\d{4}-\d{2}-\d{2}$/.test(body[k] || "")) rec[k] = body[k]; else delete rec[k]; }
+      if (body.canManageClients === true && !isMgr) rec.canManageClients = true; else delete rec.canManageClients;
+      if (cur) d.profiles[d.profiles.indexOf(cur)] = rec; else d.profiles.push(rec);
+      d.memberships = (d.memberships || []).filter(m => !(m.email === target && ["screener", "qc", "medical_reviewer"].includes(m.role)));
+      if (active) for (const r of sub) for (const pf of pfs) d.memberships.push({ email:target, portfolio:pf, role:r, by:email, at });
+      if (!active || (cur && cur.active !== false && !sub.includes("screener") && cur.roles?.includes("screener"))) release(d, target);
+      d.assignments.filter(a => !a.reviewer).forEach(a => allocate(d, a));
+      return "";
+    });
+    if (out) return json({ error:({ owner:"The owner is always a manager.", last:"There must be at least one active manager.", self:"You cannot remove your own manager role or deactivate yourself." })[out] }, 409);
+    await audit(env, { by:email, action:"person.saved", target, detail:{ roles, portfolios:pfs, active } });
+    return json({ ok:true });
   }
   if (path === "/api/synchrony-import" && viewer) {
     // A document goes straight into Synchrony: a Discover result, a PDF or XML, or pasted OCR text. It becomes an article, a "potential ICSR" assignment in the chosen portfolio, stored full text, and a prepared draft.
@@ -6527,9 +6573,11 @@ async function apiCore(request, env, path) {
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(profile.email) || !profile.name || !Number.isInteger(profile.capacity) ||
         profile.capacity < 1 || profile.capacity > 500) return json({ error:"Enter a valid profile and capacity." },400);
     await write(env, data => {
-      const existing = data.profiles.findIndex(p => p.email === profile.email);
+      const existing = data.profiles.findIndex(p => p.email === profile.email), cur = data.profiles[existing];
       if (existing < 0) data.profiles.push(profile);
-      else if (data.profiles[existing].role === "reviewer") data.profiles[existing] = { ...profile, ...(data.profiles[existing].canManageClients ? { canManageClients:true } : {}) };
+      else if (cur.owner) throw new Error("The owner profile cannot be replaced.");
+      else if (cur.roles || cur.role === "manager") data.profiles[existing] = { ...cur, name:profile.name, capacity:profile.capacity, active:profile.active, ...(profile.awayFrom ? { awayFrom:profile.awayFrom } : {}), ...(profile.awayUntil ? { awayUntil:profile.awayUntil } : {}) };
+      else if (cur.role === "reviewer") data.profiles[existing] = { ...profile, ...(cur.canManageClients ? { canManageClients:true } : {}) };
       else throw new Error("The owner profile cannot be replaced.");
       data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data,a));
     });
@@ -6790,6 +6838,9 @@ details.tools{margin:0 0 14px}details.tools>summary{cursor:pointer;color:var(--b
 .dv-head,.dv-mol{display:flex;gap:10px;align-items:center;border:0;background:none;font:inherit;color:inherit;cursor:pointer;text-align:left;border-radius:10px;padding:6px}.dv-head:hover,.dv-mol:hover{background:var(--card)}.dv-mol.on{background:var(--card);box-shadow:0 0 0 2px var(--brand)}.dv-t{display:grid;flex:1;min-width:0}.dv-mn{flex:0 0 38%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.dv-n{font-size:12px;white-space:nowrap}
 .sbar2{display:flex;flex:1;height:10px;background:var(--border);border-radius:999px;overflow:hidden}.dvcard>.sbar2{margin:0 6px 4px;flex:none}.sbar2 .s{background:var(--red)}.sbar2 .n{background:var(--brand)}
 .mqtabs{margin:0 0 12px}.mqh{margin:0 0 10px;font-size:15px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.mqnear{border-color:var(--red)}.agechip{display:inline-block;font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:999px;background:var(--accent);color:var(--muted)}.acard.mq{grid-template-columns:1fr 200px}.acard.mq.r-amber{border-left-color:var(--amber)}
+.teamhead{margin-bottom:12px}.pgrid{display:grid;gap:14px;grid-template-columns:repeat(auto-fill,minmax(min(320px,100%),1fr))}.pcard{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;display:grid;gap:12px}.pcard.off{opacity:.65}.pc-top{display:flex;gap:12px;align-items:center}.pc-id{flex:1;min-width:0}.pc-id .sub{overflow:hidden;text-overflow:ellipsis}.av.lg{width:40px;height:40px;font-size:16px}
+.pc-roles{display:flex;flex-wrap:wrap;gap:6px}.rchip{display:inline-flex;flex-direction:column;border-radius:10px;padding:5px 10px;font-size:12px;line-height:1.25}.rchip b{font-weight:600}.rchip i{font-style:normal;opacity:.8;font-size:11px}.rc-blue{background:#dbe8fb;color:#1d4f9a}.rc-teal{background:#d8f1ec;color:#0b5b50}.rc-violet{background:#e9e0fa;color:#58349a}.rc-amber{background:#fbecd0;color:#8a5200}
+.pc-meter{display:grid;gap:4px}.pc-foot{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.roleboxes{display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin-top:6px}.rolebox{display:flex;flex-direction:row;gap:10px;align-items:flex-start;border:1px solid var(--border);border-radius:12px;padding:10px 12px;cursor:pointer;font-weight:400}.rolebox span{display:grid}.rolebox input{margin-top:3px}.acctbox{border-top:1px dashed var(--border);margin-top:12px;padding-top:12px}
 .pbadge{display:inline-block;min-width:62px;text-align:center;padding:3px 10px;border-radius:999px;font-size:11.5px;font-weight:600;border:1px solid var(--border);flex:none;align-self:flex-start}.p-high.pbadge{background:var(--red);border-color:var(--red);color:#fff}.p-medium.pbadge{background:#fbecd0;border-color:#f3d79a;color:#9a5b05}.p-low.pbadge{background:var(--accent);color:var(--muted)}
 .plist{display:grid;gap:10px;margin-bottom:12px}.plitem{display:flex;gap:14px;align-items:flex-start;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:14px;padding:14px 16px}.plitem.late{border-left-color:var(--red)}.pl-main{flex:1;min-width:0}.pl-main b{display:block;font-size:14.5px;line-height:1.35}.pl-side{text-align:right;display:grid;gap:8px;justify-items:end}.pl-btns{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .wf{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600}.wf-teal{background:#d8f1ec;color:#0b5b50}.wf-blue{background:#dbe8fb;color:#1d4f9a}.wf-violet{background:#e9e0fa;color:#58349a}
@@ -6945,7 +6996,7 @@ const paths = {
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Dashboard:"Your workload by workflow: what is open, late and coming up, and for which clients and molecules.",Planner:"A calendar of what to screen, check or review, and when each is due. Dates run from the IRD.","My Desk":"Your work in three steps: data entry, QC, medical review. Each has its own list and its own actions.","Line Listing":"Every case in one table, built automatically from the cases and kept up to date. Download it any time.",Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"Reviewers and capacity.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
+const subtitles = {Dashboard:"Your workload by workflow: what is open, late and coming up, and for which clients and molecules.",Planner:"A calendar of what to screen, check or review, and when each is due. Dates run from the IRD.","My Desk":"Your work in three steps: data entry, QC, medical review. Each has its own list and its own actions.","Line Listing":"Every case in one table, built automatically from the cases and kept up to date. Download it any time.",Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across portfolios.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Type a molecule and a date range to pull every matching PubMed article.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"People, their roles and portfolios, availability and sign-in access.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -7929,7 +7980,7 @@ async function loadPlanner(){
     box.innerHTML=filt+ctl+lateHtml+(plState.view==="list"?listHtml:cal+selHtml+nextHtml)+'<p class="sub" style="margin-top:14px">Timelines run from the IRD (the day LiteraSift received the item): '+tl.screenDays+' working days to screen and route to QC, '+tl.qcDays+' for QC, '+tl.medicalDays+' for medical review. Weekends'+(tl.holidays.length?" and "+tl.holidays.length+" listed holiday"+(tl.holidays.length===1?"":"s"):"")+' do not count.'+(mgr?" You can change the days per molecule on the Clients page and a single item's date here.":"")+'</p>';
   }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
 }
-function wfAllowed(){const m=data.viewer.role==="manager",roles=data.viewerRoles||[];return [["screening",true],["qc",m||roles.includes("qc")],["medical",m||roles.includes("medical_reviewer")]].filter(x=>x[1]).map(x=>x[0]);}
+function wfAllowed(){const m=data.viewer.role==="manager",roles=data.viewerRoles||[];return [["screening",m||roles.includes("screener")||!roles.length],["qc",m||roles.includes("qc")],["medical",m||roles.includes("medical_reviewer")]].filter(x=>x[1]).map(x=>x[0]);}
 async function loadDashboard(){
   const box=$("dbbox");if(!box)return;const mgr=data.viewer.role==="manager",allowed=wfAllowed();if(!allowed.includes(dbState.wf))dbState.wf=allowed[0];
   try{
@@ -8552,7 +8603,7 @@ function deskVisual(list){
 }
 function deskHtml(){
   const me=data.viewer.email, mgr=data.viewer.role==="manager", roles=data.viewerRoles||[], cases=(data.cases||[]).filter(c=>!c.archived&&c.status!=="Sent to PV Nexus"&&c.status!=="Closed: not a valid ICSR");
-  const flows=[["screening","1","Screener","Data entry","Complete the case from the article with the AI's help, then submit it to QC.",true],["qc","2","QC","Quality check","Approve for medical review, or return it to the screener with the exact fields to fix.",mgr||roles.includes("qc")],["medical_review","3","Medical reviewer","Medical review","Confirm seriousness, causality and listedness, then approve and sign.",mgr||roles.includes("medical_reviewer")]].filter(f=>f[5]);
+  const flows=[["screening","1","Screener","Data entry","Complete the case from the article with the AI's help, then submit it to QC.",mgr||roles.includes("screener")||!roles.length],["qc","2","QC","Quality check","Approve for medical review, or return it to the screener with the exact fields to fix.",mgr||roles.includes("qc")],["medical_review","3","Medical reviewer","Medical review","Confirm seriousness, causality and listedness, then approve and sign.",mgr||roles.includes("medical_reviewer")]].filter(f=>f[5]);
   if(!flows.some(f=>f[0]===deskTab))deskTab=flows[0][0];
   const mine=st=>cases.filter(c=>caseStage(c)===st&&(mgr||c.assignee===me));
   const hot=st=>st==="screening"&&cases.some(c=>caseStage(c)==="screening"&&c.assignee===me&&c.qc&&c.qc.status==="returned");
@@ -8589,6 +8640,65 @@ function minePullHtml(){
   const today=new Date().toISOString().slice(0,10), start=new Date(Date.now()-30*864e5).toISOString().slice(0,10), mine=(data.config&&data.config.myPortfolios)||[];
   if(!mine.length)return panel("Search and pull articles",'<div class="empty">You are not in a portfolio yet. Ask a manager to add you under Team.</div>');
   return panel("Search and pull articles",'<form class="grid" data-route="pull-mine" data-pull="1">'+drugFinderHtml()+'<label>Molecule (INN)<input name="molecule" required placeholder="Filled by the lookup, or type it"></label><label>Generic names and brands, searched with it<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Portfolio<select name="portfolio">'+mine.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label><label class="check"><input type="checkbox" name="safety">&nbsp;Safety-related articles only</label><div class="wide" style="display:flex;gap:16px;flex-wrap:wrap;grid-column:1/-1"><span class="sub">Narrow with PubMed filters:</span><label class="check"><input type="checkbox" name="humans">&nbsp;Humans only</label><label class="check"><input type="checkbox" name="caseReports">&nbsp;Case reports only</label><label class="check"><input type="checkbox" name="english">&nbsp;English only</label><label class="check"><input type="checkbox" name="noReviews">&nbsp;Exclude reviews</label></div><div><button class="btn">Pull into my queue</button></div></form>',"The articles go to your own queue in the portfolio you choose, with the usual two working days from today. Nothing is added to the watchlists, and other people's work is not changed.");
+}
+let teamState={role:"",q:""};
+const ROLE_META={manager:["Manager","blue","Everything: people, clients, timelines, settings"],screener:["Screener","teal","Screens articles and enters cases"],qc:["QC","violet","Checks screening and cases, routes them on"],medical_reviewer:["Medical reviewer","amber","Reviews, approves and signs cases"]};
+function personRoles(p){
+  const mem=(data.memberships||[]).filter(m=>m.email===p.email),scope=m=>m.portfolio==="*"?"All portfolios":m.portfolio,out=[];
+  if(p.role==="manager")out.push({r:"manager",scope:"Everything"});
+  const legacyOk=!mem.some(m=>m.role==="qc"||m.role==="medical_reviewer")||mem.some(m=>m.role==="screener"),sc=p.roles?mem.filter(m=>m.role==="screener").map(scope):(p.role==="reviewer"&&legacyOk?[p.portfolio||"All portfolios"]:[]);
+  if(sc.length)out.push({r:"screener",scope:[...new Set(sc)].join(", ")});
+  ["qc","medical_reviewer"].forEach(r=>{const l=mem.filter(m=>m.role===r).map(scope);if(l.length)out.push({r,scope:[...new Set(l)].join(", ")});});
+  const pm=mem.filter(m=>m.role==="manager").map(scope);if(pm.length)out.push({r:"portfolio",scope:[...new Set(pm)].join(", ")});
+  return out;
+}
+const roleChip=c=>{const m=c.r==="portfolio"?["Portfolio manager","blue"]:ROLE_META[c.r];return '<span class="rchip rc-'+m[1]+'"><b>'+m[0]+'</b><i>'+esc(c.scope)+'</i></span>';};
+function teamHtml(){
+  const hosted=data.config.accounts,accts=(data.accounts||{}).users||{},today=todayStr(),away=p=>p.awayFrom&&p.awayFrom<=today&&(!p.awayUntil||p.awayUntil>=today);
+  const all=data.profiles||[],has=(p,r)=>personRoles(p).some(c=>c.r===r),count=r=>all.filter(p=>p.active&&has(p,r)).length;
+  const load=p=>{const own=(data.assignments||[]).filter(a=>a.reviewer===p.email&&!["Complete","Full text needed"].includes(a.status)&&!a.disposition),qc=(data.assignments||[]).filter(a=>a.qc&&a.qc.reviewer===p.email&&a.qc.status==="pending"),cs=(data.cases||[]).filter(c=>c.assignee===p.email&&!c.archived&&c.status!=="Sent to PV Nexus"&&c.status!=="Closed: not a valid ICSR"),late=own.filter(a=>a.dueAt&&a.dueAt<today).length;return {open:own.length+qc.length+cs.length,late};};
+  const q=teamState.q.trim().toLowerCase(),list=all.filter(p=>(!teamState.role||(teamState.role==="inactive"?(!p.active||away(p)):p.active&&has(p,teamState.role)))&&(!q||(p.name+" "+p.email).toLowerCase().includes(q)));
+  const chip=(k,l,n)=>'<button type="button" class="fchip'+(teamState.role===k?" on":"")+'" data-teamrole="'+k+'">'+l+'<b>'+n+'</b></button>';
+  const bar='<div class="fbar">'+chip("","Everyone",all.length)+chip("manager","Managers",count("manager"))+chip("screener","Screeners",count("screener"))+chip("qc","QC",count("qc"))+chip("medical_reviewer","Medical reviewers",count("medical_reviewer"))+chip("inactive","Away or inactive",all.filter(p=>!p.active||away(p)).length)+'</div>';
+  const cards=list.map(p=>{
+    const l=load(p),st=accts[p.email],cap=p.capacity||0,pct=cap?Math.min(100,Math.round(l.open/cap*100)):0,state=!p.active?'<span class="badge">Inactive</span>':away(p)?'<span class="badge amber">Away until '+esc(p.awayUntil||"further notice")+'</span>':'<span class="badge green">Available</span>';
+    return '<article class="pcard'+(p.active?"":" off")+'"><div class="pc-top"><span class="av lg" aria-hidden="true">'+esc((p.name||p.email).slice(0,1).toUpperCase())+'</span><div class="pc-id"><b>'+esc(p.name||p.email)+(p.owner?' <span class="badge blue">Owner</span>':"")+'</b><div class="sub">'+esc(p.email)+'</div></div>'+state+'</div>'+
+      '<div class="pc-roles">'+(personRoles(p).map(roleChip).join("")||'<span class="sub">No role yet</span>')+'</div>'+
+      '<div class="pc-meter"><span class="sub">Open work '+l.open+(cap&&has(p,"screener")?' of '+cap:"")+(l.late?' · <b style="color:var(--red)">'+l.late+' late</b>':"")+'</span>'+(cap&&has(p,"screener")?'<span class="bar"><i style="width:'+pct+'%"></i></span>':"")+'</div>'+
+      '<div class="pc-foot">'+(hosted?(st==="active"?'<span class="badge green">Signed in before</span>':st==="invited"?'<span class="badge amber">Invited</span>':'<span class="badge">No account</span>'):"")+'<span style="margin-left:auto"><button type="button" class="btn outline sm" data-person="'+esc(p.email)+'">Edit</button></span></div></article>';
+  }).join("");
+  return '<section class="teamhead"><div class="body"><div class="dv-top"><div><h3 style="margin:0 0 4px">People</h3><div class="sub">Each person has roles and the portfolios they apply to. Routing, queues and dashboards follow from this.</div></div><button type="button" class="btn" data-person="" style="margin-left:auto">Add a person</button></div></div></section>'+bar+'<div class="filters slim" style="border:0;padding:0 0 10px"><input id="teamq" type="search" placeholder="Search name or email" value="'+esc(teamState.q)+'" aria-label="Search people"></div>'+(list.length?'<div class="pgrid">'+cards+'</div>':'<div class="empty">No one matches.</div>');
+}
+function openPersonDialog(email){
+  const old=$("pdlg");if(old)old.remove();
+  const p=email?(data.profiles||[]).find(x=>x.email===email):null,hosted=data.config.accounts,accts=(data.accounts||{}).users||{},st=email?accts[email]:"",pfs=[...new Set([...(data.watches||[]).map(w=>w.portfolio),...(data.assignments||[]).map(a=>a.portfolio)])].sort();
+  const cur=p?personRoles(p):[],roleSet=new Set(cur.filter(c=>["manager","screener","qc","medical_reviewer"].includes(c.r)).map(c=>c.r)),mem=(data.memberships||[]).filter(m=>p&&m.email===p.email&&["screener","qc","medical_reviewer"].includes(m.role)),pfSel=new Set(mem.map(m=>m.portfolio));
+  if(p&&!p.roles&&p.role==="reviewer"){pfSel.add(p.portfolio||"*");}
+  const allOn=!p||pfSel.has("*")||!pfSel.size;
+  const rbox=(r)=>'<label class="rolebox"><input type="checkbox" name="roles" value="'+r+'"'+(roleSet.has(r)||(!p&&r==="screener")?" checked":"")+'><span><b>'+ROLE_META[r][0]+'</b><span class="sub">'+ROLE_META[r][2]+'</span></span></label>';
+  const acct=hosted&&p?'<div class="acctbox"><b>Sign-in account</b> '+(st==="active"?'<span class="badge green">Active</span>':st==="invited"?'<span class="badge amber">Invited</span>':'<span class="badge">No account</span>')+(p.email===data.viewer.email?"":'<div class="pc-foot" style="margin-top:8px"><button type="button" class="btn outline sm" data-p4="setpw|'+esc(p.email)+'">Set password</button><button type="button" class="btn outline sm" data-resetlink="'+esc(p.email)+'">'+(st==="active"?"Reset password":"Send invite")+'</button>'+(st?'<button type="button" class="btn outline sm" data-revoke="'+esc(p.email)+'">Revoke sign-in</button>':"")+'</div>')+'</div>':"";
+  document.body.insertAdjacentHTML("beforeend",'<dialog id="pdlg" style="width:min(640px,96vw)"><h3 style="margin:0 0 4px">'+(p?"Edit "+esc(p.name||p.email):"Add a person")+'</h3><p class="sub" style="margin:0 0 12px">Choose what they do and where. Roles apply to every portfolio you tick.</p><form id="pform" data-own="1" class="impgrid">'+
+    '<label>Name<input name="name" required value="'+esc(p?p.name:"")+'"></label><label>Sign-in email<input type="email" name="email" required value="'+esc(p?p.email:"")+'"'+(p?" readonly":"")+'></label>'+
+    '<div class="wide"><span class="sub">Roles</span><div class="roleboxes">'+["screener","qc","medical_reviewer","manager"].map(rbox).join("")+'</div></div>'+
+    '<div class="wide"><span class="sub">Portfolios (for screener, QC and medical reviewer)</span><div class="pfpick" id="pfx"><label class="pfchip"><input type="checkbox" data-pfx="*"'+(allOn?" checked":"")+'><span>All portfolios</span></label>'+pfs.map(x=>'<label class="pfchip"><input type="checkbox" data-pfx="'+esc(x)+'"'+(!allOn&&pfSel.has(x)?" checked":"")+'><span>'+esc(x)+'</span></label>').join("")+'</div></div>'+
+    '<label>Open work limit (screeners)<input type="number" name="capacity" min="1" max="500" value="'+esc(p?p.capacity||25:25)+'"></label><label>Availability<select name="active"><option value="true"'+(!p||p.active?" selected":"")+'>Available</option><option value="false"'+(p&&!p.active?" selected":"")+'>Unavailable (work goes back to routing)</option></select></label>'+
+    '<label>Away from<input type="date" name="awayFrom" value="'+esc(p&&p.awayFrom||"")+'"></label><label>Away until<input type="date" name="awayUntil" value="'+esc(p&&p.awayUntil||"")+'"></label>'+
+    '<label class="check wide"><input type="checkbox" name="canManageClients"'+(p&&p.canManageClients?" checked":"")+'>&nbsp;May add clients and group molecules (managers can always)</label>'+
+    (hosted&&!st?'<label class="check wide"><input type="checkbox" name="invite" checked>&nbsp;Create a sign-in account and send an invite'+((data.accounts||{}).mail?"":" (email is not set up, so you will get a link to send yourself)")+'</label>':"")+
+    '<div class="wide" style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">'+(p&&!p.owner&&p.email!==data.viewer.email?'<button type="button" class="btn outline" id="pdel" style="color:var(--red);margin-right:auto">Deactivate</button>':"")+'<button type="button" class="btn outline" id="pno">Cancel</button><button class="btn" id="pgo">Save</button></div></form>'+acct+'<p id="perr" class="msg" style="color:var(--red)" role="alert"></p></dialog>');
+  const d=$("pdlg");d.showModal();$("pno").onclick=()=>{d.close();d.remove();};
+  $("pfx").addEventListener("change",e=>{const t=e.target;if(!t.dataset.pfx)return;const boxes=[...$("pfx").querySelectorAll("[data-pfx]")];if(t.dataset.pfx==="*"&&t.checked)boxes.forEach(b=>{if(b!==t)b.checked=false;});else if(t.checked)boxes[0].checked=false;if(!boxes.some(b=>b.checked))boxes[0].checked=true;});
+  if($("pdel"))$("pdel").onclick=async()=>{if(!confirm("Deactivate "+(p.name||p.email)+"? Their open work goes back to routing."))return;try{await api("person-remove",{email:p.email});d.close();d.remove();await refresh();render();message("Deactivated.");}catch(err){$("perr").textContent=err.message;}};
+  $("pform").onsubmit=async e=>{
+    e.preventDefault();const f=e.target,roles=[...f.querySelectorAll('[name="roles"]:checked')].map(x=>x.value),pf=[...$("pfx").querySelectorAll("[data-pfx]:checked")].map(x=>x.dataset.pfx);
+    const body={email:f.elements.email.value.trim().toLowerCase(),name:f.elements.name.value.trim(),roles,portfolios:pf,capacity:Number(f.elements.capacity.value||25),active:f.elements.active.value==="true",awayFrom:f.elements.awayFrom.value,awayUntil:f.elements.awayUntil.value,canManageClients:Boolean(f.elements.canManageClients&&f.elements.canManageClients.checked)};
+    $("pgo").disabled=true;$("perr").textContent="";
+    try{
+      await api("person-save",body);let note="Saved.";
+      if(f.elements.invite&&f.elements.invite.checked){const r=await api("/host/invite",{name:body.name,email:body.email,portfolio:"",capacity:body.capacity,active:body.active?"true":"false"});if(r.link){d.close();d.remove();await refresh();render();showLink("Invite link for "+body.email,(r.mailError?r.mailError+" ":"Email isn't configured. ")+"Send this link to them yourself. It works once and expires in 7 days.",r.link);return;}note=r.emailed?"Saved. Invite emailed.":"Saved.";}
+      d.close();d.remove();await refresh();render();message(note);
+    }catch(err){$("perr").textContent=err.message;$("pgo").disabled=false;}
+  };
 }
 function clientsHtml(){
   const clients=data.clients||[], items=data.assignments, wk=w=>encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||"");
@@ -8779,24 +8889,7 @@ function render() {
   if(tab==="Planner")html='<div id="plbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Dashboard")html='<div id="dbbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Line Listing")html='<div id="llbox"><div class="skel"></div><div class="skel"></div></div>';
-  if(tab==="Team"){
-    const hosted=data.config.accounts, accts=data.accounts.users;
-    const pfList=[...new Set([...data.watches.map(w=>w.portfolio),...data.assignments.map(a=>a.portfolio)])].sort(), mem=data.memberships||[];
-    const memberPanel=panel("Roles by portfolio",'<form class="grid" data-route="membership-save"><label>Team member<select name="email">'+(data.profiles||[]).filter(p=>p.active).map(p=>'<option value="'+esc(p.email)+'">'+esc(p.name||p.email)+'</option>').join("")+'</select></label><label>Portfolio<select name="portfolio"><option value="*">All portfolios</option>'+pfList.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label><label>Role<select name="role"><option value="screener">Screener</option><option value="medical_reviewer">Medical reviewer</option><option value="qc">QC</option><option value="manager">Manager (this portfolio)</option></select></label><div><button class="btn">Add role</button></div></form>'+
-      table(["Member","Portfolio","Role","Added by",""],mem.map(m=>[esc((data.profiles.find(p=>p.email===m.email)||{}).name||m.email),esc(m.portfolio==="*"?"All":m.portfolio),esc(m.role.replace("_"," ")),esc(m.by||""),'<button class="btn outline sm" data-memremove="'+esc(m.email+"|"+m.portfolio+"|"+m.role)+'">Remove</button>']),"No portfolio roles yet. Reviewers screen the portfolio on their profile; add QC and medical reviewer roles here."),"A QC reviewer checks screening decisions made by someone else. Roles apply to one portfolio, so the same citation can be reviewed independently in two portfolios.");
-    html=memberPanel+panel(hosted?"Invite or update a reviewer":"Add or update a reviewer",'<form class="grid" data-route="'+(hosted?"/host/invite":"profile")+'"><label>Name<input name="name" required></label><label>Sign-in email<input type="email" name="email" required></label><label>Portfolio<input name="portfolio" list="pfopts" autocomplete="off" placeholder="All portfolios"></label><label>Open assignment limit<input type="number" name="capacity" min="1" max="500" value="25" required></label><label>Availability<select name="active"><option value="true">Active</option><option value="false">Unavailable</option></select></label><label>Away from<input type="date" name="awayFrom"></label><label>Away until<input type="date" name="awayUntil"></label><div><button class="btn">'+(hosted?"Save and invite":"Save reviewer")+'</button></div></form>',
-        hosted?(data.accounts.mail?"New reviewers get an email with a link to set their password.":"Email delivery isn't configured, so you'll be shown a link to send to each new reviewer yourself."):"")+
-      panel("Team",table(hosted?["Name","Email","Role","Portfolio","Open","Screened","Sign-in",""]:["Name","Email","Role","Portfolio","Open","Screened"],data.profiles.map(p=>{
-        const own=items.filter(a=>a.reviewer===p.email), fin=own.filter(a=>a.status==="Complete").length;
-        const row=[esc(p.name),esc(p.email),badge(p.role,p.role==="manager"?"blue":""),esc(p.portfolio||"All"),own.length-fin,fin+" / "+own.length+(own.length?" ("+Math.round(fin/own.length*100)+"%)":"")];
-        if(hosted){
-          const st=accts[p.email];
-          row.push(st==="active"?badge("Active","green"):st==="invited"?badge("Invited","amber"):badge("No account"));
-          row.push(p.email===data.viewer.email?"":'<button class="btn outline sm" data-p4="setpw|'+esc(p.email)+'">Set password</button> <button class="btn outline sm" data-resetlink="'+esc(p.email)+'">'+(st==="active"?"Reset password":"Send invite")+'</button> '+(st?'<button class="btn outline sm" data-revoke="'+esc(p.email)+'">Revoke</button>':""));
-        }
-        return row;
-      }),"No profiles."),"",true);
-  }
+  if(tab==="Team")html=teamHtml();
   if(tab==="Batches") html=panel("Backfill a date range",watchOptions?
     '<form class="grid" data-route="import"><label>Watchlist<select name="watch">'+watchOptions+'</select></label><label>From<input name="from" type="date" required></label><label>Through<input name="to" type="date" required></label><label>Date field<select name="dateField"><option value="pdat">Publication date (backfill)</option><option value="crdt">Create date (when added to PubMed)</option></select></label><div><button class="btn">Import citations</button></div></form>':
     '<div class="empty">Save a watchlist before importing a batch.</div>')+
@@ -8895,6 +8988,7 @@ $("gsearch").addEventListener("keydown",e=>{if(e.key==="Enter")globalSearch();})
   window.addEventListener("scroll",()=>tip.classList.remove("on"),true);})();
 $("theme").onclick=()=>setTheme(document.documentElement.dataset.theme==="dark"?"light":"dark");
 document.addEventListener("input",event=>{
+  if(event.target.id==="teamq"){teamState.q=event.target.value;const pos=event.target.selectionStart;render();const el=$("teamq");if(el){el.focus();el.setSelectionRange(pos,pos);}return;}
   const key=event.target.dataset?.filter;
   if(!key)return;
   filt[key]=event.target.value;
@@ -8972,7 +9066,7 @@ document.addEventListener("click",event=>{
   const lc=event.target.closest&&event.target.closest("[data-llcsv]");
   if(lc){fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:"csv"})}).then(async res=>{if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"Nothing to export.");const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-line-listing-"+new Date().toISOString().slice(0,10)+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}).catch(e=>message(e.message,true));return;}
   const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-chpf],[data-mqwf],[data-mqview],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -9061,6 +9155,8 @@ document.addEventListener("click",event=>{
   if(target.dataset.mqwf){mqState.wf=target.dataset.mqwf;loadMyQueue();return;}
   if(target.dataset.mqview){mqState.view=target.dataset.mqview;render();return;}
   if(target.dataset.chpf){const cp=target.dataset.chpf.split('|'),kind=cp[0],id=cp[1],wk=cp.slice(2).join('|');openPortfolioChange(kind,id?[id]:[],wk,kind==='watch'?'The molecule, its articles and its cases move.':'');return;}
+  if(target.dataset.person!==undefined){openPersonDialog(target.dataset.person);return;}
+  if(target.dataset.teamrole!==undefined){teamState.role=target.dataset.teamrole;render();return;}
   if(target.dataset.plwf!==undefined){plState.wf=target.dataset.plwf;loadPlanner();return;}
   if(target.dataset.plview){plState.view=target.dataset.plview;loadPlanner();return;}
   if(target.dataset.plday){plState.sel=plState.sel===target.dataset.plday?"":target.dataset.plday;if(tab!=="Planner"){tab="Planner";render();return;}loadPlanner();return;}
