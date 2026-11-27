@@ -18,3 +18,25 @@ services:
       - ./scripts/run-watchlists.mjs:/app/run-watchlists.mjs:ro
     command: ["sh", "-c", "while true; do node /app/run-watchlists.mjs; sleep 60; done"]
     restart: unless-stopped
+  alerts:
+    profiles: ["alerts"]
+    build: ./alerts
+    environment:
+      ALERT_GATEWAY_TOKEN: ${ALERT_GATEWAY_TOKEN:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      ALERT_FROM_EMAIL: ${ALERT_FROM_EMAIL:-}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM: ${TWILIO_FROM:-}
+      MOBILE_RECIPIENTS_JSON: ${MOBILE_RECIPIENTS_JSON:-}
+      ALERT_LEDGER_DIR: /data
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - alert-ledger:/data
+    restart: unless-stopped
+volumes:
+  alert-ledger:
