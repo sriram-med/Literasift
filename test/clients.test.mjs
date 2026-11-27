@@ -128,3 +128,18 @@ test("a removed client stays removed even when its old articles, pulls and roles
   await t.call(MANAGER, "/api/client-save", { name: "USV" }); st = await t.state();
   assert.deepEqual(st.clients.map(c => c.name), ["USV"]); assert.deepEqual(st.retiredClients, []);
 });
+
+test("molecules without a client can be deleted in one go; articles only they pulled are listed for deletion, others are kept", async () => {
+  const t = await makeEnv({ clients: [{ id: "u", name: "USV" }], schema: { grouping: "client" },
+    watches: [{ portfolio: "No client", molecule: "a", query: "a", client: null }, { portfolio: "No client", molecule: "b", query: "b", client: null }, { portfolio: "USV", molecule: "c", query: "c", client: "u" }],
+    articles: { 1: { pmid: "1" }, 2: { pmid: "2" }, 3: { pmid: "3" } },
+    assignments: [{ id: "x1", pmid: "1", portfolio: "No client", molecules: ["a"] }, { id: "x2", pmid: "2", portfolio: "No client", molecules: ["a"] }, { id: "x3", pmid: "2", portfolio: "USV", molecules: ["c"] }, { id: "x4", pmid: "3", portfolio: "No client", molecules: ["b"] }],
+    cases: [{ id: "k", pmid: "3" }] });
+  const k = m => encodeURIComponent("No client") + "|" + m;
+  assert.equal((await t.call(SCREENER, "/api/delete-watches", { watches: [k("a")] })).status, 403);
+  assert.equal((await t.call(MANAGER, "/api/delete-watches", { watches: [encodeURIComponent("USV") + "|c"] })).status, 400, "a molecule with a client is not mass-deleted");
+  const r = await t.call(MANAGER, "/api/delete-watches", { watches: [k("a"), k("b")] });
+  assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal(r.body.deleted, 2);
+  assert.deepEqual(r.body.orphanPmids, ["1"], "2 is also pulled for c, 3 has a case");
+  assert.deepEqual((await t.state()).watches.map(w => w.molecule), ["c"]);
+});
