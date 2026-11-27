@@ -3191,12 +3191,20 @@ function buildBroadQuery(names, safetyOnly) {
   return query.length <= 1500 ? query : "(" + take.slice(0, 12).map(term).join(" OR ") + ")" + (safetyOnly ? " AND " + safetyFilter : "");
 }
 // Every name known for a molecule: the name itself, the names already in its stored query, the portfolio dictionary, and the drug name list.
-async function namesFor(env, state, kb, w, { online = false } = {}) {
+// What a molecule is searched by: its own name, and only the other names (brands, salts, synonyms) someone gave it. Never its portfolio, and nothing added
+// automatically from the portfolio's dictionary or the drug name list. Older molecules keep the names they were created with (their first query).
+const firstQuery = w => (w.versions || []).slice().sort((a, b) => a.version - b.version)[0]?.query || w.query || "";
+function ownNames(w) {
   const out = [], add = n => { const t = String(n || "").replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim(); if (t.length > 1 && t.length <= 100 && !out.some(x => x.toLowerCase() === t.toLowerCase())) out.push(t); };
-  add(w.molecule); queryTerms(w.query || "").forEach(add); namesWithDictionary(state, w.portfolio, [w.molecule]).forEach(add);
-  if (kb) { let hit = kbLookup(kb, w.molecule); if ((!hit || !hit.enriched) && online) { try { if (await kbPull(env, kb, w.molecule)) kb.__dirty = true; } catch { /* the names known so far are used */ } hit = kbLookup(kb, w.molecule); } if (hit) [hit.name, ...hit.salts, ...hit.synonyms, ...hit.brands.slice(0, 40)].forEach(add); }
+  // A molecule added before names were kept separately may have extra names appended to its first query as "(own names) OR (added names)": only the first part counts.
+  let fq = firstQuery(w); const cut = fq.indexOf(") OR (("); if (fq.startsWith("((") && cut > 0) fq = fq.slice(1, cut);
+  add(w.molecule); (Array.isArray(w.names) ? w.names : queryTerms(fq)).forEach(add);
   return out;
 }
+// A query someone wrote by hand (no field-tagged names in it) is searched exactly as written.
+const handQuery = w => !Array.isArray(w.names) && !queryTerms(firstQuery(w)).length && Boolean(w.query);
+const styledQuery = (w, broad, safety) => broad ? buildBroadQuery(ownNames(w), safety) : buildQuery(ownNames(w).slice(0, 30), safety);
+async function namesFor(env, state, kb, w) { return ownNames(w); }
 const countAny = async (env, term) => { try { const { esearchresult: r } = await withRetry(env, () => pubmed(env, "esearch", { term, retmode:"json", retmax:"0" }), { tries:2 }); return Number(r?.count ?? NaN); } catch { return null; } };
 const saveKb = async (env, kb) => { kb.updatedAt = new Date().toISOString(); await env.BUCKET.put(KB_KEY, JSON.stringify(kb), { httpMetadata:{ contentType:"application/json" } }); };
 function kbLookup(kb, text) {
@@ -5277,7 +5285,7 @@ async function apiCore(request, env, path) {
     if (items.length > 100) return json({ error:"Add up to 100 molecules at a time." }, 400);
     if (!items.some(i => i.molecule)) return json({ error:"Enter the molecule name." }, 400);
     const owner = String(body.owner || "").trim().toLowerCase(); if (owner && !state.profiles.some(p => p.email === owner && p.active)) return json({ error:"Choose an active team member to assign it to." }, 400);
-    const cfg = withSettings(env, state), kb0 = await loadKb(env).catch(() => null), results = [], toSave = [], toUpdate = [], seen = new Set(), keyOf = w => encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || "");
+    const cfg = withSettings(env, state), results = [], toSave = [], toUpdate = [], seen = new Set(), keyOf = w => encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || "");
     for (const { molecule, synonyms } of items) {
       if (!molecule) continue;
       // From Search & Pull a molecule that is already watched is reused wherever it lives (same client, or no client yet), and the new names are added to its search.
@@ -5292,9 +5300,7 @@ async function apiCore(request, env, path) {
       if (state.watches.some(w => watchKey(w) === key) || seen.has(key)) { results.push({ ...info, status:"exists", error:molecule + " is already in " + portfolio + "." }); continue; }
       let query = (items.length === 1 && String(body.query || "").trim()) || buildQuery([molecule, ...synonyms], body.safetyOnly === true);
       if (!query || query.length > 1500) { results.push({ ...info, status:"error", error:"The names could not be turned into a search. Shorten them." }); continue; }
-      // Start from the broad search: the portfolio's dictionary and the drug name list already known for this molecule are searched too.
-      if (!String(body.query || "").trim()) { const full = await fullSearch(cfg, state, kb0, { portfolio, molecule }, query, { online:false }).catch(() => null); if (full) query = full.query; }
-      seen.add(key); const watch = { portfolio, molecule, query }; if (body.client) watch.client = String(body.client); if (owner) watch.owner = owner;
+      seen.add(key); const watch = { portfolio, molecule, query, names:synonyms }; if (body.client) watch.client = String(body.client); if (owner) watch.owner = owner;
       state.watches.push(watch); toSave.push({ watch, names:[molecule, ...synonyms] }); results.push({ ...info, status:"added", watch:keyOf(watch), client:body.client || "" });
     }
     if (!toSave.length && !toUpdate.length) { const first = results[0]; return json({ error:first ? first.error : "Enter the molecule name.", results }, first?.status === "exists" ? 409 : 400); }
@@ -5302,8 +5308,9 @@ async function apiCore(request, env, path) {
       for (const { watch } of toSave) { keepOwner(data, watch); commitWatch(data, watch, email, "molecule added"); }
       for (const { key, synonyms } of toUpdate) { const cur = data.watches.find(x => watchKey(x) === key); if (!cur) continue;
         if (body.client && !cur.client) cur.client = String(body.client); if (owner) cur.owner = owner;
-        const fresh = synonyms.filter(n => !String(cur.query || "").toLowerCase().includes('"' + n.toLowerCase() + '"')), extra = fresh.length ? buildQuery(fresh, String(cur.query || "").includes(safetyFilter)) : "";
-        if (extra && (cur.query.length + extra.length) < 1490) commitWatch(data, { ...cur, query:"(" + cur.query + ") OR " + extra }, email, "names added from Search & Pull"); }
+        if (handQuery(cur) || !synonyms.length) continue;
+        const merged = uniq([...ownNames(cur).slice(1), ...synonyms]), next = { ...cur, names:merged }, broadStyle = (data.clients || []).find(c => c.id === cur.client)?.searchMode === "broad", q = styledQuery(next, broadStyle, String(cur.query || "").includes(safetyFilter));
+        if (q && q !== cur.query) commitWatch(data, { ...next, query:q }, email, "names added from Search & Pull"); else cur.names = merged; }
     });
     if (!toSave.length) return json({ ok:true, added:0, updated:toUpdate.length, results, portfolio:results[0].portfolio, molecule:results[0].molecule });
     for (const { watch, names } of toSave) await audit(env, { by:email, action:"molecule.added", target:watch.portfolio + " · " + watch.molecule, detail:{ client:body.client || "", names:names.slice(0, 20).join(", ") } });
@@ -5432,13 +5439,14 @@ async function apiCore(request, env, path) {
     if (watches.length > 25) return json({ error:"A client pull covers up to 25 molecules at a time. Choose fewer." }, 400);
     const results = new Array(watches.length), progress = watches.map(w => ({ molecule:w.molecule, portfolio:w.portfolio, stage:"waiting", runId:"" })), work = async () => {
     const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
-    const cfg = withSettings(env, state), kb = await loadKb(env).catch(() => null), grown = new Map();
+    const cfg = withSettings(env, state), aligned = new Map();
     const clientRec = (state.clients || []).find(c => c.id === clientId), broad = body.searchMode ? body.searchMode === "broad" : clientRec?.searchMode === "broad";
     const one = async (w, slot) => {
-      progress[slot].stage = "names"; let query = queryAt(w, day())?.query || w.query, full = { query, added:[] };
-      const names = await namesFor(cfg, state, kb, w, { online:body.online !== false }).catch(() => [w.molecule]), safety = query.includes(safetyFilter), broadQuery = buildBroadQuery(names, safety);
-      if (broad && broadQuery) { full = { query:broadQuery, added:names.slice(1) }; } else { full = await fullSearch(cfg, state, kb, w, query, { online:false }).catch(() => ({ query, added:[] })); }
-      query = full.query; if (full.added.length && !broad) grown.set(watchKey(w), query);
+      progress[slot].stage = "names"; const stored = queryAt(w, day())?.query || w.query, hand = handQuery(w), names = ownNames(w), safety = String(stored).includes(safetyFilter);
+      const broadQuery = hand ? "" : buildBroadQuery(names, safety), full = { query:hand ? stored : (styledQuery(w, broad, safety) || stored), added:hand ? [] : names.slice(1) };
+      let query = full.query;
+      // The molecule's daily search follows the client's search style and its own names, so a pull and the automatic pull search the same way.
+      if (isMgr && !hand) { const daily = styledQuery(w, clientRec?.searchMode === "broad", safety); if (daily && daily !== w.query) aligned.set(watchKey(w), daily); }
       if (narrow.length || body.noReviews === true) query = "(" + query + ")" + narrow.map(f => " AND " + f).join("") + (body.noReviews === true ? " NOT review[pt]" : "");
       if (query.length > 1500) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, error:"The search became too long; use fewer filters." }; return; }
       const before = new Set(state.assignments.filter(a => a.portfolio === w.portfolio).map(a => a.pmid));
@@ -5465,9 +5473,7 @@ async function apiCore(request, env, path) {
     };
     // A few molecules at a time; the shared NCBI gate keeps the request rate within the allowed limit.
     let nextSlot = 0; await Promise.all(Array.from({ length:Math.min(Math.max(1, Number(env.PULL_LANES ?? 3)), watches.length) }, async () => { while (nextSlot < watches.length) { const slot = nextSlot++; await one(watches[slot], slot); } }));
-    if (kb?.__dirty) { delete kb.__dirty; await saveKb(env, kb).catch(() => {}); }
-    // The broader search becomes the molecule's search from now on, so the automatic daily pull is as thorough as this one (only when no one-off filters were applied).
-    if (isMgr && grown.size && !narrow.length && body.noReviews !== true) await write(env, data => { for (const [k, q] of grown) { const cur = data.watches.find(x => watchKey(x) === k); if (cur && cur.query !== q && q.length <= 1500) commitWatch(data, { ...cur, query:q }, email, "names added for a client pull"); } }).catch(() => {});
+    if (aligned.size) await write(env, data => { for (const [k, q] of aligned) { const cur = data.watches.find(x => watchKey(x) === k); if (cur && cur.query !== q && q.length <= 1500) commitWatch(data, { ...cur, query:q }, email, "search uses the molecule and its own names only"); } }).catch(() => {});
     const name = clientId === "none" ? "No client" : state.clients.find(c => c.id === clientId).name;
     await audit(env, { by:email, action:"pull.client", target:name, detail:{ from:body.from, to:body.to, molecules:results.length, articles:results.reduce((n, r) => n + (r.count || 0), 0), failed:results.filter(r => r.error).length } });
     return ({ client:name, from:allDates ? "" : body.from, to:allDates ? "" : body.to, allDates, results, complete:results.every(r => r.complete), total:results.reduce((n, r) => n + (r.count || 0), 0), added:results.reduce((n, r) => n + (r.added || 0), 0) });
@@ -5492,8 +5498,8 @@ async function apiCore(request, env, path) {
     if (allDates) { body.from = "1900-01-01"; body.to = day(); }
     else { if (!valid(body.from) || !valid(body.to) || body.from > body.to || body.to > day()) return json({ error:"Choose a valid date range through today, or leave both dates empty for all dates." }, 400);
       if ((Date.parse(body.to) - Date.parse(body.from)) / 864e5 > 366) return json({ error:"Pull one year at a time or less, or leave both dates empty for all dates." }, 400); }
-    const cfg = withSettings(env, state), kb = await loadKb(env).catch(() => null), safety = body.safetyOnly === true;
-    const names = uniq([...namesWithDictionary(state, portfolio, [molecule, ...synonyms]), ...(await namesFor(cfg, state, kb, { portfolio, molecule, query:"" }, { online:body.online !== false }).catch(() => []))]);
+    const cfg = withSettings(env, state), safety = body.safetyOnly === true;
+    const names = ownNames({ molecule, names:synonyms });
     let query = body.searchMode === "precise" ? buildQuery(names.slice(0, 30), safety) : buildBroadQuery(names, safety);
     if (!query) return json({ error:"Enter a molecule name (up to 30 names, 100 characters each)." }, 400);
     const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
@@ -5507,7 +5513,6 @@ async function apiCore(request, env, path) {
       for (let again = 0; again < 2 && !["reconciled", "zero_results"].includes(run.coverage); again++) run = await runImport(env, run.id, 600);
       await write(env, d => { for (const a of d.assignments) if (a.portfolio === portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
       await settleEvidence(env, run.ids);
-      if (kb?.__dirty) { delete kb.__dirty; await saveKb(env, kb).catch(() => {}); }
       await audit(env, { by:email, action:"pull.mine", target:portfolio + " · " + molecule, detail:{ from:allDates ? "all dates" : body.from, to:allDates ? "" : body.to, count:run.count ?? 0 } });
       const wins = run.windows || [];
       return { molecule, portfolio, mode:body.searchMode === "precise" ? "precise" : "broad", names:names.length - 1, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, mine:(run.ids || []).filter(id => !before.has(id)).length,
@@ -6542,7 +6547,7 @@ async function apiCore(request, env, path) {
     if (path === "/api/scheduler-status") {
       const missed = state.watches.flatMap(w => missedWindows(state, w, through)).sort((a, b) => a.from.localeCompare(b.from));
       const age = h.lastBeatAt ? Math.round((Date.now() - Date.parse(h.lastBeatAt)) / 60000) : null;
-      const perWatch = state.watches.map(w => { const last = state.runs.filter(r => r.portfolio === w.portfolio && (r.molecule || "") === (w.molecule || "") && r.status === "Imported").map(r => r.time).sort().pop() || ""; return { watch:encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || ""), portfolio:w.portfolio, molecule:w.molecule || "", clientId:w.client || "", client:(state.clients || []).find(x => x.id === w.client)?.name || "", auto:w.auto !== false, startFrom:w.startFrom || "", until:w.until || "", effective:pullRange(state, w), missing:missedWindows(state, w, through).filter(m => m.state === "missing").length, lastRunAt:last, articles:state.assignments.filter(a => a.portfolio === w.portfolio && (!w.molecule || (a.molecules || []).includes(w.molecule))).length }; });
+      const perWatch = state.watches.map(w => { const last = state.runs.filter(r => r.portfolio === w.portfolio && (r.molecule || "") === (w.molecule || "") && r.status === "Imported").map(r => r.time).sort().pop() || ""; return { watch:encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || ""), portfolio:w.portfolio, molecule:w.molecule || "", clientId:w.client || "", client:(state.clients || []).find(x => x.id === w.client)?.name || "", auto:w.auto !== false, names:ownNames(w).slice(1), hand:handQuery(w), startFrom:w.startFrom || "", until:w.until || "", effective:pullRange(state, w), missing:missedWindows(state, w, through).filter(m => m.state === "missing").length, lastRunAt:last, articles:state.assignments.filter(a => a.portfolio === w.portfolio && (!w.molecule || (a.molecules || []).includes(w.molecule))).length }; });
       const perClient = [...(state.clients || []).map(c => ({ id:c.id, name:c.name, auto:c.autoPull !== false, searchMode:c.searchMode || "precise", startFrom:c.startFrom || "", until:c.until || "" })), { id:"", name:"No client", auto:true }].map(c => { const ws = perWatch.filter(w => w.clientId === c.id); return { ...c, molecules:ws.length, waiting:ws.reduce((n, w) => n + w.missing, 0), articles:ws.reduce((n, w) => n + w.articles, 0), lastRunAt:ws.map(w => w.lastRunAt).filter(Boolean).sort().pop() || "" }; }).filter(c => c.id || c.molecules);
       return json({ perClient, autoPull:state.settings?.autoPull !== false, autoPullFrom:state.settings?.autoPullFrom || "", everyMinutes:Number(env.SCHEDULE_MINUTES || 60), perWatch, expectedThrough:through, heartbeat:{ lastBeatAt:h.lastBeatAt || null, lastFinishedAt:h.lastFinishedAt || null, lastSuccessAt:h.lastSuccessAt || null, running:Boolean(h.running), lastError:h.lastError || "", consecutiveFailures:h.consecutiveFailures || 0, ageMinutes:age, recent:(h.beats || []).slice(0, 12) }, stale:age === null || age > staleMin, staleAfterMinutes:staleMin, lastBatch:h.lastBatch || null, missed, watches:state.watches.length });
     }
@@ -6870,7 +6875,7 @@ async function apiCore(request, env, path) {
     if (!list.length) return json({ error:"This client has no molecules." }, 400);
     const allDates = body.allDates === true || (!body.from && !body.to), field = "any", from = isDate(body.from) ? body.from : addDays(day(), -30), to = isDate(body.to) ? body.to : day(), cfg = withSettings(env, state), kb = await loadKb(env).catch(() => null), rows = new Array(list.length);
     let next = 0; await Promise.all(Array.from({ length:Math.min(3, list.length) }, async () => { while (next < list.length) { const i = next++, w = list[i];
-      const names = await namesFor(cfg, state, kb, w).catch(() => [w.molecule]), safety = (queryAt(w, day())?.query || w.query || "").includes(safetyFilter), broadQ = buildBroadQuery(names, safety), preciseQ = buildQuery(names.slice(0, 30), safety) || (queryAt(w, day())?.query || w.query);
+      const stored = queryAt(w, day())?.query || w.query || "", names = ownNames(w), safety = stored.includes(safetyFilter), broadQ = handQuery(w) ? stored : buildBroadQuery(names, safety), preciseQ = handQuery(w) ? stored : (buildQuery(names.slice(0, 30), safety) || stored);
       const [precise, site, allTime] = await Promise.all([allDates ? countAny(cfg, preciseQ) : countAny(cfg, searchTerm(preciseQ, from, to, field)), allDates ? countAny(cfg, broadQ) : countAny(cfg, searchTerm(broadQ, from, to, field)), countAny(cfg, broadQ)]);
       rows[i] = { molecule:w.molecule, portfolio:w.portfolio, names:names.length, precise, site, allTime, stored:state.assignments.filter(a => a.portfolio === w.portfolio && (a.molecules || []).includes(w.molecule)).length, link:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(broadQ) }; } }));
     return json({ from:allDates ? "" : from, to:allDates ? "" : to, allDates, dateField:field, rows });
@@ -6886,7 +6891,7 @@ async function apiCore(request, env, path) {
     if ("searchMode" in body) {
       // Switching the search style rewrites each molecule's search (a new query version from today), so the automatic daily pull follows it.
       const kb = await loadKb(env).catch(() => null), updates = [];
-      for (const w of state.watches.filter(x => x.client === body.client && x.molecule)) { const names = await namesFor(withSettings(env, state), state, kb, w).catch(() => [w.molecule]), safety = String(w.query || "").includes(safetyFilter), q = body.searchMode === "broad" ? buildBroadQuery(names, safety) : buildQuery(names.slice(0, 30), safety); if (q && q !== w.query && q.length <= 1500) updates.push([watchKey(w), q]); }
+      for (const w of state.watches.filter(x => x.client === body.client && x.molecule && !handQuery(x))) { const q = styledQuery(w, body.searchMode === "broad", String(w.query || "").includes(safetyFilter)); if (q && q !== w.query && q.length <= 1500) updates.push([watchKey(w), q]); }
       await write(env, data => { for (const [k, q] of updates) { const cur = data.watches.find(x => watchKey(x) === k); if (cur) commitWatch(data, { ...cur, query:q }, email, "search style: " + body.searchMode); } });
       restyled = updates.length;
     }
@@ -6903,7 +6908,9 @@ async function apiCore(request, env, path) {
     for (const k of ["startFrom", "until"]) if (k in body && String(body[k] || "").trim() && !isDate(String(body[k]).trim())) return json({ error:"Enter the date as a calendar date." }, 400);
     await write(env, data => { const w = data.watches.find(x => x.portfolio === portfolio && (x.molecule || "") === molecule);
       if ("on" in body) { if (body.on === false) w.auto = false; else delete w.auto; }
-      for (const k of ["startFrom", "until"]) if (k in body) { const v = String(body[k] || "").trim(); if (v) w[k] = v; else delete w[k]; } });
+      for (const k of ["startFrom", "until"]) if (k in body) { const v = String(body[k] || "").trim(); if (v) w[k] = v; else delete w[k]; }
+      // The other names the molecule is searched by; its search is rebuilt from them (a new query version from today).
+      if ("names" in body && !handQuery(w)) { const next = { ...w, names:splitNames(body.names) }, q = styledQuery(next, (data.clients || []).find(c => c.id === w.client)?.searchMode === "broad", String(w.query || "").includes(safetyFilter)); if (q) commitWatch(data, { ...next, query:q }, email, "names edited"); } });
     return json({ ok:true });
   }
   if (path === "/api/client-permission") {
@@ -7143,10 +7150,10 @@ async function apiCore(request, env, path) {
     const bulkOwner = String(body.owner || "").trim().toLowerCase();
     if (bulkOwner && !state.profiles.some(p => p.email === bulkOwner && p.active)) return json({error:"Choose an active team member."},400);
     for (const row of body.rows) {
-      const names = namesWithDictionary(state, portfolio, [row?.molecule, ...(Array.isArray(row?.synonyms) ? row.synonyms : [])].filter(Boolean));
+      const given = splitNames(Array.isArray(row?.synonyms) ? row.synonyms : []), names = [row?.molecule, ...given].filter(Boolean);
       const molecule = String(row?.molecule || "").trim().slice(0,100);
       const query = molecule && buildQuery(names, body.safetyOnly === true);
-      if (query) created.push({ portfolio, molecule, query, ...(bulkOwner ? { owner:bulkOwner } : {}), ...(body.client && (state.clients || []).some(c => c.id === body.client) ? { client:body.client } : {}) }); else skipped.push(molecule || "(blank)");
+      if (query) created.push({ portfolio, molecule, query, names:given, ...(bulkOwner ? { owner:bulkOwner } : {}), ...(body.client && (state.clients || []).some(c => c.id === body.client) ? { client:body.client } : {}) }); else skipped.push(molecule || "(blank)");
     }
     await write(env, data => {
       created.forEach(w => { keepOwner(data, w); commitWatch(data, w, email); });
@@ -7159,7 +7166,7 @@ async function apiCore(request, env, path) {
     const molecule = String(body.molecule || "").trim().slice(0,100);
     const synonyms = String(body.synonyms || "").split(/[,;\n]/).map(x => x.trim()).filter(Boolean);
     const portfolio = String(body.portfolio || "").trim().slice(0,100) || molecule;
-    let query = molecule && buildQuery(namesWithDictionary(state, portfolio, [molecule, ...synonyms]), body.safetyOnly === true);
+    let query = molecule && buildQuery([molecule, ...synonyms], body.safetyOnly === true);
     if (!query) return json({error:"Enter a molecule name (up to 30 names, 100 characters each)."},400);
     // Optional PubMed filters, written in PubMed's own field syntax.
     const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
@@ -7171,7 +7178,7 @@ async function apiCore(request, env, path) {
     const owner = String(body.owner || "").trim().toLowerCase();
     if (owner && !state.profiles.some(p => p.email === owner && p.active)) return json({error:"Choose an active team member."},400);
     const clientId = (state.clients || []).some(c => c.id === body.client) ? String(body.client) : "";
-    const watch = { portfolio, molecule, query, ...(owner ? { owner } : {}), ...(clientId ? { client:clientId } : {}) };
+    const watch = { portfolio, molecule, query, names:splitNames(synonyms), ...(owner ? { owner } : {}), ...(clientId ? { client:clientId } : {}) };
     await write(env, data => { keepOwner(data, watch); commitWatch(data, watch, email); });
     const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField, force:true, budget:600 });
     await settleEvidence(env, run.ids);
@@ -8646,11 +8653,11 @@ function openMolDates(key){
   const w=((wlData&&wlData.perWatch)||[]).find(x=>x.watch===key);if(!w)return;const old=$("moldatesdlg");if(old)old.remove();
   const today=new Date().toISOString().slice(0,10),start=new Date(Date.now()-30*864e5).toISOString().slice(0,10);
   document.body.insertAdjacentHTML("beforeend",'<dialog id="moldatesdlg" style="width:min(520px,96vw)"><h3 style="margin:0 0 4px">'+esc(w.molecule||w.portfolio)+'</h3><p class="sub" style="margin:0 0 12px">'+esc(w.portfolio)+(w.client?' · '+esc(w.client):"")+'. Dates set here win over the dates of the client.</p>'+
-    '<form id="mdform" data-own="1" class="impgrid"><label>Start pulling from<input type="date" name="startFrom" value="'+esc(w.startFrom||"")+'"></label><label>Stop pulling after (optional)<input type="date" name="until" value="'+esc(w.until||"")+'"></label><div class="wide sub">Leave the stop date empty and pulling continues every day until a manager pauses it. Leave a date empty to follow the client. Now: '+((w.effective&&w.effective.from)?'from '+esc(w.effective.from):'no start limit')+((w.effective&&w.effective.until)?' until '+esc(w.effective.until):', continuing until paused')+'.</div><div class="wide"><button class="btn">Save dates</button></div></form>'+
+    '<form id="mdform" data-own="1" class="impgrid"><label>Start pulling from<input type="date" name="startFrom" value="'+esc(w.startFrom||"")+'"></label><label>Stop pulling after (optional)<input type="date" name="until" value="'+esc(w.until||"")+'"></label>'+(w.hand?'<div class="wide sub">This molecule has a hand-written search, used exactly as written.</div>':'<label class="wide">Other names searched with it (brands, salts; separated by commas)<input name="names" value="'+esc((w.names||[]).join(", "))+'" placeholder="none: only the molecule name"></label>')+'<div class="wide sub">Leave the stop date empty and pulling continues every day until a manager pauses it. Leave a date empty to follow the client. Now: '+((w.effective&&w.effective.from)?'from '+esc(w.effective.from):'no start limit')+((w.effective&&w.effective.until)?' until '+esc(w.effective.until):', continuing until paused')+'.</div><div class="wide"><button class="btn">Save dates</button></div></form>'+
     '<h4 style="margin:16px 0 6px">Pull custom dates now</h4><div class="impgrid"><label>From<input type="date" id="mdfrom" value="'+start+'" max="'+today+'"></label><label>Through<input type="date" id="mdto" value="'+today+'" max="'+today+'"></label><div class="wide"><button type="button" class="btn outline" id="mdpull">Pull these dates</button> <span class="sub" id="mdout"></span></div></div>'+
     '<div style="display:flex;justify-content:flex-end;margin-top:12px"><button type="button" class="btn outline" id="mdclose">Close</button></div></dialog>');
   const d=$("moldatesdlg");d.showModal();$("mdclose").onclick=()=>{d.close();d.remove();};
-  $("mdform").onsubmit=async e=>{e.preventDefault();try{await api("watch-auto",{watch:key,startFrom:e.target.elements.startFrom.value,until:e.target.elements.until.value});d.close();d.remove();await refresh();render();message("Dates saved.");}catch(err){$("mdout").textContent=err.message;}};
+  $("mdform").onsubmit=async e=>{e.preventDefault();try{await api("watch-auto",{watch:key,startFrom:e.target.elements.startFrom.value,until:e.target.elements.until.value,...(e.target.elements.names?{names:e.target.elements.names.value}:{})});d.close();d.remove();await refresh();render();message("Dates saved.");}catch(err){$("mdout").textContent=err.message;}};
   $("mdpull").onclick=async()=>{$("mdpull").disabled=true;$("mdout").textContent="Pulling…";try{const r=await api("pull-client",{client:w.clientId||"none",molecules:[key],from:$("mdfrom").value,to:$("mdto").value});$("mdout").textContent=r.total+" article"+(r.total===1?"":"s")+" found, "+r.added+" new.";await refresh();}catch(err){$("mdout").textContent=err.message;}$("mdpull").disabled=false;};
 }
 async function clientRangePull(btn){
@@ -9356,7 +9363,7 @@ function spSettingsHtml(withSafety){
   const ck=(k,l)=>'<label class="check"><input type="checkbox" data-sp="'+k+'"'+(spState[k]?" checked":"")+'>&nbsp;'+l+'</label>';
   return '<section class="spset"><div class="body"><div class="sp-grid">'+
     '<div class="sp-col"><span class="sp-h">Dates</span><div class="fbar" style="margin:0 0 8px">'+chip("all","All dates")+chip("30","Last 30 days")+chip("90","Last 3 months")+chip("365","Last 12 months")+'</div><div class="sp-row"><label>From<input type="date" data-sp="from" value="'+esc(spState.from)+'" max="'+today+'"></label><label>Through<input type="date" data-sp="to" value="'+esc(spState.to)+'" max="'+today+'"></label></div><span class="sub" id="spdatehint">'+(has?"Articles added to PubMed or published between these dates.":"Every article PubMed has, whatever its dates.")+'</span></div>'+
-    '<div class="sp-col"><span class="sp-h">Search</span><label class="check"><input type="radio" name="spmode" data-sp="mode" value="broad"'+(spState.broad?" checked":"")+'>&nbsp;<b>Broad</b>, like the PubMed website</label><label class="check"><input type="radio" name="spmode" data-sp="mode" value="precise"'+(spState.broad?"":" checked")+'>&nbsp;<b>Precise</b>: title, abstract and MeSH</label><span class="sub">Broad finds several times more. Every known name (INN, salts, brands, dictionary) is searched either way.</span></div>'+
+    '<div class="sp-col"><span class="sp-h">Search</span><label class="check"><input type="radio" name="spmode" data-sp="mode" value="broad"'+(spState.broad?" checked":"")+'>&nbsp;<b>Broad</b>, like the PubMed website</label><label class="check"><input type="radio" name="spmode" data-sp="mode" value="precise"'+(spState.broad?"":" checked")+'>&nbsp;<b>Precise</b>: title, abstract and MeSH</label><span class="sub">Broad finds several times more. Only the molecule name and the other names given to it are searched, never its portfolio.</span></div>'+
     '<div class="sp-col"><span class="sp-h">NCBI sources</span><label class="check"><input type="checkbox" checked disabled>&nbsp;PubMed</label>'+ck("pmc","PubMed Central (full texts)")+'<span class="sub">PubMed Central finds papers that name the drug only in the body text.</span></div>'+
     '<div class="sp-col"><span class="sp-h">Filters (optional)</span>'+ck("humans","Humans")+ck("caseReports","Case reports")+ck("english","English")+ck("noReviews","No reviews")+(withSafety?ck("safety","Safety articles only"):"")+'</div>'+
   '</div>'+(((data.config||{}).ncbi||{}).keySet?"":'<div class="sp-tip"><b>Pull about three times faster:</b> PubMed allows 3 requests a second without a key and 10 with a free NCBI API key. <button type="button" class="btn outline sm" data-tab="Settings">Add the key in Settings</button></div>')+'</div></section>';
@@ -9370,7 +9377,7 @@ function spClientHtml(){
     '<div class="wide" style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" data-cppull="1">Pull this client</button><button type="button" class="btn outline" data-cpcompare="1">Compare with PubMed</button></div></div><div id="cpout">'+(cpState.out||"")+'</div>',mgr?"Every ticked molecule is pulled with the settings above, three at a time, and each row shows whether every article PubMed has was retrieved.":"The molecules of the client that are in your portfolios are pulled into your own queue.");
 }
 function spMoleculeHtml(){
-  return panel("Pull one molecule",'<form class="grid" id="molpullform" data-own="1" data-pull="1">'+drugFinderHtml()+'<label>Molecule (INN)<input name="molecule" required placeholder="Filled by the lookup, or type it"></label><label>Generic names and brands<input name="synonyms" placeholder="acyclovir, Zovirax"></label>'+
+  return panel("Pull one molecule",'<form class="grid" id="molpullform" data-own="1" data-pull="1">'+drugFinderHtml()+'<label>Molecule (INN)<input name="molecule" required placeholder="Filled by the lookup, or type it"></label><label>Other names, optional (brands, salts)<input name="synonyms" placeholder="Zovirax, acyclovir"></label>'+
     ((data.clients||[]).length?'<label>Client<select name="client"><option value="">No client</option>'+data.clients.map(c=>'<option value="'+esc(c.id)+'"'+(cpState.client===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select></label>':"")+
     '<label>Portfolio<input name="portfolio" list="pfopts" autocomplete="off" placeholder="Auto: by drug class"></label><label>Assign to<select name="owner">'+peopleOptions("","Auto-assign")+'</select></label>'+
     '<div class="wide" style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="molpullgo">Pull articles</button><button type="button" class="btn outline" data-suggest="1">Suggest synonyms &amp; brands</button></div></form><div id="suggest"></div><div id="cpout">'+(cpState.out||"")+'</div>',
@@ -9379,7 +9386,7 @@ function spMoleculeHtml(){
 function spMineHtml(){
   const mine=(data.config&&data.config.myPortfolios)||[];
   if(!mine.length)return panel("Pull one molecule",'<div class="empty">You are not in a portfolio yet. Ask a manager to add you under Team.</div>');
-  return panel("Pull one molecule into my queue",'<form class="grid" id="minepullform" data-own="1" data-pull="1">'+drugFinderHtml()+'<label>Molecule (INN)<input name="molecule" required placeholder="Filled by the lookup, or type it"></label><label>Generic names and brands<input name="synonyms" placeholder="acyclovir, Zovirax"></label><label>Portfolio<select name="portfolio">'+mine.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label>'+
+  return panel("Pull one molecule into my queue",'<form class="grid" id="minepullform" data-own="1" data-pull="1">'+drugFinderHtml()+'<label>Molecule (INN)<input name="molecule" required placeholder="Filled by the lookup, or type it"></label><label>Other names, optional (brands, salts)<input name="synonyms" placeholder="Zovirax, acyclovir"></label><label>Portfolio<select name="portfolio">'+mine.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label>'+
     '<div class="wide"><button class="btn" id="minepullgo">Pull into my queue</button></div></form><div id="cpout">'+(cpState.out||"")+'</div>',"The articles go to your own queue in the portfolio you choose. Nothing is added to the watchlists, and other people's work is not changed.");
 }
 function cpSettings(){
@@ -9392,7 +9399,7 @@ function cpSettings(){
 async function runPullJobs(btn,list,bodyFor,route,done){
   btn.disabled=true;const rows=new Array(list.length).fill(null),prog=new Array(list.length).fill(null),started=Date.now();let fin=0,found=0,added=0,incomplete=0,failed=0;
   const draw=()=>{cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+fin+' of '+list.length+' molecule'+(list.length===1?"":"s")+' done · '+found+' article'+(found===1?"":"s")+' found, '+added+' new</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(incomplete?' · '+incomplete+' not yet complete, retried automatically':"")+(failed?' · '+failed+' failed':"")+'</span></div>'+
-    table(["Molecule","Found","New","Checked against PubMed"],list.map((it,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||it.name)+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · searched with '+x.names+' more name'+(x.names===1?"":"s"):"")+(x.mode?' · '+(x.mode==="broad"?"broad":"precise"):"")+'</div>':""),x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("Complete: "+x.retrieved+" of "+x.expected,"green"):badge("Incomplete: "+x.retrieved+" of "+x.expected+", will retry","amber"))+(x.pmc?(x.pmc.error?'<div class="sub" style="color:var(--amber)">PubMed Central: '+esc(x.pmc.error)+'</div>':'<div class="sub">PubMed Central: '+x.pmc.found+' found, '+x.pmc.added+' new</div>'):"")+(x.mode==="precise"&&x.siteCount!=null&&x.siteCount>(x.retrieved||0)*1.15?'<div class="sub" style="color:var(--amber)">The broad search finds '+x.siteCount+'. Choose Broad to pull them.</div>':"")]:(()=>{const p=prog[i];const st=!p?"Starting…":p.stage==="names"?"Collecting every name…":p.stage==="counting"?"Asking PubMed how many…"+(p.expected!=null?" "+p.expected:""):p.stage==="finishing"?"Storing…":"Pulling: "+p.articles+" article"+(p.articles===1?"":"s")+(p.windows?" · "+p.windowsDone+" of "+p.windows+" search windows":"")+(p.expected!=null?" of about "+p.expected:"");return ['<b>'+esc(it.name)+'</b>',p&&p.articles?String(p.articles):'','','<span class="sub">'+esc(st)+'</span>'];})();}),"");
+    table(["Molecule","Found","New","Checked against PubMed"],list.map((it,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||it.name)+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · +'+x.names+' other name'+(x.names===1?"":"s"):"")+(x.mode?' · '+(x.mode==="broad"?"broad":"precise"):"")+'</div>':""),x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("Complete: "+x.retrieved+" of "+x.expected,"green"):badge("Incomplete: "+x.retrieved+" of "+x.expected+", will retry","amber"))+(x.pmc?(x.pmc.error?'<div class="sub" style="color:var(--amber)">PubMed Central: '+esc(x.pmc.error)+'</div>':'<div class="sub">PubMed Central: '+x.pmc.found+' found, '+x.pmc.added+' new</div>'):"")+(x.mode==="precise"&&x.siteCount!=null&&x.siteCount>(x.retrieved||0)*1.15?'<div class="sub" style="color:var(--amber)">The broad search finds '+x.siteCount+'. Choose Broad to pull them.</div>':"")]:(()=>{const p=prog[i];const st=!p?"Starting…":p.stage==="names"?"Collecting every name…":p.stage==="counting"?"Asking PubMed how many…"+(p.expected!=null?" "+p.expected:""):p.stage==="finishing"?"Storing…":"Pulling: "+p.articles+" article"+(p.articles===1?"":"s")+(p.windows?" · "+p.windowsDone+" of "+p.windows+" search windows":"")+(p.expected!=null?" of about "+p.expected:"");return ['<b>'+esc(it.name)+'</b>',p&&p.articles?String(p.articles):'','','<span class="sub">'+esc(st)+'</span>'];})();}),"");
     if($("cpout"))$("cpout").innerHTML=cpState.out;};
   draw();let next=0;
   const lane=async()=>{while(next<list.length){const i=next++;try{let r=await api(route,{...bodyFor(list[i]),background:true});

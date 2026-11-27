@@ -331,3 +331,7 @@ One page, one engine. At the top, choose what to pull: **By client**, **One mole
 - **Live progress.** While a molecule is pulling, its row shows the stage and the running count ("Pulling: 45 articles · 21 of 23 search windows"), then "Complete: N of N" checked against PubMed.
 - **Kept after a restart.** A finished pull's answer is stored, so the page still gets it if the server restarted; a pull interrupted by a restart says so, and everything pulled before is kept.
 - Large literatures: a molecule with more than 25,000 articles is reported with its count; choose Last 12 months or your own dates for it.
+
+## Searched by the molecule and its own names only
+
+A molecule is searched by its name and by the other names someone gave it (typed when it was added, in the One molecule pull, or in **Watchlists > Dates…**, which now has an editable "Other names searched with it" field). It is never searched by its portfolio, and nothing is added automatically from the portfolio's product dictionary or the drug name list. Molecules added earlier keep the names they were created with; names that the app had appended for them are dropped, and a manager's next pull brings the daily search back in line. A hand-written PubMed query is searched exactly as written. This applies to client pulls, single-molecule pulls, personal pulls, Compare with PubMed, the search-style switch and the automatic daily pull.

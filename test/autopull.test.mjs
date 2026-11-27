@@ -118,32 +118,39 @@ test("a manual pull always fetches again: after pulled articles are cleared, pul
   const again = await pull(); assert.equal(again.added, 2, JSON.stringify(again)); assert.equal(Object.keys((await t.state()).articles).length, 2); assert.equal((await t.state()).assignments.length, 2);
 });
 
-test("a client pull searches every name known for a molecule (dictionary and drug list), like a single-molecule pull does", async () => {
-  const t = await makeEnv({ watches: [{ portfolio: "Antivirals", molecule: "aciclovir", query: '"aciclovir"[tiab]' }, { portfolio: "CNS", molecule: "sertraline", query: '"sertraline"[tiab]' }], NCBI_GAP_MS: 0, RETRY_BASE_MS: 1 });
+test("a pull searches only the molecule name and the names someone gave it: never the portfolio, nothing from the portfolio dictionary or the drug list", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "Antivirals", molecule: "aciclovir", query: '("aciclovir"[tiab] OR "aciclovir"[MeSH Terms] OR "aciclovir"[Supplementary Concept] OR "Zovirax"[tiab] OR "Zovirax"[MeSH Terms] OR "Zovirax"[Supplementary Concept])' }, { portfolio: "CNS", molecule: "sertraline", query: '"sertraline"[tiab]' }] });
   const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; s.watches.forEach(w => { w.client = "k1"; });
-  s.dictionaries = { Antivirals: { version: 1, products: [{ name: "aciclovir", generics: ["acyclovir"], brands: ["Zovirax"], salts: ["aciclovir sodium"], aliases: [] }] } };
+  s.dictionaries = { Antivirals: { version: 1, products: [{ name: "aciclovir", generics: ["acyclovir"], brands: ["Zovirax", "Herpex"], salts: ["aciclovir sodium"], aliases: [] }] } };
   await t.BUCKET.put("bench.json", JSON.stringify(s));
   await t.BUCKET.put("drugkb.json", JSON.stringify({ version: 1, ingredients: { sertraline: { name: "sertraline", rxcui: "36437", brands: ["Zoloft", "Lustral"], salts: ["sertraline hydrochloride"], synonyms: [], atc: [], sources: [], enrichedAt: "2026-01-01" } }, sync: {} }));
   const ncbi = fakeNcbi([{ pmid: "1", date: dAgo(2) }]);
-  const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(5), to: dAgo(0), dateField: "crdt", online: false })); assert.equal(r.status, 200, JSON.stringify(r.body));
-  const terms = decodeURIComponent(ncbi.calls.filter(c => c.startsWith("esearch")).join(" ").replace(/\+/g, " "));
-  for (const name of ["Zovirax", "acyclovir", "aciclovir sodium", "Zoloft", "Lustral", "sertraline hydrochloride"]) assert.ok(terms.includes('"' + name + '"'), name + " is searched; got " + terms.slice(0, 400));
-  assert.ok(r.body.results.every(x => x.names > 0), "the result says how many extra names were searched");
-  const w = (await t.state()).watches.find(x => x.molecule === "aciclovir"); assert.ok(/Zovirax/.test(w.query), "the broader search is kept for the automatic pull");
-  // filters apply on top of the broad search and are not saved into the watch
-  const n2 = fakeNcbi([{ pmid: "2", date: dAgo(2) }]); await withFetch(n2.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(5), to: dAgo(0), caseReports: true, online: false }));
-  assert.ok(decodeURIComponent(n2.calls.join(" ").replace(/\+/g, " ")).includes("case reports"));
-  assert.ok(!(await t.state()).watches.some(x => /case reports/.test(x.query)));
+  for (const searchMode of ["precise", "broad"]) {
+    ncbi.calls.length = 0;
+    const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(5), to: dAgo(0), searchMode })); assert.equal(r.status, 200, JSON.stringify(r.body));
+    const terms = decodeURIComponent(ncbi.calls.filter(c => c.startsWith("esearch")).join(" ").replace(/\+/g, " "));
+    for (const name of ["aciclovir", "Zovirax", "sertraline"]) assert.ok(terms.includes(name), searchMode + ": " + name + " is searched");
+    for (const name of ["Herpex", "acyclovir", "aciclovir sodium", "Zoloft", "Lustral", "sertraline hydrochloride", "Antivirals", "CNS", "Acme"]) assert.ok(!terms.includes(name), searchMode + ": " + name + " is not searched; got " + terms.slice(0, 300));
+  }
+  // names given when the molecule is added (or later from Search & Pull) are searched
+  const none = async () => new Response("{}", { status: 404 });
+  await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { list: "sertraline, Zoloft", client: "k1", reuse: true }));
+  ncbi.calls.length = 0; await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(5), to: dAgo(0), searchMode: "precise" }));
+  const t2 = decodeURIComponent(ncbi.calls.filter(c => c.startsWith("esearch")).join(" ").replace(/\+/g, " ")); assert.ok(t2.includes("Zoloft") && !t2.includes("Lustral"), t2.slice(0, 300));
+  // a hand-written query is searched exactly as written
+  const s2 = await t.state(); s2.watches.push({ portfolio: "X", molecule: "custom", query: "custom[ti] AND toxicity[tiab]", client: "k1" }); await t.BUCKET.put("bench.json", JSON.stringify(s2));
+  ncbi.calls.length = 0; await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(5), to: dAgo(0), molecules: ["X|custom"] }));
+  assert.ok(decodeURIComponent(ncbi.calls.join(" ").replace(/\+/g, " ")).includes("custom[ti] AND toxicity[tiab]"));
 });
 
 test("broad search style: bare names like the PubMed website, a client switch that rewrites its searches, and a comparison with PubMed", async () => {
-  const t = await makeEnv({ watches: [{ portfolio: "CNS", molecule: "sertraline", query: '"sertraline"[tiab]' }], NCBI_GAP_MS: 0, RETRY_BASE_MS: 1 });
+  const t = await makeEnv({ watches: [{ portfolio: "CNS", molecule: "sertraline", query: '"sertraline"[tiab]', names: ["Zoloft", "sertraline hydrochloride"] }], NCBI_GAP_MS: 0, RETRY_BASE_MS: 1 });
   const s = await t.state(); s.clients = [{ id: "k1", name: "Square" }]; s.watches[0].client = "k1"; await t.BUCKET.put("bench.json", JSON.stringify(s));
-  await t.BUCKET.put("drugkb.json", JSON.stringify({ version: 1, ingredients: { sertraline: { name: "sertraline", rxcui: "1", brands: ["Zoloft"], salts: ["sertraline hydrochloride"], synonyms: [], atc: [], sources: [], enrichedAt: "x" } }, sync: {} }));
+  await t.BUCKET.put("drugkb.json", JSON.stringify({ version: 1, ingredients: { sertraline: { name: "sertraline", rxcui: "1", brands: ["Zoloft", "Lustral"], salts: ["sertraline hydrochloride"], synonyms: [], atc: [], sources: [], enrichedAt: "x" } }, sync: {} }));
   const ncbi = fakeNcbi([{ pmid: "1", date: dAgo(2) }, { pmid: "2", date: dAgo(3) }]);
   const term = () => decodeURIComponent(ncbi.calls.filter(c => c.startsWith("esearch")).join(" ").replace(/\+/g, " "));
   const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(6), to: dAgo(0), dateField: "crdt", searchMode: "broad", online: false })); assert.equal(r.status, 200, JSON.stringify(r.body));
-  assert.equal(r.body.results[0].mode, "broad"); assert.ok(/\(\(sertraline OR /.test(term()) && term().includes("Zoloft") && term().includes('"sertraline hydrochloride"') && !term().includes("[tiab]"), term().slice(0, 300));
+  assert.equal(r.body.results[0].mode, "broad"); assert.ok(/\(\(sertraline OR /.test(term()) && term().includes("Zoloft") && term().includes('"sertraline hydrochloride"') && !term().includes("Lustral") && !term().includes("[tiab]"), term().slice(0, 300));
   assert.equal(typeof r.body.results[0].siteCount, "number", "the website-style count is reported");
   assert.equal((await t.call(MANAGER, "/api/client-auto", { client: "k1", searchMode: "nope" })).status, 400);
   const sw = await t.call(MANAGER, "/api/client-auto", { client: "k1", searchMode: "broad" }); assert.equal(sw.status, 200); assert.equal(sw.body.restyled, 1);
@@ -216,4 +223,13 @@ test("a long pull runs every search window in one go (no 12-window limit), shows
     const kept = await t.BUCKET.get("jobs/pull/" + start.body.job + ".json"); assert.ok(kept, "the answer is stored, so it survives a restart");
   });
   assert.equal((await t.call(MANAGER, "/api/pull-job", { id: "00000000-0000-0000-0000-000000000000" })).status, 404);
+});
+
+test("the other names of a molecule can be edited, and its search is rebuilt from the molecule and those names only", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "CNS", molecule: "sertraline", query: '"sertraline"[tiab]' }] });
+  assert.deepEqual((await status(t)).perWatch[0].names, []);
+  await t.call(MANAGER, "/api/watch-auto", { watch: "CNS|sertraline", names: "Zoloft, Lustral" });
+  const w = (await t.state()).watches[0]; assert.deepEqual(w.names, ["Zoloft", "Lustral"]); assert.ok(/Zoloft/.test(w.query) && /Lustral/.test(w.query) && !/CNS/.test(w.query), w.query);
+  assert.deepEqual((await status(t)).perWatch[0].names, ["Zoloft", "Lustral"]);
+  await t.call(MANAGER, "/api/watch-auto", { watch: "CNS|sertraline", names: "" }); assert.ok(!/Zoloft/.test((await t.state()).watches[0].query));
 });
