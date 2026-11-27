@@ -160,3 +160,17 @@ test("articles per drug for one week: pulled into the app, and PubMed's count wi
   assert.equal(p.body.rows[0].pubmed, 2); assert.ok(p.body.rows[0].term.includes("2026/11/16[crdt]:2026/11/22[crdt]"), p.body.rows[0].term);
   assert.equal((await t.call(SCREENER, "/api/drug-week-stats", { client: "u", from: "2026-11-16", to: "2026-11-22" })).status, 403);
 });
+
+test("the per-drug week table downloads as Excel, client by client, with numeric counts and client totals", async () => {
+  const { readZip } = await import("./helpers.mjs"); const worker = (await import("../worker/index.js")).default;
+  const t = await makeEnv({ clients: [{ id: "u", name: "USV" }, { id: "s", name: "Square" }], schema: { grouping: "client" },
+    watches: [{ portfolio: "USV", molecule: "acarbose", query: "a", client: "u" }, { portfolio: "Square", molecule: "omeprazole", query: "o", client: "s" }],
+    articles: { 1: { pmid: "1" } }, assignments: [{ id: "a", pmid: "1", portfolio: "USV", molecules: ["acarbose"], ird: "2026-11-17T10:00:00Z" }] });
+  const res = await worker.fetch(new Request("http://localhost/api/drug-week-stats", { method: "POST", headers: { "oai-authenticated-user-email": MANAGER, "content-type": "application/json" }, body: JSON.stringify({ client: "all", from: "2026-11-16", to: "2026-11-22", format: "xlsx" }) }), t.env);
+  assert.equal(res.status, 200); assert.match(res.headers.get("content-type"), /spreadsheetml/);
+  const sheet = readZip(new Uint8Array(await res.arrayBuffer())).get("xl/worksheets/sheet1.xml").toString("utf8");
+  const text = [...sheet.matchAll(/<t xml:space="preserve">([^<]*)<\/t>/g)].map(m => m[1]);
+  assert.deepEqual(text.slice(0, 3), ["Client", "Drug", "Articles (2026-11-16 to 2026-11-22)"]);
+  assert.deepEqual(text.slice(3), ["Square", "omeprazole", "Square total", "", "USV", "acarbose", "USV total", ""]);
+  assert.deepEqual([...sheet.matchAll(/<v>(\d+)<\/v>/g)].map(m => m[1]), ["0", "0", "1", "1"]);
+});

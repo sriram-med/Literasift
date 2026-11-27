@@ -4320,7 +4320,7 @@ function buildAuthorTopicQuery(authors, topics) {
 function xlsxFile(sheetName, header, rows) {
   const x = v => String(v ?? "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").slice(0, 32000).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   const col = i => { let n = i + 1, out = ""; while (n) { const m = (n - 1) % 26; out = String.fromCharCode(65 + m) + out; n = Math.floor((n - 1) / 26); } return out; };
-  const row = (cells, r) => '<row r="' + r + '">' + cells.map((v, i) => '<c r="' + col(i) + r + '" t="inlineStr"><is><t xml:space="preserve">' + x(v) + '</t></is></c>').join("") + "</row>";
+  const row = (cells, r) => '<row r="' + r + '">' + cells.map((v, i) => typeof v === "number" && Number.isFinite(v) ? '<c r="' + col(i) + r + '"><v>' + v + '</v></c>' : '<c r="' + col(i) + r + '" t="inlineStr"><is><t xml:space="preserve">' + x(v) + '</t></is></c>').join("") + "</row>";
   const sheet = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' + [header, ...rows].map((r, i) => row(r, i + 1)).join("") + "</sheetData></worksheet>";
   const enc = new TextEncoder(), f = (name, text) => ({ name, data:enc.encode(text) });
   return zipFiles([
@@ -7542,6 +7542,13 @@ async function apiCore(request, env, path) {
         row.pubmed = info?.count ?? null; row.term = term; row.pubmedUrl = "https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(term); row.warnings = info?.warnings || []; }
       rows.push(row);
     }
+    if (body.format === "xlsx") {
+      // Client by client: each drug with its count, and the client's total under its drugs.
+      const out = [], names = uniq(rows.map(r => r.client));
+      for (const n of names) { const mine = rows.filter(r => r.client === n); for (const r of mine) out.push([n, r.molecule, r.pulled]); out.push([n + " total", "", mine.reduce((k, r) => k + r.pulled, 0)]); }
+      const file = xlsxFile("Drugs " + body.from, ["Client", "Drug", "Articles (" + body.from + " to " + body.to + ")"], out);
+      return new Response(file, { headers:{ "Content-Type":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Content-Disposition":'attachment; filename="literasift-drugs-' + body.from + '.xlsx"' } });
+    }
     return json({ from:body.from, to:body.to, client:clientId === "all" ? "All clients" : clientId === "none" ? "No client" : cname(clientId), dateField:basis, dateBasisLabel:DATE_BASIS_LABEL[basis], rows,
       totals:{ pulled:rows.reduce((n, r) => n + r.pulled, 0), pubmed:body.pubmed === true ? rows.reduce((n, r) => n + (r.pubmed || 0), 0) : null } });
   }
@@ -10286,12 +10293,40 @@ function drugWeekHtml(){
     '<label>Client<select id="dwclient">'+opts.map(o=>'<option value="'+esc(o[0])+'"'+(o[0]===dwState.client?" selected":"")+'>'+esc(o[1])+'</option>').join("")+'</select></label>'+
     '<label>Week starting (Monday)<input type="date" id="dwfrom" value="'+esc(dwState.from)+'"></label>'+
     '<button type="button" class="btn outline sm" data-dwshift="-7">Previous week</button><button type="button" class="btn outline sm" data-dwshift="7">Next week</button>'+
-    '<button type="button" class="btn sm" data-dwbuild="1">Build table</button><button type="button" class="btn outline sm" data-dwcsv="1">Export CSV</button></div>'+
+    '<button type="button" class="btn sm" data-dwbuild="1">Build table</button><button type="button" class="btn outline sm" data-dwxlsx="1">Excel</button><button type="button" class="btn outline sm" data-dwpng="1">Image</button><button type="button" class="btn outline sm" data-dwcsv="1">CSV</button></div>'+
     '<div id="dwout" style="margin-top:12px">'+(dwState.out?dwTable(dwState.out):'<div class="sub">Choose a week and press Build table.</div>')+'</div>',
     "Each drug with the number of articles that reached the app in that week (Monday to Sunday).");
 }
+function dwGroups(r){const out=[];for(const x of r.rows){let g=out.find(y=>y.client===x.client);if(!g)out.push(g={client:x.client,rows:[],total:0});g.rows.push(x);g.total+=x.pulled;}return out;}
 function dwTable(r){
-  return '<div class="sub" style="margin-bottom:6px">'+esc(r.client)+' · '+esc(r.from)+' to '+esc(r.to)+'</div>'+table(["Drug","Articles"],r.rows.map(x=>[esc(x.molecule),String(x.pulled)]),"No drugs for this client.");
+  if(!r.rows.length)return '<div class="empty">No drugs for this client.</div>';
+  return '<div class="sub" style="margin-bottom:6px">'+esc(r.from)+' to '+esc(r.to)+'</div>'+dwGroups(r).map(g=>'<h4 style="margin:12px 0 4px">'+esc(g.client)+' <span class="badge">'+g.total+'</span></h4>'+table(["Drug","Articles"],g.rows.map(x=>[esc(x.molecule),String(x.pulled)]),"")).join("");
+}
+async function dwXlsx(btn){
+  const r=dwState.out;if(!r)return message("Build the table first.",true);btn.disabled=true;
+  try{const res=await fetch("/api/drug-week-stats",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({client:dwState.client,from:r.from,to:r.to,format:"xlsx"})});
+    if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"The Excel file could not be made.");
+    const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-drugs-"+r.from+".xlsx";document.body.appendChild(a);a.click();a.remove();}
+  catch(err){message(err.message,true);}btn.disabled=false;
+}
+function dwImage(){
+  // A picture of the table, client by client, drawn on a canvas and saved as PNG.
+  const r=dwState.out;if(!r)return message("Build the table first.",true);
+  const groups=dwGroups(r),sc=2,W=640,rowH=30,pad=24,lines=groups.reduce((n,g)=>n+g.rows.length+2,0),H=pad*2+56+lines*rowH+groups.length*10;
+  const c=document.createElement("canvas");c.width=W*sc;c.height=H*sc;const g=c.getContext("2d");g.scale(sc,sc);
+  g.fillStyle="#ffffff";g.fillRect(0,0,W,H);g.fillStyle="#0e6a5d";g.font="600 18px system-ui, sans-serif";g.fillText("Articles per drug",pad,pad+16);
+  g.fillStyle="#555";g.font="13px system-ui, sans-serif";g.fillText(r.from+" to "+r.to,pad,pad+38);
+  let y=pad+60;
+  for(const grp of groups){
+    g.fillStyle="#e7f1ef";g.fillRect(pad,y,W-pad*2,rowH);g.fillStyle="#0e3b35";g.font="600 14px system-ui, sans-serif";g.fillText(grp.client,pad+10,y+20);
+    g.textAlign="right";g.fillText(String(grp.total),W-pad-10,y+20);g.textAlign="left";y+=rowH;
+    g.font="12px system-ui, sans-serif";g.fillStyle="#777";g.fillText("Drug",pad+10,y+19);g.textAlign="right";g.fillText("Articles",W-pad-10,y+19);g.textAlign="left";y+=rowH;
+    for(const x of grp.rows){g.strokeStyle="#eee";g.beginPath();g.moveTo(pad,y);g.lineTo(W-pad,y);g.stroke();g.fillStyle="#111";g.font="14px system-ui, sans-serif";
+      let name=String(x.molecule);while(g.measureText(name).width>W-pad*2-110&&name.length>4)name=name.slice(0,-2);if(name!==String(x.molecule))name+="…";
+      g.fillText(name,pad+10,y+20);g.textAlign="right";g.fillText(String(x.pulled),W-pad-10,y+20);g.textAlign="left";y+=rowH;}
+    y+=10;
+  }
+  c.toBlob(b=>{const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="literasift-drugs-"+r.from+".png";document.body.appendChild(a);a.click();a.remove();},"image/png");
 }
 async function dwBuild(btn,pubmed){
   dwState.client=$("dwclient").value;dwState.from=dwMonday($("dwfrom").value||undefined);
@@ -10301,7 +10336,7 @@ async function dwBuild(btn,pubmed){
 }
 function dwCsv(){
   const r=dwState.out;if(!r)return message("Build the table first.",true);
-  const q=v=>'"'+String(v==null?"":v).split('"').join('""')+'"',nl=String.fromCharCode(13,10),lines=[[q("Drug"),q("Articles")].join(",")].concat(r.rows.map(x=>[q(x.molecule),x.pulled].join(",")));
+  const q=v=>'"'+String(v==null?"":v).split('"').join('""')+'"',nl=String.fromCharCode(13,10),lines=[[q("Client"),q("Drug"),q("Articles")].join(",")].concat(r.rows.map(x=>[q(x.client),q(x.molecule),x.pulled].join(",")));
   const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([String.fromCharCode(65279)+lines.join(nl)+nl],{type:"text/csv;charset=utf-8"}));a.download="literasift-drugs-week-"+r.from+".csv";document.body.appendChild(a);a.click();a.remove();
 }
 async function loadPullStats(){
@@ -10693,7 +10728,7 @@ document.addEventListener("click",event=>{
   const lc=event.target.closest&&event.target.closest("[data-llcsv]");
   if(lc){fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:"csv"})}).then(async res=>{if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"Nothing to export.");const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-line-listing-"+new Date().toISOString().slice(0,10)+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}).catch(e=>message(e.message,true));return;}
   const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
-  const target=event.target.closest("[data-dwbuild],[data-dwshift],[data-dwcsv],[data-freeall],[data-freenone],[data-freedel],[data-ssdates],[data-ssdatesoff],[data-ssrange],[data-sscount],[data-ssedit],[data-sspreview],[data-sssave],[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-syncmode],[data-showkey],[data-wsuse],[data-wsrun],[data-wsall],[data-wsadd],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-mqby],[data-addmol],[data-cpsweeks],[data-cpsexport],[data-moldates],[data-clientrange],[data-wlby],[data-cppull],[data-cpcompare],[data-cpretry],[data-cppullsame],[data-runrepair],[data-recocsv],[data-qbuild],[data-xlsx],[data-sptab],[data-sprange],[data-btclient],[data-clientpull],[data-go-clients],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-dwxlsx],[data-dwpng],[data-dwbuild],[data-dwshift],[data-dwcsv],[data-freeall],[data-freenone],[data-freedel],[data-ssdates],[data-ssdatesoff],[data-ssrange],[data-sscount],[data-ssedit],[data-sspreview],[data-sssave],[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-syncmode],[data-showkey],[data-wsuse],[data-wsrun],[data-wsall],[data-wsadd],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-mqby],[data-addmol],[data-cpsweeks],[data-cpsexport],[data-moldates],[data-clientrange],[data-wlby],[data-cppull],[data-cpcompare],[data-cpretry],[data-cppullsame],[data-runrepair],[data-recocsv],[data-qbuild],[data-xlsx],[data-sptab],[data-sprange],[data-btclient],[data-clientpull],[data-go-clients],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -10796,6 +10831,8 @@ document.addEventListener("click",event=>{
   if(target.dataset.dwbuild){dwBuild(target,target.dataset.dwbuild==="pubmed");return;}
   if(target.dataset.dwshift){const f=$("dwfrom");f.value=dwAdd(dwMonday(f.value||undefined),Number(target.dataset.dwshift));dwState.from=f.value;return;}
   if(target.dataset.dwcsv){dwCsv();return;}
+  if(target.dataset.dwxlsx){dwXlsx(target);return;}
+  if(target.dataset.dwpng){dwImage();return;}
   if(target.dataset.freeall||target.dataset.freenone){document.querySelectorAll("[data-freesel]").forEach(x=>{x.checked=!!target.dataset.freeall;});return;}
   if(target.dataset.freedel){const keys=[...document.querySelectorAll("[data-freesel]:checked")].map(x=>x.dataset.freesel);if(!keys.length)return message("Tick the molecules to delete.",true);
     const arts=$("freearts")&&$("freearts").checked;
