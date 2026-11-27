@@ -1908,10 +1908,32 @@ async function caseEvidenceChanges(state, rec) {
 }
 const approvalValid = async rec => Boolean(rec.approval?.status === "approved" && rec.approval.hash === await caseDataHash(rec));
 const safetyFilter = '("adverse effects"[sh] OR "drug-related side effects and adverse reactions"[MeSH Terms] OR safety[tiab] OR toxicity[tiab] OR "adverse event*"[tiab] OR "adverse reaction*"[tiab] OR "adverse drug reaction*"[tiab] OR "side effect*"[tiab])';
+// Product names as written on a pack ("Acarbose Tablets 25 mg and 50mg", "VOBOSE 0.2/0.3 mg") are searched as the drug: strengths, units and dosage forms
+// are removed, because PubMed ignores them and then finds nothing. A combination ("glimepiride and metformin", "A + B") is searched as all of its parts together.
+const DOSE_RE = /(?:^|\s)\d+(?:[.,]\d+)?(?:\s*(?:\/|-|to|and|&|\+)\s*\d+(?:[.,]\d+)?)*\s*(?:mg|mcg|µg|ug|microgram(?:s)?|milligram(?:s)?|gm|g|kg|ml|mL|l|iu|IU|units?|%|w\/w|w\/v|v\/v)(?:\s*\/\s*(?:ml|mL|g|kg|dose|tab(?:let)?|cap(?:sule)?|day|hr|h|5\s*ml))?(?=\s|$|[,;)])/gi;
+const FORM_WORDS = ["tablets?", "tabs?", "capsules?", "caps?", "injections?", "inj", "infusions?", "syrups?", "suspensions?", "creams?", "ointments?", "lotions?", "drops?", "eye\\s+drops?", "ear\\s+drops?",
+  "sachets?", "granules?", "powders?", "for\\s+oral\\s+suspension", "for\\s+injection", "inhalers?", "rotacaps?", "respules?", "nebuli[sz]er\\s+solution", "sprays?", "nasal\\s+sprays?", "patch(?:es)?", "suppositor(?:y|ies)",
+  "pessar(?:y|ies)", "film[\\s-]*coated", "f\\.?c\\.?", "extended[\\s-]*release", "sustained[\\s-]*release", "prolonged[\\s-]*release", "modified[\\s-]*release", "controlled[\\s-]*release", "delayed[\\s-]*release",
+  "gastro[\\s-]*resistant", "enteric[\\s-]*coated", "orally\\s+disintegrating", "dispersible", "chewable", "effervescent", "mouth\\s+dissolving", "er", "sr", "xr", "xl", "mr", "cr", "dr", "od", "dt", "md", "ip", "usp", "bp", "ph\\.?\\s*eur\\.?",
+  "vials?", "ampoules?", "prefilled\\s+syringes?", "pens?", "strips?", "kits?", "bottles?", "packs?"];
+const FORM_RE = new RegExp("(?:^|\\s)(?:" + FORM_WORDS.join("|") + ")(?=\\s|$|[,;.)])", "gi");
+const JOIN_RE = /\s*(?:\+|&|\/|\bwith\b|\band\b|\bplus\b)\s*/gi;
+function productParts(name) {
+  let t = " " + String(name || "").replace(/[ \t]/g, " ") + " ";
+  t = t.replace(/(\d)\s*(?:mg|mcg|µg|g|ml|iu)\s*(\/|\+)\s*(?=\d)/gi, "$1$2");   // "1mg/500mg" is one strength, written as "1/500mg"
+  for (let i = 0; i < 3; i++) t = t.replace(DOSE_RE, " ").replace(FORM_RE, " ");
+  t = t.replace(/(?:^|\s)\d+(?:[.,]\d+)?(?=\s|$)/g, " ").replace(/\s+/g, " ").trim();
+  const parts = t.split(JOIN_RE).map(x => x.replace(/^[\s,;.-]+|[\s,;.-]+$/g, "").trim()).filter(x => x.length > 1 || /^[a-z]$/i.test(x));
+  return parts.length ? parts : [];
+}
+// The searchable form of a name: the parts joined with " and " (one part is just the drug name).
+function searchName(name) { const parts = productParts(name), raw = String(name || "").replace(/\s+/g, " ").trim(); return parts.length ? parts.join(" and ") : raw; }
+const nameParts = n => String(n).split(/\s+and\s+/i).map(x => x.trim()).filter(Boolean);
 function buildQuery(names, safetyOnly) {
   const clean = [...new Set(names.map(n => String(n || "").replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim()).filter(Boolean))];
   if (!clean.length || clean.length > 30 || clean.some(n => n.length > 100)) return "";
-  const terms = clean.map(n => '"' + n + '"[tiab] OR "' + n + '"[MeSH Terms] OR "' + n + '"[Supplementary Concept]');
+  const one = n => '"' + n + '"[tiab] OR "' + n + '"[MeSH Terms] OR "' + n + '"[Supplementary Concept]';
+  const terms = clean.map(n => { const parts = nameParts(n); return parts.length > 1 ? "(" + parts.map(x => "(" + one(x) + ")").join(" AND ") + ")" : one(n); });
   const query = "(" + terms.join(" OR ") + ")" + (safetyOnly ? " AND " + safetyFilter : "");
   return query.length <= 1500 ? query : "";
 }
@@ -3373,7 +3395,7 @@ async function fullSearch(env, state, kb, w, base, { online = true } = {}) {
 function buildBroadQuery(names, safetyOnly) {
   const clean = [...new Set(names.map(n => String(n || "").replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim()).filter(x => x.length > 0))];
   if (!clean.length || clean.some(n => n.length > 100)) return "";
-  const term = n => "(" + n + ")", tail = safetyOnly ? " AND " + safetyFilter : "";
+  const term = n => { const parts = nameParts(n); return "(" + (parts.length > 1 ? parts.join(" AND ") : n) + ")"; }, tail = safetyOnly ? " AND " + safetyFilter : "";
   const query = "(" + clean.slice(0, 40).map(term).join(" OR ") + ")" + tail;
   return query.length <= 1500 ? query : "(" + clean.slice(0, 12).map(term).join(" OR ") + ")" + tail;
 }
@@ -3387,7 +3409,7 @@ const moleculeSpellings = new Map([
 ]);
 const firstQuery = w => (w.versions || []).slice().sort((a, b) => a.version - b.version)[0]?.query || w.query || "";
 function ownNames(w) {
-  const out = [], add = n => { const t = String(n || "").replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim(); if (t.length > 0 && t.length <= 100 && !out.some(x => x.toLowerCase() === t.toLowerCase())) out.push(t); };
+  const out = [], add = n => { const t = searchName(String(n || "").replace(/["\[\]()*]/g, " ")).replace(/\s+/g, " ").trim(); if (t.length > 0 && t.length <= 100 && !out.some(x => x.toLowerCase() === t.toLowerCase())) out.push(t); };
   // A molecule added before names were kept separately may have extra names appended to its first query as "(own names) OR (added names)": only the first part counts.
   let fq = firstQuery(w); const cut = fq.indexOf(") OR (("); if (fq.startsWith("((") && cut > 0) fq = fq.slice(1, cut);
   add(w.molecule); (Array.isArray(w.names) ? w.names : queryTerms(fq)).forEach(add);
@@ -10026,7 +10048,7 @@ async function runPullJobs(btn,list,bodyFor,route,done){
     return head+(x.idCheck?'<div class="sub">Compared PMID by PMID with PubMed</div>':(x.expectedSource?'<div class="sub">Compared with '+esc(x.expectedSource)+'</div>':""))+
       (miss&&x.missingSample&&x.missingSample.length?'<div class="sub">Missing: '+esc(x.missingSample.join(", "))+(miss>x.missingSample.length?" …":"")+'</div>':"")+
       (unx&&x.unexpectedSample&&x.unexpectedSample.length?'<div class="sub">Unexpected: '+esc(x.unexpectedSample.join(", "))+'</div>':"")+
-      (x.warnings&&x.warnings.length?'<div class="sub" style="color:var(--amber)">PubMed: '+esc(x.warnings.join("; "))+'</div>':"");};
+      (x.warnings&&x.warnings.length?'<div class="sub" style="color:var(--amber)">PubMed: '+esc(x.warnings.join("; "))+'</div>':"")+ssHint(x.warnings);};
   const draw=()=>{const fin=rows.filter(Boolean).length,late=rows.filter(x=>x&&!x.error&&!x.complete).length,bad=rows.filter(x=>x&&x.error).length,ids=new Set(),idsKnown=rows.every(x=>!x||x.error||Array.isArray(x.storedIds));
     rows.forEach(x=>{if(x&&Array.isArray(x.storedIds))x.storedIds.forEach(i=>ids.add(i));});
     const runIds=rows.filter(x=>x&&x.runId).map(x=>x.runId);
@@ -10082,11 +10104,13 @@ async function runMinePull(f){
   const molecule=e.molecule.value.trim();if(!molecule)return message("Enter the molecule.",true);
   await runPullJobs(btn,[{key:molecule,name:molecule}],()=>({...st,molecule,synonyms:e.synonyms.value,portfolio:e.portfolio.value,safetyOnly:spState.safety}),"pull-mine",r=>{if(r.added)message(r.added+" new article"+(r.added===1?"":"s")+" added to your queue.");});
 }
+// A brand PubMed does not know (for example a local trade name) finds nothing: the generic name has to be added to the saved search.
+function ssHint(w){const miss=(w||[]).filter(x=>String(x).indexOf("Not found in PubMed:")===0).map(x=>String(x).slice(20).trim());return miss.length?'<div class="sub" style="color:var(--red)"><b>PubMed does not know '+esc(miss.join(", "))+'.</b> Add the generic (INN) name, for example the active ingredient, in Saved searches, Edit, Other names.</div>':"";}
 const SS_FILTERS=[["humans","Humans"],["caseReports","Case reports"],["english","English"],["noReviews","No reviews"],["safety","Safety articles only"]];
 const SS_MODES=[["pubmed","PubMed default","automatic term mapping, as on the PubMed website"],["precise","Precise","quoted names in title/abstract, MeSH and supplementary concept"],["custom","Custom","your own PubMed expression, run exactly as written"]];
 function ssCard(x){
   const k=esc(x.key),on=SS_FILTERS.filter(f=>x.filters&&x.filters[f[0]]).map(f=>f[1]),c=cpState.ssCounts&&cpState.ssCounts[x.key];
-  const cnt=!c?"":c.busy?'<span class="sub">Counting…</span>':c.error?'<span class="sub" style="color:var(--red)">'+esc(c.error)+'</span>':'<span class="badge">'+esc(String(c.count==null?"?":c.count))+' in PubMed</span> <span class="sub">'+esc(c.dateBasisLabel||"")+(c.from?" · "+esc(c.from)+" to "+esc(c.to):"")+'</span>'+(c.warnings&&c.warnings.length?'<div class="sub" style="color:var(--amber)">PubMed: '+esc(c.warnings.join("; "))+'</div>':"")+(c.translation?'<details class="sub"><summary>PubMed read it as</summary><code>'+esc(c.translation)+'</code></details>':"");
+  const cnt=!c?"":c.busy?'<span class="sub">Counting…</span>':c.error?'<span class="sub" style="color:var(--red)">'+esc(c.error)+'</span>':'<span class="badge">'+esc(String(c.count==null?"?":c.count))+' in PubMed</span> <span class="sub">'+esc(c.dateBasisLabel||"")+(c.from?" · "+esc(c.from)+" to "+esc(c.to):"")+'</span>'+(c.warnings&&c.warnings.length?'<div class="sub" style="color:var(--amber)">PubMed: '+esc(c.warnings.join("; "))+'</div>':"")+ssHint(c.warnings)+(c.translation?'<details class="sub"><summary>PubMed read it as</summary><code>'+esc(c.translation)+'</code></details>':"");
   const edit=cpState.ssEdit===x.key?ssEditor(x):"";
   return '<div class="sscard" data-sskey="'+k+'"><div class="ss-top"><label class="check"><input type="checkbox" data-cpmol="'+k+'"'+(cpState.ssOff&&cpState.ssOff[x.key]?"":" checked")+'>&nbsp;<b>'+esc(x.molecule)+'</b></label>'+
     badge(x.modeLabel?x.mode==="pubmed"?"PubMed default":x.mode==="precise"?"Precise":"Custom":x.mode,x.mode==="custom"?"amber":"blue")+(on.length?" "+on.map(f=>badge(f,"")).join(" "):"")+(x.auto?"":" "+badge("Daily pull off",""))+

@@ -86,3 +86,14 @@ test("Compare shows each molecule's saved search with its own filters", async ()
   assert.equal(om.filters.humans, true); assert.ok(om.query.includes("humans[mh]"));
   assert.equal(ca.filters.humans, false); assert.ok(!ca.query.includes("humans[mh]"));
 });
+
+test("product names with strengths and dosage forms are searched as the drug; combinations as all of their parts", async () => {
+  const watches = [{ id: "a", portfolio: "USV", molecule: "Acarbose Tablets 25 mg and 50mg", query: "((Acarbose Tablets 25 mg and 50mg))", names: [], client: "usv" },
+    { id: "v", portfolio: "USV", molecule: "VOBOSE 0.2/0.3 mg", query: "x", names: ["Voglibose"], client: "usv" },
+    { id: "g", portfolio: "USV", molecule: "Glimepiride and Metformin Hydrochloride Tablets 1mg/500mg", query: "x", names: [], client: "usv", searchMode: "precise" }];
+  const t = await makeEnv({ watches, clients: [{ id: "usv", name: "USV" }] });
+  const q = Object.fromEntries((await t.call(MANAGER, "/api/saved-searches", { client: "usv" })).body.searches.map(s => [s.id, s.query]));
+  assert.equal(q.a, "((Acarbose))");
+  assert.equal(q.v, "((VOBOSE) OR (Voglibose))");
+  assert.ok(q.g.startsWith('((("Glimepiride"[tiab]') && q.g.includes(') AND ("Metformin Hydrochloride"[tiab]') && !/mg|Tablets/.test(q.g), q.g);
+});
