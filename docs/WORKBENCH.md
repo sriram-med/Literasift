@@ -276,3 +276,11 @@ A stop date is optional. With no stop date, pulling continues every day until a 
 ## Articles pulled per client, per week
 
 The top of the Clients page shows a table of how many articles each client received in each week (4, 8, 12 or 26 weeks; an article counts in the week it reached the queue, its IRD), with a total per client for the period, an all-time figure, and a totals row; busier weeks are shaded darker. **Export CSV** downloads the same numbers with the client name and the number side by side (`Client, Articles pulled (period), Week of ..., All time`, plus a Total row). Routes: `/api/client-pull-stats` and `/api/client-pull-export` (managers and users allowed to manage clients).
+
+## Faster pulls that miss nothing
+
+- **Several at once.** The windows of one import run four at a time, and a client pull works on three molecules at a time. NCBI's shared request gate still spaces the requests, so the allowed rate is never exceeded; only the waiting is overlapped. Windows are tracked by their dates, so a window that splits in two while others run is handled safely.
+- **Instant on the host.** Full texts and screenshots take much longer than the citations, so on the server (`DEFER_EVIDENCE=1`, the default there) a pull answers as soon as every citation is stored and gathers the evidence right behind it, and again on every scheduler tick.
+- **Checked against PubMed.** Every window compares PubMed's count with what came back. A client pull re-runs any window that did not reconcile (up to two more times) before answering, shows "Complete: N of N" or "Incomplete, will retry" per molecule, and an incomplete window stays on the retry list. Articles are stored once and never assigned twice in a portfolio.
+- **Live Search & Pull.** Pull for a client now pulls molecule by molecule, three at a time, and each row appears as it finishes with the running totals.
+- **Dashboard.** Each client card on the Dashboard shows how many articles were pulled for the client (all time) and in the last 7 days, even when nothing is open.

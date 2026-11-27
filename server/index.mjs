@@ -26,7 +26,7 @@ const useSqlite = existsSync(dataDir + "/state.db") && e.STORE !== "file";
 const bucket = useSqlite ? new SqliteBucket(dataDir + "/state.db", dataDir + "/objects") : new FileBucket(dataDir + "/objects");
 console.log("Operational store: " + (useSqlite ? "SQLite (transactional, versioned)" : "file store (run server/store-admin.mjs migrate to move to SQLite)"));
 const env = { BUCKET: bucket, RUN_TOKEN: runToken, SCHEDULE_MINUTES: e.SCHEDULE_MINUTES, UNPAYWALL_EMAIL: e.UNPAYWALL_EMAIL, CROSSREF_EMAIL: e.CROSSREF_EMAIL,
-  SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN, HOST_ACCOUNTS: true, AUDIT_ANCHOR_KEY: e.AUDIT_ANCHOR_KEY || createHmac("sha256", secret).update("literasift-audit-anchor").digest("hex"), LIBRARY_PATH: dataDir + "/library" };
+  SCREENSHOT_ENDPOINT: e.SCREENSHOT_ENDPOINT, SCREENSHOT_TOKEN: e.SCREENSHOT_TOKEN, HOST_ACCOUNTS: true, DEFER_EVIDENCE: e.DEFER_EVIDENCE ?? "1", AUDIT_ANCHOR_KEY: e.AUDIT_ANCHOR_KEY || createHmac("sha256", secret).update("literasift-audit-anchor").digest("hex"), LIBRARY_PATH: dataDir + "/library" };
 
 const pdfTextFn = await makePdfTextFn(), ocrFn = await makeOcrFn();
 // The reader says how it got the text (text layer or OCR) so the evidence record can show it: OCR is used only when the text layer is unusable.

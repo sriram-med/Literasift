@@ -119,7 +119,10 @@ function dashboardFor(state, viewer, workflow, person, client = "") {
     const m = c.molecules.get(i.molecule || i.portfolio) || { molecule:i.molecule || i.portfolio, portfolio:i.portfolio, open:0, overdue:0, high:0, serious:0, nextDue:"" };
     for (const x of [c, m]) { x.open++; if (i.overdue) x.overdue++; if (i.priority.level === "high") x.high++; if ((i.flags || []).includes("serious")) x.serious++; if (i.due && (!x.nextDue || i.due < x.nextDue)) x.nextDue = i.due; }
     c.molecules.set(m.molecule, m); cardMap.set(key, c); }
-  const clientCards = [...cardMap.values()].map(c => ({ ...c, molecules:[...c.molecules.values()].sort((a, b) => b.overdue - a.overdue || b.open - a.open) })).sort((a, b) => b.overdue - a.overdue || b.open - a.open);
+  // The number of articles pulled for each client (all time, and in the last seven days), whatever is still open.
+  const pulled = new Map(); for (const a of state.assignments || []) { const k = clientIdFor(state, a) || "", c = pulled.get(k) || { articles:0, week:0 }; c.articles++; if (irdOf(state, a).slice(0, 10) >= weekAgo) c.week++; pulled.set(k, c); }
+  for (const c of state.clients || []) if ((!client || client === c.id) && !cardMap.has(c.id) && pulled.get(c.id)) cardMap.set(c.id, { id:c.id, client:c.name, open:0, overdue:0, high:0, serious:0, nextDue:"", molecules:new Map() });
+  const clientCards = [...cardMap.values()].map(c => ({ ...c, articles:pulled.get(c.id)?.articles || 0, pulledWeek:pulled.get(c.id)?.week || 0, molecules:[...c.molecules.values()].sort((a, b) => b.overdue - a.overdue || b.open - a.open) })).sort((a, b) => b.overdue - a.overdue || b.open - a.open || b.articles - a.articles);
   const done = [];
   for (const a of state.assignments) { if (!mayAccess(state, viewer, a)) continue; const w = watchFor(state, a.portfolio, (a.molecules || [])[0] || "");
     if (workflow === "screening" && a.disposition?.at && a.disposition.at.slice(0, 10) >= weekAgo && a.disposition.by !== "system") done.push({ by:a.disposition.by, ontime:!a.dueAt || a.disposition.at.slice(0, 10) <= a.dueAt });
@@ -381,11 +384,13 @@ async function storeEfetch(env, xmlById) {
 async function processWindow(env, runId, index) {
   const { state } = await load(env), run = state.runs.find(r => r.id === runId), win = run?.windows?.[index];
   if (!win) return null;
-  const mark = patch => write(env, data => { const r = data.runs.find(x => x.id === runId), w = r.windows[index]; Object.assign(w, patch); summarizeRun(r); });
+  // Several windows run at once and one of them may be split in two, so a window is found by its dates, never by its position.
+  const at = r => r.windows.findIndex(x => x.from === win.from && x.to === win.to), winOf = r => r.windows[at(r)];
+  const mark = patch => write(env, data => { const r = data.runs.find(x => x.id === runId), w = r && winOf(r); if (!w) return; Object.assign(w, patch); summarizeRun(r); });
   try {
     // Claim the window atomically; an overlapping worker skips a window that another one is processing.
     let claimed = false; const now = new Date().toISOString();
-    await write(env, data => { const r = data.runs.find(x => x.id === runId), w = r?.windows?.[index]; if (!w || (w.state === "running" && w.claimUntil && w.claimUntil > now)) return;
+    await write(env, data => { const r = data.runs.find(x => x.id === runId), w = r && winOf(r); if (!w || (w.state === "running" && w.claimUntil && w.claimUntil > now)) return;
       w.state = "running"; w.claimUntil = new Date(Date.now() + 180000).toISOString(); w.attempts = (w.attempts || 0) + 1; w.lastAttemptAt = now; w.error = ""; claimed = true; summarizeRun(r); });
     if (!claimed) return { busy:true };
     const { esearchresult: result } = await withRetry(env, () => pubmed(env, "esearch", { term:win.term, retmode:"json", retmax:"9999" }));
@@ -394,9 +399,9 @@ async function processWindow(env, runId, index) {
     if (expected > ids.length && win.from < win.to) {
       // More records than one search can return: split the window in two. Both halves keep the same query version.
       const middle = addDays(win.from, Math.floor((Date.parse(win.to) - Date.parse(win.from)) / 86400000 / 2));
-      await write(env, data => { const r = data.runs.find(x => x.id === runId), w = r.windows[index];
+      await write(env, data => { const r = data.runs.find(x => x.id === runId), i = at(r), w = r.windows[i];
         const left = { ...w, claimUntil:undefined, to:middle, state:"pending", attempts:0, term:searchTerm(w.query, w.from, middle, run.dateField) }, right = { ...w, claimUntil:undefined, from:addDays(middle, 1), state:"pending", attempts:0, term:searchTerm(w.query, addDays(middle, 1), w.to, run.dateField) };
-        r.windows.splice(index, 1, left, right); summarizeRun(r); });
+        r.windows.splice(i, 1, left, right); summarizeRun(r); });
       return { split:true };
     }
     if (expected > ids.length) throw new Error("A single day has more than 9,999 records. Narrow the query.");
@@ -406,7 +411,7 @@ async function processWindow(env, runId, index) {
     const missing = uniq([...fetched.missing, ...ids.filter(id => fetched.articles[id] && !fetched.xml[id])]);
     const reconciled = ids.length === expected && missing.length === 0;
     await write(env, data => {
-      const r = data.runs.find(x => x.id === runId), w = r.windows[index], watch = data.watches.find(x => x.portfolio === r.portfolio && (x.molecule || "") === (r.molecule || "")) || { portfolio:r.portfolio, molecule:r.molecule };
+      const r = data.runs.find(x => x.id === runId), w = winOf(r), watch = data.watches.find(x => x.portfolio === r.portfolio && (x.molecule || "") === (r.molecule || "")) || { portfolio:r.portfolio, molecule:r.molecule };
       let imported = 0;
       for (const [id, article] of Object.entries(fetched.articles)) {
         if (!data.articles[id]) imported++;
@@ -436,13 +441,15 @@ const MAX_WINDOW_ATTEMPTS = 8, backoffMs = attempts => Math.min(5 * 60000 * 2 **
 const windowRetryable = (w, { ignoreBackoff = false } = {}) => (w.state === "failed" || w.state === "partial") && (w.attempts || 0) < MAX_WINDOW_ATTEMPTS && (ignoreBackoff || !w.lastAttemptAt || Date.parse(w.lastAttemptAt) + backoffMs(w.attempts || 1) <= Date.now());
 async function runImport(env, runId, budget = 12, { respectBackoff = false } = {}) {
   env = withSettings(env, (await load(env)).state);
-  const tried = new Map();
-  for (let step = 0; step < budget; step++) {
+  const tried = new Map(), lanes = Math.max(1, Math.min(6, Number(env.IMPORT_LANES ?? 4)));
+  for (let used = 0; used < budget;) {
     const { state } = await load(env), run = state.runs.find(r => r.id === runId), now = new Date().toISOString();
-    const index = run?.windows?.findIndex((w, i) => (tried.get(w.from + "|" + w.to) || 0) < 2 && (w.state === "pending" || (w.state === "running" && !(w.claimUntil && w.claimUntil > now)) || windowRetryable(w, { ignoreBackoff:!respectBackoff })));
-    if (index === undefined || index < 0) break;
-    { const w = run.windows[index], k = w.from + "|" + w.to; tried.set(k, (tried.get(k) || 0) + 1); }
-    await processWindow(env, runId, index);
+    const eligible = (run?.windows || []).map((w, i) => ({ w, i })).filter(({ w }) => (tried.get(w.from + "|" + w.to) || 0) < 2 && (w.state === "pending" || (w.state === "running" && !(w.claimUntil && w.claimUntil > now)) || windowRetryable(w, { ignoreBackoff:!respectBackoff }))).slice(0, Math.min(lanes, budget - used));
+    if (!eligible.length) break;
+    for (const { w } of eligible) tried.set(w.from + "|" + w.to, (tried.get(w.from + "|" + w.to) || 0) + 1);
+    used += eligible.length;
+    // The shared NCBI gate still spaces the requests, so running windows side by side hides the waiting without exceeding the allowed rate.
+    await Promise.all(eligible.map(({ i }) => processWindow(env, runId, i)));
   }
   return (await load(env)).state.runs.find(r => r.id === runId);
 }
@@ -4019,6 +4026,11 @@ async function captureScreenshot(env, article) {
   const at = new Date().toISOString();
   return { status:{ screenshotKey:key, screenshotStatus:"Captured", screenshotKind:"pubmed_page", screenshotAt:at }, evidence:{ status:"captured", kind:"pubmed_page", key, sha256:await sha256Hex(image), bytes:image.byteLength, at, verified:true } };
 }
+// Full texts and screenshots take far longer than the citations themselves. On the host (DEFER_EVIDENCE=1) a pull returns as soon as every citation is in and the evidence is gathered right behind it, and again on every scheduler tick, so nothing is lost; elsewhere it is awaited.
+function settleEvidence(env, ids) {
+  if (env.DEFER_EVIDENCE === "1") { Promise.resolve().then(() => collectEvidence(env, ids)).catch(() => {}); return Promise.resolve(null); }
+  return collectEvidence(env, ids);
+}
 async function collectEvidence(baseEnv, ids) {
   const {state} = await load(baseEnv);
   const env = withSettings(baseEnv, state);
@@ -5327,21 +5339,26 @@ async function apiCore(request, env, path) {
     let watches = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule && (isMgr || allowed.includes(w.portfolio)) && (!only.size || only.has(encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || ""))));
     if (!watches.length) return json({ error:isMgr ? "This client has no molecules yet. Add one on the Clients page." : "This client has no molecules in your portfolios." }, 400);
     if (watches.length > 25) return json({ error:"A client pull covers up to 25 molecules at a time. Choose fewer." }, 400);
-    const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean), results = [];
-    for (const w of watches) {
+    const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean), results = new Array(watches.length);
+    const one = async (w, slot) => {
       let query = queryAt(w, day())?.query || w.query; if (narrow.length || body.noReviews === true) query = "(" + query + ")" + narrow.map(f => " AND " + f).join("") + (body.noReviews === true ? " NOT review[pt]" : "");
-      if (query.length > 1500) { results.push({ molecule:w.molecule, portfolio:w.portfolio, error:"The search became too long; use fewer filters." }); continue; }
+      if (query.length > 1500) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, error:"The search became too long; use fewer filters." }; return; }
       const before = new Set(state.assignments.filter(a => a.portfolio === w.portfolio).map(a => a.pmid));
       try {
-        const run = await execute(env, narrow.length || body.noReviews === true ? { portfolio:w.portfolio, molecule:w.molecule, query } : w, body.from, body.to, { mode:"backfill", dateField:body.dateField });
+        let run = await execute(env, narrow.length || body.noReviews === true ? { portfolio:w.portfolio, molecule:w.molecule, query } : w, body.from, body.to, { mode:"backfill", dateField:body.dateField });
+        // Nothing may be missed: a window that did not reconcile (PubMed's count against what came back) is run again before the answer is given, and it stays on the retry list if it still has gaps.
+        for (let again = 0; again < 2 && !["reconciled", "zero_results"].includes(run.coverage); again++) run = await runImport(env, run.id, 12);
         if (!isMgr) await write(env, d => { for (const a of d.assignments) if (a.portfolio === w.portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
-        await collectEvidence(env, run.ids);
-        results.push({ molecule:w.molecule, portfolio:w.portfolio, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, coverage:run.coverage || run.status });
-      } catch (error) { results.push({ molecule:w.molecule, portfolio:w.portfolio, error:String(error.message || error).slice(0, 160) }); }
-    }
+        await settleEvidence(env, run.ids);
+        const wins = run.windows || [], expected = run.expected ?? wins.reduce((n, x) => n + (x.expected || 0), 0), got = run.retrieved ?? (run.ids || []).length;
+        results[slot] = { molecule:w.molecule, portfolio:w.portfolio, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, expected, retrieved:got, coverage:run.coverage || run.status, complete:["reconciled", "zero_results"].includes(run.coverage), gaps:(run.gaps || []).length };
+      } catch (error) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, error:String(error.message || error).slice(0, 160) }; }
+    };
+    // A few molecules at a time; the shared NCBI gate keeps the request rate within the allowed limit.
+    let nextSlot = 0; await Promise.all(Array.from({ length:Math.min(Math.max(1, Number(env.PULL_LANES ?? 3)), watches.length) }, async () => { while (nextSlot < watches.length) { const slot = nextSlot++; await one(watches[slot], slot); } }));
     const name = clientId === "none" ? "No client" : state.clients.find(c => c.id === clientId).name;
     await audit(env, { by:email, action:"pull.client", target:name, detail:{ from:body.from, to:body.to, molecules:results.length, articles:results.reduce((n, r) => n + (r.count || 0), 0), failed:results.filter(r => r.error).length } });
-    return json({ client:name, from:body.from, to:body.to, results, total:results.reduce((n, r) => n + (r.count || 0), 0), added:results.reduce((n, r) => n + (r.added || 0), 0) });
+    return json({ client:name, from:body.from, to:body.to, results, complete:results.every(r => r.complete), total:results.reduce((n, r) => n + (r.count || 0), 0), added:results.reduce((n, r) => n + (r.added || 0), 0) });
   }
   if (path === "/api/pull-mine" && viewer) {
     // Data-entry and QC people search PubMed for a molecule and pull the articles into their own queue, in a portfolio they work in. No watchlist is created and nobody else's work is touched.
@@ -5357,7 +5374,7 @@ async function apiCore(request, env, path) {
     if ((Date.parse(body.to) - Date.parse(body.from)) / 864e5 > 366) return json({ error:"Pull one year at a time or less." }, 400);
     const before = new Set(state.assignments.filter(a => a.portfolio === portfolio).map(a => a.pmid)), run = await execute(env, { portfolio, molecule, query }, body.from, body.to, { mode:"backfill", dateField:body.dateField });
     await write(env, d => { for (const a of d.assignments) if (a.portfolio === portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
-    await collectEvidence(env, run.ids);
+    await settleEvidence(env, run.ids);
     await audit(env, { by:email, action:"pull.mine", target:portfolio + " · " + molecule, detail:{ from:body.from, to:body.to, count:run.count ?? 0 } });
     return json({ ...run, mine:(run.ids || []).filter(id => !before.has(id)).length });
   }
@@ -6990,7 +7007,7 @@ async function apiCore(request, env, path) {
     const watch = { portfolio, molecule, query, ...(owner ? { owner } : {}), ...(clientId ? { client:clientId } : {}) };
     await write(env, data => { keepOwner(data, watch); commitWatch(data, watch, email); });
     const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField });
-    await collectEvidence(env, run.ids);
+    await settleEvidence(env, run.ids);
     return json(run);
   } else if (path === "/api/social-add") {
     const posts = String(body.text || "").split(/\r?\n\s*-{3,}\s*\r?\n/).map(t => t.trim()).filter(t => t.length >= 20).slice(0, 50).map(text => ({ text:text.slice(0, 6000), url:String(body.url || "").trim(), postedAt:/^\d{4}-\d{2}-\d{2}$/.test(body.postedAt || "") ? body.postedAt : "" }));
@@ -7016,7 +7033,7 @@ async function apiCore(request, env, path) {
       return json({error:"Choose a saved portfolio and a valid date range through today."},400);
     }
     const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField });
-    await collectEvidence(env, run.ids);
+    await settleEvidence(env, run.ids);
     return json(run);
   } else return json({ error:"Route unavailable." },404);
   return json({ ok:true });
@@ -8427,7 +8444,7 @@ async function loadDashboard(){
     const strip='<div class="qstrip">'+tile("Open",k.open,"")+tile("Overdue",k.overdue,"red","overdue")+tile("Due today",k.dueToday,"amber")+tile("Next 5 days",k.thisWeek,"")+tile("High priority",k.high,"red")+tile("Done in 7 days",r.completed7d,"green")+(r.onTimeRate!==null?tile("On time",r.onTimeRate+"%",r.onTimeRate>=90?"green":"amber"):"")+'</div>';
     const maxD=Math.max(1,...r.days.map(d=>d.count+d.late)),bars='<section><div class="body"><h3 style="margin:0 0 10px">Workload, next working days</h3><div class="dbars">'+r.days.map(d=>'<button type="button" class="dbar" data-plday="'+d.date+'" title="'+esc(d.date)+'"><i style="height:'+Math.round((d.count+d.late)/maxD*100)+'%"'+(d.late?' class="hot"':"")+'></i><b>'+(d.count+d.late)+'</b><span>'+d.date.slice(5)+'</span></button>').join("")+'</div></div></section>';
     const cl=Object.entries(r.byClient).map(([c,ms])=>{const tot=Object.values(ms).reduce((n,m)=>n+m.open,0);return '<div class="row" style="align-items:flex-start"><span><b>'+esc(c)+'</b><div class="sub">'+Object.entries(ms).map(([m,v])=>esc(m)+' '+v.open+(v.overdue?' <span style="color:var(--red)">('+v.overdue+' late)</span>':"")).join(" · ")+'</span></span><b style="margin-left:auto;padding-left:14px">'+tot+'</b></div>';}).join("");
-    const maxOpen=Math.max(1,...(r.clientCards||[]).map(c=>c.open)),card=c=>'<div class="ccard'+(c.overdue?" late":"")+'"><div class="cc-top"><b>'+esc(c.client)+'</b><span class="sub">'+(c.nextDue?"next due "+esc(c.nextDue):"")+'</span></div><div class="cc-bar"><i style="width:'+Math.round(c.open/maxOpen*100)+'%"></i></div><div class="cc-nums"><span><b>'+c.open+'</b> open</span><span'+(c.overdue?' style="color:var(--red)"':"")+'><b>'+c.overdue+'</b> overdue</span><span><b>'+c.high+'</b> high</span><span><b>'+c.serious+'</b> serious</span></div>'+c.molecules.map(m=>'<div class="cc-row"><span>'+esc(m.molecule)+'</span><span class="sub">'+m.open+(m.overdue?' · <b style="color:var(--red)">'+m.overdue+' late</b>':"")+(m.serious?' · '+m.serious+' serious':"")+(m.nextDue?' · due '+esc(m.nextDue):"")+'</span></div>').join("")+'</div>';
+    const maxOpen=Math.max(1,...(r.clientCards||[]).map(c=>c.open)),card=c=>'<div class="ccard'+(c.overdue?" late":"")+'"><div class="cc-top"><b>'+esc(c.client)+'</b><span class="sub">'+(c.nextDue?"next due "+esc(c.nextDue):"")+'</span></div><div class="cc-bar"><i style="width:'+Math.round(c.open/maxOpen*100)+'%"></i></div><div class="cc-nums"><span><b>'+c.open+'</b> open</span><span'+(c.overdue?' style="color:var(--red)"':"")+'><b>'+c.overdue+'</b> overdue</span><span><b>'+c.high+'</b> high</span><span><b>'+c.serious+'</b> serious</span></div><div class="cc-nums"><span><b>'+(c.articles||0)+'</b> articles pulled</span><span><b>'+(c.pulledWeek||0)+'</b> in the last 7 days</span></div>'+c.molecules.map(m=>'<div class="cc-row"><span>'+esc(m.molecule)+'</span><span class="sub">'+m.open+(m.overdue?' · <b style="color:var(--red)">'+m.overdue+' late</b>':"")+(m.serious?' · '+m.serious+' serious':"")+(m.nextDue?' · due '+esc(m.nextDue):"")+'</span></div>').join("")+'</div>';
     const clSec='<section style="grid-column:1/-1"><div class="body"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 10px"><h3 style="margin:0">Clients and molecules</h3>'+((r.clients||[]).length?'<select id="dbclient" aria-label="Client"><option value="">All clients</option>'+r.clients.map(c=>'<option value="'+esc(c.id)+'"'+(dbState.client===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select>':"")+(data.clientAdmin?'<button type="button" class="btn outline sm" data-go-clients="1" style="margin-left:auto">Manage in Clients</button>':"")+'</div>'+((r.clientCards||[]).length?'<div class="ccgrid">'+r.clientCards.map(card).join("")+'</div>':'<div class="empty">Nothing open.</div>')+'</div></section>';
     const ppl=mgr?'<section><div class="body"><h3 style="margin:0 0 6px">People</h3>'+table(["Person","Open","Overdue","High","Done 7d","Capacity"],r.people.map(p=>['<b>'+esc(p.name)+'</b>',String(p.open),p.overdue?'<b style="color:var(--red)">'+p.overdue+'</b>':"0",String(p.high),String(p.completed7d),p.capacity?String(p.capacity):"-"]),"No one has work here.")+'</div></section>':"";
     const nx='<h3 class="cg-title">Next up</h3>'+(r.next.length?'<div class="plist">'+r.next.map(i=>planItem(i,mgr,[])).join("")+'</div>':'<div class="empty">Nothing waiting.</div>');
@@ -9158,11 +9175,13 @@ function clientPullHtml(title,sub){
 function cpMolsFill(){const box=$("cpmols");if(!box)return;const c=$("cpclient").value;cpState.client=c;box.innerHTML=clientMols(c).map(w=>{const k=encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||"");return '<label class="pfchip"><input type="checkbox" data-cpmol="'+esc(k)+'" checked><span>'+esc(w.molecule)+'</span></label>';}).join("");}
 async function runClientPull(btn){
   const f=$("cpform");if(!f.reportValidity())return;const sel=[...f.querySelectorAll("[data-cpmol]")].filter(x=>x.checked).map(x=>x.dataset.cpmol);if(!sel.length)return message("Tick at least one molecule.",true);
-  btn.disabled=true;$("cpout").innerHTML='<div class="sub" style="margin-top:10px">Pulling '+sel.length+' molecule'+(sel.length===1?"":"s")+'. This can take a minute…</div>';
-  try{const e=f.elements,r=await api("pull-client",{client:e.client.value,molecules:sel,from:e.from.value,to:e.to.value,dateField:e.dateField.value,humans:e.humans.checked,caseReports:e.caseReports.checked,english:e.english.checked,noReviews:e.noReviews.checked});
-    $("cpout").innerHTML='<div class="purgesum" style="margin-top:12px"><b>'+esc(r.client)+': '+r.total+' article'+(r.total===1?"":"s")+' found, '+r.added+' new</b><span class="sub">'+esc(r.from)+' to '+esc(r.to)+'</span></div>'+table(["Molecule","Found","New","Result"],r.results.map(x=>['<b>'+esc(x.molecule)+'</b><div class="sub">'+esc(x.portfolio)+'</div>',x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):covBadge(x.coverage)]),"");
-    await refresh();}catch(err){$("cpout").innerHTML='<div class="sub" style="color:var(--red);margin-top:10px">'+esc(err.message)+'</div>';}
-  btn.disabled=false;
+  btn.disabled=true;const e=f.elements,common={client:e.client.value,from:e.from.value,to:e.to.value,dateField:e.dateField.value,humans:e.humans.checked,caseReports:e.caseReports.checked,english:e.english.checked,noReviews:e.noReviews.checked};
+  const rows=new Array(sel.length).fill(null),name=k=>decodeURIComponent(k.split("|")[1]||""),started=Date.now();let done=0,found=0,added=0,incomplete=0,failed=0;
+  const draw=()=>{$("cpout").innerHTML='<div class="purgesum" style="margin-top:12px"><b>'+done+' of '+sel.length+' molecules done · '+found+' article'+(found===1?"":"s")+' found, '+added+' new</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(incomplete?' · '+incomplete+' not yet complete, retried automatically':"")+(failed?' · '+failed+' failed':"")+'</span></div>'+table(["Molecule","Found","New","Checked against PubMed"],sel.map((k,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||name(k))+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+'</div>':""),x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("Complete: "+x.retrieved+" of "+x.expected,"green"):badge("Incomplete: "+x.retrieved+" of "+x.expected+", will retry","amber"))]:['<b>'+esc(name(k))+'</b>','','','<span class="sub">Pulling…</span>'];}),"");};
+  draw();let next=0;
+  const lane=async()=>{while(next<sel.length){const i=next++;try{const r=await api("pull-client",{...common,molecules:[sel[i]]}),x=r.results[0];rows[i]=x;found+=x.count||0;added+=x.added||0;if(x.error)failed++;else if(!x.complete)incomplete++;}catch(err){rows[i]={molecule:name(sel[i]),error:err.message};failed++;}done++;draw();}};
+  await Promise.all(Array.from({length:Math.min(3,sel.length)},lane));
+  try{await refresh();}catch(_){}btn.disabled=false;
 }
 function minePullHtml(){
   const today=new Date().toISOString().slice(0,10), start=new Date(Date.now()-30*864e5).toISOString().slice(0,10), mine=(data.config&&data.config.myPortfolios)||[];

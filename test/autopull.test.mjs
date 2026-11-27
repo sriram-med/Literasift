@@ -90,3 +90,20 @@ test("pulling dates: a client and a molecule can each have a start and stop date
   assert.equal((await t.call(MANAGER, "/api/watch-auto", { watch: key(W1), startFrom: "x" })).status, 400);
   await t.call(MANAGER, "/api/watch-auto", { watch: key(W1), startFrom: "" }); assert.equal((await status(t)).perWatch.find(w => w.molecule === "aciclovir").effective.from, dAgo(10));
 });
+
+test("fast pulls lose nothing: windows run side by side, split under a cap, and retry a failure, yet every article is retrieved once and counted against PubMed", async () => {
+  const t = await makeEnv({ watches: [W1, W2], NCBI_GAP_MS: 0, RETRY_BASE_MS: 1 });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; s.watches.forEach(w => { w.client = "k1"; }); await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const recs = Array.from({ length: 80 }, (_, i) => ({ pmid: String(1000 + i), date: dAgo(1 + Math.floor(i * 1.7)) })), from = dAgo(140), to = dAgo(0);
+  const ncbi = fakeNcbi(recs, { cap: 6, failWindows: { [from]: 2 } });
+  const t0 = Date.now();
+  const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from, to, dateField: "pdat" })); assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.ok(r.body.results.every(x => x.complete && x.retrieved === x.expected), JSON.stringify(r.body.results)); assert.equal(r.body.complete, true);
+  const st = await t.state(), want = new Set(recs.map(x => x.pmid));
+  assert.deepEqual(new Set(Object.keys(st.articles)), want, "every article PubMed reported is stored");
+  for (const w of ["aciclovir", "aripiprazole"]) { const own = st.assignments.filter(a => (a.molecules || []).includes(w) || a.portfolio); }
+  const per = {}; for (const a of st.assignments) per[a.portfolio + "|" + a.pmid] = (per[a.portfolio + "|" + a.pmid] || 0) + 1;
+  assert.ok(Object.values(per).every(n => n === 1), "never two assignments for the same article in a portfolio");
+  assert.ok(st.runs.every(run => run.windows.every(w => ["reconciled", "zero_results"].includes(w.state))), "every window, including the split halves, is reconciled");
+  assert.ok(Date.now() - t0 < 20000, "no waiting when the gap is zero");
+});
