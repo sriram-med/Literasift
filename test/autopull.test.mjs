@@ -420,3 +420,24 @@ test("PubMed alerts view: per product, the articles added to PubMed in the dates
   assert.deepEqual(row.articles.map(a => [a.pmid, a.stored, a.title]), [["11", true, "Carmustine wafer case"], ["12", false, "Carmustine toxicity"]]);
   assert.equal((await t.call(M, "/api/alerts-preview", { client: "n", from: ago(0), to: ago(7) })).status, 400);
 });
+
+test("a publication-date pull also pulls the articles added to PubMed in the same dates that its search missed (like PubMed alerts)", async () => {
+  const { makeEnv: mk, MANAGER: M, withFetch: wf, pubmedXml } = await import("./helpers.mjs");
+  const ago = n => new Date(Date.now() + 5.5 * 3600000 - n * 864e5).toISOString().slice(0, 10);
+  const t = await mk({ clients: [{ id: "n", name: "Navinta" }], schema: { grouping: "client" }, watches: [{ portfolio: "Navinta", molecule: "benztropine", query: "((benztropine))", names: [], client: "n" }] });
+  // PMID 51 was published in the week; PMID 52 was added to PubMed in the week but carries a later publication date
+  const recs = { dp: [{ pmid: "51" }], crdt: [{ pmid: "51" }, { pmid: "52" }] };
+  const handler = async u => { const url = new URL(String(u)), op = url.pathname.split("/").pop(), term = url.searchParams.get("term") || "";
+    if (op === "esearch.fcgi") { const ids = term.includes("[crdt]") ? recs.crdt : term.includes("[dp]") ? recs.dp : []; return new Response(JSON.stringify({ esearchresult: { count: String(ids.length), idlist: url.searchParams.get("retmax") === "0" ? [] : ids.map(r => r.pmid) } })); }
+    const ids = (url.searchParams.get("id") || "").split(",").filter(Boolean);
+    if (op === "esummary.fcgi") { const result = { uids: ids }; for (const id of ids) result[id] = { title: "Case " + id, fulljournalname: "J Test", pubdate: ago(1), articleids: [] }; return new Response(JSON.stringify({ result })); }
+    return new Response('<?xml version="1.0"?><PubmedArticleSet>' + ids.map(id => pubmedXml(id)).join("") + "</PubmedArticleSet>"); };
+  const r = await wf(handler, () => t.call(M, "/api/pull-client", { client: "n", from: ago(7), to: ago(0), dateField: "pdat" }));
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const x = r.body.results[0];
+  assert.equal(x.dateBasis, "pdat"); assert.deepEqual([x.alertExtra.found, x.alertExtra.added], [1, 1]);
+  const st = await t.state(); assert.ok(st.articles["52"] && st.assignments.some(a => a.pmid === "52" && a.molecules.includes("benztropine")), "the alert-only article is pulled and linked");
+  // switched off on request
+  const off = await wf(handler, () => t.call(M, "/api/pull-client", { client: "n", from: ago(7), to: ago(0), dateField: "pdat", alertCheck: false }));
+  assert.equal(off.body.results[0].alertExtra, null);
+});
