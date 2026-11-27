@@ -240,11 +240,11 @@ async function deliverAlerts(env) {
     }
   }
   let accepted=0,failed=0;
-  for(const job of pending.slice(0,8)){
+  for(const job of pending.slice(0,3)){
     let ok=false;
     try {
       // No case narratives, titles, client names or patient details leave the application.
-      const response=await fetch(endpoint,{method:"POST",redirect:"error",headers:{"Authorization":"Bearer "+env.ALERT_GATEWAY_TOKEN,"Content-Type":"application/json","Idempotency-Key":job.id},body:JSON.stringify({...job,title:"LiteraSift",body:job.priority?"A safety citation requires priority review.":"New literature is ready for review.",url:"https://literasift.tech/"}),signal:AbortSignal.timeout(5000)});
+      const response=await fetch(endpoint,{method:"POST",redirect:"error",headers:{"Authorization":"Bearer "+env.ALERT_GATEWAY_TOKEN,"Content-Type":"application/json","Idempotency-Key":job.id},body:JSON.stringify({...job,title:"LiteraSift",body:job.priority?"A safety citation requires priority review.":"New literature is ready for review.",url:"https://literasift.tech/"}),signal:AbortSignal.timeout(12000)});
       ok=response.ok;
     } catch {}
     await write(env,data=>{
