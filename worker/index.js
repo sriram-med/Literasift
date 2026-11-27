@@ -4270,7 +4270,7 @@ const SYNC_ENGINE = 1;
 const syncMode = state => state.settings?.syncMode || "shadow";
 // Active rollout is scoped to the pilot portfolios when any are listed; every other portfolio stays in Shadow. An empty list keeps the old behaviour (the global mode applies everywhere).
 const syncModeFor = (state, portfolio) => { const mode = syncMode(state), pilot = state.settings?.syncActivePortfolios || []; return mode === "active" && pilot.length && !pilot.includes(portfolio) ? "shadow" : mode; };
-const syncEligible = (state, a) => state.settings?.autoIcsr !== false && a.disposition?.value === "potential_icsr" && a.qc?.status !== "pending" && a.qc?.status !== "returned";
+const syncEligible = (state, a) => state.settings?.autoIcsr !== false && a.synchronyOff !== true && a.disposition?.value === "potential_icsr" && a.qc?.status !== "pending" && a.qc?.status !== "returned";
 const syncFingerprint = (state, a, article) => JSON.stringify([
   SYNC_ENGINE, AI_PROMPT_VERSION, syncModeFor(state, a.portfolio), citationEvidence(article), evidenceRef(article).fulltext,
   article.fullTextTextKey || "", a.molecules || [], a.patientPassages || null, a.patientDecisions || null,
@@ -5158,6 +5158,37 @@ async function apiCore(request, env, path) {
     if (!out) return json({ error:"Item not found." }, 404);
     await audit(env, { by:email, action:"timeline.set", entityType:body.kind === "case" ? "Case" : "Assignment", entityId:String(body.id), detail:{ workflow:wf, due, reason:note } });
     return json({ ok:true });
+  }
+  if (["/api/cases-purge", "/api/cases-purge-preview"].includes(path) && viewer) {
+    // Permanent deletion of cases at any stage, to free space. A manager only. What is stored for a case (version snapshots, release packages, optionally the article's files) is removed;
+    // a tombstone keeps the number, who signed it and its hash, and the audit log records who deleted it and why.
+    if (viewer.role !== "manager") return json({ error:"Manager access required." }, 403);
+    const ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(String)), doomed = (state.cases || []).filter(c => ids.has(c.id)); if (!doomed.length) return json({ error:"Choose at least one case." }, 400);
+    const signedOf = c => (c.signatures || []).filter(x => !x.superseded), protectedOf = c => signedOf(c).length > 0 || Boolean(c.approval || c.data?.approval) || (c.versions || []).some(x => x.action === "exported" || x.action === "approved");
+    const keysOf = c => { const k = new Set((c.versions || []).map(x => x.key).filter(Boolean)); for (const sg of c.signatures || []) if (c.approval?.hash) k.add("synchrony-packs/" + c.id + "/" + c.approval.hash + "-" + sg.id + ".zip"); return [...k]; };
+    const sizeOf = async key => { try { const o = await env.BUCKET.get(key); return o ? Number(o.size) || 0 : 0; } catch { return 0; } };
+    const remainingPmids = new Set((state.cases || []).filter(c => !ids.has(c.id)).map(c => c.pmid)), articleKeys = id => { const a = state.articles[id] || {}, names = ["pubmed.png", "fulltext.txt", "fulltext.json", "parsed.json", "pmc.pdf", "pmc.xml", "europepmc.xml", "unpaywall.pdf", "wiley.pdf", "elsevier.xml", "core.pdf", "core.txt", "rxiv.xml", "preprint.xml", "uploaded.pdf", "uploaded.xml", "uploaded.txt", "report.xml"], k = new Set([a.fullTextKey, a.fullTextTextKey, a.screenshotKey, a.evidence?.parsed?.key].filter(Boolean)); for (const n of names) k.add("evidence/" + id + "/" + n); return [...k]; };
+    const articleIds = body.freeArticleFiles === true ? [...new Set(doomed.map(c => c.pmid))].filter(id => state.articles[id] && !remainingPmids.has(id)) : [];
+    const rows = []; let bytes = 0;
+    for (const c of doomed) { const ks = keysOf(c); let b = 0; for (const key of ks) b += await sizeOf(key); bytes += b; rows.push({ id:c.id, number:c.number, stage:stageOf(c), status:c.status, archived:Boolean(c.archived), protected:protectedOf(c), signedBy:signedOf(c).map(x => x.signer_id).filter(Boolean), objects:ks.length, bytes:b }); }
+    let articleBytes = 0; for (const id of articleIds) for (const key of articleKeys(id)) articleBytes += await sizeOf(key);
+    if (path === "/api/cases-purge-preview") return json({ cases:rows, bytes, articleBytes, articles:articleIds.length, protectedCount:rows.filter(r => r.protected).length });
+    const reason = String(body.reason || "").trim(), anyProtected = rows.some(r => r.protected);
+    if (reason.length < (anyProtected ? 10 : 5)) return json({ error:"Give a reason of at least " + (anyProtected ? 10 : 5) + " characters. It is recorded in the audit trail." }, 400);
+    const typed = String(body.confirm || "").trim(); if (doomed.length === 1 ? typed !== doomed[0].number : typed !== "DELETE " + doomed.length) return json({ error:doomed.length === 1 ? "Type the case number to confirm." : "Type DELETE " + doomed.length + " to confirm." }, 400);
+    if (anyProtected && body.acknowledgeSigned !== true) return json({ error:rows.filter(r => r.protected).map(r => r.number).join(", ") + (rows.filter(r => r.protected).length === 1 ? " was" : " were") + " approved, signed or exported. Confirm that you understand this removes a regulatory record.", needsAck:true }, 409);
+    const at = new Date().toISOString(), tombs = doomed.map(c => ({ id:c.id, number:c.number, pmid:c.pmid, portfolio:c.portfolio || "", molecule:c.molecule || "", stage:stageOf(c), status:c.status, hash:(c.versions || []).at(-1)?.hash || "", approvalHash:c.approval?.hash || "", signed:signedOf(c).map(x => ({ signer:x.signer_id || "", at:x.signed_at || "", meaning:x.meaning || "", contentSha256:x.content_sha256 || "" })), createdAt:c.createdAt, deletedAt:at, deletedBy:email, reason:reason.slice(0, 300), freedBytes:rows.find(r => r.id === c.id)?.bytes || 0, purged:true }));
+    await write(env, d => {
+      const gone = new Set(doomed.map(c => c.id)), asg = new Set(doomed.map(c => c.provenance?.assignmentId).filter(Boolean));
+      d.cases = d.cases.filter(c => !gone.has(c.id)); (d.deletedCases ||= []).push(...tombs);
+      for (const c of d.cases) if ((c.links || []).some(l => gone.has(l.otherId))) c.links = c.links.map(l => gone.has(l.otherId) ? { ...l, otherDeleted:true } : l);
+      for (const a of d.assignments) if (asg.has(a.id) || (doomed.some(c => c.pmid === a.pmid && c.portfolio === a.portfolio) && body.allowRepreparation !== true)) { if (body.allowRepreparation === true) delete a.synchronyOff; else a.synchronyOff = true; }
+      for (const id of articleIds) { const a = d.articles[id]; if (a) { delete a.fullTextKey; delete a.fullTextTextKey; delete a.screenshotKey; a.fullTextStatus = "Removed to free space"; if (a.evidence) a.evidence = {}; } }
+    });
+    let removed = 0, freed = bytes + articleBytes;
+    if (typeof env.BUCKET.delete === "function") { for (const key of [...doomed.flatMap(keysOf), ...articleIds.flatMap(articleKeys)]) { try { await env.BUCKET.delete(key); removed++; } catch { /* an object that is already gone is fine */ } } }
+    await audit(env, { by:email, action:"case.purged", target:doomed.length + " case" + (doomed.length === 1 ? "" : "s"), detail:{ cases:doomed.map(c => c.number + " (" + stageOf(c) + (protectedOf(c) ? ", signed or approved" : "") + ")").slice(0, 50).join(", "), reason:reason.slice(0, 300), freedBytes:freed, objectsRemoved:removed, articleFiles:articleIds.length } });
+    return json({ ok:true, deleted:doomed.length, freedBytes:freed, objectsRemoved:removed, articlesCleared:articleIds.length });
   }
   if (path === "/api/sources-add" && viewer) {
     // Results found in other sources become articles in the queue: one article per record, one assignment per portfolio, nothing duplicated. A person adds to their own queue in their own portfolios; a manager's go through normal routing.
@@ -6929,6 +6960,7 @@ details.tools{margin:0 0 14px}details.tools>summary{cursor:pointer;color:var(--b
 .modecards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.modecard{display:grid;gap:3px;text-align:left;border:1px solid var(--border);border-radius:12px;background:var(--card);padding:10px 12px;cursor:pointer;font:inherit;color:inherit}.modecard.on{border-color:var(--brand);box-shadow:0 0 0 2px #0e6a5d33;background:var(--accent)}@media(max-width:560px){.modecards{grid-template-columns:1fr}}
 .ai-card{display:grid;gap:12px}.aisteps{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}.aistep{display:flex;gap:8px;align-items:center;border:1px solid var(--border);border-radius:12px;padding:8px 10px;background:var(--card)}.aistep i{font-style:normal;width:22px;height:22px;border-radius:50%;display:grid;place-items:center;background:var(--border);font-size:12px;flex:none}.aistep.ok i{background:var(--green);color:#fff}.aistep span{display:grid}.aistep b{font-size:12.5px}
 .ai-ok{background:#d8f1ec;color:#0b5b50;border-radius:10px;padding:8px 12px;font-size:13px}.ai-missing{background:#fbecd0;color:#8a5200;border-radius:10px;padding:8px 12px;font-size:13px}.ai-form{display:grid;gap:10px}.keyrow{display:flex;gap:8px}.keyrow input{flex:1;min-width:0}.ai-btns{display:flex;gap:8px;flex-wrap:wrap}.usage{display:grid;gap:4px}details.more>summary{cursor:pointer;color:var(--brand);font-size:13px}
+.purgesum{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin:12px 0;padding:10px 14px;background:var(--accent);border-radius:12px}.purgewarn{background:#fbe3e3;color:#7a1d1d;border-radius:12px;padding:12px 14px;font-size:13px}
 .pbadge{display:inline-block;min-width:62px;text-align:center;padding:3px 10px;border-radius:999px;font-size:11.5px;font-weight:600;border:1px solid var(--border);flex:none;align-self:flex-start}.p-high.pbadge{background:var(--red);border-color:var(--red);color:#fff}.p-medium.pbadge{background:#fbecd0;border-color:#f3d79a;color:#9a5b05}.p-low.pbadge{background:var(--accent);color:var(--muted)}
 .plist{display:grid;gap:10px;margin-bottom:12px}.plitem{display:flex;gap:14px;align-items:flex-start;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:14px;padding:14px 16px}.plitem.late{border-left-color:var(--red)}.pl-main{flex:1;min-width:0}.pl-main b{display:block;font-size:14.5px;line-height:1.35}.pl-side{text-align:right;display:grid;gap:8px;justify-items:end}.pl-btns{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .wf{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600}.wf-teal{background:#d8f1ec;color:#0b5b50}.wf-blue{background:#dbe8fb;color:#1d4f9a}.wf-violet{background:#e9e0fa;color:#58349a}
@@ -7878,13 +7910,26 @@ function archivePicker(count){
   });
 }
 async function afterCaseChange(m){await refresh();if(tab==="Search"&&srch.res)await runSearchUi(true);else render();message(m);}
-async function deleteCases(list){
-  const cs=list.map(i=>(data.cases||[]).find(c=>c.id===i)).filter(Boolean);if(!cs.length)return;
-  const why=prompt("Why are you permanently deleting "+cs.length+" case"+(cs.length===1?"":"s")+"? (recorded in the audit trail)","");if(!why)return;
-  const typed=prompt(cs.length===1?"Type the case number "+cs[0].number+" to confirm:":"Type DELETE "+cs.length+" to confirm:","");if(!typed)return;
-  const r=await api("cases-delete",{ids:list,reason:why,confirm:typed});
-  if(confirm(r.deleted+" deleted. Also delete the pulled citation"+(r.pmids.length===1?"":"s")+" (PMID "+r.pmids.join(", ")+") from the library?")){try{await api("library-delete",{pmids:r.pmids,reason:why});}catch(e){message(e.message,true);}}
-  await afterCaseChange("Deleted.");
+const fmtBytes=n=>n>=1048576?(n/1048576).toFixed(1)+" MB":n>=1024?Math.round(n/1024)+" KB":n+" bytes";
+async function deleteCases(list,afterClose){
+  const old=$("purgedlg");if(old)old.remove();
+  document.body.insertAdjacentHTML("beforeend",'<dialog id="purgedlg" style="width:min(720px,96vw)"><h3 style="margin:0 0 4px">Delete permanently</h3><p class="sub" style="margin:0 0 12px">Removes the case at any stage, and what is stored for it, to free space. A record that it existed stays in the audit log and under Deleted cases.</p><div id="purgebody"><div class="skel"></div></div><p id="purgeerr" class="msg" style="color:var(--red)" role="alert"></p></dialog>');
+  const d=$("purgedlg");d.showModal();
+  let pre=null;
+  const load=async()=>{
+    const free=($("purgefree")||{}).checked===true;pre=await api("cases-purge-preview",{ids:list,freeArticleFiles:free});
+    const single=pre.cases.length===1,rows=pre.cases.map(c=>'<tr><td><b>'+esc(c.number)+'</b></td><td>'+esc((data.stages||{})[c.stage]||c.stage)+(c.archived?' · archived':"")+'</td><td>'+(c.protected?'<span class="badge red" title="'+esc((c.signedBy||[]).join(", "))+'">Signed or approved</span>':'<span class="badge">'+esc(c.status)+'</span>')+'</td><td>'+esc(fmtBytes(c.bytes))+'</td></tr>').join("");
+    $("purgebody").innerHTML='<div class="tablewrap"><table><thead><tr><th>Case</th><th>Stage</th><th>State</th><th>Stored</th></tr></thead><tbody>'+rows+'</tbody></table></div><div class="purgesum"><b>Frees about '+esc(fmtBytes(pre.bytes+(free?pre.articleBytes:0)))+'</b><span class="sub">'+pre.cases.reduce((n,c)=>n+c.objects,0)+' stored version and package file'+(pre.cases.reduce((n,c)=>n+c.objects,0)===1?"":"s")+(free&&pre.articles?' and the files of '+pre.articles+' article'+(pre.articles===1?"":"s"):"")+'</span></div>'+
+      '<form id="purgeform" data-own="1" class="impgrid"><label class="check wide"><input type="checkbox" id="purgefree"'+(free?" checked":"")+'>&nbsp;Also remove the article files (full text, screenshot) when no other case needs them. The citation stays and the full text can be fetched again.</label><label class="check wide"><input type="checkbox" name="repre">&nbsp;Let Synchrony prepare this article again (otherwise it will not be recreated)</label>'+
+      (pre.protectedCount?'<div class="wide purgewarn"><b>'+pre.protectedCount+' signed or approved record'+(pre.protectedCount===1?"":"s")+'.</b> Deleting removes a regulatory record. Only the case number, who signed it, when, and its hash stay in the tombstone and the audit log. Export what you need first.<label class="check" style="margin-top:8px"><input type="checkbox" name="ack">&nbsp;I understand this removes a signed record</label></div>':"")+
+      '<label class="wide">Reason (recorded in the audit log)<textarea name="reason" rows="2" required placeholder="Why is this being deleted?"></textarea></label><label class="wide"><span>'+(single?'Type the case number <b>'+esc(pre.cases[0].number)+'</b> to confirm':'Type <b>DELETE '+pre.cases.length+'</b> to confirm')+'</span><input name="confirm" autocomplete="off" required></label><div class="wide" style="display:flex;gap:8px;justify-content:flex-end"><button type="button" class="btn outline" id="purgeno">Cancel</button><button class="btn" id="purgego" style="background:var(--red);border-color:var(--red)">Delete permanently</button></div></form>';
+    $("purgeno").onclick=()=>{d.close();d.remove();};$("purgefree").onchange=()=>{load();};
+    $("purgeform").onsubmit=async e=>{e.preventDefault();const f=e.target;$("purgego").disabled=true;$("purgeerr").textContent="";
+      try{const r=await api("cases-purge",{ids:list,reason:f.elements.reason.value,confirm:f.elements.confirm.value,acknowledgeSigned:Boolean(f.elements.ack&&f.elements.ack.checked),freeArticleFiles:$("purgefree").checked,allowRepreparation:f.elements.repre.checked});
+        d.close();d.remove();if(afterClose)afterClose();await refresh();render();message(r.deleted+" deleted, "+fmtBytes(r.freedBytes)+" freed.");}
+      catch(err){$("purgeerr").textContent=err.message;$("purgego").disabled=false;}};
+  };
+  try{await load();}catch(err){$("purgebody").innerHTML="";$("purgeerr").textContent=err.message;}
 }
 async function rowSelect(el){
   const [kind,id]=el.dataset.rowsel.split("|"),v=el.value;
@@ -7929,7 +7974,7 @@ function archiveHtml(){
   const tools='<div class="card" style="padding:10px;margin-bottom:10px;display:flex;gap:12px;flex-wrap:wrap;align-items:center">'+groupSelect(arcGroup,["category","portfolio","folder","seriousness","listedness","owner","none"],"arc_group")+'<label style="display:inline-flex;gap:6px;align-items:center">Category <select id="arc_filter"><option value="">All categories</option>'+cats.map(c=>'<option'+(c===arcFilter?" selected":"")+'>'+esc(c)+'</option>').join("")+'</select></label></div>';
   return panel("Archived cases",'<div class="sub" style="margin-bottom:8px">Archived cases are out of working lists and case series counts and cannot be edited. They stay searchable and can be restored by a manager or medical reviewer. A manager may delete a case permanently; approved or exported cases must be archived first.</div>'+tools+(arc.length?bulkBar("arc_c",{archive:true}):""))+
     (arc.length?groupedTables(arc,arcGroup,head,rowOf,"No archived cases."):'<div class="empty">Nothing archived'+(arcFilter?" in this category":" yet")+'.</div>')+
-    (data.viewer.role==="manager"?panel("Deleted cases (record kept)",table(["Case","PMID","Deleted","By","Reason"],(data.deletedCases||[]).slice().reverse().map(d=>[esc(d.number),esc(d.pmid),esc(String(d.deletedAt).slice(0,10)),esc(d.deletedBy),esc(d.reason)]),"No cases have been deleted."),"Deleting a case leaves this record and an audit trail entry.",true):"");
+    (data.viewer.role==="manager"?panel("Deleted cases (record kept)",table(["Case","Stage","PMID","Deleted","By","Reason","Freed"],(data.deletedCases||[]).slice().reverse().map(d=>[esc(d.number)+((d.signed||[]).length?' <span class="badge red" title="Signed by '+esc(d.signed.map(x=>x.signer).join(", "))+'">signed</span>':""),esc((data.stages||{})[d.stage]||d.stage||""),esc(d.pmid),esc(String(d.deletedAt).slice(0,10)),esc(d.deletedBy),esc(d.reason),d.freedBytes?esc(fmtBytes(d.freedBytes)):""]),"No cases have been deleted."),"Total freed: "+fmtBytes((data.deletedCases||[]).reduce((n,d)=>n+(d.freedBytes||0),0))+". Deleting a case leaves this record, who signed it and its hash, and an audit trail entry.",true):"");
 }
 async function p5action(target){
   const [act,a1]=target.dataset.p5.split("|"),ids=cls=>[...document.querySelectorAll("."+cls+":checked")].map(x=>x.value),again=async m=>{await refresh();if(tab==="Search"&&srch.res)await runSearchUi(true);else render();message(m);};
@@ -9368,7 +9413,7 @@ document.addEventListener("click",event=>{
     (async()=>{
       try{
         if(["json","package","e2b","cioms","fhir","csv"].includes(act)){await downloadCase(act);}
-        else if(act==="delete"){if(!confirm("Delete "+curCase.number+"? This cannot be undone (the audit trail keeps a record)."))return;await api("case-delete",{id:curCase.id});$("casedlg").close();await refresh();message("Case deleted.");}
+        else if(act==="delete"){deleteCases([curCase.id],()=>{$("casedlg").close();});}
         else{
           collectCase();
           if(act==="assess"){const r=await api("case-assess",{id:curCase.id,data:curCase.data});curAssess=r.assessment;$("caseassess").innerHTML=assessmentHtml(curAssess);}

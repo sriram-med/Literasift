@@ -179,3 +179,28 @@ test("pasting an OpenAI key is enough: the first key switches AI on with a month
   const conn = await t.call(MANAGER, "/api/settings", { openaiKey: key, aiEnabled: "on", aiMonthlyTokens: 250000, aiPaused: "off" }); assert.equal(conn.status, 200); const b = await cfg(); assert.equal(b.available, true); assert.equal(b.monthlyTokens, 250000);
   const smoke = await t.call(MANAGER, "/api/ai-smoke", {}); assert.equal(smoke.body.configured, true); assert.equal(smoke.body.enabled, true);
 });
+
+test("cases at any stage can be permanently deleted to free space: stored versions and packages go, signed records need a second confirmation, a tombstone and audit entry remain, and Synchrony does not recreate them", async () => {
+  const f = x => ({ value: x, state: "edited", evidence: [] });
+  const mk = (id, stage, extra = {}) => ({ id, number: "LS-" + id, pmid: "1", portfolio: "Antivirals", molecule: "aciclovir", status: "Draft", stage, assignee: SCREENER, createdAt: dAgo(3) + "T09:00:00Z", updatedAt: dAgo(3), history: [], versions: [{ n: 1, action: "edited", hash: "h" + id, key: "cases/" + id + "/snap1.json" }, { n: 2, action: "edited", hash: "g" + id, key: "cases/" + id + "/snap2.json" }], provenance: { assignmentId: "a1" }, data: worker.normalizeCase({ products: [{ role: "suspect", name: f("aciclovir") }], events: [{ verbatim: f("rash") }] }), ...extra });
+  const signed = mk("s1", "medical_review", { locked: true, approval: { hash: "apphash", status: "approved" }, signatures: [{ id: "sig1", meaning: "case_approve", superseded: null, signer_id: MEDICAL, signed_at: dAgo(1) + "T10:00:00Z", content_sha256: "abc" }] });
+  const t = await makeEnv({ profiles: PROFILES, memberships: MEMBERS, watches: [{ portfolio: "Antivirals", molecule: "aciclovir", query: "q" }], articles: { 1: { id: "1", title: "Aciclovir rash", abstract: "x", authors: ["A"], fullTextKey: "evidence/1/report.xml" } },
+    assignments: [{ id: "a1", pmid: "1", portfolio: "Antivirals", molecules: ["aciclovir"], reviewer: SCREENER, status: "Complete", disposition: { value: "potential_icsr" }, ird: dAgo(4) }], cases: [mk("c1", "screening"), mk("c2", "qc"), signed] });
+  for (const k of ["cases/c1/snap1.json", "cases/c1/snap2.json", "cases/c2/snap1.json", "cases/s1/snap1.json", "synchrony-packs/s1/apphash-sig1.zip", "evidence/1/report.xml"]) await t.BUCKET.put(k, "x".repeat(1000));
+  assert.equal((await t.call(SCREENER, "/api/cases-purge", { ids: ["c1"], reason: "test reason", confirm: "LS-c1" })).status, 403, "managers only");
+  const pre = (await t.call(MANAGER, "/api/cases-purge-preview", { ids: ["c1", "s1"], freeArticleFiles: false })).body; assert.equal(pre.cases.length, 2); assert.equal(pre.cases.find(c => c.id === "c1").bytes, 2000); assert.equal(pre.cases.find(c => c.id === "s1").bytes, 2000); assert.equal(pre.protectedCount, 1);
+  assert.equal((await t.call(MANAGER, "/api/cases-purge", { ids: ["c1"], reason: "no", confirm: "LS-c1" })).status, 400, "a reason is needed");
+  assert.equal((await t.call(MANAGER, "/api/cases-purge", { ids: ["c1"], reason: "duplicate draft", confirm: "wrong" })).status, 400, "the number must be typed");
+  const one = await t.call(MANAGER, "/api/cases-purge", { ids: ["c1"], reason: "duplicate draft", confirm: "LS-c1" }); assert.equal(one.status, 200, JSON.stringify(one.body)); assert.equal(one.body.freedBytes, 2000);
+  assert.equal(await t.BUCKET.get("cases/c1/snap1.json"), null, "the stored versions are gone"); assert.ok(await t.BUCKET.get("cases/c2/snap1.json"), "other cases are untouched");
+  let s = await t.state(); assert.ok(!s.cases.some(c => c.id === "c1")); const tomb = s.deletedCases.find(x => x.number === "LS-c1"); assert.equal(tomb.stage, "screening"); assert.equal(tomb.freedBytes, 2000); assert.equal(tomb.reason, "duplicate draft");
+  assert.equal(s.assignments[0].synchronyOff, true, "Synchrony will not recreate it");
+  const run = await t.call(MANAGER, "/api/synchrony", { action: "run" }); assert.equal(run.status, 200); assert.ok(!(await t.state()).cases.some(c => c.number === "LS-c1"), "preparation does not bring it back");
+  // a signed case needs the second confirmation, a longer reason, and keeps who signed it
+  const noAck = await t.call(MANAGER, "/api/cases-purge", { ids: ["s1"], reason: "obsolete test record", confirm: "LS-s1" }); assert.equal(noAck.status, 409); assert.equal(noAck.body.needsAck, true);
+  assert.equal((await t.call(MANAGER, "/api/cases-purge", { ids: ["s1"], reason: "short", confirm: "LS-s1", acknowledgeSigned: true })).status, 400, "10 characters for a signed record");
+  const sg = await t.call(MANAGER, "/api/cases-purge", { ids: ["s1", "c2"], reason: "retention period ended", confirm: "DELETE 2", acknowledgeSigned: true, freeArticleFiles: true }); assert.equal(sg.status, 200, JSON.stringify(sg.body)); assert.equal(sg.body.deleted, 2); assert.equal(sg.body.articlesCleared, 1);
+  assert.equal(await t.BUCKET.get("synchrony-packs/s1/apphash-sig1.zip"), null); assert.equal(await t.BUCKET.get("evidence/1/report.xml"), null, "the article's files went too"); s = await t.state(); assert.equal(s.cases.length, 0);
+  const st = s.deletedCases.find(x => x.number === "LS-s1"); assert.equal(st.signed[0].signer, MEDICAL); assert.equal(st.signed[0].contentSha256, "abc"); assert.equal(st.approvalHash, "apphash"); assert.equal(s.articles[1].fullTextStatus, "Removed to free space");
+  const audit = (await t.call(MANAGER, "/api/audit", {})).body; assert.ok(JSON.stringify(audit).includes("case.purged"), "the audit log records it");
+});
