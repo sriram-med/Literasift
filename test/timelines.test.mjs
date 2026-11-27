@@ -57,3 +57,11 @@ test("a manager moves one item's date; the change is recorded and the item sorts
   const d = (await t.call(SCREENER, "/api/dashboard", { workflow: "screening" })).body; assert.equal(d.kpi.open, 1); assert.equal(d.kpi.overdue, 0); assert.ok(d.days.length >= 5); assert.ok(d.byClient["No client"] || Object.keys(d.byClient).length);
   const m = (await t.call(MANAGER, "/api/dashboard", { workflow: "screening" })).body; assert.ok(m.people.some(p => p.email === SCREENER && p.open === 1));
 });
+
+test("a QC checker and a medical reviewer get their own workflow dashboards with only their own work", async () => {
+  const t = await makeEnv({ profiles: PROFILES, memberships: MEMBERS, watches: [{ portfolio: "Antivirals", molecule: "aciclovir", query: "q" }], articles: { 1: { id: "1", title: "Aciclovir rash", abstract: "x", authors: ["A"] } },
+    assignments: [{ id: "a1", pmid: "1", portfolio: "Antivirals", molecules: ["aciclovir"], reviewer: SCREENER, status: "Awaiting QC", ird: dAgo(4), disposition: { value: "potential_icsr", at: dAgo(3) + "T09:00:00Z", by: SCREENER }, qc: { status: "pending", reviewer: QC, requestedAt: dAgo(3) + "T09:00:00Z" } }] });
+  const qc = (await t.call(QC, "/api/dashboard", { workflow: "qc" })).body; assert.equal(qc.kpi.open, 1); assert.equal(qc.kpi.overdue, 1, "QC had 2 working days, which have passed"); assert.equal(qc.label, "QC");
+  const other = (await t.call("qc2@example.org", "/api/dashboard", { workflow: "qc" })).body; assert.equal(other.kpi.open, 0, "another checker sees none of it");
+  const med = (await t.call(MEDICAL, "/api/dashboard", { workflow: "medical" })).body; assert.equal(med.kpi.open, 0); assert.equal(med.label, "Medical review");
+});

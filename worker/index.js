@@ -6724,6 +6724,7 @@ details.tools{margin:0 0 14px}details.tools>summary{cursor:pointer;color:var(--b
 .cal-d{font-weight:600;font-size:13px;display:flex;justify-content:space-between}.cal-d i{font-style:normal;font-size:10px;font-weight:500;color:var(--muted)}.cal-i{display:block;font-size:11px;padding:2px 6px;border-radius:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-left:3px solid transparent}.cal-i.p-high{border-left-color:var(--red)}.cal-i.p-medium{border-left-color:var(--amber)}.cal-more{font-size:11px;color:var(--muted)}
 .plate{margin:0 0 12px}.qstat.click{cursor:pointer}
 .dgrid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));margin-bottom:14px}.dgrid>section{margin:0}
+.deskdash{margin-bottom:14px}.dd-head{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin-bottom:10px}.dbars.slim{height:96px}
 .dbars{display:flex;gap:8px;align-items:flex-end;height:150px}.dbar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px;border:0;background:none;cursor:pointer;height:100%;font:inherit;color:inherit;padding:0}.dbar i{display:block;width:100%;max-width:34px;background:var(--brand);border-radius:6px 6px 2px 2px;min-height:3px}.dbar i.hot{background:var(--red)}.dbar b{font-size:12px}.dbar span{font-size:10.5px;color:var(--muted)}
 @media(max-width:760px){.plitem{flex-direction:column}.pl-side{justify-items:start;text-align:left}.pl-btns{justify-content:flex-start}.cal{gap:3px}.cal-c{min-height:64px;padding:4px}.cal-i,.cal-more{display:none}.cal-c:has(.cal-i)::after{content:"";width:8px;height:8px;border-radius:50%;background:var(--brand);margin:2px auto 0}}
 .acards{display:grid;gap:10px;padding:12px 14px 16px}
@@ -7064,6 +7065,16 @@ function assistTabs(ref){
   if(assistTab==="automation") renderSynchronyPanel();
 }
 let syncPanelRequest=0;
+async function loadDeskDash(){
+  const box=$("deskdash");if(!box)return;const wf=({screening:"screening",qc:"qc",medical_review:"medical"})[deskTab]||"screening";
+  try{
+    const r=await api("dashboard",{workflow:wf});if(!$("deskdash")||wf!==(({screening:"screening",qc:"qc",medical_review:"medical"})[deskTab]||"screening"))return;
+    const k=r.kpi,tile=(l,n,t)=>'<div class="qstat"><span class="sub">'+l+'</span><b'+(t&&n?' style="color:var(--'+t+')"':"")+'>'+n+'</b></div>',maxD=Math.max(1,...r.days.map(d=>d.count+d.late));
+    box.innerHTML='<section class="deskdash"><div class="body"><div class="dd-head"><h3 style="margin:0">'+esc(r.label)+' dashboard</h3><span class="sub">'+r.timeline.days+' working days from the IRD'+(wf==="screening"?" to screen and route to QC":"")+'</span><span style="margin-left:auto;display:flex;gap:8px"><button type="button" class="btn outline sm" data-plgo="planner">Planner</button><button type="button" class="btn outline sm" data-godash="'+wf+'">Full dashboard</button></span></div>'+
+      '<div class="qstrip">'+tile("Open",k.open,"")+tile("Overdue",k.overdue,"red")+tile("Due today",k.dueToday,"amber")+tile("Next 5 days",k.thisWeek,"")+tile("High priority",k.high,"red")+tile("Done in 7 days",r.completed7d,"green")+(r.onTimeRate!==null?tile("On time",r.onTimeRate+"%",r.onTimeRate>=90?"green":"amber"):"")+'</div>'+
+      '<div class="dbars slim">'+r.days.map(d=>'<button type="button" class="dbar" data-plday="'+d.date+'" title="'+esc(d.date)+'"><i style="height:'+Math.round((d.count+d.late)/maxD*100)+'%"'+(d.late?' class="hot"':"")+'></i><b>'+(d.count+d.late)+'</b><span>'+d.date.slice(5)+'</span></button>').join("")+'</div></div></section>';
+  }catch(e){box.innerHTML="";}
+}
 async function loadDeskQueues(){
   const box=$("deskq"); if(!box)return;
   try{
@@ -8415,7 +8426,7 @@ function deskHtml(){
     const todo=data.assignments.filter(a=>a.reviewer===me&&a.status!=="Complete"&&!a.disposition);
     articles='<h3 class="cg-title" style="margin-top:22px">Articles waiting for your screening <span class="sub">'+todo.length+'</span></h3>'+(todo.length?'<div class="acards flat">'+todo.slice(0,12).map(a=>{const ar=data.articles[a.pmid]||{},late=a.dueAt&&a.dueAt<todayStr();return '<article class="acard"><div class="ac-main"><div class="ac-title" style="-webkit-line-clamp:2">'+esc(ar.title||"PMID "+a.pmid)+'</div><div class="ac-meta">PMID '+esc(a.pmid)+' · '+esc((a.molecules||[]).join(", "))+'</div></div><div class="ac-side"><div class="sub"'+(late?' style="color:var(--red);font-weight:600"':"")+'>'+(a.dueAt?(late?"Overdue · ":"Due ")+esc(a.dueAt):"no date")+'</div><button type="button" class="btn outline sm" data-review="'+esc(a.id)+'">Screen</button></div></article>';}).join("")+'</div>'+(todo.length>12?'<div class="sub" style="padding:8px 4px">Showing 12 of '+todo.length+'. Open My Queue for all.</div>':""):'<div class="empty">Nothing waiting. New articles appear here when they are assigned to you.</div>');
   }
-  return '<div id="deskq"></div>'+tiles+'<p class="sub" style="margin:4px 2px 14px">'+esc(f[4])+'</p>'+body+articles;
+  return '<div id="deskq"></div>'+tiles+'<div id="deskdash"></div>'+'<p class="sub" style="margin:4px 2px 14px">'+esc(f[4])+'</p>'+body+articles;
 }
 function molTable(list,removable){
   const people=(data.profiles||[]).filter(p=>p.active), wk=w=>encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||"");
@@ -8665,7 +8676,7 @@ function render() {
   if(tab==="Watchlists"&&$("autobox"))loadAutoPull();
   if(tab==="Admin"&&$("kbstatus"))loadKbStatus();
   if(tab==="Watchlists"&&$("dictbox"))loadDictionaries();
-  if(tab==="My Desk")loadDeskQueues();
+  if(tab==="My Desk"){loadDeskQueues();loadDeskDash();}
   if(tab==="Synchrony")loadSynJobs();
   if(tab==="Synchrony"){
     document.querySelectorAll("[data-assignsel]").forEach(el=>{el.onchange=()=>api("case-assign",{ids:[el.dataset.assignsel],assignee:el.value}).then(()=>{message(el.value?"Case assigned.":"Case unassigned.");return refresh();}).catch(e=>message(e.message,true));});
@@ -8813,7 +8824,7 @@ document.addEventListener("click",event=>{
   const lc=event.target.closest&&event.target.closest("[data-llcsv]");
   if(lc){fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:"csv"})}).then(async res=>{if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"Nothing to export.");const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-line-listing-"+new Date().toISOString().slice(0,10)+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}).catch(e=>message(e.message,true));return;}
   const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -8897,11 +8908,12 @@ document.addEventListener("click",event=>{
         (L?'<div class="dc-label"><b>FDA label</b> '+esc(L.brand||L.generic||"")+(L.manufacturer?' · '+esc(L.manufacturer):"")+' · effective '+esc(L.effective||"unknown")+(L.version?' · version '+esc(L.version):"")+(L.dailymed?' · <a href="'+esc(L.dailymed)+'" target="_blank" rel="noopener">DailyMed</a>':"")+'<div class="sub">Sections read for listedness: '+esc(L.sections.join(", ")||"none")+'. The label is checked automatically for every case on this molecule, and a change opens a follow-up.</div></div>':'<div class="dc-label sub">No FDA label found for this name. Listedness will need the EU SmPC pasted into the case.</div>')+'<div class="sub" style="margin-top:6px">The molecule and its names are filled in below. Change them if needed, then pull.</div></div>';
     }).catch(e=>{$("drugcard").innerHTML='<div class="roban">'+esc(e.message)+'</div>';}).finally(()=>{target.disabled=false;target.textContent="Look up";});return;
   }
+  if(target.dataset.godash){dbState.wf=target.dataset.godash;tab="Dashboard";render();return;}
   if(target.dataset.plwf!==undefined){plState.wf=target.dataset.plwf;loadPlanner();return;}
   if(target.dataset.plview){plState.view=target.dataset.plview;loadPlanner();return;}
   if(target.dataset.plday){plState.sel=plState.sel===target.dataset.plday?"":target.dataset.plday;if(tab!=="Planner"){tab="Planner";render();return;}loadPlanner();return;}
   if(target.dataset.planchor!==undefined){const n=Number(target.dataset.planchor);plState.anchor=n===0?todayStr():addIso(plState.anchor||todayStr(),n*(plState.view==="week"?7:30));loadPlanner();return;}
-  if(target.dataset.plgo){plState.sel="overdue";tab="Planner";render();return;}
+  if(target.dataset.plgo){plState.sel=target.dataset.plgo==="planner"?"":"overdue";tab="Planner";render();return;}
   if(target.dataset.dbwf){dbState.wf=target.dataset.dbwf;loadDashboard();return;}
   if(target.dataset.pldate){const [kind,id,wf,cur]=target.dataset.pldate.split("|"),v=prompt("New due date for this item (YYYY-MM-DD)",cur);if(!v)return;if(!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(v)){message("Use the form YYYY-MM-DD.",true);return;}const why=prompt("Reason (recorded)","")||"";api("timeline-set",{kind,id,workflow:wf,due:v,reason:why}).then(()=>{message("Date changed.");return refresh();}).then(()=>{if(tab==="Planner")loadPlanner();else render();}).catch(e=>message(e.message,true));return;}
   if(target.dataset.synfilter){synFilter=target.dataset.synfilter;render();return;}
