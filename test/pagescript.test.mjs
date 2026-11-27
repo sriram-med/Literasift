@@ -12,3 +12,9 @@ test("the page script parses", async () => {
   assert.ok(script.length > 50000);
   assert.doesNotThrow(() => new vm.Script(script, { filename: "page.js" }));
 });
+
+test("the off-canvas menu scrim is hidden by default, so the desktop grid is not pushed out of place", async () => {
+  const { env } = await makeEnv();
+  const html = await (await worker.fetch(new Request("http://localhost/", { headers: { "oai-authenticated-user-email": MANAGER } }), env)).text();
+  assert.match(html, /\n\.navscrim\{display:none\}\n\.shell\{display:grid/, "a global rule hides the scrim outside the phone media query");
+});

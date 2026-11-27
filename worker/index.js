@@ -6470,6 +6470,7 @@ const html = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="v
 [data-theme=dark]{--bg:#0a100e;--fg:#edf2ef;--muted:#93a199;--card:#121a17;--border:#243029;--accent:#1a2420;--primary:#3cc3ab;--primary-fg:#04110d;--brand:#3cc3ab;--brand-soft:#103a33;--ring:#3c4b43;--red:#f27b73;--red-soft:#3a1412;--amber:#f0a94a;--amber-soft:#3a2508;--green:#55c987;--green-soft:#0f3320;--blue:#7eaef0;--blue-soft:#12294d;--shadow:none;--side:#070c0a;--side-fg:#b6c2bb;--side-hover:#16201c;--side-label:#667870}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 var(--font);-webkit-font-smoothing:antialiased;letter-spacing:-.005em}code,pre,.mono{font-family:var(--mono)}
 button,input,select,textarea{font:inherit;color:inherit}a{color:var(--brand);text-decoration:none}a:hover{text-decoration:underline}
+.navscrim{display:none}
 .shell{display:grid;grid-template-columns:232px minmax(0,1fr);min-height:100vh}.shell>div{min-width:0}
 aside{background:var(--side);color:var(--side-fg);padding:18px 14px;display:flex;flex-direction:column;gap:2px;position:sticky;top:0;height:100vh;overflow-y:auto}.navlabel{font-size:10.5px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--side-label);padding:12px 10px 4px}.navlabel:first-child{padding-top:4px}
 .brand{display:flex;align-items:center;gap:10px;padding:4px 10px 14px;font-weight:600;font-size:16px;letter-spacing:-.02em;color:#fff}
