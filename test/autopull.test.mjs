@@ -310,3 +310,15 @@ test("comparison checks exact PMIDs under the selected molecule, date basis and 
   assert.equal(pull.body.results[0].complete,true);
   assert.equal((await t.state()).assignments.filter(a => a.pmid === "22").length,1);
 });
+
+test("a start date in the future is accepted, and nothing is pulled before it", async () => {
+  const { makeEnv: mk, MANAGER: M, fakeNcbi: fk, withFetch: wf } = await import("./helpers.mjs");
+  const future = new Date(Date.now() + 10 * 864e5).toISOString().slice(0, 10);
+  const t = await mk({ watches: [{ portfolio: "P", molecule: "aspirin", query: "((aspirin))", names: [] }] });
+  const r = await t.call(M, "/api/settings", { autoPullFrom: future }); assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal((await t.state()).settings.autoPullFrom, future);
+  const ncbi = fk([{ pmid: "1", date: new Date(Date.now() - 2 * 864e5).toISOString().slice(0, 10) }]);
+  await wf(ncbi.handler, () => t.call(M, "/api/scheduled", { force: true }));
+  assert.equal(ncbi.calls.filter(c => c.startsWith("esearch")).length, 0, "no search before the start date");
+  const s = await t.call(M, "/api/scheduler-status", {}); assert.equal(s.body.perWatch[0].missing, 0);
+});
