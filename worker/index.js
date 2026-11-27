@@ -7525,6 +7525,26 @@ async function apiCore(request, env, path) {
     lines.push([q("Total"), list.reduce((x, r) => x + r.total, 0), ...totals, list.reduce((x, r) => x + r.allTime, 0)].join(","));
     return new Response("﻿" + lines.join("\r\n") + "\r\n", { headers:{ "Content-Type":"text/csv; charset=utf-8", "Content-Disposition":'attachment; filename="literasift-client-pulls-' + today + '.csv"' } });
   }
+  if (path === "/api/drug-week-stats" && viewer) {
+    // One row per drug (molecule) for one week: how many articles reached the app that week (the queue date, IRD), and, when asked, how many PubMed has
+    // for the same week with the drug's saved search, so the two can be compared side by side.
+    if (viewer.role !== "manager" && viewer.canManageClients !== true) return json({ error:"Client figures are limited to managers and users a manager has allowed." }, 403);
+    if (!isDate(body.from) || !isDate(body.to) || body.from > body.to || (Date.parse(body.to) - Date.parse(body.from)) / 864e5 > 92) return json({ error:"Choose a week (up to three months)." }, 400);
+    const clientId = String(body.client || "all"), basis = basisOf(body.dateField || "crdt"), cname = id => (state.clients || []).find(c => c.id === id)?.name || "No client";
+    const watches = state.watches.filter(w => w.molecule && (clientId === "all" || (clientId === "none" ? !w.client : w.client === clientId)))
+      .sort((a, b) => cname(a.client).localeCompare(cname(b.client)) || String(a.molecule).localeCompare(String(b.molecule)));
+    if (body.pubmed === true && watches.length > 150) return json({ error:"PubMed counts cover up to 150 drugs at a time. Choose one client." }, 400);
+    const cfg = withSettings(env, state), rows = [];
+    for (const w of watches) {
+      const linked = state.assignments.filter(a => samePf(w, a.portfolio) && (a.molecules || []).includes(w.molecule)), inWeek = linked.filter(a => { const d = irdOf(state, a).slice(0, 10); return d >= body.from && d <= body.to; });
+      const row = { key:encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule), client:cname(w.client), molecule:w.molecule, pulled:inWeek.length, total:linked.length, auto:w.auto !== false };
+      if (body.pubmed === true) { const spec = searchSpec(state, w, {}), term = searchTerm(spec.query, body.from, body.to, basis), info = await esearchInfo(cfg, term);
+        row.pubmed = info?.count ?? null; row.term = term; row.pubmedUrl = "https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(term); row.warnings = info?.warnings || []; }
+      rows.push(row);
+    }
+    return json({ from:body.from, to:body.to, client:clientId === "all" ? "All clients" : clientId === "none" ? "No client" : cname(clientId), dateField:basis, dateBasisLabel:DATE_BASIS_LABEL[basis], rows,
+      totals:{ pulled:rows.reduce((n, r) => n + r.pulled, 0), pubmed:body.pubmed === true ? rows.reduce((n, r) => n + (r.pubmed || 0), 0) : null } });
+  }
   if (path === "/api/client-auto" && viewer) {
     // Automatic options of a client: on or off, the day pulling starts, and the day it stops. Each is optional in the request.
     if (viewer.role !== "manager") return json({ error:"Manager access required." }, 403);
@@ -10255,6 +10275,44 @@ function openPersonDialog(email){
   };
 }
 let cpsState={weeks:8};
+// ---- Articles per drug for one week: a table built on request, with optional PubMed counts and a CSV.
+let dwState={client:"all",from:"",basis:"crdt",out:null};
+function dwMonday(d){const t=new Date((d||new Date().toISOString().slice(0,10))+"T00:00:00Z"),dow=(t.getUTCDay()+6)%7;t.setUTCDate(t.getUTCDate()-dow);return t.toISOString().slice(0,10);}
+function dwAdd(d,n){const t=new Date(d+"T00:00:00Z");t.setUTCDate(t.getUTCDate()+n);return t.toISOString().slice(0,10);}
+function drugWeekHtml(){
+  if(!dwState.from)dwState.from=dwAdd(dwMonday(),-7);
+  const opts=[["all","All clients"],...(data.clients||[]).map(c=>[c.id,c.name]),["none","No client"]];
+  return panel("Articles per drug, per week",'<div class="row" style="flex-wrap:wrap;gap:8px;align-items:flex-end">'+
+    '<label>Client<select id="dwclient">'+opts.map(o=>'<option value="'+esc(o[0])+'"'+(o[0]===dwState.client?" selected":"")+'>'+esc(o[1])+'</option>').join("")+'</select></label>'+
+    '<label>Week starting (Monday)<input type="date" id="dwfrom" value="'+esc(dwState.from)+'"></label>'+
+    '<button type="button" class="btn outline sm" data-dwshift="-7">Previous week</button><button type="button" class="btn outline sm" data-dwshift="7">Next week</button>'+
+    '<label>PubMed date basis<select id="dwbasis">'+[["crdt","Create date [crdt]"],["pdat","Publication date [dp]"],["any","Created or published"]].map(o=>'<option value="'+o[0]+'"'+(o[0]===dwState.basis?" selected":"")+'>'+o[1]+'</option>').join("")+'</select></label>'+
+    '<button type="button" class="btn sm" data-dwbuild="1">Build table</button><button type="button" class="btn outline sm" data-dwbuild="pubmed">Build with PubMed counts</button><button type="button" class="btn outline sm" data-dwcsv="1">Export CSV</button></div>'+
+    '<div id="dwout" style="margin-top:12px">'+(dwState.out?dwTable(dwState.out):'<div class="sub">Choose a week and press Build table.</div>')+'</div>',
+    "One row per drug: the articles that reached the app in that week (Monday to Sunday), and, if you ask, how many PubMed has for the same week with the drug's saved search.");
+}
+function dwTable(r){
+  const pm=r.rows.some(x=>"pubmed" in x),num=v=>v==null?"?":String(v);
+  return '<div class="sub" style="margin-bottom:6px"><b>'+esc(r.client)+'</b> · week '+esc(r.from)+' to '+esc(r.to)+(pm?' · PubMed by '+esc(r.dateBasisLabel):"")+' · '+r.rows.length+' drug'+(r.rows.length===1?"":"s")+'</div>'+
+    table(["Client","Drug","Pulled into the app this week",...(pm?["In PubMed this week",""]:[]),"All articles in the app"],
+      r.rows.map(x=>[esc(x.client),'<b>'+esc(x.molecule)+'</b>'+(x.auto?"":' <span class="sub">(daily pull off)</span>'),x.pulled?'<b>'+x.pulled+'</b>':'<span class="sub">0</span>',
+        ...(pm?[num(x.pubmed)+(x.pubmed!=null&&x.pubmed>x.pulled?" "+badge((x.pubmed-x.pulled)+" more in PubMed","amber"):""),x.pubmedUrl?'<a href="'+esc(x.pubmedUrl)+'" target="_blank" rel="noopener">Open in PubMed</a>':""]:[]),String(x.total)])
+      .concat([['<b>Total</b>',"",'<b>'+r.totals.pulled+'</b>',...(pm?['<b>'+num(r.totals.pubmed)+'</b>',""]:[]),""]]),"No drugs for this client.");
+}
+async function dwBuild(btn,pubmed){
+  dwState.client=$("dwclient").value;dwState.from=dwMonday($("dwfrom").value||undefined);dwState.basis=$("dwbasis").value;
+  btn.disabled=true;$("dwout").innerHTML='<div class="sub">'+(pubmed?"Asking PubMed, one drug at a time…":"Counting…")+'</div>';
+  try{dwState.out=await api("drug-week-stats",{client:dwState.client,from:dwState.from,to:dwAdd(dwState.from,6),dateField:dwState.basis,pubmed:!!pubmed});$("dwout").innerHTML=dwTable(dwState.out);$("dwfrom").value=dwState.from;}
+  catch(err){$("dwout").innerHTML='<div class="sub" style="color:var(--red)">'+esc(err.message)+'</div>';}btn.disabled=false;
+}
+function dwCsv(){
+  const r=dwState.out;if(!r)return message("Build the table first.",true);
+  const pm=r.rows.some(x=>"pubmed" in x),q=v=>'"'+String(v==null?"":v).split('"').join('""')+'"',nl=String.fromCharCode(13,10);
+  const head=["Client","Drug","Week from","Week to","Pulled into the app this week",...(pm?["In PubMed this week ("+r.dateBasisLabel+")","PubMed search"]:[]),"All articles in the app"];
+  const lines=[head.map(q).join(",")].concat(r.rows.map(x=>[q(x.client),q(x.molecule),q(r.from),q(r.to),x.pulled,...(pm?[x.pubmed==null?"":x.pubmed,q(x.term||"")]:[]),x.total].join(",")));
+  lines.push([q("Total"),"",q(r.from),q(r.to),r.totals.pulled,...(pm?[r.totals.pubmed==null?"":r.totals.pubmed,""]:[]),""].join(","));
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([String.fromCharCode(65279)+lines.join(nl)+nl],{type:"text/csv;charset=utf-8"}));a.download="literasift-drugs-week-"+r.from+".csv";document.body.appendChild(a);a.click();a.remove();
+}
 async function loadPullStats(){
   const box=$("pullstats");if(!box)return;
   try{
@@ -10279,7 +10337,7 @@ function clientsHtml(){
       '<button type="button" class="btn sm" data-addmol="'+esc(c.id)+'" style="margin-top:10px">+ Add new molecule</button>'+
       (free.length?'<form data-route="client-assign" class="cc-add"><input type="hidden" name="client" value="'+esc(c.id)+'"><select name="watch" aria-label="Molecule">'+watchOpts(free)+'</select><button class="btn sm">Add molecule</button></form>':"")+'</div>';
   }).join("");
-  return panel("Articles pulled per client, per week",'<div id="pullstats"><div class="skel"></div></div>',"How many articles each client received each week, with the totals. Export gives the client name and the number side by side.")+(data.viewer.role==="manager"?timelinesPanel():"")+panel("Add a client",'<form class="grid" data-route="client-save"><label>Client name<input name="name" required maxlength="80" placeholder="e.g. Acme Pharma"></label><label>Contact (optional)<input name="contact" maxlength="120" placeholder="Name or email"></label><div><button class="btn">Add client</button></div></form>',"Assign molecules to a client below. Every queue groups articles by client, then by molecule.")+
+  return drugWeekHtml()+panel("Articles pulled per client, per week",'<div id="pullstats"><div class="skel"></div></div>',"How many articles each client received each week, with the totals. Export gives the client name and the number side by side.")+(data.viewer.role==="manager"?timelinesPanel():"")+panel("Add a client",'<form class="grid" data-route="client-save"><label>Client name<input name="name" required maxlength="80" placeholder="e.g. Acme Pharma"></label><label>Contact (optional)<input name="contact" maxlength="120" placeholder="Name or email"></label><div><button class="btn">Add client</button></div></form>',"Assign molecules to a client below. Every queue groups articles by client, then by molecule.")+
     panel("Add a molecule",'<div class="row"><span>Add a new molecule to a client. It is searched in PubMed automatically from then on.</span><button type="button" class="btn" data-addmol="">+ Add molecule</button></div>')+
     (clients.length?'<div class="clientgrid">'+cards+'</div>':'<div class="empty">No clients yet. Add one above, then assign molecules to it.</div>')+
     (free.length?panel("Molecules without a client ("+free.length+")",(data.viewer.role==="manager"?'<div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:10px"><button type="button" class="btn outline sm" data-freeall="1">Select all</button><button type="button" class="btn outline sm" data-freenone="1">Select none</button><label class="check"><input type="checkbox" id="freearts">&nbsp;Also delete their articles (articles with a case, or also pulled for another molecule, are kept)</label><button type="button" class="btn sm" data-freedel="1" style="background:var(--red);border-color:var(--red)">Delete selected</button></div>':"")+molTable(free,false,data.viewer.role==="manager"),"Add them to a client above, set their owners and priority here, or tick and delete them in one go."):"");
@@ -10644,7 +10702,7 @@ document.addEventListener("click",event=>{
   const lc=event.target.closest&&event.target.closest("[data-llcsv]");
   if(lc){fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:"csv"})}).then(async res=>{if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"Nothing to export.");const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-line-listing-"+new Date().toISOString().slice(0,10)+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}).catch(e=>message(e.message,true));return;}
   const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
-  const target=event.target.closest("[data-freeall],[data-freenone],[data-freedel],[data-ssdates],[data-ssdatesoff],[data-ssrange],[data-sscount],[data-ssedit],[data-sspreview],[data-sssave],[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-syncmode],[data-showkey],[data-wsuse],[data-wsrun],[data-wsall],[data-wsadd],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-mqby],[data-addmol],[data-cpsweeks],[data-cpsexport],[data-moldates],[data-clientrange],[data-wlby],[data-cppull],[data-cpcompare],[data-cpretry],[data-cppullsame],[data-runrepair],[data-recocsv],[data-qbuild],[data-xlsx],[data-sptab],[data-sprange],[data-btclient],[data-clientpull],[data-go-clients],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-dwbuild],[data-dwshift],[data-dwcsv],[data-freeall],[data-freenone],[data-freedel],[data-ssdates],[data-ssdatesoff],[data-ssrange],[data-sscount],[data-ssedit],[data-sspreview],[data-sssave],[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-syncmode],[data-showkey],[data-wsuse],[data-wsrun],[data-wsall],[data-wsadd],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-mqby],[data-addmol],[data-cpsweeks],[data-cpsexport],[data-moldates],[data-clientrange],[data-wlby],[data-cppull],[data-cpcompare],[data-cpretry],[data-cppullsame],[data-runrepair],[data-recocsv],[data-qbuild],[data-xlsx],[data-sptab],[data-sprange],[data-btclient],[data-clientpull],[data-go-clients],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -10744,6 +10802,9 @@ document.addEventListener("click",event=>{
   if(target.dataset.xlsx){downloadPost("/api/pull-xlsx",{runIds:target.dataset.xlsx.split(",")},"literasift-pubmed-results.xlsx").catch(e=>message(e.message,true));return;}
   if(target.dataset.recocsv){downloadPost("/api/reconciliation-csv",{runIds:target.dataset.recocsv.split(",")},"literasift-reconciliation.csv").catch(e=>message(e.message,true));return;}
   if(target.dataset.cppullsame){const c=cpState.compared;if(c&&$("cpclient")&&$("cpclient").value===c.client){document.querySelectorAll("[data-cpmol]").forEach(x=>{x.checked=c.sel.includes(x.dataset.cpmol);});if(JSON.stringify((()=>{const v=cpSavedSettings();delete v._lim;return v;})())+JSON.stringify(ssOwnMap(c.sel))!==c.st)return message("The settings changed after the comparison. Compare again, then pull.",true);}runClientPull(target);return;}
+  if(target.dataset.dwbuild){dwBuild(target,target.dataset.dwbuild==="pubmed");return;}
+  if(target.dataset.dwshift){const f=$("dwfrom");f.value=dwAdd(dwMonday(f.value||undefined),Number(target.dataset.dwshift));dwState.from=f.value;return;}
+  if(target.dataset.dwcsv){dwCsv();return;}
   if(target.dataset.freeall||target.dataset.freenone){document.querySelectorAll("[data-freesel]").forEach(x=>{x.checked=!!target.dataset.freeall;});return;}
   if(target.dataset.freedel){const keys=[...document.querySelectorAll("[data-freesel]:checked")].map(x=>x.dataset.freesel);if(!keys.length)return message("Tick the molecules to delete.",true);
     const arts=$("freearts")&&$("freearts").checked;

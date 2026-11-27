@@ -143,3 +143,20 @@ test("molecules without a client can be deleted in one go; articles only they pu
   assert.deepEqual(r.body.orphanPmids, ["1"], "2 is also pulled for c, 3 has a case");
   assert.deepEqual((await t.state()).watches.map(w => w.molecule), ["c"]);
 });
+
+test("articles per drug for one week: pulled into the app, and PubMed's count with the drug's saved search", async () => {
+  const { fakeNcbi, withFetch } = await import("./helpers.mjs");
+  const t = await makeEnv({ clients: [{ id: "u", name: "USV" }], schema: { grouping: "client" },
+    watches: [{ portfolio: "USV", molecule: "acarbose", query: "((acarbose))", names: [], client: "u" }, { portfolio: "USV", molecule: "voglibose", query: "((voglibose))", names: [], client: "u" }],
+    articles: { 1: { pmid: "1" }, 2: { pmid: "2" }, 3: { pmid: "3" } },
+    assignments: [{ id: "a", pmid: "1", portfolio: "USV", molecules: ["acarbose"], ird: "2026-11-17T10:00:00Z" }, { id: "b", pmid: "2", portfolio: "USV", molecules: ["acarbose"], ird: "2026-11-23T10:00:00Z" },
+      { id: "c", pmid: "3", portfolio: "USV", molecules: ["acarbose"], ird: "2026-11-24T10:00:00Z" }] });
+  const r = await t.call(MANAGER, "/api/drug-week-stats", { client: "u", from: "2026-11-16", to: "2026-11-22" });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.deepEqual(r.body.rows.map(x => [x.molecule, x.pulled, x.total]), [["acarbose", 1, 3], ["voglibose", 0, 0]]);
+  assert.equal(r.body.totals.pulled, 1);
+  const ncbi = fakeNcbi([{ pmid: "9", date: "2026-11-18" }, { pmid: "8", date: "2026-11-20" }]);
+  const p = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/drug-week-stats", { client: "u", from: "2026-11-16", to: "2026-11-22", pubmed: true }));
+  assert.equal(p.body.rows[0].pubmed, 2); assert.ok(p.body.rows[0].term.includes("2026/11/16[crdt]:2026/11/22[crdt]"), p.body.rows[0].term);
+  assert.equal((await t.call(SCREENER, "/api/drug-week-stats", { client: "u", from: "2026-11-16", to: "2026-11-22" })).status, 403);
+});
