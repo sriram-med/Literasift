@@ -164,3 +164,18 @@ test("the dashboard counts serious and non-serious cases at each stage, divides 
   const mgr = (await t.call(MANAGER, "/api/dashboard", { workflow: "screening" })).body.casesMix; assert.equal(mgr.total, 5, "a manager sees everyone's");
   const qc = (await t.call(QC, "/api/dashboard", { workflow: "qc" })).body.casesMix; assert.equal(qc.total, 1); assert.equal(qc.serious, 1); assert.equal(qc.flow.serious.listed, 1);
 });
+
+test("pasting an OpenAI key is enough: the first key switches AI on with a monthly limit, status says what is missing, and a bad paste is explained", async () => {
+  const t = await makeEnv({ profiles: PROFILES, memberships: MEMBERS, watches: [{ portfolio: "Antivirals", molecule: "aciclovir", query: "q" }] });
+  const cfg = async () => (await (await worker.fetch(new Request("http://localhost/api/state", { headers: { "oai-authenticated-user-email": MANAGER } }), t.env)).json()).config.ai;
+  assert.equal((await cfg()).available, false);
+  const bad = await t.call(MANAGER, "/api/settings", { openaiKey: "sk-abc def\nghi" }); assert.equal(bad.status, 400); assert.match(bad.body.error, /spaces or characters/);
+  const key = "sk-proj-" + "A1b2C3d4_".repeat(10);
+  assert.equal((await t.call(MANAGER, "/api/settings", { openaiKey: "  " + key + "\n" })).status, 200, "surrounding spaces and a line break are trimmed");
+  const a = await cfg(); assert.equal(a.hasKey, true); assert.equal(a.enabled, true); assert.equal(a.monthlyTokens, 500000); assert.equal(a.available, true, "a first key is enough");
+  assert.equal(JSON.stringify(await (await worker.fetch(new Request("http://localhost/api/state", { headers: { "oai-authenticated-user-email": MANAGER } }), t.env)).json()).includes("A1b2C3d4_A1b2"), false, "the key is never sent back");
+  // an explicit choice is respected: switching off stays off, and a later key does not override it
+  await t.call(MANAGER, "/api/settings", { aiEnabled: "off" }); await t.call(MANAGER, "/api/settings", { openaiKey: key + "x" }); assert.equal((await cfg()).enabled, false, "a manager's switch is not overridden");
+  const conn = await t.call(MANAGER, "/api/settings", { openaiKey: key, aiEnabled: "on", aiMonthlyTokens: 250000, aiPaused: "off" }); assert.equal(conn.status, 200); const b = await cfg(); assert.equal(b.available, true); assert.equal(b.monthlyTokens, 250000);
+  const smoke = await t.call(MANAGER, "/api/ai-smoke", {}); assert.equal(smoke.body.configured, true); assert.equal(smoke.body.enabled, true);
+});
