@@ -385,4 +385,5 @@ Every molecule has exactly one saved search: its own names (brands, salts, spell
 - **Search & Pull → Saved searches** lists them per client, with the exact PubMed query. *Count in PubMed* gives a live count for the chosen dates. Managers can *Edit* a saved search, *Preview and count* the draft, and *Save search*.
 - Saving creates a new query version effective from today. Past pulls keep the version they ran with (audit trail).
 - *Pull this client* and *Compare with PubMed* send only the dates, the date basis and the PubMed Central option. Each molecule runs its saved search. The daily automatic pull runs the same saved search, so manual and automatic pulls cannot differ.
+- **Own dates per molecule:** on a saved-search card, *Own dates for this molecule* sets From/Through (or Past week, 30 days, 3 months, 12 months) for that molecule only. Count, Compare and Pull use them; the other molecules use the shared dates. *Use the dates above* removes them.
 - Routes: `/api/saved-searches` (list for a client), `/api/saved-search` (preview/count, or `save:true` for managers).

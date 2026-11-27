@@ -97,3 +97,17 @@ test("product names with strengths and dosage forms are searched as the drug; co
   assert.equal(q.v, "((VOBOSE) OR (Voglibose))");
   assert.ok(q.g.startsWith('((("Glimepiride"[tiab]') && q.g.includes(') AND ("Metformin Hydrochloride"[tiab]') && !/mg|Tablets/.test(q.g), q.g);
 });
+
+test("a molecule can have its own dates: Compare and Pull use them, the other molecules keep the shared dates", async () => {
+  const { t, watches } = await setup();
+  const ncbi = fakeNcbi([{ pmid: "31", date: dAgo(2) }, { pmid: "32", date: dAgo(50) }, { pmid: "33", date: dAgo(80) }]);
+  const own = { [key(watches[0])]: { from: dAgo(90), to: dAgo(0) } };
+  const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/compare-client", { client: "sq", from: dAgo(5), to: dAgo(0), dateField: "crdt", dates: own }));
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const ca = r.body.rows.find(x => x.molecule === "calcium acetate"), om = r.body.rows.find(x => x.molecule === "omeprazole");
+  assert.equal(ca.ownDates, true); assert.equal(ca.from, dAgo(90)); assert.equal(ca.count, 3);
+  assert.equal(om.ownDates, false); assert.equal(om.from, dAgo(5)); assert.equal(om.count, 1);
+  // a pull sends each molecule with its own dates
+  const p = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "sq", from: dAgo(90), to: dAgo(0), molecules: [key(watches[0])] }));
+  assert.equal(p.body.results[0].expected, 3); assert.equal(p.body.results[0].from, dAgo(90));
+});
