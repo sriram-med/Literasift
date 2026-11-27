@@ -342,3 +342,12 @@ A molecule is searched by its name and by the other names someone gave it (typed
 - **A busy PubMed** answer (HTTP 429, an HTML page, a cut-off reply, or an "ERROR" inside the JSON) is treated as temporary and tried again, up to five times, for searches, citations, details, PubMed Central and the comparison counts. Before, a busy details reply was read as "no details" and left the molecule incomplete.
 - **Clearer incomplete rows**: they say what is still missing ("2 citations still to fetch" or "1 search window failed"), and that it is retried automatically.
 - **A running pull** is saved as it goes, so its progress can be read even from another server process or after a restart; one cut off by a restart says so after 20 minutes without progress.
+
+## Same pull, same result
+
+Pulls gave different numbers from one try to the next because a busy PubMed made some search windows fail, and the pull gave up after a fixed number of tries, at a different point each time. Now:
+
+- **A pull you start is finished only when every search window matches PubMed's own count.** Windows that failed or came back short are reset and run again with a growing pause, for up to six rounds; then PubMed is asked for its total for the whole search, and if more articles exist than were stored, the whole range is searched once more.
+- **Requests are paced to what PubMed allows**: without an NCBI API key two molecules and two windows run at a time (with a key, three and four), so PubMed refuses far fewer requests.
+- **The results table shows the same columns every time**: *In PubMed* (PubMed's own total for the search), *Stored here* (all of them for this molecule), *New this time*, and a check that reads "All N stored" only when the two match. A repeat pull shows the same In PubMed and Stored numbers with 0 new.
+- A test pulls the same client five times against a PubMed that randomly fails a third of its requests and gets the identical, complete result each time.

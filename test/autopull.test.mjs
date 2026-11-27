@@ -233,3 +233,25 @@ test("the other names of a molecule can be edited, and its search is rebuilt fro
   assert.deepEqual((await status(t)).perWatch[0].names, ["Zoloft", "Lustral"]);
   await t.call(MANAGER, "/api/watch-auto", { watch: "CNS|sertraline", names: "" }); assert.ok(!/Zoloft/.test((await t.state()).watches[0].query));
 });
+
+test("the same pull gives the same result every time, even when PubMed randomly fails a third of the requests", async () => {
+  const t = await makeEnv({ watches: [W1, W2] });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; s.watches.forEach(w => { w.client = "k1"; }); await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const recs = Array.from({ length: 57 }, (_, i) => ({ pmid: String(4000 + i), date: dAgo(1 + i * 6) })), ncbi = fakeNcbi(recs, { cap: 9 });
+  let seed = 7; const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const flaky = async (u, i) => { const r = rnd();
+    if (r < 0.12) return new Response("rate", { status: 429 });
+    if (r < 0.2) return new Response("<html>busy</html>", { status: 200 });
+    if (r < 0.26) return new Response('{"esearchresult":{"ERROR":"Search Backend failed"}}', { status: 200 });
+    if (r < 0.33 && String(u).includes("efetch")) { const full = await (await ncbi.handler(u, i)).text(); return new Response(full.slice(0, Math.floor(full.length / 2)), { status: 200 }); }
+    return ncbi.handler(u, i); };
+  const seen = [];
+  for (let k = 0; k < 5; k++) {
+    const r = await withFetch(flaky, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(365), to: dAgo(0), searchMode: "precise" }));
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    seen.push(r.body.results.map(x => [x.molecule, x.expected, x.retrieved, x.complete].join(":")).join(" | "));
+  }
+  assert.ok(seen.every(x => x === seen[0]), "identical every time:\n" + seen.join("\n"));
+  assert.ok(seen[0].split(" | ").every(x => x.endsWith(":57:57:true")), seen[0]);
+  assert.equal(Object.keys((await t.state()).articles).length, 57);
+});
