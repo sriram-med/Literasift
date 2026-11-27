@@ -3158,6 +3158,30 @@ async function kbFetch(env, url) {
 }
 const rxGroup = (json, tty) => (json?.relatedGroup?.conceptGroup || []).filter(g => g.tty === tty).flatMap(g => g.conceptProperties || []);
 // Resolves a name (generic, brand or salt) through RxNorm to its ingredient, then collects brands, salts and synonyms; openFDA label brand names add to the brands.
+// ---- Therapeutic area of a molecule, from its drug class. WHO ATC first letter gives the area; a built-in table of name endings and common drugs works offline, and RxNorm's ATC classes confirm it when reachable.
+const ATC_AREAS = { A:"Gastro-intestinal and metabolism", B:"Blood and haematology", C:"Cardiovascular", D:"Dermatology", G:"Genito-urinary and sex hormones", H:"Endocrine (systemic hormones)", J:"Anti-infectives", L:"Oncology and immunology", M:"Musculoskeletal", N:"Nervous system", P:"Antiparasitics", R:"Respiratory", S:"Sensory organs", V:"Various" };
+const AREA_WORDS = { A:["gastro", "metabol", "diabet"], B:["blood", "haemat", "hemat"], C:["cardio", "hypertens", "heart"], D:["dermat", "skin"], G:["urolog", "genito", "women", "hormone"], H:["endocrin"], J:["infect", "antibiotic", "antiviral", "antimicrob"], L:["oncol", "cancer", "immun"], M:["musculo", "pain", "rheum"], N:["nerv", "cns", "neuro", "psych"], P:["parasit"], R:["respir", "pulmon", "asthma"], S:["ophthal", "eye", "sensory"], V:["various"] };
+const ATC_ENDINGS = [[/sartan$/, "C", "Angiotensin II receptor blocker"], [/pril$/, "C", "ACE inhibitor"], [/olol$/, "C", "Beta blocker"], [/dipine$/, "C", "Calcium channel blocker"], [/statin$/, "C", "Statin"], [/(thiazide|chlorthalidone|furosemide|torasemide|spironolactone)$/, "C", "Diuretic"], [/(parin|xaban|gatran)$/, "B", "Anticoagulant"], [/(gliptin|gliflozin|glitazone|glutide|glimepiride|glipizide|gliclazide)$/, "A", "Antidiabetic"], [/(prazole|tidine)$/, "A", "Acid suppressant"], [/(cillin|mycin|floxacin|cycline|penem|cef\w+)$/, "J", "Antibacterial"], [/(vir|virine|tegravir)$/, "J", "Antiviral"], [/(conazole|fungin)$/, "J", "Antifungal"], [/(tinib|mab|ciclib|platin|taxel|rubicin)$/, "L", "Oncology and immunology"], [/(oxetine|pram|faxine|zodone|triptyline|zepam|zolam|pine|piprazole|idone|barbital|tiracetam|gabalin|triptan|dopa)$/, "N", "Nervous system"], [/(caine|codone|morphine|tramadol|fentanyl)$/, "N", "Analgesic or anaesthetic"], [/(lukast|terol|tropium|sonide)$/, "R", "Respiratory"], [/(coxib|profen|fenac|nabumetone)$/, "M", "NSAID"], [/(sone|solone|olone)$/, "H", "Corticosteroid"], [/(azole)$/, "J", "Anti-infective"]];
+const ATC_NAMES = { metformin:"A", insulin:"A", warfarin:"B", clopidogrel:"B", aspirin:"B", digoxin:"C", amiodarone:"C", amlodipine:"C", paracetamol:"N", acetaminophen:"N", ibuprofen:"M", diclofenac:"M", methotrexate:"L", levothyroxine:"H", salbutamol:"R", albuterol:"R", tamoxifen:"L", sildenafil:"G", tamsulosin:"G", finasteride:"G", isotretinoin:"D", ondansetron:"A", lithium:"N", valproate:"N", carbamazepine:"N", levetiracetam:"N", haloperidol:"N", aripiprazole:"N", olanzapine:"N", quetiapine:"N", risperidone:"N", sertraline:"N", fluoxetine:"N", aciclovir:"J", acyclovir:"J", oseltamivir:"J", hydroxychloroquine:"P", ivermectin:"P" };
+function areaByName(name) {
+  const n = String(name || "").toLowerCase().trim(); if (ATC_NAMES[n]) return { letter:ATC_NAMES[n], class:"", source:"built-in table" };
+  for (const [re, letter, cls] of ATC_ENDINGS) if (re.test(n)) return { letter, class:cls, source:"built-in table" };
+  return null;
+}
+async function therapeuticArea(env, names) {
+  const list = (Array.isArray(names) ? names : [names]).map(x => String(x || "").trim()).filter(Boolean).slice(0, 4);
+  for (const n of list) { const a = areaByName(n); if (a) return a; }
+  for (const n of list.slice(0, 2)) { const j = await kbFetch(env, RXNAV + "/rxclass/class/byDrugName.json?relaSource=ATC&drugName=" + encodeURIComponent(n)).catch(() => null);
+    const info = j?.rxclassDrugInfoList?.rxclassDrugInfo || [], hit = info.map(x => String(x?.rxclassMinConceptItem?.classId || "")).find(id => /^[A-Z]\d/.test(id));
+    if (hit) return { letter:hit[0], atc:hit, class:info.find(x => x?.rxclassMinConceptItem?.classId === hit)?.rxclassMinConceptItem?.className || "", source:"RxNorm ATC" }; }
+  return null;
+}
+// An existing portfolio that already covers the area is reused (so valsartan joins "Cardiovascular" or "Hypertension"), otherwise the area name is used.
+function portfolioForArea(state, letter) {
+  const area = ATC_AREAS[letter]; if (!area) return "";
+  const existing = uniq([...(state.watches || []).map(w => w.portfolio), ...(state.assignments || []).map(a => a.portfolio)]).filter(Boolean);
+  return existing.find(p => p.toLowerCase() === area.toLowerCase()) || existing.find(p => (AREA_WORDS[letter] || []).some(w => p.toLowerCase().includes(w))) || area;
+}
 async function kbPull(env, kb, name, { openfda = true } = {}) {
   const at = new Date().toISOString(), clean = String(name || "").trim(); if (clean.length < 2) return null;
   const found = await kbFetch(env, RXNAV + "/rxcui.json?search=2&name=" + encodeURIComponent(clean));
@@ -5170,8 +5194,9 @@ async function apiCore(request, env, path) {
     if (!molecule) return json({ error:"Enter the molecule name." }, 400);
     if (body.client && !(state.clients || []).some(c => c.id === body.client)) return json({ error:"Choose a client from the list." }, 400);
     // Automatic portfolio: the one the client already uses most, else the client's name, else "General".
-    let portfolio = String(body.portfolio || "").trim().slice(0, 100), auto = false;
-    if (!portfolio) { auto = true; const counts = new Map(); for (const w of state.watches) if (body.client && w.client === body.client) counts.set(w.portfolio, (counts.get(w.portfolio) || 0) + 1);
+    let portfolio = String(body.portfolio || "").trim().slice(0, 100), auto = false, area = null;
+    if (!portfolio) { auto = true; area = await therapeuticArea(withSettings(env, state), [molecule, ...synonyms]); if (area) portfolio = portfolioForArea(state, area.letter); }
+    if (!portfolio) { const counts = new Map(); for (const w of state.watches) if (body.client && w.client === body.client) counts.set(w.portfolio, (counts.get(w.portfolio) || 0) + 1);
       portfolio = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || (state.clients || []).find(c => c.id === body.client)?.name?.slice(0, 100) || "General"; }
     if (state.watches.some(w => watchKey(w) === watchKey({ portfolio, molecule }))) return json({ error:molecule + " is already in " + portfolio + "." }, 409);
     const query = String(body.query || "").trim() || buildQuery([molecule, ...synonyms], body.safetyOnly === true);
@@ -5179,7 +5204,7 @@ async function apiCore(request, env, path) {
     const watch = { portfolio, molecule, query }; if (body.client) watch.client = String(body.client);
     await write(env, data => { keepOwner(data, watch); commitWatch(data, watch, email, "molecule added"); });
     await audit(env, { by:email, action:"molecule.added", target:portfolio + " · " + molecule, detail:{ client:body.client || "", names:[molecule, ...synonyms].slice(0, 20).join(", ") } });
-    return json({ ok:true, portfolio, molecule, auto });
+    return json({ ok:true, portfolio, molecule, auto, classification:area ? { area:ATC_AREAS[area.letter], atc:area.atc || "", class:area.class || "", source:area.source } : null });
   }
   if (path === "/api/dashboard" && viewer) {
     const wf = ["screening", "qc", "medical"].includes(body.workflow) ? body.workflow : "screening", mgr = viewer.role === "manager";
@@ -8047,14 +8072,14 @@ function openAddMolecule(presetClient){
   const pfs=(typeof allPortfolios==="function"?allPortfolios():[]),cls=data.clients||[];
   document.body.insertAdjacentHTML("beforeend",'<dialog id="moldlg" style="width:min(520px,96vw)"><h3 style="margin:0 0 4px">Add molecule</h3><p class="sub" style="margin:0 0 12px">The molecule is searched in PubMed automatically from now on, and its articles appear in the queue.</p>'+
     '<form id="molform" data-own="1" class="impgrid"><label class="wide">Client<select name="client"><option value="">No client</option>'+cls.map(c=>'<option value="'+esc(c.id)+'"'+(c.id===presetClient?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select></label>'+
-    '<label>Portfolio<select name="portfolio"><option value="">Auto (recommended)</option>'+pfs.map(x=>'<option>'+esc(x)+'</option>').join("")+'<option value="__new">New portfolio…</option></select></label><label id="molnewpf" style="display:none">New portfolio name<input name="newpf" maxlength="100"></label>'+
+    '<label>Portfolio<select name="portfolio"><option value="">Auto: by drug class (recommended)</option>'+pfs.map(x=>'<option>'+esc(x)+'</option>').join("")+'<option value="__new">New portfolio…</option></select></label><label id="molnewpf" style="display:none">New portfolio name<input name="newpf" maxlength="100"></label>'+
     '<label class="wide">Molecule (INN or generic name)<input name="molecule" required maxlength="100" placeholder="e.g. aciclovir"></label><label class="wide">Brands and other names (optional, separated by commas)<input name="synonyms" placeholder="Zovirax, acyclovir"></label>'+
     '<label class="check wide"><input type="checkbox" name="safety">&nbsp;Safety articles only (adverse events, toxicity, case reports)</label><div class="wide" id="molerr" style="color:#b3261e"></div>'+
     '<div class="wide" style="display:flex;gap:8px;justify-content:flex-end"><button type="button" class="btn outline" id="molno">Cancel</button><button class="btn" id="molgo">Add molecule</button></div></form></dialog>');
   const d=$("moldlg"),f=$("molform");d.showModal();
   f.elements.portfolio.onchange=()=>{$("molnewpf").style.display=f.elements.portfolio.value==="__new"?"":"none";};$("molno").onclick=()=>{d.close();d.remove();};
   f.onsubmit=async e=>{e.preventDefault();$("molgo").disabled=true;$("molerr").textContent="";const pf=f.elements.portfolio.value==="__new"?f.elements.newpf.value:f.elements.portfolio.value;
-    try{const r=await api("molecule-add",{client:f.elements.client.value,portfolio:pf,molecule:f.elements.molecule.value,synonyms:f.elements.synonyms.value,safetyOnly:f.elements.safety.checked});d.close();d.remove();await refresh();render();message(f.elements.molecule.value+" added to "+r.portfolio+(r.auto?" (automatic portfolio)":"")+". Its articles will be pulled automatically.");}
+    try{const r=await api("molecule-add",{client:f.elements.client.value,portfolio:pf,molecule:f.elements.molecule.value,synonyms:f.elements.synonyms.value,safetyOnly:f.elements.safety.checked});d.close();d.remove();await refresh();render();message(f.elements.molecule.value+" added to "+r.portfolio+(r.auto?(r.classification?" (classified as "+(r.classification.class||r.classification.area)+")":" (automatic)"):"")+". Its articles will be pulled automatically.");}
     catch(err){$("molerr").textContent=err.message;$("molgo").disabled=false;}};
 }
 async function clearPulled(){

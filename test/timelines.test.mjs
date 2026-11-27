@@ -254,3 +254,15 @@ test("add molecule: the portfolio is automatic (the client's own, else its name,
   assert.equal((await t.call(MANAGER, "/api/molecule-add", { molecule: "e" })).body.portfolio, "General");
   assert.equal((await t.call(MANAGER, "/api/molecule-add", { client: "k2", portfolio: "Own", molecule: "f" })).body.auto, false);
 });
+
+test("add molecule: the portfolio follows the drug class (valsartan joins Cardiovascular) and reuses a matching portfolio", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "Hypertension Products", molecule: "x", query: "x" }, { portfolio: "CNS", molecule: "y", query: "y" }] });
+  const none = async () => new Response("{}", { status: 404 });
+  const add = body => withFetch(none, () => t.call(MANAGER, "/api/molecule-add", body)).then(r => r.body);
+  const v = await add({ molecule: "valsartan" }); assert.equal(v.portfolio, "Hypertension Products"); assert.equal(v.classification.class, "Angiotensin II receptor blocker");
+  assert.equal((await add({ molecule: "sertraline" })).portfolio, "CNS");
+  assert.equal((await add({ molecule: "amoxicillin" })).portfolio, "Anti-infectives");
+  const rx = async url => String(url).includes("rxclass") ? Response.json({ rxclassDrugInfoList: { rxclassDrugInfo: [{ rxclassMinConceptItem: { classId: "L01XE01", className: "Protein kinase inhibitors" } }] } }) : new Response("{}", { status: 404 });
+  const q = await withFetch(rx, () => t.call(MANAGER, "/api/molecule-add", { molecule: "zzzquine" })).then(r => r.body); assert.equal(q.portfolio, "Oncology and immunology"); assert.equal(q.classification.source, "RxNorm ATC");
+  assert.equal((await add({ molecule: "valsartan2x", portfolio: "Mine" })).portfolio, "Mine", "an explicit portfolio always wins");
+});

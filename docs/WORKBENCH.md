@@ -240,3 +240,7 @@ Tick any number of cases (or "Select all shown") and press Delete. For cases tha
 - **Dashboard > Clients and molecules** shows a card per client (open, overdue, high priority, serious, next due, and each molecule), with a client filter that applies to the whole dashboard (`/api/dashboard` takes `client`).
 
 The Add molecule dialog's portfolio defaults to **Auto**: the portfolio the chosen client already uses most, else the client's name, else "General". A portfolio can still be picked or typed.
+
+### Portfolio by drug class
+
+With the portfolio left on Auto, Add molecule classifies the molecule by its WHO ATC class and files it under the matching therapeutic area (for example valsartan, an angiotensin II receptor blocker, goes to Cardiovascular). A built-in table of drug-name endings and common drugs answers instantly; RxNorm's ATC classes are asked when the name is not in the table. If a portfolio that covers the area already exists ("Cardiovascular", "Hypertension Products", "CNS"), it is reused instead of creating a new one. If the molecule cannot be classified, the client's usual portfolio, the client's name or "General" is used. Picking a portfolio yourself always wins, and the confirmation says how it was classified.
