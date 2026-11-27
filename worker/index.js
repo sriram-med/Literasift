@@ -1927,7 +1927,7 @@ function productParts(name) {
   return parts.length ? parts : [];
 }
 // The searchable form of a name: the parts joined with " and " (one part is just the drug name).
-function searchName(name) { const parts = productParts(name), raw = String(name || "").replace(/\s+/g, " ").trim(); return parts.length ? parts.join(" and ") : raw; }
+function searchName(name) { name = String(name || "").replace(/\s*_\d+\s*$/, " "); const parts = productParts(name), raw = String(name || "").replace(/\s+/g, " ").trim(); return parts.length ? parts.join(" and ") : raw; }
 const nameParts = n => String(n).split(/\s+and\s+/i).map(x => x.trim()).filter(Boolean);
 function buildQuery(names, safetyOnly) {
   const clean = [...new Set(names.map(n => String(n || "").replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim()).filter(Boolean))];
@@ -3427,6 +3427,16 @@ async function namesFor(env, state, kb, w) { return ownNames(w); }
 const SEARCH_MODES = { pubmed:"PubMed default (automatic term mapping)", precise:"Precise (title/abstract, MeSH, supplementary concept)", custom:"Custom (approved Boolean expression)" };
 const DATE_BASIS_LABEL = { crdt:"Create date [crdt]", pdat:"Publication date [dp]", any:"Created or published ([crdt] OR [dp])" };
 // Filters sent with a request override the saved search only when the request names one; otherwise the saved search's own filters apply.
+// PubMed's automatic term mapping drops words it does not know. In a name of several words that turns, for example, "Pioz MF G-1" into a search for
+// "MF" and "G-1" and pulls thousands of unrelated articles. Such a search is refused until the saved search is fixed (add the generic name, or use Precise).
+function looseNames(spec, warnings) {
+  if (spec.mode !== "pubmed") return [];
+  const dropped = (warnings || []).map(w => String(w)).filter(w => /^(Not found in PubMed|Phrase ignored|Quoted phrase not found):/i.test(w)).map(w => w.replace(/^[^:]*:\s*/, "").toLowerCase().trim()).filter(Boolean);
+  if (!dropped.length) return [];
+  const words = n => n.toLowerCase().split(/[\s,;/+&-]+/).filter(Boolean);
+  return spec.names.filter(n => { const all = words(n); return all.length > 1 && dropped.some(d => words(d).length && words(d).every(x => all.includes(x))); });
+}
+const looseError = names => "PubMed could not read part of " + names.map(n => '"' + n + '"').join(", ") + " and would search the remaining words loosely, pulling unrelated articles. Nothing was pulled. Edit the saved search: add the generic (INN) name, or switch it to Precise.";
 const FILTER_KEYS = ["humans", "caseReports", "english", "noReviews"];
 const requestFilters = body => FILTER_KEYS.some(k => k in body) ? Object.fromEntries(FILTER_KEYS.map(k => [k, body[k] === true])) : undefined;
 const savedFilters = f => Object.fromEntries([...FILTER_KEYS, "safety"].map(k => [k, f?.[k] === true]));
@@ -5990,7 +6000,7 @@ async function apiCore(request, env, path) {
       // A live count from PubMed for the chosen dates (or all dates), with PubMed's own reading of the search.
       const cfg = withSettings(env, state), basis = basisOf(body.dateField), dated = isDate(body.from) && isDate(body.to) && body.from <= body.to;
       const term = dated ? searchTerm(spec.query, body.from, body.to, basis) : spec.query;
-      try { const info = await esearchInfo(cfg, term); count = { count:info?.count ?? null, translation:info?.translation || "", warnings:info?.warnings || [], term, from:dated ? body.from : "", to:dated ? body.to : "", dateBasisLabel:dated ? DATE_BASIS_LABEL[basis] : "All dates" }; }
+      try { const info = await esearchInfo(cfg, term), loose = looseNames(spec, info?.warnings); count = { loose, looseError:loose.length ? looseError(loose) : "", count:info?.count ?? null, translation:info?.translation || "", warnings:info?.warnings || [], term, from:dated ? body.from : "", to:dated ? body.to : "", dateBasisLabel:dated ? DATE_BASIS_LABEL[basis] : "All dates" }; }
       catch (error) { count = { error:String(error.message || error).slice(0, 160), term }; }
     }
     if (body.save === true) {
@@ -6064,6 +6074,8 @@ async function apiCore(request, env, path) {
         const cap = Math.min(50000, Math.max(100, Number(body.maxPerMolecule) || 25000));
         progress[slot].stage = "counting";
         let info = null;
+        { const pre = await esearchInfo(cfg, termOf(query)), loose = looseNames(spec, pre?.warnings);
+          if (loose.length) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, mode:spec.mode, loose, warnings:pre?.warnings || [], error:looseError(loose) }; return; } }
         if (allDates) { info = await esearchInfo(cfg, query); const total = info?.count ?? null; progress[slot].expected = total; if (total != null && total > cap) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, mode:spec.mode, error:total + " articles in PubMed, more than the " + cap + " one pull takes. Choose Last 12 months, or your own dates, for this molecule." }; return; } }
         progress[slot].stage = "pulling";
         // Wide windows (a quarter at a time, or everything at once without dates) mean few searches; a window that holds more than PubMed returns in one go is split automatically.
@@ -7158,7 +7170,8 @@ async function apiCore(request, env, path) {
     const names = ["pubmed.png", "fulltext.txt", "pmc.pdf", "pmc.xml", "europepmc.xml", "unpaywall.pdf", "wiley.pdf", "elsevier.xml", "core.pdf", "core.txt", "rxiv.xml", "preprint.xml", "uploaded.pdf", "uploaded.xml", "uploaded.txt"];
     const files = new Set();
     for (const id of doomed) { const a = state.articles[id]; for (const key of [a.fullTextKey, a.fullTextTextKey, a.screenshotKey]) if (key) files.add(key); for (const name of names) files.add("evidence/" + id + "/" + name); }
-    if (typeof env.BUCKET.delete === "function") for (const key of files) { try { await env.BUCKET.delete(key); } catch { /* an object that is already gone is fine */ } }
+    // Many files per article: removed 50 at a time in parallel, so a large folder does not time out.
+    if (typeof env.BUCKET.delete === "function") { const all = [...files]; for (let i = 0; i < all.length; i += 50) await Promise.all(all.slice(i, i + 50).map(key => Promise.resolve().then(() => env.BUCKET.delete(key)).catch(() => {}))); }
     const titles = doomed.slice(0, 20).map(id => id + ": " + String(state.articles[id].title || "").slice(0, 80));
     if (doomed.length) {
       const gone = new Set(doomed);
@@ -7431,7 +7444,9 @@ async function apiCore(request, env, path) {
     for (const { watch, m } of plan.slice(0, maxWatchesPerRun)) {
       try {
         // The daily pull runs the molecule's saved search exactly as a manual pull does.
-        const daily = watch.molecule ? searchSpec(st, watch, {}).query : "", broad = daily && daily !== watch.query && daily.length <= 1500 ? daily : "";
+        const dspec = watch.molecule ? searchSpec(st, watch, {}) : null, daily = dspec ? dspec.query : "", broad = daily && daily !== watch.query && daily.length <= 1500 ? daily : "";
+        if (dspec && dspec.mode === "pubmed") { const pre = await esearchInfo(withSettings(env, st), searchTerm(daily, m.from, m.to, "crdt")), loose = looseNames(dspec, pre?.warnings);
+          if (loose.length) { results.push({ portfolio:watch.portfolio, molecule:watch.molecule || "", from:m.from, to:m.to, error:looseError(loose) }); continue; } }
         const current = queryAt(watch,through);
         const effective = broad && current.query === watch.query ? { ...watch, query:broad,
           versions:(watch.versions || [current]).map(v => v.version === current.version ? { ...v, query:broad } : v) } : watch;
@@ -9068,7 +9083,7 @@ async function p5action(target){
     if(act==="archive"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const pick=await archivePicker(list.length);if(!pick)return;const r=await api("case-archive",{ids:list,category:pick.category,note:pick.note});await again(r.changed+" archived.");return;}
     if(act==="restore"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const r=await api("case-restore",{ids:list});await again(r.changed+" restored.");return;}
     if(act==="delcase"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);await deleteCases(list);return;}
-    if(act==="delpulled"){const list=ids("srch_a");if(!list.length)return message("Tick the citations first.",true);if(!confirm("Delete "+list.length+" pulled citation"+(list.length===1?"":"s")+" with their stored files? Citations with a case are kept. This cannot be undone."))return;const why=prompt("Reason (recorded in the audit trail):","");if(!why)return;const r=await api("library-delete",{pmids:list,reason:why});await again(r.deleted+" deleted"+((r.kept||[]).length?", "+r.kept.length+" kept because they have a case":"")+".");return;}
+    if(act==="delpulled"){const list=ids("srch_a");if(!list.length)return message("Tick the citations first.",true);if(!confirm("Delete "+list.length+" pulled citation"+(list.length===1?"":"s")+" with their stored files? Citations with a case are kept. This cannot be undone."))return;const why=prompt("Reason (recorded in the audit trail):","");if(!why)return;let r={deleted:0,kept:[]};for(let i=0;i<list.length;i+=500){const x=await api("library-delete",{pmids:list.slice(i,i+500),reason:why});r.deleted+=x.deleted||0;r.kept=r.kept.concat(x.kept||[]);}await again(r.deleted+" deleted"+((r.kept||[]).length?", "+r.kept.length+" kept because they have a case":"")+".");return;}
     if(act==="newfolder"){const name=prompt("Folder name:","");if(!name)return;await api("folder-save",{name});await again("Folder created.");return;}
     if(act==="delfolder"){if(!confirm("Delete this folder? Its cases are kept and become unfiled."))return;const r=await api("folder-delete",{id:a1});if(synFolder===a1)synFolder="";await again("Folder deleted; "+r.unfiled+" case"+(r.unfiled===1?"":"s")+" unfiled.");return;}
     if(act==="ctag"||act==="cuntag"){const tag=act==="ctag"?(($("ct_custom").value||"").trim()||$("ct_tag").value):a1;await api("case-tag",{ids:[curCase.id],tag,remove:act==="cuntag"});await refresh();const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c)curCase.tags=c.tags;loadReview();return;}
@@ -10111,12 +10126,13 @@ async function runMinePull(f){
   await runPullJobs(btn,[{key:molecule,name:molecule}],()=>({...st,molecule,synonyms:e.synonyms.value,portfolio:e.portfolio.value,safetyOnly:spState.safety}),"pull-mine",r=>{if(r.added)message(r.added+" new article"+(r.added===1?"":"s")+" added to your queue.");});
 }
 // A brand PubMed does not know (for example a local trade name) finds nothing: the generic name has to be added to the saved search.
+function ssLoose(c){return c&&c.looseError?'<div class="sub" style="color:var(--red)"><b>Will not be pulled.</b> '+esc(c.looseError)+'</div>':"";}
 function ssHint(w){const miss=(w||[]).filter(x=>String(x).indexOf("Not found in PubMed:")===0).map(x=>String(x).slice(20).trim());return miss.length?'<div class="sub" style="color:var(--red)"><b>PubMed does not know '+esc(miss.join(", "))+'.</b> Add the generic (INN) name, for example the active ingredient, in Saved searches, Edit, Other names.</div>':"";}
 const SS_FILTERS=[["humans","Humans"],["caseReports","Case reports"],["english","English"],["noReviews","No reviews"],["safety","Safety articles only"]];
 const SS_MODES=[["pubmed","PubMed default","automatic term mapping, as on the PubMed website"],["precise","Precise","quoted names in title/abstract, MeSH and supplementary concept"],["custom","Custom","your own PubMed expression, run exactly as written"]];
 function ssCard(x){
   const k=esc(x.key),on=SS_FILTERS.filter(f=>x.filters&&x.filters[f[0]]).map(f=>f[1]),c=cpState.ssCounts&&cpState.ssCounts[x.key];
-  const cnt=!c?"":c.busy?'<span class="sub">Counting…</span>':c.error?'<span class="sub" style="color:var(--red)">'+esc(c.error)+'</span>':'<span class="badge">'+esc(String(c.count==null?"?":c.count))+' in PubMed</span> <span class="sub">'+esc(c.dateBasisLabel||"")+(c.from?" · "+esc(c.from)+" to "+esc(c.to):"")+'</span>'+(c.warnings&&c.warnings.length?'<div class="sub" style="color:var(--amber)">PubMed: '+esc(c.warnings.join("; "))+'</div>':"")+ssHint(c.warnings)+(c.translation?'<details class="sub"><summary>PubMed read it as</summary><code>'+esc(c.translation)+'</code></details>':"");
+  const cnt=!c?"":c.busy?'<span class="sub">Counting…</span>':c.error?'<span class="sub" style="color:var(--red)">'+esc(c.error)+'</span>':'<span class="badge">'+esc(String(c.count==null?"?":c.count))+' in PubMed</span> <span class="sub">'+esc(c.dateBasisLabel||"")+(c.from?" · "+esc(c.from)+" to "+esc(c.to):"")+'</span>'+(c.warnings&&c.warnings.length?'<div class="sub" style="color:var(--amber)">PubMed: '+esc(c.warnings.join("; "))+'</div>':"")+ssHint(c.warnings)+ssLoose(c)+(c.translation?'<details class="sub"><summary>PubMed read it as</summary><code>'+esc(c.translation)+'</code></details>':"");
   const edit=cpState.ssEdit===x.key?ssEditor(x):"";
   return '<div class="sscard" data-sskey="'+k+'"><div class="ss-top"><label class="check"><input type="checkbox" data-cpmol="'+k+'"'+(cpState.ssOff&&cpState.ssOff[x.key]?"":" checked")+'>&nbsp;<b>'+esc(x.molecule)+'</b></label>'+
     badge(x.modeLabel?x.mode==="pubmed"?"PubMed default":x.mode==="precise"?"Precise":"Custom":x.mode,x.mode==="custom"?"amber":"blue")+(on.length?" "+on.map(f=>badge(f,"")).join(" "):"")+(x.auto?"":" "+badge("Daily pull off",""))+
@@ -10894,7 +10910,9 @@ document.addEventListener("click",event=>{
     if(!confirm("Delete "+ids.length+" article"+(ids.length===1?"":"s")+" from the library? Their stored files, screenshots and queue entries are removed. Articles that have an ICSR case are kept. This is recorded in the audit trail and cannot be undone."))return;
     const reason=prompt("Reason for deleting (recorded in the audit trail):","");if(!reason)return;
     target.disabled=true;
-    api("library-delete",{pmids:ids,reason}).then(async r=>{await refresh();if($("dialog").open)$("dialog").close();if(!target.dataset.articledel&&target.dataset.libdel!=="/"&&!libIds(target.dataset.libdel).length){libPath="/";}render();message(r.deleted+" article"+(r.deleted===1?"":"s")+" deleted. Recorded in the audit trail."+(r.kept.length?" Kept because they have cases: "+r.kept.join(", ")+".":""),r.kept.length>0);}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
+    // Large folders are deleted in batches of 500 so no single request runs too long; progress is shown as it goes.
+    const libDeleteAll=async()=>{let deleted=0,kept=[];for(let i=0;i<ids.length;i+=500){message("Deleting… "+Math.min(i+500,ids.length)+" of "+ids.length);const r=await api("library-delete",{pmids:ids.slice(i,i+500),reason});deleted+=r.deleted||0;kept=kept.concat(r.kept||[]);}return {deleted,kept};};
+    libDeleteAll().then(async r=>{await refresh();if($("dialog").open)$("dialog").close();if(!target.dataset.articledel&&target.dataset.libdel!=="/"&&!libIds(target.dataset.libdel).length){libPath="/";}render();message(r.deleted+" article"+(r.deleted===1?"":"s")+" deleted. Recorded in the audit trail."+(r.kept.length?" Kept because they have cases: "+r.kept.join(", ")+".":""),r.kept.length>0);}).catch(e=>message(e.message,true)).finally(()=>{target.disabled=false;});
     return;
   }
   if(target.dataset.libzip||target.dataset.libpdf||target.dataset.libris){

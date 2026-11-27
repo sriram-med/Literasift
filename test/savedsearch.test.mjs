@@ -111,3 +111,16 @@ test("a molecule can have its own dates: Compare and Pull use them, the other mo
   const p = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "sq", from: dAgo(90), to: dAgo(0), molecules: [key(watches[0])] }));
   assert.equal(p.body.results[0].expected, 3); assert.equal(p.body.results[0].from, dAgo(90));
 });
+
+test("a brand PubMed cannot read is not searched loosely: nothing is pulled and the saved search must be fixed", async () => {
+  const watches = [{ id: "p", portfolio: "USV", molecule: "Pioz MF G-1 _2", query: "x", names: [], client: "usv" }];
+  const t = await makeEnv({ watches, clients: [{ id: "usv", name: "USV" }] });
+  assert.equal((await t.call(MANAGER, "/api/saved-searches", { client: "usv" })).body.searches[0].query, "((Pioz MF G-1))", "the duplicate marker is dropped");
+  const recs = Array.from({ length: 50 }, (_, i) => ({ pmid: String(900 + i), date: dAgo(2) })), ncbi = fakeNcbi(recs);
+  const handler = async (u, i) => { const res = await ncbi.handler(u, i); if (!String(u).includes("esearch")) return res;
+    const j = await res.json(); j.esearchresult.warninglist = { phrasesignored: [], quotedphrasesnotfound: [], outputmessages: [] }; j.esearchresult.errorlist = { phrasesnotfound: ["Pioz"] }; return new Response(JSON.stringify(j)); };
+  const r = await withFetch(handler, () => t.call(MANAGER, "/api/pull-client", { client: "usv", from: dAgo(5), to: dAgo(0) }));
+  const x = r.body.results[0];
+  assert.match(x.error, /could not read part of "Pioz MF G-1"/); assert.deepEqual(x.loose, ["Pioz MF G-1"]);
+  assert.equal(Object.keys((await t.state()).articles).length, 0, "nothing was pulled");
+});
