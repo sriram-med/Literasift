@@ -4073,18 +4073,39 @@ const safeName = value => String(value || "").replace(/[\\/:*?"<>|\u0000-\u001f]
 // Folders are Source / Molecule / Date range. Each article sits in the first (oldest) date range that imported it, once per source and molecule.
 function libraryLayout(state, by = "range") {
   const seen = new Set(), out = [];
+  const watches = new Map(state.watches.map(w => [watchKey(w),w]));
+  const clients = new Map((state.clients || []).map(c => [c.id,c.name]));
+  const assigned = new Set();
+  const add = (pmid, portfolio, name, sourceName, range, fallback = false) => {
+    const key = watchKey({ portfolio, molecule:name });
+    const membership = JSON.stringify([key,pmid]);
+    if (fallback && assigned.has(membership)) return;
+    const source = safeName(sourceName), molecule = safeName(name || portfolio);
+    const client = safeName(clients.get(watches.get(key)?.client) || "No client");
+    const c = articleCountry(state.articles[pmid]), country = safeName(c.name);
+    const folder = by === "country" ? source + "/" + country + "/" + molecule : by === "client" ? client + "/" + molecule + "/" + range : source + "/" + molecule + "/" + range;
+    const entryKey = JSON.stringify([client,source,molecule,by === "country" ? country : range,pmid]);
+    assigned.add(membership);
+    if (seen.has(entryKey)) return;
+    seen.add(entryKey);
+    out.push({ pmid, source, client, molecule, range, country, basis:c.basis, folder });
+  };
   for (const run of [...state.runs].reverse()) {
-    if (run.status !== "Imported") continue;
-    const source = safeName(run.source || "PubMed"), molecule = safeName(run.molecule || run.portfolio), range = run.from + "_to_" + run.to;
-    const wl = state.watches.find(w => w.portfolio === run.portfolio && (w.molecule || "") === (run.molecule || "")), cl = (state.clients || []).find(c => c.id === wl?.client), client = safeName(cl ? cl.name : "No client");
-    for (const pmid of run.ids) {
-      if (seen.has(pmid + "|" + source + "|" + molecule)) continue;
-      seen.add(pmid + "|" + source + "|" + molecule);
-      const c = articleCountry(state.articles[pmid]), country = safeName(c.name);
-      out.push({ pmid, source, client, molecule, range, country, basis:c.basis, folder:by === "country" ? source + "/" + country + "/" + molecule : by === "client" ? client + "/" + molecule + "/" + range : source + "/" + molecule + "/" + range });
+    if (!["Imported","Running"].includes(run.status)) continue;
+    for (const pmid of run.ids || []) {
+      add(pmid,run.portfolio,run.molecule || "",run.source || "PubMed",run.from + "_to_" + run.to);
     }
   }
-  // Numbers are stable: a folder's membership is fixed when its pull imports, and articles are numbered by PMID within it.
+  // Some import routes add an assignment without writing a batch. Use the receipt month for these records.
+  for (const a of state.assignments || []) {
+    const article = state.articles[a.pmid];
+    if (!article) continue;
+    const received = String(a.ird || a.createdAt || article.pullAt || "").slice(0,7);
+    const range = /^\d{4}-\d{2}$/.test(received) ? "Received " + received : "No recorded pull range";
+    for (const molecule of a.molecules?.length ? a.molecules : [""]) {
+      add(a.pmid,a.portfolio,molecule,article.source || "PubMed",range,true);
+    }
+  }
   const byFolder = new Map();
   for (const e of out) (byFolder.get(e.folder) || byFolder.set(e.folder, []).get(e.folder)).push(e);
   for (const list of byFolder.values()) {
@@ -9887,11 +9908,11 @@ function render() {
     const regulator=c=>{const hit=(data.config.countryInfo||{})[c];return hit?hit:"";};
     if(!lib.length) html=panel("Library",'<div class="empty">Nothing here yet. Pull articles for a molecule on Search &amp; Pull and its folder appears here.</div>');
     else if(!p0) html=modeBar+crumbs+'<div class="cards">'+Object.entries(tree).sort().map(([k,groups])=>{const st=stat(idsOf(groups));
-      return '<div class="card"><div class="lbl"><b style="font-size:16px;color:var(--fg)">📁 '+esc(reg(k).label)+'</b></div><div class="sub" style="margin:6px 0 10px">'+Object.keys(groups).length+" "+lvl1+(Object.keys(groups).length===1?"":"s")+" · "+st.n+" articles · "+st.ft+' full texts</div><button class="btn sm" data-libopen="'+esc(k)+'">Open</button> <button class="btn outline sm" data-libzip="'+esc(k)+'">ZIP</button></div>';}).join("")+'</div>'+
+      return '<div class="card"><div class="lbl"><b style="font-size:16px;color:var(--fg)">📁 '+esc(reg(k).label)+'</b></div><div class="sub" style="margin:6px 0 10px">'+Object.keys(groups).length+" "+lvl1+(Object.keys(groups).length===1?"":"s")+" · "+st.n+" unique articles · "+st.ft+' full texts</div><button class="btn sm" data-libopen="'+esc(k)+'">Open</button> <button class="btn outline sm" data-libzip="'+esc(k)+'">ZIP</button></div>';}).join("")+'</div>'+
       panel("Whole library",'<button class="btn outline" data-libzip="/">Download everything (ZIP)</button>',"Full texts arranged as "+(byCountry?"Source / Country / Molecule":libMode==="client"?"Client / Molecule / Date range":"Source / Molecule / Date range")+" / files, with a manifest.csv. "+(libMode==="client"?"In the Client view, PubMed and agency material share each molecule folder; every file keeps its source in the manifest. Switch to Date range or Country to keep each source in its own top-level folder.":"PubMed articles and each government agency's material are kept in separate top-level folders."));
     else if(!p1) html=modeBar+crumbs+'<div class="cards">'+Object.entries(tree[p0]).sort().map(([k,groups])=>{const st=stat(idsOf(groups));
       const maSummary=byCountry&&(data.config.ma||[]).length?Object.keys(groups).map(m=>maChip([m],k)).join(" "):"";
-      return '<div class="card"><div class="lbl"><b style="font-size:16px;color:var(--fg)">📁 '+esc(k)+'</b></div><div class="sub" style="margin:6px 0 6px">'+Object.keys(groups).length+" "+(byCountry?"molecule":"date range")+(Object.keys(groups).length===1?"":"s")+" · "+st.n+" articles · "+st.ft+' full texts</div>'+(maSummary?'<div class="chips" style="margin-bottom:8px">'+maSummary+'</div>':"")+'<button class="btn sm" data-libopen="'+esc(p0+"/"+k)+'">Open</button> <button class="btn outline sm" data-libzip="'+esc(p0+"/"+k)+'">ZIP</button></div>';}).join("")+'</div>'+panel("Whole source folder",actions(p0),reg(p0).note);
+      return '<div class="card"><div class="lbl"><b style="font-size:16px;color:var(--fg)">📁 '+esc(k)+'</b></div><div class="sub" style="margin:6px 0 6px">'+Object.keys(groups).length+" "+(byCountry?"molecule":"date range")+(Object.keys(groups).length===1?"":"s")+" · "+st.n+" unique articles · "+st.ft+' full texts</div>'+(maSummary?'<div class="chips" style="margin-bottom:8px">'+maSummary+'</div>':"")+'<button class="btn sm" data-libopen="'+esc(p0+"/"+k)+'">Open</button> <button class="btn outline sm" data-libzip="'+esc(p0+"/"+k)+'">ZIP</button></div>';}).join("")+'</div>'+panel("Whole source folder",actions(p0),reg(p0).note);
     else if(!p2) html=modeBar+crumbs+panel(esc(p1),table([byCountry?"Molecule":"Date range","Articles","Full text","Snapshots"].concat(byCountry&&(data.config.ma||[]).length?["Marketing authorisation"]:[],[""]),Object.entries(tree[p0][p1]).sort((x,y)=>byCountry?x[0].localeCompare(y[0]):y[0].localeCompare(x[0])).map(([r,ids])=>{const st=stat(ids);
       return ['📁 <a href="#" data-libopen="'+esc(p0+"/"+p1+"/"+r)+'">'+esc(byCountry?r:r.replace("_to_"," → "))+'</a>',st.n,st.ft+" / "+st.n,st.shot+" / "+st.n].concat(byCountry&&(data.config.ma||[]).length?[maChip([r],p1)]:[],[actions(p0+"/"+p1+"/"+r)]);}),"Nothing here."),"",true)+
       panel("Whole folder",actions(p0+"/"+p1));
