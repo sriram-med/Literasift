@@ -156,7 +156,7 @@ test("articles per drug for one week: pulled into the app, and PubMed's count wi
   assert.deepEqual(r.body.rows.map(x => [x.molecule, x.pulled, x.total]), [["acarbose", 1, 3], ["voglibose", 0, 0]]);
   assert.equal(r.body.totals.pulled, 1);
   const ncbi = fakeNcbi([{ pmid: "9", date: "2026-11-18" }, { pmid: "8", date: "2026-11-20" }]);
-  const p = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/drug-week-stats", { client: "u", from: "2026-11-16", to: "2026-11-22", pubmed: true }));
+  const p = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/drug-week-stats", { client: "u", from: "2026-11-16", to: "2026-11-22", pubmed: true, by: "ird" }));
   assert.equal(p.body.rows[0].pubmed, 2); assert.ok(p.body.rows[0].term.includes("2026/11/16[crdt]:2026/11/22[crdt]"), p.body.rows[0].term);
   assert.equal((await t.call(SCREENER, "/api/drug-week-stats", { client: "u", from: "2026-11-16", to: "2026-11-22" })).status, 403);
 });
