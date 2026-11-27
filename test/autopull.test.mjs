@@ -169,3 +169,36 @@ test("a pull can run in the background: the request answers at once with a job, 
   });
   const plain = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(6), to: dAgo(0), online: false })); assert.equal(plain.body.job, undefined); assert.ok(plain.body.results, "without background it still answers with the results");
 });
+
+test("pull without dates: everything PubMed has for the molecule, whatever its dates, split only where PubMed would cut the list; a huge literature is reported, not pulled", async () => {
+  const t = await makeEnv({ watches: [W1] });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Square" }]; s.watches[0].client = "k1"; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const dates = ["2003-05-01", "2009-11-20", "2015-02-02", "2019-07-07", "2022-01-15", "2024-12-24", dAgo(3), dAgo(40), dAgo(400), "1998-03-03"];
+  const recs = dates.map((d, i) => ({ pmid: String(500 + i), date: d })), ncbi = fakeNcbi(recs, { cap: 3 });
+  const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", allDates: true, searchMode: "precise", online: false })); assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.allDates, true); assert.equal(r.body.results[0].count, 10, JSON.stringify(r.body.results)); assert.equal(r.body.results[0].complete, true);
+  assert.deepEqual(new Set(Object.keys((await t.state()).articles)), new Set(recs.map(x => x.pmid)), "articles of every year are stored");
+  // no dates given at all means the same
+  const again = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", online: false })); assert.equal(again.body.allDates, true); assert.equal(again.body.results[0].added, 0);
+  // a molecule whose literature is far too large is reported, not pulled whole
+  const big = fakeNcbi(Array.from({ length: 30 }, (_, i) => ({ pmid: String(900 + i), date: dAgo(i) })), {});
+  const bigHandler = async (u, i) => { const url = new URL(String(u)); if (url.pathname.endsWith("esearch.fcgi") && !/\[(?:crdt|dp)\]/.test(url.searchParams.get("term") || "")) return new Response(JSON.stringify({ esearchresult: { count: "90000", idlist: [] } })); return big.handler(u, i); };
+  const huge = await withFetch(bigHandler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", allDates: true, online: false })); assert.ok(/more than the 10000/.test(huge.body.results[0].error), JSON.stringify(huge.body.results));
+});
+
+test("calcium acetate (a two-word name) gets a field-tagged broad search, and NCBI PubMed Central adds articles found only in full texts", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "Renal", molecule: "calcium acetate", query: '"calcium acetate"[tiab]' }] });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Square" }]; s.watches[0].client = "k1"; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const pm = fakeNcbi([{ pmid: "1", date: dAgo(2) }]), seen = [];
+  const handler = async (u, i) => { const url = new URL(String(u)), db = url.searchParams.get("db");
+    if (db === "pmc") { seen.push(url.pathname.split("/").pop() + " " + (url.searchParams.get("term") || "")); if (url.pathname.endsWith("esearch.fcgi")) return new Response(JSON.stringify({ esearchresult: { count: "2", idlist: ["7001", "7002"] } }));
+      return new Response(JSON.stringify({ result: { uids: ["7001", "7002"], 7001: { articleids: [{ idtype: "pmid", value: "1" }] }, 7002: { articleids: [{ idtype: "pmid", value: "77" }] } } })); }
+    if (url.pathname.endsWith("esummary.fcgi") && (url.searchParams.get("id") || "").includes("77")) return new Response(JSON.stringify({ result: { uids: ["77"], 77: { title: "Calcium acetate in full text only", fulljournalname: "J Renal", pubdate: "2024", articleids: [{ idtype: "pubmed", value: "77" }] } } }));
+    return pm.handler(u, i); };
+  const r = await withFetch(handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", allDates: true, searchMode: "broad", includePmc: true, online: false })); assert.equal(r.status, 200, JSON.stringify(r.body));
+  const term = decodeURIComponent(pm.calls.filter(c => c.startsWith("esearch")).join(" ").replace(/\+/g, " ")); assert.ok(term.includes('"calcium acetate"[All Fields]') && term.includes('"calcium acetate"[MeSH Terms]'), term.slice(0, 300));
+  assert.ok(seen.some(x => x.startsWith("esearch") && x.includes('"calcium acetate"[All Fields]')), "PubMed Central is searched with the names");
+  assert.equal(r.body.results[0].pmc.found, 2, JSON.stringify(r.body.results[0])); assert.ok(!r.body.results[0].pmc.error);
+  // the Discover sources include PubMed Central
+  const d = await withFetch(handler, () => t.call(MANAGER, "/api/discover", { q: "calcium acetate", sources: ["pmc"], limit: 5 })); assert.equal(d.status, 200, JSON.stringify(d.body)); assert.ok(JSON.stringify(d.body).includes("pmc"));
+});
