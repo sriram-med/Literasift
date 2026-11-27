@@ -270,3 +270,17 @@ test("book chapters, records without an English title, and PMIDs PubMed cannot s
   const st = await t.state(); assert.ok(st.articles["12"] && /LiverTox|Aciclovir/.test(st.articles["12"].title), "the book chapter is stored"); assert.ok(st.articles["13"], "the record without an English title is stored");
   assert.ok(x.pubmedUrl.startsWith("https://pubmed.ncbi.nlm.nih.gov/?term=") && decodeURIComponent(x.pubmedUrl).includes("[crdt]"), "a link to exactly the same search");
 });
+
+test("the final PMID-by-PMID check finds an article the window searches missed and adds it to the same pull", async () => {
+  const t = await makeEnv({ watches: [W1] });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; s.watches[0].client = "k1"; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const from = dAgo(200), to = dAgo(0), recs = Array.from({ length: 12 }, (_, i) => ({ pmid: String(600 + i), date: dAgo(3 + i * 15) })).concat([{ pmid: "699", date: dAgo(50) }]);
+  const ncbi = fakeNcbi(recs), whole = from.replaceAll("-", "/");
+  // the date-slice searches never mention PMID 699 (and their counts agree with that); only the search over the whole range lists it
+  const handler = async (u, i) => { const url = new URL(String(u)), term = url.searchParams.get("term") || "";
+    if (url.pathname.endsWith("esearch.fcgi") && !term.includes(whole + "[crdt]")) { const res = await (await ncbi.handler(u, i)).json(); const ids = res.esearchresult.idlist.filter(x => x !== "699"); res.esearchresult.idlist = ids; res.esearchresult.count = String(Number(res.esearchresult.count) - (res.esearchresult.idlist.length < (await (await ncbi.handler(u, i)).json()).esearchresult.idlist.length ? 1 : 0)); return Response.json(res); }
+    return ncbi.handler(u, i); };
+  const r = await withFetch(handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from, to, searchMode: "precise" })); assert.equal(r.status, 200, JSON.stringify(r.body));
+  const x = r.body.results[0]; assert.equal(x.idCheck, true, JSON.stringify(x)); assert.equal(x.filledByCheck, 1); assert.equal(x.retrieved, 13); assert.equal(x.complete, true);
+  const st = await t.state(); assert.ok(st.articles["699"]); assert.ok(st.assignments.some(a => a.pmid === "699"), "it is in the queue too"); assert.ok(st.runs[0].ids.includes("699"), "and in the same pull");
+});

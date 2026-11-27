@@ -358,3 +358,11 @@ Pulls gave different numbers from one try to the next because a busy PubMed made
 - **Records without an English title** (only a vernacular or book title) are stored instead of being counted as missing.
 - **PMIDs PubMed lists but cannot supply** (withdrawn, merged, not yet released) are asked for again once; if PubMed still has no record, they are counted as such and no longer hold the pull open.
 - **Concrete results.** Each row shows *In PubMed*, *Stored here*, *New this time* and a check: "All N stored" (plus how many PubMed listed but could not supply), or "X of N not stored" with the PMIDs concerned and a **Try again** button for that molecule only. Each row links to **Same search on PubMed**: the exact query and dates the app used, to compare on the website.
+
+## Accuracy over speed
+
+Pulls are deliberately careful now; they take longer and are checked to the PMID.
+
+- **One stream at a time.** A pull works on one molecule and one search window at a time, at a pace a little under what PubMed allows (2.5 requests a second without a key, 8 with one), so PubMed has no reason to refuse requests. Citations are fetched 100 at a time, and every request is tried up to seven times.
+- **Checked PMID by PMID.** After every window matches PubMed's count, the app asks PubMed for the exact list of PMIDs for the whole search and compares it with what was stored. Anything missing is fetched there and then, added to the same pull and the same queue, and the row says "Checked PMID by PMID against PubMed" (and how many the check filled in). Searches of up to 9,999 articles are checked this way; above that, the per-window counts are the check.
+- The progress line shows each stage, including "Checking every PMID against PubMed…".

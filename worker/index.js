@@ -30,7 +30,7 @@ async function writeOnce(env, mutate) {
 // 3 requests/second, or 10 with a free API key. All E-utilities calls share one pacing gate and identity.
 let ncbiNext = 0;
 async function ncbiThrottle(env) {
-  const gap = env.NCBI_GAP_MS !== undefined ? Number(env.NCBI_GAP_MS) : env.NCBI_API_KEY ? 110 : 340, at = Math.max(Date.now(), ncbiNext);
+  const gap = env.NCBI_GAP_MS !== undefined ? Number(env.NCBI_GAP_MS) : env.NCBI_API_KEY ? 125 : 400, at = Math.max(Date.now(), ncbiNext);
   ncbiNext = at + gap;
   if (at > Date.now()) await new Promise(resolve => setTimeout(resolve, at - Date.now()));
 }
@@ -307,7 +307,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 // Times printed on screenshots, snapshots and PDF exports are Indian Standard Time (UTC+05:30), never UTC. Stored timestamps stay ISO UTC.
 const istStamp = iso => { const d = new Date(iso); if (!iso || Number.isNaN(d.getTime())) return ""; const x = new Date(d.getTime() + 19800000).toISOString(); return x.slice(0, 10) + " " + x.slice(11, 16) + " IST"; };
 const DATE_FIELDS = { crdt:{ label:"Create Date", tag:"crdt" }, pdat:{ label:"Publication Date", tag:"dp" }, any:{ label:"Any date (created or published)", tag:"crdt" } };
-async function withRetry(env, fn, { tries = 5 } = {}) {
+async function withRetry(env, fn, { tries = 7 } = {}) {
   for (let attempt = 0; ; attempt++) {
     try { return await fn(); }
     catch (error) {
@@ -352,9 +352,9 @@ function summarizeRun(run) {
 }
 async function fetchCitations(env, ids) {
   const articles = {}, missing = [], xml = {}, unavailable = [];
-  // 200 per request (PubMed allows it), so a pull makes half as many calls as before.
-  for (let offset = 0; offset < ids.length; offset += 200) {
-    const chunk = ids.slice(offset, offset + 200);
+  // 100 per request: small answers are less likely to be cut off by a busy PubMed.
+  for (let offset = 0; offset < ids.length; offset += 100) {
+    const chunk = ids.slice(offset, offset + 100);
     const { result: summary } = await withRetry(env, () => pubmed(env, "esummary", { id:chunk.join(","), retmode:"json" }));
     const found = [];
     for (const id of chunk) {
@@ -459,6 +459,33 @@ const windowRetryable = (w, { ignoreBackoff = false } = {}) => (w.state === "fai
 // A pull someone started is only finished when every search window matches PubMed's own count. Windows that failed or came back short are reset and run
 // again, with a growing pause, until they reconcile or six rounds have passed. Then, if PubMed now reports more for the whole range than was stored, the
 // whole range is searched once more (new articles may have arrived meanwhile). Same search, same dates: the same articles, every time.
+// The last word on a pull: ask PubMed for the exact list of PMIDs for the whole search and compare it, PMID by PMID, with what was stored. Anything missing is
+// fetched now and added to the same run (and the same queue). Up to 9,999 PMIDs are checked this way; above that the per-window counts are the check.
+async function verifyIds(env, runId, term, total) {
+  if (total == null || total > 9999) return { checked:false, filled:0, ids:null };
+  const { esearchresult: r } = await withRetry(env, () => pubmed(env, "esearch", { term, retmode:"json", retmax:String(Math.max(1, total)) }));
+  const listed = uniq(r?.idlist || []);
+  if (Number(r?.count) > listed.length) return { checked:false, filled:0, ids:null };
+  let run = (await load(env)).state.runs.find(x => x.id === runId); if (!run) return { checked:false, filled:0, ids:null };
+  const have = new Set([...(run.ids || []), ...(run.unavailable || [])]), gap = listed.filter(id => !have.has(id));
+  let filled = 0, unavailable = [];
+  if (gap.length) {
+    const fetched = await fetchCitations(withSettings(env, (await load(env)).state), gap); unavailable = fetched.unavailable || [];
+    const evidence = await storeEfetch(env, fetched.xml);
+    await write(env, data => {
+      const r2 = data.runs.find(x => x.id === runId), watch = data.watches.find(x => x.portfolio === r2.portfolio && (x.molecule || "") === (r2.molecule || "")) || { portfolio:r2.portfolio, molecule:r2.molecule };
+      for (const [id, article] of Object.entries(fetched.articles)) data.articles[id] = { ...data.articles[id], ...article, pullQuery:term, pullAt:new Date().toISOString(), evidence:{ ...(data.articles[id]?.evidence || {}), ...(evidence[id] ? { efetch:evidence[id] } : {}) } };
+      for (const id of Object.keys(fetched.articles)) {
+        const existing = data.assignments.find(a => a.pmid === id && a.portfolio === r2.portfolio);
+        if (existing) { if (watch.molecule && !(existing.molecules || []).includes(watch.molecule) && (existing.molecules || []).length < 20) (existing.molecules ||= []).push(watch.molecule); continue; }
+        const item = { id:crypto.randomUUID(), pmid:id, portfolio:r2.portfolio, molecules:watch.molecule ? [watch.molecule] : [], reviewer:"", status:"Pending" }; allocate(data, item); data.assignments.push(item);
+      }
+      r2.ids = uniq([...(r2.ids || []), ...Object.keys(fetched.articles)]); r2.verifiedUnavailable = uniq([...(r2.verifiedUnavailable || []), ...unavailable]); summarizeRun(r2); r2.unavailable = uniq([...(r2.unavailable || []), ...r2.verifiedUnavailable]);
+    });
+    filled = Object.keys(fetched.articles).length;
+  }
+  return { checked:true, filled, listed:listed.length, ids:listed };
+}
 async function completeRun(env, runId, { total = null, rounds = 6 } = {}) {
   let run = (await load(env)).state.runs.find(r => r.id === runId);
   for (let round = 1; round <= rounds && run && !["reconciled", "zero_results"].includes(run.coverage); round++) {
@@ -475,7 +502,7 @@ async function completeRun(env, runId, { total = null, rounds = 6 } = {}) {
 }
 async function runImport(env, runId, budget = 12, { respectBackoff = false } = {}) {
   env = withSettings(env, (await load(env)).state);
-  const tried = new Map(), lanes = Math.max(1, Math.min(6, Number(env.IMPORT_LANES ?? (env.NCBI_API_KEY ? 4 : 2))));
+  const tried = new Map(), lanes = Math.max(1, Math.min(6, Number(env.IMPORT_LANES ?? 1)));
   for (let used = 0; used < budget;) {
     const { state } = await load(env), run = state.runs.find(r => r.id === runId), now = new Date().toISOString();
     const eligible = (run?.windows || []).map((w, i) => ({ w, i })).filter(({ w }) => (tried.get(w.from + "|" + w.to) || 0) < 2 && (w.state === "pending" || (w.state === "running" && !(w.claimUntil && w.claimUntil > now)) || windowRetryable(w, { ignoreBackoff:!respectBackoff }))).slice(0, Math.min(lanes, budget - used));
@@ -5509,6 +5536,8 @@ async function apiCore(request, env, path) {
         // Nothing may be missed: a window that did not reconcile (PubMed's count against what came back) is run again before the answer is given, and it stays on the retry list if it still has gaps.
         const pubmedTotal = allDates ? progress[slot].expected ?? null : await countAny(cfg, searchTerm(query, body.from, body.to, "any")); progress[slot].expected = pubmedTotal;
         run = await completeRun(env, run.id, { total:pubmedTotal });
+        progress[slot].stage = "checking"; const check = await verifyIds(cfg, run.id, allDates ? query : searchTerm(query, body.from, body.to, "any"), pubmedTotal).catch(() => ({ checked:false, filled:0 }));
+        run = (await load(env)).state.runs.find(x => x.id === run.id) || run;
         if (!isMgr) await write(env, d => { for (const a of d.assignments) if (a.portfolio === w.portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
         progress[slot].stage = "finishing"; await settleEvidence(env, run.ids);
         const wins = run.windows || [], got = uniq(run.ids || []).length, expected = pubmedTotal ?? run.expected ?? wins.reduce((n, x) => n + (x.expected || 0), 0);
@@ -5518,13 +5547,13 @@ async function apiCore(request, env, path) {
           pmc = { found:hit.count, withPmid:hit.pmids.length, added:imported }; } catch (error) { pmc = { error:String(error.message || error).slice(0, 120) }; } }
         const site = broadQuery ? await countAny(cfg, allDates ? broadQuery : searchTerm(broadQuery, body.from, body.to, "any")) : null;
         results[slot] = { molecule:w.molecule, portfolio:w.portfolio, mode:broad ? "broad" : "precise", pmc, siteCount:site, missing:wins.reduce((n, x) => n + ((x.missing || []).length), 0), failedWindows:wins.filter(x => x.state === "failed").length, names:full.added.length, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, expected, retrieved:got, coverage:run.coverage || run.status,
-          unavailable:(run.unavailable || []).length, notStored:Math.max(0, expected - got - (run.unavailable || []).length), missingSample:uniq(wins.flatMap(x => x.missing || [])).slice(0, 6),
+          idCheck:check.checked, filledByCheck:check.filled || 0, unavailable:(run.unavailable || []).length, notStored:Math.max(0, expected - got - (run.unavailable || []).length), missingSample:uniq(wins.flatMap(x => x.missing || [])).slice(0, 6),
           term:allDates ? query : searchTerm(query, body.from, body.to, "any"), pubmedUrl:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(allDates ? query : searchTerm(query, body.from, body.to, "any")),
           complete:["reconciled", "zero_results"].includes(run.coverage) && (pubmedTotal == null || got + (run.unavailable || []).length >= pubmedTotal), gaps:(run.gaps || []).length };
       } catch (error) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, error:String(error.message || error).slice(0, 160) }; }
     };
     // A few molecules at a time; the shared NCBI gate keeps the request rate within the allowed limit.
-    let nextSlot = 0; await Promise.all(Array.from({ length:Math.min(Math.max(1, Number(env.PULL_LANES ?? (cfg.NCBI_API_KEY ? 3 : 2))), watches.length) }, async () => { while (nextSlot < watches.length) { const slot = nextSlot++; await one(watches[slot], slot); if (jobHook) await jobHook(); } }));
+    let nextSlot = 0; await Promise.all(Array.from({ length:Math.min(Math.max(1, Number(env.PULL_LANES ?? 1)), watches.length) }, async () => { while (nextSlot < watches.length) { const slot = nextSlot++; await one(watches[slot], slot); if (jobHook) await jobHook(); } }));
     if (aligned.size) await write(env, data => { for (const [k, q] of aligned) { const cur = data.watches.find(x => watchKey(x) === k); if (cur && cur.query !== q && q.length <= 1500) commitWatch(data, { ...cur, query:q }, email, "search uses the molecule and its own names only"); } }).catch(() => {});
     const name = clientId === "none" ? "No client" : state.clients.find(c => c.id === clientId).name;
     await audit(env, { by:email, action:"pull.client", target:name, detail:{ from:body.from, to:body.to, molecules:results.length, articles:results.reduce((n, r) => n + (r.count || 0), 0), failed:results.filter(r => r.error).length } });
@@ -5565,12 +5594,14 @@ async function apiCore(request, env, path) {
       let run = await execute(env, { portfolio, molecule, query }, body.from, body.to, { mode:"backfill", dateField:"any", force:true, windowDays:allDates ? 40000 : 92, budget:600, onRun:id => { progress[0].runId = id; } });
       const pubmedTotal = allDates ? progress[0].expected ?? null : await countAny(cfg, searchTerm(query, body.from, body.to, "any"));
       run = await completeRun(env, run.id, { total:pubmedTotal });
+      progress[0].stage = "checking"; const check = await verifyIds(cfg, run.id, allDates ? query : searchTerm(query, body.from, body.to, "any"), pubmedTotal).catch(() => ({ checked:false, filled:0 }));
+      run = (await load(env)).state.runs.find(x => x.id === run.id) || run;
       await write(env, d => { for (const a of d.assignments) if (a.portfolio === portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
       await settleEvidence(env, run.ids);
       await audit(env, { by:email, action:"pull.mine", target:portfolio + " · " + molecule, detail:{ from:allDates ? "all dates" : body.from, to:allDates ? "" : body.to, count:run.count ?? 0 } });
       const wins = run.windows || [];
       return { molecule, portfolio, mode:body.searchMode === "precise" ? "precise" : "broad", names:names.length - 1, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, mine:(run.ids || []).filter(id => !before.has(id)).length,
-        expected:pubmedTotal ?? run.expected ?? wins.reduce((n, x) => n + (x.expected || 0), 0), retrieved:uniq(run.ids || []).length, coverage:run.coverage, unavailable:(run.unavailable || []).length,
+        expected:pubmedTotal ?? run.expected ?? wins.reduce((n, x) => n + (x.expected || 0), 0), retrieved:uniq(run.ids || []).length, coverage:run.coverage, idCheck:check.checked, filledByCheck:check.filled || 0, unavailable:(run.unavailable || []).length,
         notStored:Math.max(0, (pubmedTotal ?? run.expected ?? 0) - uniq(run.ids || []).length - (run.unavailable || []).length), missingSample:uniq(wins.flatMap(x => x.missing || [])).slice(0, 6),
         term:allDates ? query : searchTerm(query, body.from, body.to, "any"), pubmedUrl:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(allDates ? query : searchTerm(query, body.from, body.to, "any")),
         complete:["reconciled", "zero_results"].includes(run.coverage) && (pubmedTotal == null || uniq(run.ids || []).length + (run.unavailable || []).length >= pubmedTotal), id:run.id };
@@ -9446,20 +9477,20 @@ async function runPullJobs(btn,list,bodyFor,route,done){
   const tot=k=>rows.reduce((n,x)=>n+(x&&!x.error?(x[k]||0):0),0);
   const check=x=>{
     if(x.error)return badge(x.error,"red");
-    if(x.complete)return badge("All "+x.expected+" stored","green")+(x.unavailable?'<div class="sub">'+x.unavailable+' listed by PubMed but withdrawn or not released, so nothing to store</div>':"");
+    if(x.complete)return badge("All "+x.expected+" stored","green")+(x.idCheck?'<div class="sub">Checked PMID by PMID against PubMed'+(x.filledByCheck?", "+x.filledByCheck+" filled in by the check":"")+'</div>':"")+(x.unavailable?'<div class="sub">'+x.unavailable+' listed by PubMed but withdrawn or not released, so nothing to store</div>':"");
     return badge(x.notStored+" of "+x.expected+" not stored","amber")+(x.missingSample&&x.missingSample.length?'<div class="sub">PMIDs '+esc(x.missingSample.join(", "))+(x.notStored>x.missingSample.length?" …":"")+'</div>':"");};
   const draw=()=>{const done0=rows.filter(Boolean).length,late=rows.filter(x=>x&&!x.error&&!x.complete).length,bad=rows.filter(x=>x&&x.error).length;
     cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+done0+' of '+list.length+' molecule'+(list.length===1?"":"s")+' done · '+tot("retrieved")+' article'+(tot("retrieved")===1?"":"s")+' stored, '+tot("added")+' new this time</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(late?' · '+late+' not complete: press Try again on the row':"")+(bad?' · '+bad+' failed':"")+'</span></div>'+
     table(["Molecule","In PubMed","Stored here","New this time","Check",""],list.map((it,i)=>{const x=rows[i];
       if(x)return ['<b>'+esc(x.molecule||it.name)+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · +'+x.names+' other name'+(x.names===1?"":"s"):"")+(x.mode?' · '+x.mode:"")+'</div>':"")+(x.pubmedUrl?'<div class="sub"><a href="'+esc(x.pubmedUrl)+'" target="_blank" rel="noopener">Same search on PubMed</a></div>':""),x.error?"-":String(x.expected),x.error?"-":String(x.retrieved),x.error?"-":String(x.added),check(x)+(x.pmc?(x.pmc.error?'<div class="sub" style="color:var(--amber)">PubMed Central: '+esc(x.pmc.error)+'</div>':'<div class="sub">PubMed Central: '+x.pmc.found+' found, '+x.pmc.added+' new</div>'):"")+(x.mode==="precise"&&x.siteCount!=null&&x.siteCount>(x.retrieved||0)*1.15?'<div class="sub" style="color:var(--amber)">The broad search finds '+x.siteCount+'. Choose Broad to pull them.</div>':""),(x.error||!x.complete)?'<button type="button" class="btn outline sm" data-cpretry="'+i+'">Try again</button>':""];
-      const p=prog[i];const st=!p?"Starting…":p.stage==="names"?"Preparing the search…":p.stage==="counting"?"Asking PubMed how many…":p.stage==="finishing"?"Storing…":"Pulling: "+p.articles+" stored"+(p.windows?" · "+p.windowsDone+" of "+p.windows+" search windows":"");
+      const p=prog[i];const st=!p?"Starting…":p.stage==="names"?"Preparing the search…":p.stage==="counting"?"Asking PubMed how many…":p.stage==="checking"?"Checking every PMID against PubMed…":p.stage==="finishing"?"Storing…":"Pulling: "+p.articles+" stored"+(p.windows?" · "+p.windowsDone+" of "+p.windows+" search windows":"");
       return ['<b>'+esc(it.name)+'</b>',p&&p.expected!=null?String(p.expected):'',p&&p.articles?String(p.articles):'','','<span class="sub">'+esc(st)+'</span>',''];}),"");
     if($("cpout"))$("cpout").innerHTML=cpState.out;};
   const runOne=async i=>{try{let r=await api(route,{...bodyFor(list[i]),background:true});
       while(r.job){await new Promise(ok=>setTimeout(ok,1500));const pj=await api("pull-job",{id:r.job});prog[i]=(pj.progress||[])[0]||null;draw();if(pj.state==="failed")throw new Error(pj.error||"The pull failed.");if(pj.state==="done"){r=pj.payload;break;}}
       rows[i]=r.results[0];}catch(err){rows[i]={molecule:list[i].name,error:err.message};}draw();};
   draw();let next=0;
-  await Promise.all(Array.from({length:Math.min(((data.config||{}).ncbi||{}).keySet?3:2,list.length)},async()=>{while(next<list.length){await runOne(next++);}}));
+  await Promise.all(Array.from({length:1},async()=>{while(next<list.length){await runOne(next++);}}));
   cpState.retry=async(i,b)=>{if(!list[i])return;b.disabled=true;rows[i]=null;prog[i]=null;draw();await runOne(i);try{await refresh();}catch(_){}};
   try{await refresh();}catch(_){}btn.disabled=false;if(done)done({found:tot("retrieved"),added:tot("added"),failed:rows.filter(x=>x&&x.error).length});
 }
