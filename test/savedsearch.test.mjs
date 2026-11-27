@@ -34,7 +34,7 @@ test("a manager edits a saved search: names, mode and filters become a new query
   assert.ok(r.body.search.query.includes('"PhosLo"[tiab]') && r.body.search.query.endsWith("AND humans[mh]"), r.body.search.query);
   const w = (await t.state()).watches.find(x => x.id === "ca");
   assert.equal(w.query, r.body.search.query, "the stored query is the saved search, so the daily pull runs it");
-  assert.equal(w.versions.length, 2); assert.equal(w.versions[1].note, "saved search edited"); assert.equal(w.client, "sq");
+  assert.equal(w.versions.length, 2); assert.match(w.versions[1].note, /^saved search edited/); assert.equal(w.client, "sq");
   const denied = await t.call(SCREENER, "/api/saved-search", { key: k, mode: "pubmed", save: true });
   assert.equal(denied.status, 403);
   // a custom query runs exactly as written, with the safety filter only if ticked
@@ -123,4 +123,20 @@ test("a brand PubMed cannot read is not searched loosely: nothing is pulled and 
   const x = r.body.results[0];
   assert.match(x.error, /could not read part of "Pioz MF G-1"/); assert.deepEqual(x.loose, ["Pioz MF G-1"]);
   assert.equal(Object.keys((await t.state()).articles).length, 0, "nothing was pulled");
+});
+
+test("a custom search saved before anything was pulled applies to every date, so the automatic catch-up runs it too", async () => {
+  const watches = [{ id: "m", portfolio: "Laurus", molecule: "metformin", query: "((metformin))", names: [], client: "l" }];
+  const t = await makeEnv({ watches, clients: [{ id: "l", name: "Laurus" }] });
+  const k = encodeURIComponent("Laurus") + "|metformin";
+  const r = await t.call(MANAGER, "/api/saved-search", { key: k, mode: "custom", customQuery: "(metformin) AND (Philippines)", save: true });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const w = (await t.state()).watches[0]; assert.equal(w.versions.at(-1).effectiveFrom, "0000-00-00");
+  const ncbi = fakeNcbi([{ pmid: "71", date: dAgo(2) }]);
+  await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/scheduled", { force: true }));
+  const terms = esearchTerms(ncbi);
+  assert.ok(terms.length && terms.every(x => x.includes("(metformin) AND (Philippines)")), terms[0]);
+  // once something has been pulled, a later edit applies from today only
+  const again = await t.call(MANAGER, "/api/saved-search", { key: k, mode: "custom", customQuery: "(metformin) AND (Philippines[ad])", save: true });
+  assert.equal(again.status, 200); assert.notEqual((await t.state()).watches[0].versions.at(-1).effectiveFrom, "0000-00-00");
 });

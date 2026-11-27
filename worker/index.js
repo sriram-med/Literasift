@@ -6011,7 +6011,11 @@ async function apiCore(request, env, path) {
       await write(env, data => { const cur = data.watches.find(x => watchKey(x) === watchKey(w)); if (!cur) throw new Error("That saved search was removed.");
         const next = { ...cur, names:draft.names, searchMode:draft.searchMode, filters:draft.filters, query:spec.query };
         next.customQuery = draft.searchMode === "custom" ? draft.customQuery : undefined;   // undefined (not deleted), so the old custom query is not carried over
-        commitWatch(data, next, email, "saved search edited"); });
+        commitWatch(data, next, email, "saved search edited");
+        // Nothing was ever pulled with the earlier search (a molecule just added): the saved search then applies to every date, so the automatic
+        // catch-up for earlier days does not run the old search. Once pulls exist, an edit applies from today and past pulls keep their version.
+        const saved = data.watches.find(x => watchKey(x) === watchKey(next)), pulled = (data.runs || []).some(r => samePf(saved, r.portfolio) && (r.molecule || "") === saved.molecule);
+        const last = saved.versions[saved.versions.length - 1]; if (!pulled && last) { last.effectiveFrom = "0000-00-00"; last.note = "saved search edited (applies to all dates: nothing pulled before)"; } });
       await audit(env, { by:email, action:"saved-search.edit", target:w.portfolio + " · " + w.molecule, detail:{ before:{ mode:before.mode, names:before.names, filters:before.filters, query:before.query }, after:{ mode:spec.mode, names:draft.names, filters:spec.filters, query:spec.query } } });
       const fresh = (await load(env)).state.watches.find(x => watchKey(x) === watchKey(w));
       return json({ saved:true, search:fresh ? view(fresh) : null, count });
