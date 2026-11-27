@@ -197,3 +197,24 @@ test("Remove on a client's molecule deletes exactly that molecule, not a namesak
   const r = await t.call(MANAGER, "/api/delete-watch", { watch: "USV|metformin" }); assert.equal(r.status, 200);
   const st = await t.state(); assert.deepEqual(st.watches.map(w => w.portfolio + "/" + w.molecule), ["Square/metformin"]);
 });
+
+test("a client report is compared article by article with the app for the same dates, with a reason for every difference", async () => {
+  const { fakeNcbi, withFetch } = await import("./helpers.mjs");
+  const t = await makeEnv({ clients: [{ id: "l", name: "Laurus" }], schema: { grouping: "client" },
+    watches: [{ portfolio: "Laurus", molecule: "metformin", query: "((metformin))", names: [], client: "l" }, { portfolio: "Laurus", molecule: "atorvastatin", query: "((atorvastatin))", names: [], client: "l" }],
+    articles: { 101: { pmid: "101" }, 103: { pmid: "103" } },
+    assignments: [{ id: "a", pmid: "101", portfolio: "Laurus", molecules: ["metformin"] }, { id: "b", pmid: "103", portfolio: "Laurus", molecules: ["metformin"] }] });
+  // PubMed: 101 and 102 match in the week (102 not pulled yet); 103 is stored but published outside the week; 104 is in the report only
+  const ncbi = fakeNcbi([{ pmid: "101", date: "2026-11-10" }, { pmid: "102", date: "2026-11-12" }, { pmid: "103", date: "2026-10-01" }]);
+  const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/report-compare", { client: "l", from: "2026-11-09", to: "2026-11-15", text: "metformin: 101, 102, 104\natorvastatin: -\nunknown: 1" }));
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const m = r.body.rows[0];
+  assert.deepEqual([m.client, m.app, m.both], [3, 1, 1]); assert.ok(m.term.includes("[dp]"));
+  assert.deepEqual(m.onlyClient, [{ pmid: "102", reason: "found by the search, not pulled yet" }, { pmid: "104", reason: "the app's search does not find it with these dates" }]);
+  assert.deepEqual(m.onlyApp, []);
+  assert.deepEqual([r.body.rows[1].client, r.body.rows[1].app], [0, 0]); assert.match(r.body.rows[2].error, /No molecule/);
+  assert.equal((await t.call(SCREENER, "/api/report-compare", { client: "l", from: "2026-11-09", to: "2026-11-15", text: "metformin: 1" })).status, 403);
+  // as PubMed was on a day: the search is limited to records created by then
+  const asOf = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/report-compare", { client: "l", from: "2026-11-09", to: "2026-11-15", asOf: "2026-11-15", text: "metformin: 101" }));
+  assert.ok(asOf.body.rows[0].term.endsWith("AND (1800/01/01[crdt]:2026/11/15[crdt])"), asOf.body.rows[0].term); assert.equal(asOf.body.asOf, "2026-11-15");
+});
