@@ -366,3 +366,26 @@ test("each client is pulled on its own schedule (daily or weekly at a time, Indi
   const s = await t.call(M, "/api/scheduler-status", {}); const pc = s.body.perClient.find(x => x.id === "c");
   assert.equal(pc.nextPull, ago(-3) + " 09:00"); assert.equal(pc.lastSlotDone, true);
 });
+
+test("a client counted like PubMed alerts is pulled by the date articles enter PubMed; others stay on publication date", async () => {
+  const { makeEnv: mk, MANAGER: M, fakeNcbi: fk, withFetch: wf } = await import("./helpers.mjs");
+  const ago = n => new Date(Date.now() + 5.5 * 3600000 - n * 864e5).toISOString().slice(0, 10);
+  const t = await mk({ clients: [{ id: "n", name: "Navinta" }, { id: "l", name: "Laurus" }], schema: { grouping: "client" },
+    watches: [{ portfolio: "Navinta", molecule: "carmustine", query: "((carmustine))", names: [], client: "n" }, { portfolio: "Laurus", molecule: "trientine", query: "((trientine))", names: [], client: "l" }] });
+  const r = await t.call(M, "/api/client-auto", { client: "n", alerts: true, every: "weekly", weekday: 7, time: "06:00" });
+  assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal((await t.state()).clients[0].dateBasis, "crdt");
+  const ncbi = fk([{ pmid: "1", date: ago(1) }]);
+  await wf(ncbi.handler, () => t.call(M, "/api/scheduled", { force: true }));
+  const terms = ncbi.calls.filter(c => c.startsWith("esearch")).map(c => c.slice(13));
+  assert.ok(terms.some(x => x.includes("carmustine") && x.includes("[crdt]")), "Navinta by entry date");
+  assert.ok(!terms.some(x => x.includes("carmustine") && x.includes("[dp]")), "no publication-date search or sweep for Navinta");
+  assert.ok(terms.some(x => x.includes("trientine") && x.includes("[dp]")), "Laurus stays on publication date");
+  const st = await t.state(); assert.ok(st.runs.some(x => x.molecule === "carmustine" && x.mode === "monitor" && x.dateField === "crdt"));
+  const s = await t.call(M, "/api/scheduler-status", {}); assert.equal(s.body.perClient.find(x => x.id === "n").countBy, "alerts");
+  assert.equal(s.body.perWatch.find(x => x.molecule === "carmustine").missing, 0, "monitoring coverage is kept by entry date");
+  // switched off again: publication date
+  await t.call(M, "/api/client-auto", { client: "n", alerts: false }); assert.equal((await t.state()).clients[0].dateBasis, undefined);
+  // the paste box schedule line can set it too
+  await t.call(M, "/api/saved-search-bulk", { client: "n", text: "schedule | every: weekly | day: Sunday | time: 06:00 | count: alerts" });
+  assert.equal((await t.state()).clients[0].dateBasis, "crdt");
+});
