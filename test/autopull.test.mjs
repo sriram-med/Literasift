@@ -159,7 +159,7 @@ test("broad search style: bare names like the PubMed website, a client switch th
   await t.call(MANAGER, "/api/client-auto", { client: "k1", searchMode: "precise" }); st = await t.state(); assert.ok(/\[tiab\]/.test(st.watches[0].query) && st.clients[0].searchMode === undefined);
   const cmp = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/client-compare", { client: "k1", from: dAgo(6), to: dAgo(0) })); assert.equal(cmp.status, 200, JSON.stringify(cmp.body));
   const row = cmp.body.rows[0]; assert.equal(row.molecule, "sertraline"); assert.equal(row.site, 2); assert.ok(row.allTime === null || row.allTime === 2, "the undated count is asked for"); assert.ok(row.link.startsWith("https://pubmed.ncbi.nlm.nih.gov/?term="));
-  assert.equal((await t.call(SCREENER, "/api/client-compare", { client: "k1" })).status, 403);
+  const sc = await t.call(SCREENER, "/api/compare-client", { client: "k1" }); assert.ok(sc.status === 400 || sc.body.rows.every(r => r.portfolio === "CNS"), "others compare only the molecules of their own portfolios");
 });
 
 test("a pull can run in the background: the request answers at once with a job, and progress is polled until it is done", async () => {

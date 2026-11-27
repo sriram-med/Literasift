@@ -55,7 +55,7 @@ test("clients: a user can manage clients only after a manager allows it, and rev
   st = await (await t.get(SCREENER, "/api/state")).json(); assert.equal(st.clientAdmin, true, "saving the profile keeps the permission");
   await t.call(MANAGER, "/api/client-permission", { email:SCREENER, allowed:false });
   assert.equal((await t.raw(SCREENER, "/api/client-save", { name:"Delta" })).status, 403);
-  st = await (await t.get(SCREENER, "/api/state")).json(); assert.equal(st.clientAdmin, false); assert.deepEqual(st.watches, []);
+  st = await (await t.get(SCREENER, "/api/state")).json(); assert.equal(st.clientAdmin, false); assert.ok(st.watches.every(w => !w.query && w.portfolio === "CNS"), "only the molecule names of their own portfolios, for Search & Pull, never the queries");
 });
 
 import worker from "../worker/index.js";

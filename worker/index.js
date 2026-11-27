@@ -52,7 +52,12 @@ async function pubmed(env, operation, params) {
   url.search = new URLSearchParams({ db: "pubmed", ...ncbiParams(env), ...params });
   const response = await fetch(url, { signal: AbortSignal.timeout(20000) });
   if (!response.ok) throw new Error("PubMed returned HTTP " + response.status);
-  return response.json();
+  // PubMed sometimes answers a busy moment with an HTML page, half a reply, or an "ERROR" inside the JSON. Those are treated as temporary, so the call is tried again.
+  const text = await response.text(); let body;
+  try { body = JSON.parse(text); } catch { throw new Error("PubMed answer incomplete (" + text.replace(/\s+/g, " ").slice(0, 60) + ")"); }
+  const err = body?.esearchresult?.ERROR || body?.error || body?.ERROR;
+  if (err && !body?.esearchresult?.idlist && !body?.result) throw new Error("PubMed answer incomplete: " + String(err).slice(0, 80));
+  return body;
 }
 // ---- Timelines. Every item starts from its IRD (the day LiteraSift received it). Screening and routing to QC take 2 working days by default, QC 2 more, medical review 3; a manager changes the defaults,
 // the days for one molecule, or the date of a single item. Weekends and listed holidays do not count. ----
@@ -302,7 +307,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 // Times printed on screenshots, snapshots and PDF exports are Indian Standard Time (UTC+05:30), never UTC. Stored timestamps stay ISO UTC.
 const istStamp = iso => { const d = new Date(iso); if (!iso || Number.isNaN(d.getTime())) return ""; const x = new Date(d.getTime() + 19800000).toISOString(); return x.slice(0, 10) + " " + x.slice(11, 16) + " IST"; };
 const DATE_FIELDS = { crdt:{ label:"Create Date", tag:"crdt" }, pdat:{ label:"Publication Date", tag:"dp" }, any:{ label:"Any date (created or published)", tag:"crdt" } };
-async function withRetry(env, fn, { tries = 4 } = {}) {
+async function withRetry(env, fn, { tries = 5 } = {}) {
   for (let attempt = 0; ; attempt++) {
     try { return await fn(); }
     catch (error) {
@@ -1808,6 +1813,8 @@ async function fetchPubmedDetails(env, ids, xmlOut) {
   const response = await fetch(url, { signal:AbortSignal.timeout(25000) });
   if (!response.ok) throw new Error("PubMed efetch returned HTTP " + response.status);
   const xml = await response.text();
+  // A busy PubMed can answer with an HTML page or a cut-off reply; that is retried rather than read as "no articles".
+  if (!/<PubmedArticleSet[\s>]/.test(xml) || !/<\/PubmedArticleSet>\s*$/.test(xml.trim())) throw new Error("PubMed efetch answer incomplete");
   // The original XML of each article is handed back too, so it can be stored untouched.
   if (xmlOut) for (const block of xml.split("<PubmedArticle>").slice(1)) { const pmid = /<PMID[^>]*>(\d+)<\/PMID>/.exec(block)?.[1]; if (pmid) xmlOut[pmid] = '<?xml version="1.0" encoding="UTF-8"?>\n<PubmedArticleSet><PubmedArticle>' + block.replace(/<\/PubmedArticleSet>\s*$/, "").trimEnd() + "</PubmedArticleSet>"; }
   return parsePubmedXml(xml);
@@ -3205,7 +3212,7 @@ function ownNames(w) {
 const handQuery = w => !Array.isArray(w.names) && !queryTerms(firstQuery(w)).length && Boolean(w.query);
 const styledQuery = (w, broad, safety) => broad ? buildBroadQuery(ownNames(w), safety) : buildQuery(ownNames(w).slice(0, 30), safety);
 async function namesFor(env, state, kb, w) { return ownNames(w); }
-const countAny = async (env, term) => { try { const { esearchresult: r } = await withRetry(env, () => pubmed(env, "esearch", { term, retmode:"json", retmax:"0" }), { tries:2 }); return Number(r?.count ?? NaN); } catch { return null; } };
+const countAny = async (env, term) => { try { const { esearchresult: r } = await withRetry(env, () => pubmed(env, "esearch", { term, retmode:"json", retmax:"0" }), { tries:5 }); return Number(r?.count ?? NaN); } catch { return null; } };
 const saveKb = async (env, kb) => { kb.updatedAt = new Date().toISOString(); await env.BUCKET.put(KB_KEY, JSON.stringify(kb), { httpMetadata:{ contentType:"application/json" } }); };
 function kbLookup(kb, text) {
   const hit = kb.index.get(kbName(text)); if (!hit) return null;
@@ -3289,9 +3296,9 @@ async function pmcSearch(env, names, from, to, field, cap = 400) {
   const clean = [...new Set(names.map(n => String(n || "").replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim()).filter(x => x.length > 1))].slice(0, 20);
   if (!clean.length) return { count:0, pmids:[] };
   const term = "(" + clean.map(n => '"' + n + '"[All Fields]').join(" OR ") + ")", dt = field === "pdat" ? "pdat" : "edat";
-  const found = await withRetry(env, () => pubmed(env, "esearch", { db:"pmc", term, retmode:"json", retmax:String(cap), datetype:dt, mindate:from.replace(/-/g, "/"), maxdate:to.replace(/-/g, "/") }), { tries:2 });
+  const found = await withRetry(env, () => pubmed(env, "esearch", { db:"pmc", term, retmode:"json", retmax:String(cap), datetype:dt, mindate:from.replace(/-/g, "/"), maxdate:to.replace(/-/g, "/") }), { tries:5 });
   const ids = found?.esearchresult?.idlist || [], pmids = [];
-  for (let i = 0; i < ids.length; i += 100) { const sum = await withRetry(env, () => pubmed(env, "esummary", { db:"pmc", id:ids.slice(i, i + 100).join(","), retmode:"json" }), { tries:2 }); for (const id of ids.slice(i, i + 100)) { const v = (sum?.result?.[id]?.articleids || []).find(a => a.idtype === "pmid")?.value; if (v && /^\d+$/.test(v)) pmids.push(v); } }
+  for (let i = 0; i < ids.length; i += 100) { const sum = await withRetry(env, () => pubmed(env, "esummary", { db:"pmc", id:ids.slice(i, i + 100).join(","), retmode:"json" }), { tries:5 }); for (const id of ids.slice(i, i + 100)) { const v = (sum?.result?.[id]?.articleids || []).find(a => a.idtype === "pmid")?.value; if (v && /^\d+$/.test(v)) pmids.push(v); } }
   return { count:Number(found?.esearchresult?.count || ids.length), pmids:[...new Set(pmids)] };
 }
 const DISCOVER_SOURCES = ["pmc", "pubmed", "europepmc", "openalex", "crossref", "doaj", "core", "clinicaltrials", "mhra", "fdarecall"];
@@ -5219,7 +5226,7 @@ async function apiCore(request, env, path) {
       monitoring:monitoringCounts(state, viewer),
       series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ timelines:timelines(state), myPortfolios:myPortfolios(state, viewer), syncAutoScreen:state.settings?.syncAutoScreen !== false, syncActivePortfolios:state.settings?.syncActivePortfolios || [], syncMode:syncMode(state), syncAiPortfolios:manager ? (state.settings?.syncAiPortfolios || []) : [], automation:{ submit:state.settings?.automation?.submit !== false, auto:state.settings?.automation?.auto !== false, smpc:state.settings?.automation?.smpc !== false, ai:state.settings?.automation?.ai === true }, ai:(() => { const c = aiConfig(env, state); return { available:c.enabled && c.hasKey && c.monthlyTokens > 0, paused:c.paused, ...(manager ? { enabled:state.settings?.ai?.enabled === true, model:c.model, monthlyTokens:c.monthlyTokens, perCaseTokens:c.perCaseTokens, hasKey:c.hasKey, keySource:c.keySource, used:aiUsed(state), month:aiMonth() } : {}) }; })(), retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
-      profiles:manager ? state.profiles : [viewer], people:state.profiles.filter(p => p.active).map(p => ({ email:p.email, name:p.name, role:p.role, active:true })), clientAdmin:manager || viewer.canManageClients === true, watches:manager ? state.watches : viewer.canManageClients === true ? state.watches.map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "", client:w.client || "" })) : [],
+      profiles:manager ? state.profiles : [viewer], people:state.profiles.filter(p => p.active).map(p => ({ email:p.email, name:p.name, role:p.role, active:true })), clientAdmin:manager || viewer.canManageClients === true, watches:manager ? state.watches : (viewer.canManageClients === true ? state.watches : state.watches.filter(w => myPortfolios(state, viewer).includes(w.portfolio))).map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "", client:w.client || "" })),
       runs:manager ? state.runs : [], assignments,
       articles:manager ? state.articles : Object.fromEntries(assignments.map(a => [a.pmid, state.articles[a.pmid]])) });
   }
@@ -5409,11 +5416,28 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"sources.add", target:portfolio + (molecule ? " · " + molecule : ""), detail:{ added:added.length, skipped:skipped.length } });
     return json({ ok:true, added:added.length, skipped });
   }
+  if ((path === "/api/compare-client" || path === "/api/client-compare") && viewer) {
+    // For each molecule of a client: what this app's search finds, what the PubMed website's own style of search finds (same dates, and with no date limit), and what is stored here.
+    // Anyone may compare; people who are not managers see only the molecules in their own portfolios.
+    const mineOnly = viewer.role !== "manager" && viewer.canManageClients !== true, mine = myPortfolios(state, viewer);
+    const clientId = String(body.client || ""), list = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule && (!mineOnly || mine.includes(w.portfolio))).slice(0, 25);
+    if (!list.length) return json({ error:"This client has no molecules." }, 400);
+    const allDates = body.allDates === true || (!body.from && !body.to), field = "any", from = isDate(body.from) ? body.from : addDays(day(), -30), to = isDate(body.to) ? body.to : day(), cfg = withSettings(env, state), kb = await loadKb(env).catch(() => null), rows = new Array(list.length);
+    let next = 0; await Promise.all(Array.from({ length:Math.min(3, list.length) }, async () => { while (next < list.length) { const i = next++, w = list[i];
+      const stored = queryAt(w, day())?.query || w.query || "", names = ownNames(w), safety = stored.includes(safetyFilter), broadQ = handQuery(w) ? stored : buildBroadQuery(names, safety), preciseQ = handQuery(w) ? stored : (buildQuery(names.slice(0, 30), safety) || stored);
+      const [precise, site, allTime] = await Promise.all([allDates ? countAny(cfg, preciseQ) : countAny(cfg, searchTerm(preciseQ, from, to, field)), allDates ? countAny(cfg, broadQ) : countAny(cfg, searchTerm(broadQ, from, to, field)), countAny(cfg, broadQ)]);
+      rows[i] = { molecule:w.molecule, portfolio:w.portfolio, names:names.length, precise, site, allTime, stored:state.assignments.filter(a => a.portfolio === w.portfolio && (a.molecules || []).includes(w.molecule)).length, link:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(broadQ) }; } }));
+    return json({ from:allDates ? "" : from, to:allDates ? "" : to, allDates, dateField:field, rows });
+  }
   if (path === "/api/pull-job" && viewer) {
     const id = String(body.id || ""), job = pullJobs.get(id);
     if (!job) { // finished before a restart: the answer was kept
       const o = /^[0-9a-f-]{36}$/.test(id) ? await env.BUCKET.get("jobs/pull/" + id + ".json").catch(() => null) : null, saved = o ? JSON.parse(await o.text()) : null;
-      if (saved && (saved.by === email || viewer.role === "manager")) return json({ state:saved.state, total:(saved.payload?.results || []).length, done:(saved.payload?.results || []).length, results:saved.payload?.results || [], payload:saved.payload, error:saved.error || "" });
+      if (saved && (saved.by === email || viewer.role === "manager")) {
+        // A running pull seen from another server process: its last saved state. One not updated for 20 minutes was cut off by a restart.
+        if (saved.state === "running" && Date.now() - (saved.at || 0) > 1200000) return json({ error:"The server restarted while this pull was running. Everything pulled so far is kept; press Pull again to finish it." }, 404);
+        const res = saved.payload?.results || saved.results || []; return json({ state:saved.state, total:saved.total ?? res.length, done:res.filter(Boolean).length, results:res, progress:saved.progress || [], payload:saved.payload, error:saved.error || "" });
+      }
       return json({ error:"The server restarted while this pull was running. Everything pulled so far is kept; press Pull again to finish it." }, 404);
     }
     if (job.by !== email && viewer.role !== "manager") return json({ error:"That pull belongs to someone else." }, 404);
@@ -5437,7 +5461,7 @@ async function apiCore(request, env, path) {
     let watches = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule && (isMgr || allowed.includes(w.portfolio)) && (!only.size || only.has(encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || ""))));
     if (!watches.length) return json({ error:isMgr ? "This client has no molecules yet. Add one on the Clients page." : "This client has no molecules in your portfolios." }, 400);
     if (watches.length > 25) return json({ error:"A client pull covers up to 25 molecules at a time. Choose fewer." }, 400);
-    const results = new Array(watches.length), progress = watches.map(w => ({ molecule:w.molecule, portfolio:w.portfolio, stage:"waiting", runId:"" })), work = async () => {
+    let jobHook = null; const results = new Array(watches.length), progress = watches.map(w => ({ molecule:w.molecule, portfolio:w.portfolio, stage:"waiting", runId:"" })), work = async () => {
     const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
     const cfg = withSettings(env, state), aligned = new Map();
     const clientRec = (state.clients || []).find(c => c.id === clientId), broad = body.searchMode ? body.searchMode === "broad" : clientRec?.searchMode === "broad";
@@ -5468,11 +5492,11 @@ async function apiCore(request, env, path) {
           let imported = 0; if (fresh.length) { const got = await importPmidList(env, fresh.map(pmid => ({ pmid })), w.portfolio, w.molecule); imported = (got.run?.ids || []).length; run.ids = [...new Set([...(run.ids || []), ...(got.run?.ids || [])])]; }
           pmc = { found:hit.count, withPmid:hit.pmids.length, added:imported }; } catch (error) { pmc = { error:String(error.message || error).slice(0, 120) }; } }
         const site = broadQuery ? await countAny(cfg, allDates ? broadQuery : searchTerm(broadQuery, body.from, body.to, "any")) : null;
-        results[slot] = { molecule:w.molecule, portfolio:w.portfolio, mode:broad ? "broad" : "precise", pmc, siteCount:site, names:full.added.length, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, expected, retrieved:got, coverage:run.coverage || run.status, complete:["reconciled", "zero_results"].includes(run.coverage), gaps:(run.gaps || []).length };
+        results[slot] = { molecule:w.molecule, portfolio:w.portfolio, mode:broad ? "broad" : "precise", pmc, siteCount:site, missing:wins.reduce((n, x) => n + ((x.missing || []).length), 0), failedWindows:wins.filter(x => x.state === "failed").length, names:full.added.length, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, expected, retrieved:got, coverage:run.coverage || run.status, complete:["reconciled", "zero_results"].includes(run.coverage), gaps:(run.gaps || []).length };
       } catch (error) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, error:String(error.message || error).slice(0, 160) }; }
     };
     // A few molecules at a time; the shared NCBI gate keeps the request rate within the allowed limit.
-    let nextSlot = 0; await Promise.all(Array.from({ length:Math.min(Math.max(1, Number(env.PULL_LANES ?? 3)), watches.length) }, async () => { while (nextSlot < watches.length) { const slot = nextSlot++; await one(watches[slot], slot); } }));
+    let nextSlot = 0; await Promise.all(Array.from({ length:Math.min(Math.max(1, Number(env.PULL_LANES ?? 3)), watches.length) }, async () => { while (nextSlot < watches.length) { const slot = nextSlot++; await one(watches[slot], slot); if (jobHook) await jobHook(); } }));
     if (aligned.size) await write(env, data => { for (const [k, q] of aligned) { const cur = data.watches.find(x => watchKey(x) === k); if (cur && cur.query !== q && q.length <= 1500) commitWatch(data, { ...cur, query:q }, email, "search uses the molecule and its own names only"); } }).catch(() => {});
     const name = clientId === "none" ? "No client" : state.clients.find(c => c.id === clientId).name;
     await audit(env, { by:email, action:"pull.client", target:name, detail:{ from:body.from, to:body.to, molecules:results.length, articles:results.reduce((n, r) => n + (r.count || 0), 0), failed:results.filter(r => r.error).length } });
@@ -5481,7 +5505,8 @@ async function apiCore(request, env, path) {
     if (body.background === true && env.DEFER_EVIDENCE === "1") {
       const id = crypto.randomUUID(), job = { id, by:email, state:"running", total:watches.length, results, progress, startedAt:Date.now() }; pullJobs.set(id, job);
       for (const [k0, v0] of pullJobs) if (Date.now() - v0.startedAt > 3600000) pullJobs.delete(k0);
-      const keep = () => env.BUCKET.put("jobs/pull/" + id + ".json", JSON.stringify({ by:email, state:job.state, payload:job.payload || null, error:job.error || "" })).catch(() => {});
+      const keep = () => env.BUCKET.put("jobs/pull/" + id + ".json", JSON.stringify({ by:email, state:job.state, total:job.total, results:job.results.map(x => x || null), progress:(job.progress || []).map(p => ({ molecule:p.molecule, stage:p.stage, expected:p.expected ?? null })), payload:job.payload || null, error:job.error || "", at:Date.now() })).catch(() => {});
+      jobHook = keep; await keep();
       work().then(payload => { job.payload = payload; job.state = "done"; return keep(); }).catch(error => { job.state = "failed"; job.error = String(error.message || error).slice(0, 200); return keep(); });
       return json({ job:id, total:watches.length });
     }
@@ -6867,18 +6892,6 @@ async function apiCore(request, env, path) {
     for (const r of list) lines.push([q(r.name), r.total, ...r.counts, r.allTime].join(","));
     lines.push([q("Total"), list.reduce((x, r) => x + r.total, 0), ...totals, list.reduce((x, r) => x + r.allTime, 0)].join(","));
     return new Response("﻿" + lines.join("\r\n") + "\r\n", { headers:{ "Content-Type":"text/csv; charset=utf-8", "Content-Disposition":'attachment; filename="literasift-client-pulls-' + today + '.csv"' } });
-  }
-  if (path === "/api/client-compare" && viewer) {
-    // For each molecule of a client: what this app's search finds, what the PubMed website's own style of search finds (same dates, and with no date limit), and what is stored here.
-    if (viewer.role !== "manager" && viewer.canManageClients !== true) return json({ error:"Limited to managers and users allowed to manage clients." }, 403);
-    const clientId = String(body.client || ""), list = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule).slice(0, 25);
-    if (!list.length) return json({ error:"This client has no molecules." }, 400);
-    const allDates = body.allDates === true || (!body.from && !body.to), field = "any", from = isDate(body.from) ? body.from : addDays(day(), -30), to = isDate(body.to) ? body.to : day(), cfg = withSettings(env, state), kb = await loadKb(env).catch(() => null), rows = new Array(list.length);
-    let next = 0; await Promise.all(Array.from({ length:Math.min(3, list.length) }, async () => { while (next < list.length) { const i = next++, w = list[i];
-      const stored = queryAt(w, day())?.query || w.query || "", names = ownNames(w), safety = stored.includes(safetyFilter), broadQ = handQuery(w) ? stored : buildBroadQuery(names, safety), preciseQ = handQuery(w) ? stored : (buildQuery(names.slice(0, 30), safety) || stored);
-      const [precise, site, allTime] = await Promise.all([allDates ? countAny(cfg, preciseQ) : countAny(cfg, searchTerm(preciseQ, from, to, field)), allDates ? countAny(cfg, broadQ) : countAny(cfg, searchTerm(broadQ, from, to, field)), countAny(cfg, broadQ)]);
-      rows[i] = { molecule:w.molecule, portfolio:w.portfolio, names:names.length, precise, site, allTime, stored:state.assignments.filter(a => a.portfolio === w.portfolio && (a.molecules || []).includes(w.molecule)).length, link:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(broadQ) }; } }));
-    return json({ from:allDates ? "" : from, to:allDates ? "" : to, allDates, dateField:field, rows });
   }
   if (path === "/api/client-auto" && viewer) {
     // Automatic options of a client: on or off, the day pulling starts, and the day it stops. Each is optional in the request.
@@ -9399,7 +9412,7 @@ function cpSettings(){
 async function runPullJobs(btn,list,bodyFor,route,done){
   btn.disabled=true;const rows=new Array(list.length).fill(null),prog=new Array(list.length).fill(null),started=Date.now();let fin=0,found=0,added=0,incomplete=0,failed=0;
   const draw=()=>{cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+fin+' of '+list.length+' molecule'+(list.length===1?"":"s")+' done · '+found+' article'+(found===1?"":"s")+' found, '+added+' new</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(incomplete?' · '+incomplete+' not yet complete, retried automatically':"")+(failed?' · '+failed+' failed':"")+'</span></div>'+
-    table(["Molecule","Found","New","Checked against PubMed"],list.map((it,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||it.name)+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · +'+x.names+' other name'+(x.names===1?"":"s"):"")+(x.mode?' · '+(x.mode==="broad"?"broad":"precise"):"")+'</div>':""),x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("Complete: "+x.retrieved+" of "+x.expected,"green"):badge("Incomplete: "+x.retrieved+" of "+x.expected+", will retry","amber"))+(x.pmc?(x.pmc.error?'<div class="sub" style="color:var(--amber)">PubMed Central: '+esc(x.pmc.error)+'</div>':'<div class="sub">PubMed Central: '+x.pmc.found+' found, '+x.pmc.added+' new</div>'):"")+(x.mode==="precise"&&x.siteCount!=null&&x.siteCount>(x.retrieved||0)*1.15?'<div class="sub" style="color:var(--amber)">The broad search finds '+x.siteCount+'. Choose Broad to pull them.</div>':"")]:(()=>{const p=prog[i];const st=!p?"Starting…":p.stage==="names"?"Collecting every name…":p.stage==="counting"?"Asking PubMed how many…"+(p.expected!=null?" "+p.expected:""):p.stage==="finishing"?"Storing…":"Pulling: "+p.articles+" article"+(p.articles===1?"":"s")+(p.windows?" · "+p.windowsDone+" of "+p.windows+" search windows":"")+(p.expected!=null?" of about "+p.expected:"");return ['<b>'+esc(it.name)+'</b>',p&&p.articles?String(p.articles):'','','<span class="sub">'+esc(st)+'</span>'];})();}),"");
+    table(["Molecule","Found","New","Checked against PubMed"],list.map((it,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||it.name)+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · +'+x.names+' other name'+(x.names===1?"":"s"):"")+(x.mode?' · '+(x.mode==="broad"?"broad":"precise"):"")+'</div>':""),x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("Complete: "+x.retrieved+" of "+x.expected,"green"):badge(x.failedWindows?"Incomplete: "+x.failedWindows+" search window"+(x.failedWindows===1?"":"s")+" failed, retried automatically":x.missing?"Incomplete: "+x.missing+" citation"+(x.missing===1?"":"s")+" still to fetch, retried automatically":"Incomplete: "+x.retrieved+" of "+x.expected+", retried automatically","amber"))+(x.pmc?(x.pmc.error?'<div class="sub" style="color:var(--amber)">PubMed Central: '+esc(x.pmc.error)+'</div>':'<div class="sub">PubMed Central: '+x.pmc.found+' found, '+x.pmc.added+' new</div>'):"")+(x.mode==="precise"&&x.siteCount!=null&&x.siteCount>(x.retrieved||0)*1.15?'<div class="sub" style="color:var(--amber)">The broad search finds '+x.siteCount+'. Choose Broad to pull them.</div>':"")]:(()=>{const p=prog[i];const st=!p?"Starting…":p.stage==="names"?"Collecting every name…":p.stage==="counting"?"Asking PubMed how many…"+(p.expected!=null?" "+p.expected:""):p.stage==="finishing"?"Storing…":"Pulling: "+p.articles+" article"+(p.articles===1?"":"s")+(p.windows?" · "+p.windowsDone+" of "+p.windows+" search windows":"")+(p.expected!=null?" of about "+p.expected:"");return ['<b>'+esc(it.name)+'</b>',p&&p.articles?String(p.articles):'','','<span class="sub">'+esc(st)+'</span>'];})();}),"");
     if($("cpout"))$("cpout").innerHTML=cpState.out;};
   draw();let next=0;
   const lane=async()=>{while(next<list.length){const i=next++;try{let r=await api(route,{...bodyFor(list[i]),background:true});
@@ -9417,7 +9430,7 @@ async function runClientPull(btn){
 }
 async function runClientCompare(btn){
   const st=cpSettings();btn.disabled=true;cpState.out='<div class="sub" style="margin-top:10px">Asking PubMed…</div>';$("cpout").innerHTML=cpState.out;
-  try{const r=await api("client-compare",st._lim?{client:$("cpclient").value,from:st.from,to:st.to}:{client:$("cpclient").value,allDates:true}),n=x=>x==null?"?":String(x);
+  try{const r=await api("compare-client",st._lim?{client:$("cpclient").value,from:st.from,to:st.to}:{client:$("cpclient").value,allDates:true}),n=x=>x==null?"?":String(x);
     cpState.out='<div class="purgesum" style="margin-top:12px"><b>The app search against the PubMed website</b><span class="sub">'+(r.allDates?"all dates":esc(r.from)+' to '+esc(r.to))+'</span></div>'+table(["Molecule","Precise search","Broad (website style)","Broad, any date","Stored here",""],r.rows.map(x=>['<b>'+esc(x.molecule)+'</b><div class="sub">'+esc(x.portfolio)+' · '+x.names+' names</div>',n(x.precise),'<b>'+n(x.site)+'</b>',n(x.allTime),String(x.stored),'<a class="btn outline sm" href="'+esc(x.link)+'" target="_blank" rel="noopener">Open in PubMed</a>']),"")+'<p class="sub">If the broad search finds much more than the precise one, choose Broad. If only the any-date figure is large, clear the dates.</p>';
     $("cpout").innerHTML=cpState.out;}catch(err){cpState.out='<div class="sub" style="color:var(--red);margin-top:10px">'+esc(err.message)+'</div>';$("cpout").innerHTML=cpState.out;}
   btn.disabled=false;

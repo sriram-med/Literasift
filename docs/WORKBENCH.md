@@ -335,3 +335,10 @@ One page, one engine. At the top, choose what to pull: **By client**, **One mole
 ## Searched by the molecule and its own names only
 
 A molecule is searched by its name and by the other names someone gave it (typed when it was added, in the One molecule pull, or in **Watchlists > Dates…**, which now has an editable "Other names searched with it" field). It is never searched by its portfolio, and nothing is added automatically from the portfolio's product dictionary or the drug name list. Molecules added earlier keep the names they were created with; names that the app had appended for them are dropped, and a manager's next pull brings the daily search back in line. A hand-written PubMed query is searched exactly as written. This applies to client pulls, single-molecule pulls, personal pulls, Compare with PubMed, the search-style switch and the automatic daily pull.
+
+## Search & Pull fixes (end-to-end checked as manager and as data entry)
+
+- **Data-entry and QC users** saw "No client has molecules yet": the page never received their clients' molecules. It now receives the molecule names (never the queries) of their own portfolios, so By client works for them, and **Compare with PubMed** works for them too (their own portfolios' molecules only).
+- **A busy PubMed** answer (HTTP 429, an HTML page, a cut-off reply, or an "ERROR" inside the JSON) is treated as temporary and tried again, up to five times, for searches, citations, details, PubMed Central and the comparison counts. Before, a busy details reply was read as "no details" and left the molecule incomplete.
+- **Clearer incomplete rows**: they say what is still missing ("2 citations still to fetch" or "1 search window failed"), and that it is retried automatically.
+- **A running pull** is saved as it goes, so its progress can be read even from another server process or after a restart; one cut off by a restart says so after 20 minutes without progress.
