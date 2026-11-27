@@ -7529,7 +7529,7 @@ async function apiCore(request, env, path) {
     // One row per drug (molecule) for one week: how many articles reached the app that week (the queue date, IRD), and, when asked, how many PubMed has
     // for the same week with the drug's saved search, so the two can be compared side by side.
     if (viewer.role !== "manager" && viewer.canManageClients !== true) return json({ error:"Client figures are limited to managers and users a manager has allowed." }, 403);
-    if (!isDate(body.from) || !isDate(body.to) || body.from > body.to || (Date.parse(body.to) - Date.parse(body.from)) / 864e5 > 92) return json({ error:"Choose a week (up to three months)." }, 400);
+    if (!isDate(body.from) || !isDate(body.to) || body.from > body.to || (Date.parse(body.to) - Date.parse(body.from)) / 864e5 > 366) return json({ error:"Choose a date range of up to one year." }, 400);
     // By default a week means the articles PubMed dates in that week (as a pull for those dates finds them), not the day they reached the app.
     const by = ["ird", "any", "crdt", "pdat"].includes(body.by) ? body.by : "any";
     const clientId = String(body.client || "all"), basis = by === "ird" ? basisOf(body.dateField || "crdt") : by, cname = id => (state.clients || []).find(c => c.id === id)?.name || "No client";
@@ -7556,7 +7556,7 @@ async function apiCore(request, env, path) {
       const out = [], names = uniq(rows.map(r => r.client));
       for (const n of names) { const mine = rows.filter(r => r.client === n); for (const r of mine) out.push([n, r.molecule, r.pulled ?? "not available"]); out.push([n + " total", "", mine.reduce((k, r) => k + (r.pulled || 0), 0)]); }
       const file = xlsxFile("Drugs " + body.from, ["Client", "Drug", "Articles (" + body.from + " to " + body.to + ")"], out);
-      return new Response(file, { headers:{ "Content-Type":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Content-Disposition":'attachment; filename="literasift-drugs-' + body.from + '.xlsx"' } });
+      return new Response(file, { headers:{ "Content-Type":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Content-Disposition":'attachment; filename="literasift-drugs-' + body.from + '-to-' + body.to + '.xlsx"' } });
     }
     return json({ from:body.from, to:body.to, client:clientId === "all" ? "All clients" : clientId === "none" ? "No client" : cname(clientId), dateField:basis, dateBasisLabel:DATE_BASIS_LABEL[basis], rows,
       by, totals:{ pulled:rows.reduce((n, r) => n + (r.pulled || 0), 0), pubmed:body.pubmed === true ? rows.reduce((n, r) => n + (r.pubmed || 0), 0) : null } });
@@ -10292,20 +10292,20 @@ function openPersonDialog(email){
 }
 let cpsState={weeks:8};
 // ---- Articles per drug for one week: a table built on request, with optional PubMed counts and a CSV.
-let dwState={client:"all",from:"",by:"any",out:null};
+let dwState={client:"all",from:"",to:"",by:"any",out:null};
 function dwMonday(d){const t=new Date((d||new Date().toISOString().slice(0,10))+"T00:00:00Z"),dow=(t.getUTCDay()+6)%7;t.setUTCDate(t.getUTCDate()-dow);return t.toISOString().slice(0,10);}
 function dwAdd(d,n){const t=new Date(d+"T00:00:00Z");t.setUTCDate(t.getUTCDate()+n);return t.toISOString().slice(0,10);}
 function drugWeekHtml(){
-  if(!dwState.from)dwState.from=dwAdd(dwMonday(),-7);
+  if(!dwState.from){dwState.from=dwAdd(dwMonday(),-7);dwState.to=dwAdd(dwState.from,6);}const today=new Date().toISOString().slice(0,10);
   const opts=[["all","All clients"],...(data.clients||[]).map(c=>[c.id,c.name]),["none","No client"]];
-  return panel("Articles per drug, per week",'<div class="row" style="flex-wrap:wrap;gap:8px;align-items:flex-end">'+
+  return panel("Articles per drug, by date range",'<div class="row" style="flex-wrap:wrap;gap:8px;align-items:flex-end">'+
     '<label>Client<select id="dwclient">'+opts.map(o=>'<option value="'+esc(o[0])+'"'+(o[0]===dwState.client?" selected":"")+'>'+esc(o[1])+'</option>').join("")+'</select></label>'+
-    '<label>Week starting (Monday)<input type="date" id="dwfrom" value="'+esc(dwState.from)+'"></label>'+
-    '<button type="button" class="btn outline sm" data-dwshift="-7">Previous week</button><button type="button" class="btn outline sm" data-dwshift="7">Next week</button>'+
+    '<label>From<input type="date" id="dwfrom" value="'+esc(dwState.from)+'" max="'+today+'"></label><label>Through<input type="date" id="dwto" value="'+esc(dwState.to)+'" max="'+today+'"></label>'+
+    '<span class="fbar" style="margin:0">'+[["lastweek","Last week"],["thisweek","This week"],["30","Last 30 days"],["90","Last 3 months"],["month","Last month"]].map(x=>'<button type="button" class="fchip" data-dwrange="'+x[0]+'">'+x[1]+'</button>').join("")+'</span>'+
     '<label>Week counted by<select id="dwby">'+[["any","PubMed date, as a pull finds it"],["crdt","PubMed create date [crdt]"],["pdat","Publication date [dp]"],["ird","Day it reached the app"]].map(o=>'<option value="'+o[0]+'"'+(o[0]===dwState.by?" selected":"")+'>'+o[1]+'</option>').join("")+'</select></label>'+
     '<button type="button" class="btn sm" data-dwbuild="1">Build table</button><button type="button" class="btn outline sm" data-dwxlsx="1">Excel</button><button type="button" class="btn outline sm" data-dwpng="1">Image</button><button type="button" class="btn outline sm" data-dwcsv="1">CSV</button></div>'+
     '<div id="dwout" style="margin-top:12px">'+(dwState.out?dwTable(dwState.out):'<div class="sub">Choose a week and press Build table.</div>')+'</div>',
-    "Each drug with its number of articles in the app for that week (Monday to Sunday). By PubMed date, the app asks PubMed which articles the drug's saved search finds in the week and counts those stored here.");
+    "Each drug with its number of articles in the app for the chosen dates (both days included). By PubMed date, the app asks PubMed which articles the drug's saved search finds in the week and counts those stored here.");
 }
 function dwGroups(r){const out=[];for(const x of r.rows){let g=out.find(y=>y.client===x.client);if(!g)out.push(g={client:x.client,rows:[],total:0});g.rows.push(x);g.total+=x.pulled||0;}return out;}
 function dwTable(r){
@@ -10316,7 +10316,7 @@ async function dwXlsx(btn){
   const r=dwState.out;if(!r)return message("Build the table first.",true);btn.disabled=true;
   try{const res=await fetch("/api/drug-week-stats",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({client:dwState.client,from:r.from,to:r.to,by:r.by,format:"xlsx"})});
     if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"The Excel file could not be made.");
-    const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-drugs-"+r.from+".xlsx";document.body.appendChild(a);a.click();a.remove();}
+    const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-drugs-"+r.from+"-to-"+r.to+".xlsx";document.body.appendChild(a);a.click();a.remove();}
   catch(err){message(err.message,true);}btn.disabled=false;
 }
 function dwImage(){
@@ -10336,18 +10336,18 @@ function dwImage(){
       g.fillText(name,pad+10,y+20);g.textAlign="right";g.fillText(x.pulled==null?"-":String(x.pulled),W-pad-10,y+20);g.textAlign="left";y+=rowH;}
     y+=10;
   }
-  c.toBlob(b=>{const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="literasift-drugs-"+r.from+".png";document.body.appendChild(a);a.click();a.remove();},"image/png");
+  c.toBlob(b=>{const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="literasift-drugs-"+r.from+"-to-"+r.to+".png";document.body.appendChild(a);a.click();a.remove();},"image/png");
 }
 async function dwBuild(btn,pubmed){
-  dwState.client=$("dwclient").value;dwState.by=$("dwby").value;dwState.from=dwMonday($("dwfrom").value||undefined);
+  dwState.client=$("dwclient").value;dwState.by=$("dwby").value;dwState.from=$("dwfrom").value;dwState.to=$("dwto").value;if(!dwState.from||!dwState.to||dwState.from>dwState.to)return message("Choose From and Through dates, From first.",true);
   btn.disabled=true;$("dwout").innerHTML='<div class="sub">'+(dwState.by!=="ird"?"Asking PubMed, one drug at a time…":"Counting…")+'</div>';
-  try{dwState.out=await api("drug-week-stats",{client:dwState.client,from:dwState.from,to:dwAdd(dwState.from,6),by:dwState.by});$("dwout").innerHTML=dwTable(dwState.out);$("dwfrom").value=dwState.from;}
+  try{dwState.out=await api("drug-week-stats",{client:dwState.client,from:dwState.from,to:dwState.to,by:dwState.by});$("dwout").innerHTML=dwTable(dwState.out);}
   catch(err){$("dwout").innerHTML='<div class="sub" style="color:var(--red)">'+esc(err.message)+'</div>';}btn.disabled=false;
 }
 function dwCsv(){
   const r=dwState.out;if(!r)return message("Build the table first.",true);
   const q=v=>'"'+String(v==null?"":v).split('"').join('""')+'"',nl=String.fromCharCode(13,10),lines=[[q("Client"),q("Drug"),q("Articles")].join(",")].concat(r.rows.map(x=>[q(x.client),q(x.molecule),x.pulled].join(",")));
-  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([String.fromCharCode(65279)+lines.join(nl)+nl],{type:"text/csv;charset=utf-8"}));a.download="literasift-drugs-week-"+r.from+".csv";document.body.appendChild(a);a.click();a.remove();
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([String.fromCharCode(65279)+lines.join(nl)+nl],{type:"text/csv;charset=utf-8"}));a.download="literasift-drugs-"+r.from+"-to-"+r.to+".csv";document.body.appendChild(a);a.click();a.remove();
 }
 async function loadPullStats(){
   const box=$("pullstats");if(!box)return;
@@ -10738,7 +10738,7 @@ document.addEventListener("click",event=>{
   const lc=event.target.closest&&event.target.closest("[data-llcsv]");
   if(lc){fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:"csv"})}).then(async res=>{if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"Nothing to export.");const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-line-listing-"+new Date().toISOString().slice(0,10)+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}).catch(e=>message(e.message,true));return;}
   const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
-  const target=event.target.closest("[data-dwxlsx],[data-dwpng],[data-dwbuild],[data-dwshift],[data-dwcsv],[data-freeall],[data-freenone],[data-freedel],[data-ssdates],[data-ssdatesoff],[data-ssrange],[data-sscount],[data-ssedit],[data-sspreview],[data-sssave],[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-syncmode],[data-showkey],[data-wsuse],[data-wsrun],[data-wsall],[data-wsadd],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-mqby],[data-addmol],[data-cpsweeks],[data-cpsexport],[data-moldates],[data-clientrange],[data-wlby],[data-cppull],[data-cpcompare],[data-cpretry],[data-cppullsame],[data-runrepair],[data-recocsv],[data-qbuild],[data-xlsx],[data-sptab],[data-sprange],[data-btclient],[data-clientpull],[data-go-clients],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-dwxlsx],[data-dwpng],[data-dwbuild],[data-dwrange],[data-dwcsv],[data-freeall],[data-freenone],[data-freedel],[data-ssdates],[data-ssdatesoff],[data-ssrange],[data-sscount],[data-ssedit],[data-sspreview],[data-sssave],[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-syncmode],[data-showkey],[data-wsuse],[data-wsrun],[data-wsall],[data-wsadd],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-mqby],[data-addmol],[data-cpsweeks],[data-cpsexport],[data-moldates],[data-clientrange],[data-wlby],[data-cppull],[data-cpcompare],[data-cpretry],[data-cppullsame],[data-runrepair],[data-recocsv],[data-qbuild],[data-xlsx],[data-sptab],[data-sprange],[data-btclient],[data-clientpull],[data-go-clients],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -10839,7 +10839,9 @@ document.addEventListener("click",event=>{
   if(target.dataset.recocsv){downloadPost("/api/reconciliation-csv",{runIds:target.dataset.recocsv.split(",")},"literasift-reconciliation.csv").catch(e=>message(e.message,true));return;}
   if(target.dataset.cppullsame){const c=cpState.compared;if(c&&$("cpclient")&&$("cpclient").value===c.client){document.querySelectorAll("[data-cpmol]").forEach(x=>{x.checked=c.sel.includes(x.dataset.cpmol);});if(JSON.stringify((()=>{const v=cpSavedSettings();delete v._lim;return v;})())+JSON.stringify(ssOwnMap(c.sel))!==c.st)return message("The settings changed after the comparison. Compare again, then pull.",true);}runClientPull(target);return;}
   if(target.dataset.dwbuild){dwBuild(target,target.dataset.dwbuild==="pubmed");return;}
-  if(target.dataset.dwshift){const f=$("dwfrom");f.value=dwAdd(dwMonday(f.value||undefined),Number(target.dataset.dwshift));dwState.from=f.value;return;}
+  if(target.dataset.dwrange){const k=target.dataset.dwrange,today=new Date().toISOString().slice(0,10),mon=dwMonday();let f,t;
+    if(k==="lastweek"){f=dwAdd(mon,-7);t=dwAdd(mon,-1);}else if(k==="thisweek"){f=mon;t=today;}else if(k==="month"){const d=new Date(today+"T00:00:00Z");d.setUTCDate(1);t=dwAdd(d.toISOString().slice(0,10),-1);f=t.slice(0,8)+"01";}else{f=dwAdd(today,-Number(k));t=today;}
+    $("dwfrom").value=f;$("dwto").value=t;dwState.from=f;dwState.to=t;return;}
   if(target.dataset.dwcsv){dwCsv();return;}
   if(target.dataset.dwxlsx){dwXlsx(target);return;}
   if(target.dataset.dwpng){dwImage();return;}
