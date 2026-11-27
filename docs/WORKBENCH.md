@@ -272,3 +272,7 @@ The Watchlists page opens with the global automatic pull, then a **By client | B
 Every molecule row on the Watchlists page now has a switch for its automatic pull: flip it and the change is saved at once, with no page reload.
 
 A stop date is optional. With no stop date, pulling continues every day until a manager pauses the client or the molecule; the page says "continuing until paused". Pause and Resume on a client card are saved immediately and the card shows its Paused state.
+
+## Articles pulled per client, per week
+
+The top of the Clients page shows a table of how many articles each client received in each week (4, 8, 12 or 26 weeks; an article counts in the week it reached the queue, its IRD), with a total per client for the period, an all-time figure, and a totals row; busier weeks are shaded darker. **Export CSV** downloads the same numbers with the client name and the number side by side (`Client, Articles pulled (period), Week of ..., All time`, plus a Total row). Routes: `/api/client-pull-stats` and `/api/client-pull-export` (managers and users allowed to manage clients).

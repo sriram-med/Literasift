@@ -299,3 +299,20 @@ test("add several molecules to one client at once: each gets its own drug-class 
   assert.equal((await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { client: "k1", portfolio: "Mine", list: "heparin\nenoxaparin" }))).body.added, 2);
   assert.ok((await t.state()).watches.filter(x => x.portfolio === "Mine").length === 2, "an explicit portfolio applies to all of them");
 });
+
+test("client pull figures: articles per client per week, totals, and a CSV with the client name and the number side by side", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "P1", molecule: "m1", query: "m1" }, { portfolio: "P2", molecule: "m2", query: "m2" }] });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }, { id: "k2", name: "Beta, Inc" }]; s.watches[0].client = "k1"; s.watches[1].client = "k2";
+  const dAgo = n => new Date(Date.now() + 5.5 * 3600000 - n * 86400000).toISOString().slice(0, 10);
+  const mk = (id, pf, mol, ird) => ({ id: "a" + id, pmid: String(id), portfolio: pf, molecules: [mol], status: "Pending", ird });
+  s.assignments = [mk(1, "P1", "m1", dAgo(0)), mk(2, "P1", "m1", dAgo(1)), mk(3, "P1", "m1", dAgo(15)), mk(4, "P2", "m2", dAgo(2)), mk(5, "P2", "m2", dAgo(400))];
+  await t.BUCKET.put("bench.json", JSON.stringify(s));
+  assert.equal((await t.call(SCREENER, "/api/client-pull-stats", {})).status, 403);
+  const r = (await t.call(MANAGER, "/api/client-pull-stats", { weeks: 4 })).body; assert.equal(r.weeks.length, 4);
+  const acme = r.clients.find(c => c.name === "Acme"), beta = r.clients.find(c => c.name === "Beta, Inc");
+  assert.equal(acme.total, 3); assert.equal(acme.allTime, 3); assert.equal(beta.total, 1); assert.equal(beta.allTime, 2, "an article outside the period counts in all time only");
+  assert.equal(r.totals.reduce((a, b) => a + b, 0), 4); assert.equal(acme.counts.reduce((a, b) => a + b, 0), 3);
+  const csv = await (await worker.fetch(new Request("http://localhost/api/client-pull-export", { method: "POST", headers: { "oai-authenticated-user-email": MANAGER, "content-type": "application/json" }, body: JSON.stringify({ weeks: 4 }) }), t.env)).text();
+  const lines = csv.replace("﻿", "").trim().split("\r\n"); assert.ok(lines[0].startsWith('"Client","Articles pulled ('));
+  assert.ok(lines.some(l => l.startsWith('"Acme",3,')), csv); assert.ok(lines.some(l => l.startsWith('"Beta, Inc",1,')), "a comma in a name is quoted"); assert.ok(lines.at(-1).startsWith('"Total",4,'));
+});

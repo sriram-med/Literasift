@@ -6684,6 +6684,23 @@ async function apiCore(request, env, path) {
   }
   }
   if (!manager) return json({ error:"Manager access required." },403);
+  if (["/api/client-pull-stats", "/api/client-pull-export"].includes(path) && viewer) {
+    // How many articles were pulled for each client in each week (the week an article reached the queue, its IRD), and the same as a CSV with the client name and the number side by side.
+    if (viewer.role !== "manager" && viewer.canManageClients !== true) return json({ error:"Client figures are limited to managers and users a manager has allowed." }, 403);
+    const n = Math.min(52, Math.max(1, Math.round(Number(body.weeks)) || 8)), today = day(), dow = (new Date(today + "T00:00:00Z").getUTCDay() + 6) % 7, thisMon = addDays(today, -dow);
+    const weeks = Array.from({ length:n }, (_, i) => { const start = addDays(thisMon, -7 * (n - 1 - i)); return { start, end:addDays(start, 6) }; }), first = weeks[0].start;
+    const rows = new Map([...(state.clients || []).map(c => [c.id, { id:c.id, name:c.name }]), ["", { id:"", name:"No client" }]].map(([id, c]) => [id, { ...c, counts:Array(n).fill(0), total:0, allTime:0 }]));
+    for (const a of state.assignments || []) {
+      const cid = clientIdFor(state, a) || "", row = rows.get(cid) || rows.get(""), d = irdOf(state, a).slice(0, 10); row.allTime++;
+      if (d >= first && d <= weeks[n - 1].end) { const i = Math.min(n - 1, Math.floor((Date.parse(d) - Date.parse(first)) / 604800000)); row.counts[i]++; row.total++; }
+    }
+    const list = [...rows.values()].filter(r => r.id || r.allTime), totals = weeks.map((_, i) => list.reduce((x, r) => x + r.counts[i], 0));
+    if (path === "/api/client-pull-stats") return json({ weeks, clients:list, totals, total:list.reduce((x, r) => x + r.total, 0), allTime:list.reduce((x, r) => x + r.allTime, 0), today });
+    const q = v => '"' + String(v).replace(/"/g, '""') + '"', lines = [["Client", "Articles pulled (" + weeks[0].start + " to " + weeks[n - 1].end + ")", ...weeks.map(w => "Week of " + w.start), "All time"].map(q).join(",")];
+    for (const r of list) lines.push([q(r.name), r.total, ...r.counts, r.allTime].join(","));
+    lines.push([q("Total"), list.reduce((x, r) => x + r.total, 0), ...totals, list.reduce((x, r) => x + r.allTime, 0)].join(","));
+    return new Response("﻿" + lines.join("\r\n") + "\r\n", { headers:{ "Content-Type":"text/csv; charset=utf-8", "Content-Disposition":'attachment; filename="literasift-client-pulls-' + today + '.csv"' } });
+  }
   if (path === "/api/client-auto" && viewer) {
     // Automatic options of a client: on or off, the day pulling starts, and the day it stops. Each is optional in the request.
     if (viewer.role !== "manager") return json({ error:"Manager access required." }, 403);
@@ -9211,6 +9228,18 @@ function openPersonDialog(email){
     }catch(err){$("perr").textContent=err.message;$("pgo").disabled=false;}
   };
 }
+let cpsState={weeks:8};
+async function loadPullStats(){
+  const box=$("pullstats");if(!box)return;
+  try{
+    const r=await api("client-pull-stats",{weeks:cpsState.weeks}),max=Math.max(1,...r.clients.flatMap(c=>c.counts)),short=d=>new Date(d+"T00:00:00Z").toLocaleDateString([],{month:"short",day:"numeric",timeZone:"UTC"});
+    const cell=n=>'<td style="text-align:center;background:rgba(14,106,93,'+(n?(0.08+0.5*n/max).toFixed(2):0)+');color:'+(n/max>0.6?"#fff":"inherit")+'">'+(n||'<span class="sub">0</span>')+'</td>';
+    const head='<tr><th>Client</th>'+r.weeks.map(w=>'<th style="text-align:center">'+esc(short(w.start))+'</th>').join("")+'<th style="text-align:center">In period</th><th style="text-align:center">All time</th></tr>';
+    const body=r.clients.map(c=>'<tr><td><b>'+esc(c.name)+'</b></td>'+c.counts.map(cell).join("")+'<td style="text-align:center"><b>'+c.total+'</b></td><td style="text-align:center">'+c.allTime+'</td></tr>').join("")+'<tr><td><b>Total</b></td>'+r.totals.map(n=>'<td style="text-align:center"><b>'+n+'</b></td>').join("")+'<td style="text-align:center"><b>'+r.total+'</b></td><td style="text-align:center"><b>'+r.allTime+'</b></td></tr>';
+    box.innerHTML='<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px"><div class="fbar" style="margin:0">'+[4,8,12,26].map(n=>'<button type="button" class="fchip'+(cpsState.weeks===n?" on":"")+'" data-cpsweeks="'+n+'">'+n+' weeks</button>').join("")+'</div><span class="sub">Articles counted in the week they reached the queue.</span><button type="button" class="btn outline sm" data-cpsexport="1" style="margin-left:auto">Export CSV</button></div>'+
+      (r.clients.length?'<div class="tablewrap"><table><thead>'+head+'</thead><tbody>'+body+'</tbody></table></div>':'<div class="empty">Nothing pulled yet.</div>');
+  }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
+}
 function clientsHtml(){
   const clients=data.clients||[], items=data.assignments, wk=w=>encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||"");
   const free=data.watches.filter(w=>!w.client);
@@ -9224,7 +9253,7 @@ function clientsHtml(){
       '<button type="button" class="btn sm" data-addmol="'+esc(c.id)+'" style="margin-top:10px">+ Add new molecule</button>'+
       (free.length?'<form data-route="client-assign" class="cc-add"><input type="hidden" name="client" value="'+esc(c.id)+'"><select name="watch" aria-label="Molecule">'+watchOpts(free)+'</select><button class="btn sm">Add molecule</button></form>':"")+'</div>';
   }).join("");
-  return (data.viewer.role==="manager"?timelinesPanel():"")+panel("Add a client",'<form class="grid" data-route="client-save"><label>Client name<input name="name" required maxlength="80" placeholder="e.g. Acme Pharma"></label><label>Contact (optional)<input name="contact" maxlength="120" placeholder="Name or email"></label><div><button class="btn">Add client</button></div></form>',"Assign molecules to a client below. Every queue groups articles by client, then by molecule.")+
+  return panel("Articles pulled per client, per week",'<div id="pullstats"><div class="skel"></div></div>',"How many articles each client received each week, with the totals. Export gives the client name and the number side by side.")+(data.viewer.role==="manager"?timelinesPanel():"")+panel("Add a client",'<form class="grid" data-route="client-save"><label>Client name<input name="name" required maxlength="80" placeholder="e.g. Acme Pharma"></label><label>Contact (optional)<input name="contact" maxlength="120" placeholder="Name or email"></label><div><button class="btn">Add client</button></div></form>',"Assign molecules to a client below. Every queue groups articles by client, then by molecule.")+
     panel("Add a molecule",'<div class="row"><span>Add a new molecule to a client. It is searched in PubMed automatically from then on.</span><button type="button" class="btn" data-addmol="">+ Add molecule</button></div>')+
     (clients.length?'<div class="clientgrid">'+cards+'</div>':'<div class="empty">No clients yet. Add one above, then assign molecules to it.</div>')+
     (free.length&&clients.length?panel("Molecules without a client ("+free.length+")",molTable(free,false),"Add them to a client above, or set their owners and priority here."):"");
@@ -9420,6 +9449,7 @@ function render() {
   if(tab==="Watchlists"&&$("rkrows")){rkAddRow(1,20);rkAddRow(21,30);}
   if(tab==="Settings"&&$("memorybox"))loadMemory();
   if($("cpclient"))cpMolsFill();
+  if(tab==="Clients"&&$("pullstats"))loadPullStats();
   if(tab==="Batches"&&$("batchcov"))loadBatches();
   if(tab==="Batches"&&$("schedbox"))loadScheduler();
   if(tab==="Line Listing"&&$("llbox"))loadLineListing();
@@ -9581,7 +9611,7 @@ document.addEventListener("click",event=>{
   const lc=event.target.closest&&event.target.closest("[data-llcsv]");
   if(lc){fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:"csv"})}).then(async res=>{if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"Nothing to export.");const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-line-listing-"+new Date().toISOString().slice(0,10)+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}).catch(e=>message(e.message,true));return;}
   const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-syncmode],[data-showkey],[data-wsuse],[data-wsrun],[data-wsall],[data-wsadd],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-mqby],[data-addmol],[data-moldates],[data-clientrange],[data-wlby],[data-cppull],[data-btclient],[data-clientpull],[data-go-clients],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-syncmode],[data-showkey],[data-wsuse],[data-wsrun],[data-wsall],[data-wsadd],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-mqby],[data-addmol],[data-cpsweeks],[data-cpsexport],[data-moldates],[data-clientrange],[data-wlby],[data-cppull],[data-btclient],[data-clientpull],[data-go-clients],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -9668,6 +9698,8 @@ document.addEventListener("click",event=>{
   if(target.dataset.godash){dbState.wf=target.dataset.godash;tab="Dashboard";render();return;}
   if(target.dataset.dvf!==undefined){const v=target.dataset.dvf;if(v==='clear')deskFilter={on:false,client:'',molecule:''};else{const i=v.indexOf('|'),cid=v.slice(0,i),mol=v.slice(i+1);deskFilter=deskFilter.on&&deskFilter.client===cid&&deskFilter.molecule===mol?{on:false,client:'',molecule:''}:{on:true,client:cid,molecule:mol};}render();return;}
   if(target.dataset.mqwf){mqState.wf=target.dataset.mqwf;loadMyQueue();return;}
+  if(target.dataset.cpsweeks){cpsState.weeks=Number(target.dataset.cpsweeks);loadPullStats();return;}
+  if(target.dataset.cpsexport){downloadPost("/api/client-pull-export",{weeks:cpsState.weeks},"literasift-client-pulls.csv").catch(e=>message(e.message,true));return;}
   if(target.dataset.moldates){openMolDates(target.dataset.moldates);return;}
   if(target.dataset.clientrange){clientRangePull(target);return;}
   if(target.dataset.wlby){wlState.by=target.dataset.wlby;if($("autobox"))loadAutoPull();return;}
