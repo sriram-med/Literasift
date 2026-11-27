@@ -5188,23 +5188,35 @@ async function apiCore(request, env, path) {
     return json({ items:items.slice(0, 600), timelines:timelines(state), people:mgr ? state.profiles.filter(p => p.active).map(p => ({ email:p.email, name:p.name || p.email, role:p.role })) : [], clients:(state.clients || []).map(c => ({ id:c.id, name:c.name })), today:day(), manager:mgr });
   }
   if (path === "/api/molecule-add" && viewer) {
-    // Adds a molecule to a client's portfolio: a watch with a query built from its names, pulled automatically from then on.
+    // Adds one or several molecules to a client: each becomes a watch with a query built from its names, pulled automatically from then on.
+    // "list" takes one molecule per line (brands and other names after commas); the old single "molecule" and "synonyms" fields still work.
     if (viewer.role !== "manager" && viewer.canManageClients !== true) return json({ error:"Adding molecules is limited to managers and users a manager has allowed." }, 403);
-    const molecule = String(body.molecule || "").trim().slice(0, 100), synonyms = splitNames(body.synonyms);
-    if (!molecule) return json({ error:"Enter the molecule name." }, 400);
     if (body.client && !(state.clients || []).some(c => c.id === body.client)) return json({ error:"Choose a client from the list." }, 400);
-    // Automatic portfolio: the one the client already uses most, else the client's name, else "General".
-    let portfolio = String(body.portfolio || "").trim().slice(0, 100), auto = false, area = null;
-    if (!portfolio) { auto = true; area = await therapeuticArea(withSettings(env, state), [molecule, ...synonyms]); if (area) portfolio = portfolioForArea(state, area.letter); }
-    if (!portfolio) { const counts = new Map(); for (const w of state.watches) if (body.client && w.client === body.client) counts.set(w.portfolio, (counts.get(w.portfolio) || 0) + 1);
-      portfolio = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || (state.clients || []).find(c => c.id === body.client)?.name?.slice(0, 100) || "General"; }
-    if (state.watches.some(w => watchKey(w) === watchKey({ portfolio, molecule }))) return json({ error:molecule + " is already in " + portfolio + "." }, 409);
-    const query = String(body.query || "").trim() || buildQuery([molecule, ...synonyms], body.safetyOnly === true);
-    if (!query || query.length > 1500) return json({ error:"The names could not be turned into a search. Shorten them or write the PubMed query." }, 400);
-    const watch = { portfolio, molecule, query }; if (body.client) watch.client = String(body.client);
-    await write(env, data => { keepOwner(data, watch); commitWatch(data, watch, email, "molecule added"); });
-    await audit(env, { by:email, action:"molecule.added", target:portfolio + " · " + molecule, detail:{ client:body.client || "", names:[molecule, ...synonyms].slice(0, 20).join(", ") } });
-    return json({ ok:true, portfolio, molecule, auto, classification:area ? { area:ATC_AREAS[area.letter], atc:area.atc || "", class:area.class || "", source:area.source } : null });
+    const lines = (Array.isArray(body.list) ? body.list : String(body.list || "").split(/\r?\n/)).map(x => String(x).trim()).filter(Boolean);
+    const items = lines.length ? lines.map(l => { const parts = l.split(/[,;\t]/).map(x => x.trim()).filter(Boolean); return { molecule:(parts[0] || "").slice(0, 100), synonyms:splitNames(parts.slice(1)) }; })
+      : [{ molecule:String(body.molecule || "").trim().slice(0, 100), synonyms:splitNames(body.synonyms) }];
+    if (items.length > 100) return json({ error:"Add up to 100 molecules at a time." }, 400);
+    if (!items.some(i => i.molecule)) return json({ error:"Enter the molecule name." }, 400);
+    const cfg = withSettings(env, state), results = [], toSave = [], seen = new Set();
+    for (const { molecule, synonyms } of items) {
+      if (!molecule) continue;
+      // Automatic portfolio: the drug class (an existing matching portfolio is reused), else the client's usual portfolio, the client's name, or "General".
+      let portfolio = String(body.portfolio || "").trim().slice(0, 100), auto = false, area = null;
+      if (!portfolio) { auto = true; area = await therapeuticArea(cfg, [molecule, ...synonyms]); if (area) portfolio = portfolioForArea(state, area.letter); }
+      if (!portfolio) { const counts = new Map(); for (const w of state.watches) if (body.client && w.client === body.client) counts.set(w.portfolio, (counts.get(w.portfolio) || 0) + 1);
+        portfolio = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || (state.clients || []).find(c => c.id === body.client)?.name?.slice(0, 100) || "General"; }
+      const key = watchKey({ portfolio, molecule }), info = { molecule, portfolio, auto, classification:area ? { area:ATC_AREAS[area.letter], atc:area.atc || "", class:area.class || "", source:area.source } : null };
+      if (state.watches.some(w => watchKey(w) === key) || seen.has(key)) { results.push({ ...info, status:"exists", error:molecule + " is already in " + portfolio + "." }); continue; }
+      const query = (items.length === 1 && String(body.query || "").trim()) || buildQuery([molecule, ...synonyms], body.safetyOnly === true);
+      if (!query || query.length > 1500) { results.push({ ...info, status:"error", error:"The names could not be turned into a search. Shorten them." }); continue; }
+      seen.add(key); const watch = { portfolio, molecule, query }; if (body.client) watch.client = String(body.client);
+      state.watches.push(watch); toSave.push({ watch, names:[molecule, ...synonyms] }); results.push({ ...info, status:"added" });
+    }
+    if (!toSave.length) { const first = results[0]; return json({ error:first ? first.error : "Enter the molecule name.", results }, first?.status === "exists" ? 409 : 400); }
+    await write(env, data => { for (const { watch } of toSave) { keepOwner(data, watch); commitWatch(data, watch, email, "molecule added"); } });
+    for (const { watch, names } of toSave) await audit(env, { by:email, action:"molecule.added", target:watch.portfolio + " · " + watch.molecule, detail:{ client:body.client || "", names:names.slice(0, 20).join(", ") } });
+    const first = results.find(r => r.status === "added");
+    return json({ ok:true, added:toSave.length, results, portfolio:first.portfolio, molecule:first.molecule, auto:first.auto, classification:first.classification });
   }
   if (path === "/api/dashboard" && viewer) {
     const wf = ["screening", "qc", "medical"].includes(body.workflow) ? body.workflow : "screening", mgr = viewer.role === "manager";
@@ -8114,16 +8126,16 @@ async function deleteCases(list,afterClose){
 function openAddMolecule(presetClient){
   const old=$("moldlg");if(old)old.remove();
   const pfs=(typeof allPortfolios==="function"?allPortfolios():[]),cls=data.clients||[];
-  document.body.insertAdjacentHTML("beforeend",'<dialog id="moldlg" style="width:min(520px,96vw)"><h3 style="margin:0 0 4px">Add molecule</h3><p class="sub" style="margin:0 0 12px">The molecule is searched in PubMed automatically from now on, and its articles appear in the queue.</p>'+
+  document.body.insertAdjacentHTML("beforeend",'<dialog id="moldlg" style="width:min(520px,96vw)"><h3 style="margin:0 0 4px">Add molecules</h3><p class="sub" style="margin:0 0 12px">Add one or many to this client. Each is searched in PubMed automatically from now on, and its articles appear in the queue.</p>'+
     '<form id="molform" data-own="1" class="impgrid"><label class="wide">Client<select name="client"><option value="">No client</option>'+cls.map(c=>'<option value="'+esc(c.id)+'"'+(c.id===presetClient?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select></label>'+
     '<label>Portfolio<select name="portfolio"><option value="">Auto: by drug class (recommended)</option>'+pfs.map(x=>'<option>'+esc(x)+'</option>').join("")+'<option value="__new">New portfolio…</option></select></label><label id="molnewpf" style="display:none">New portfolio name<input name="newpf" maxlength="100"></label>'+
-    '<label class="wide">Molecule (INN or generic name)<input name="molecule" required maxlength="100" placeholder="e.g. aciclovir"></label><label class="wide">Brands and other names (optional, separated by commas)<input name="synonyms" placeholder="Zovirax, acyclovir"></label>'+
+    '<label class="wide">Molecules, one per line (add brands and other names after commas)<textarea name="list" rows="6" required placeholder="aciclovir, acyclovir, Zovirax&#10;valsartan, Diovan&#10;warfarin"></textarea></label><div class="sub wide" id="molcount">Paste or type as many as you need. Each one is filed under its own drug-class portfolio when the portfolio is Auto.</div>'+
     '<label class="check wide"><input type="checkbox" name="safety">&nbsp;Safety articles only (adverse events, toxicity, case reports)</label><div class="wide" id="molerr" style="color:#b3261e"></div>'+
     '<div class="wide" style="display:flex;gap:8px;justify-content:flex-end"><button type="button" class="btn outline" id="molno">Cancel</button><button class="btn" id="molgo">Add molecule</button></div></form></dialog>');
   const d=$("moldlg"),f=$("molform");d.showModal();
-  f.elements.portfolio.onchange=()=>{$("molnewpf").style.display=f.elements.portfolio.value==="__new"?"":"none";};$("molno").onclick=()=>{d.close();d.remove();};
+  f.elements.list.oninput=()=>{const n=f.elements.list.value.split(String.fromCharCode(10)).filter(x=>x.trim()).length;$("molcount").textContent=n>1?n+" molecules will be added.":"Paste or type as many as you need. Each one is filed under its own drug-class portfolio when the portfolio is Auto.";$("molgo").textContent=n>1?"Add "+n+" molecules":"Add molecule";};f.elements.portfolio.onchange=()=>{$("molnewpf").style.display=f.elements.portfolio.value==="__new"?"":"none";};$("molno").onclick=()=>{d.close();d.remove();};
   f.onsubmit=async e=>{e.preventDefault();$("molgo").disabled=true;$("molerr").textContent="";const pf=f.elements.portfolio.value==="__new"?f.elements.newpf.value:f.elements.portfolio.value;
-    try{const r=await api("molecule-add",{client:f.elements.client.value,portfolio:pf,molecule:f.elements.molecule.value,synonyms:f.elements.synonyms.value,safetyOnly:f.elements.safety.checked});d.close();d.remove();await refresh();render();message(f.elements.molecule.value+" added to "+r.portfolio+(r.auto?(r.classification?" (classified as "+(r.classification.class||r.classification.area)+")":" (automatic)"):"")+". Its articles will be pulled automatically.");}
+    try{const r=await api("molecule-add",{client:f.elements.client.value,portfolio:pf,list:f.elements.list.value,safetyOnly:f.elements.safety.checked});d.close();d.remove();await refresh();render();const skipped=r.results.filter(x=>x.status!=="added");message(r.added===1&&r.results.length===1?r.molecule+" added to "+r.portfolio+(r.auto?(r.classification?" (classified as "+(r.classification.class||r.classification.area)+")":" (automatic)"):"")+". Its articles will be pulled automatically.":r.added+" molecules added"+(skipped.length?", "+skipped.length+" skipped ("+skipped.map(x=>x.molecule).slice(0,4).join(", ")+")":"")+": "+[...new Set(r.results.filter(x=>x.status==="added").map(x=>x.portfolio))].join(", ")+".");}
     catch(err){$("molerr").textContent=err.message;$("molgo").disabled=false;}};
 }
 async function clearPulled(){

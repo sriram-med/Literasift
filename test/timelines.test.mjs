@@ -281,3 +281,21 @@ test("pull by client: pulls every molecule of a client (or a chosen subset); non
   const mol = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull", { molecule: "warfarin", portfolio: "Blood", client: "k1", from, to: today })); assert.equal(mol.status, 200, JSON.stringify(mol.body));
   assert.equal((await t.state()).watches.find(w => w.molecule === "warfarin").client, "k1");
 });
+
+test("add several molecules to one client at once: each gets its own drug-class portfolio, duplicates are skipped, and one bad line does not stop the rest", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "CNS", molecule: "y", query: "y" }] });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const none = async () => new Response("{}", { status: 404 });
+  const list = "valsartan, Diovan\nsertraline\n\namoxicillin, Amoxil\nvalsartan\nzzzunknown";
+  const r = await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { client: "k1", list })); assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.added, 4, JSON.stringify(r.body.results.map(x => x.molecule + ":" + x.status)));
+  assert.equal(r.body.results.filter(x => x.status === "exists").length, 1, "the repeated valsartan is skipped");
+  const w = (await t.state()).watches, by = m => w.find(x => x.molecule === m);
+  assert.equal(by("valsartan").portfolio, "Cardiovascular"); assert.equal(by("sertraline").portfolio, "CNS"); assert.equal(by("amoxicillin").portfolio, "Anti-infectives"); assert.ok(["Cardiovascular", "CNS", "Anti-infectives"].includes(by("zzzunknown").portfolio), "an unclassified molecule joins one of the client portfolios");
+  assert.ok([by("valsartan"), by("sertraline"), by("amoxicillin"), by("zzzunknown")].every(x => x.client === "k1"));
+  assert.ok(/Diovan/.test(by("valsartan").query));
+  assert.equal((await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { client: "k1", list: "valsartan" }))).status, 409, "only duplicates: nothing added");
+  assert.equal((await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { client: "k1", list: "x\n".repeat(101) + "y" }))).status, 400);
+  assert.equal((await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { client: "k1", portfolio: "Mine", list: "heparin\nenoxaparin" }))).body.added, 2);
+  assert.ok((await t.state()).watches.filter(x => x.portfolio === "Mine").length === 2, "an explicit portfolio applies to all of them");
+});
