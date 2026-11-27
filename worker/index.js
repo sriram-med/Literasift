@@ -6024,7 +6024,20 @@ async function apiCore(request, env, path) {
     if (twice.length) return json({ error:"These molecules appear more than once, so nothing was saved: " + twice.join(", ") + ". Clear the box, paste the block once, and apply again." }, 400);
     const keyOf = w => encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || ""), yes = v => /^(y|yes|on|true|1)$/i.test(String(v).trim());
     const out = [];
+    const DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
     for (const line of lines) {
+      // "schedule | every: weekly | day: Monday | time: 09:00" sets the client's automatic pull schedule.
+      if (/^schedule\s*(\||$)/i.test(line)) {
+        const f = {}; for (const part of line.split("|").slice(1)) { const i = part.indexOf(":"); if (i > 0) f[part.slice(0, i).trim().toLowerCase()] = part.slice(i + 1).trim(); }
+        if (!clientId || clientId === "none" || !(state.clients || []).some(c => c.id === clientId)) { out.push({ molecule:"schedule", ok:false, error:"A schedule needs a client." }); continue; }
+        const every = String(f.every || "daily").toLowerCase(), dayName = String(f.day || f.weekday || "monday").toLowerCase(), time = String(f.time || "06:00").trim();
+        const weekday = /^\d$/.test(dayName) ? Number(dayName) : DAYS.findIndex(d => d.startsWith(dayName.slice(0, 3))) + 1;
+        if (!["daily", "weekly"].includes(every) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time) || weekday < 1) { out.push({ molecule:"schedule", ok:false, error:"Write it as: schedule | every: weekly | day: Monday | time: 09:00" }); continue; }
+        await write(env, data => { const c = data.clients.find(x => x.id === clientId); c.schedule = scheduleOf({ every, weekday, time }); });
+        const sl = scheduleSlots({ every, weekday, time });
+        out.push({ molecule:"schedule", ok:true, mode:"schedule", query:(every === "weekly" ? "Every " + DAYS[weekday - 1][0].toUpperCase() + DAYS[weekday - 1].slice(1) : "Every day") + " at " + time + " (India time) · next pull " + sl.next, countries:[] });
+        continue;
+      }
       const parts = line.split("|").map(x => x.trim()), molecule = parts[0], fields = {};
       for (const part of parts.slice(1)) { const i = part.indexOf(":"); if (i > 0) fields[part.slice(0, i).trim().toLowerCase()] = part.slice(i + 1).trim(); }
       const cur = (await load(env)).state, w = cur.watches.find(x => x.molecule && x.molecule.toLowerCase() === molecule.toLowerCase() && (!clientId || (clientId === "none" ? !x.client : x.client === clientId)));
@@ -10579,7 +10592,7 @@ let ccState={open:new Set(),q:{}};
 function ssBulkHtml(cid,where){
   const c=(data.clients||[]).find(x=>x.id===cid)||{},last=c.lastPaste||"";
   return '<details class="wide ssbulk"'+(where==="cc"?' style="margin:8px 0"':"")+'><summary><b>Paste settings for several molecules</b>'+(c.lastPasteAt?' <span class="sub">last pasted '+esc(c.lastPasteAt.slice(0,10))+(c.lastPasteBy?" by "+esc(c.lastPasteBy):"")+'</span>':"")+'</summary>'+
-    '<p class="sub">One line per molecule: <code>molecule | names: … | mode: pubmed, precise or custom | query: … | countries: … | safety: yes or no</code>. Leave out what should not change; an empty value clears it (for example <code>countries:</code>). The last block pasted for this client is kept here.</p>'+
+    '<p class="sub">One line per molecule: <code>molecule | names: … | mode: pubmed, precise or custom | query: … | countries: … | safety: yes or no</code>, and optionally <code>schedule | every: weekly | day: Monday | time: 09:00</code>. Leave out what should not change; an empty value clears it (for example <code>countries:</code>). The last block pasted for this client is kept here.</p>'+
     '<textarea class="ssbulktext" data-bulkfor="'+esc(cid)+'" rows="8" style="width:100%;font-family:ui-monospace,monospace;font-size:12px" placeholder="metformin | names: metformine, dimethylbiguanide | countries:">'+esc(last)+'</textarea>'+
     '<div style="display:flex;gap:8px;margin-top:6px"><button type="button" class="btn sm" data-ssbulk="'+esc(cid)+'">Apply to '+esc(c.name||"this client")+'</button><button type="button" class="btn outline sm" data-ssbulkclear="1">Clear</button></div><div class="ssbulkout"></div></details>';
 }

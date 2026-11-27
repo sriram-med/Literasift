@@ -177,3 +177,13 @@ test("pasted settings update several saved searches at once, line by line (Lauru
   assert.equal(twice.status, 400); assert.match(twice.body.error, /more than once.*metformin/);
   assert.deepEqual((await t.state()).watches.find(w => w.molecule === "metformin").countries, []); assert.ok(c.lastPasteAt); assert.equal(c.lastPasteBy, MANAGER);
 });
+
+test("a schedule line in pasted settings sets the client's automatic pull schedule", async () => {
+  const t = await makeEnv({ watches: [{ id: "p", portfolio: "AET", molecule: "posaconazole", query: "((posaconazole))", names: [], client: "a" }], clients: [{ id: "a", name: "AET" }] });
+  const r = await t.call(MANAGER, "/api/saved-search-bulk", { client: "a", text: "posaconazole | countries: | mode: pubmed\nschedule | every: weekly | day: Monday | time: 09:00" });
+  assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal(r.body.saved, 2);
+  assert.deepEqual((await t.state()).clients[0].schedule, { every: "weekly", weekday: 1, time: "09:00" });
+  assert.match(r.body.results[1].query, /^Every Monday at 09:00/);
+  const bad = await t.call(MANAGER, "/api/saved-search-bulk", { client: "a", text: "schedule | every: monthly" });
+  assert.equal(bad.body.failed, 1);
+});
