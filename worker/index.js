@@ -344,14 +344,14 @@ function summarizeRun(run) {
   const ws = run.windows || [], count = state => ws.filter(w => w.state === state).length;
   const unresolved = ws.filter(w => !["reconciled", "zero_results"].includes(w.state));
   run.gaps = unresolved.map(w => ({ from:w.from, to:w.to, state:w.state, expected:w.expected ?? null, retrieved:w.retrieved ?? 0, error:w.error || "", missing:(w.missing || []).slice(0, 50) }));
-  run.expected = ws.reduce((n, w) => n + (w.expected || 0), 0); run.retrieved = uniq(run.ids || []).length;
+  run.expected = ws.reduce((n, w) => n + (w.expected || 0), 0); run.retrieved = uniq(run.ids || []).length; run.unavailable = uniq(ws.flatMap(w => w.state === "reconciled" ? (w.unavailable || []) : []));
   run.coverage = count("pending") || count("running") ? "running" : count("failed") === ws.length ? "failed" : unresolved.length ? "partial" : count("zero_results") === ws.length ? "zero_results" : "reconciled";
   run.status = run.coverage === "running" ? "Running" : run.coverage === "failed" && !(run.ids || []).length ? "Failed" : "Imported";
   run.count = (run.ids || []).length;
   return run;
 }
 async function fetchCitations(env, ids) {
-  const articles = {}, missing = [], xml = {};
+  const articles = {}, missing = [], xml = {}, unavailable = [];
   // 200 per request (PubMed allows it), so a pull makes half as many calls as before.
   for (let offset = 0; offset < ids.length; offset += 200) {
     const chunk = ids.slice(offset, offset + 200);
@@ -359,7 +359,10 @@ async function fetchCitations(env, ids) {
     const found = [];
     for (const id of chunk) {
       const citation = summary?.[id];
-      if (!citation?.title) { missing.push(id); continue; }
+      if (citation?.error) { unavailable.push(id); continue; }   // withdrawn, merged or not yet released: PubMed lists the PMID but has no record for it
+      const title = citation?.title || citation?.booktitle || citation?.vernaculartitle || citation?.sorttitle;
+      if (!title) { missing.push(id); continue; }
+      if (!citation.title) citation.title = title;
       found.push(id);
       articles[id] = { id, source:"PubMed", title:citation.title, journal:citation.fulljournalname, date:citation.pubdate, doi:citation.articleids?.find(a => a.idtype === "doi")?.value || "", pmcid:citation.articleids?.find(a => a.idtype === "pmc")?.value || "",
         pubmedRetracted:(citation.pubtype || []).includes("Retracted Publication"), url:"https://pubmed.ncbi.nlm.nih.gov/" + id + "/" };
@@ -371,7 +374,7 @@ async function fetchCitations(env, ids) {
       if (raw[id]) xml[id] = raw[id]; else articles[id].citationXmlStatus = details.__error ? "Failed: " + details.__error.slice(0, 120) : "Missing from the EFetch response";
     }
   }
-  return { articles, missing, xml };
+  return { articles, missing, xml, unavailable };
 }
 // One-off, idempotent: gives legacy citation XML a hash and a proper evidence record without moving the file.
 async function adoptLegacyEvidence(env) {
@@ -416,10 +419,13 @@ async function processWindow(env, runId, index) {
       return { split:true };
     }
     if (expected > ids.length) throw new Error("A single day has more than 9,999 records. Narrow the query.");
-    const fetched = ids.length ? await fetchCitations(env, ids) : { articles:{}, missing:[], xml:{} };
+    const fetched = ids.length ? await fetchCitations(env, ids) : { articles:{}, missing:[], xml:{}, unavailable:[] };
     // Original EFetch XML, one object per PMID with its hash, kept apart from full texts and screenshots.
     const evidence = await storeEfetch(env, fetched.xml);
-    const missing = uniq([...fetched.missing, ...ids.filter(id => fetched.articles[id] && !fetched.xml[id])]);
+    // A PMID that PubMed lists but has no record for (withdrawn, merged, not yet released) is asked for again on the next try; if it is still unavailable
+    // then, it is recorded as such and no longer holds the window open: the search is complete, minus what PubMed itself cannot supply.
+    const unavailable = uniq(fetched.unavailable || []), settled = unavailable.length > 0 && unavailable.every(id => (win.unavailable || []).includes(id));
+    const missing = uniq([...fetched.missing, ...ids.filter(id => fetched.articles[id] && !fetched.xml[id]), ...(settled ? [] : unavailable)]);
     const reconciled = ids.length === expected && missing.length === 0;
     await write(env, data => {
       const r = data.runs.find(x => x.id === runId), w = winOf(r), watch = data.watches.find(x => x.portfolio === r.portfolio && (x.molecule || "") === (r.molecule || "")) || { portfolio:r.portfolio, molecule:r.molecule };
@@ -437,7 +443,7 @@ async function processWindow(env, runId, index) {
         allocate(data, item); data.assignments.push(item);
       }
       r.ids = uniq([...(r.ids || []), ...ids.filter(id => data.articles[id])]);
-      Object.assign(w, { expected, retrieved:ids.length, pmids:ids, imported, missing, state:expected === 0 ? "zero_results" : reconciled ? "reconciled" : "partial", error:"", claimUntil:undefined, completedAt:new Date().toISOString() });
+      Object.assign(w, { expected, retrieved:ids.length, pmids:ids, imported, missing, unavailable, state:expected === 0 ? "zero_results" : reconciled ? "reconciled" : "partial", error:"", claimUntil:undefined, completedAt:new Date().toISOString() });
       summarizeRun(r);
     });
     return { done:true };
@@ -460,7 +466,7 @@ async function completeRun(env, runId, { total = null, rounds = 6 } = {}) {
     await sleep(Number(env.RETRY_BASE_MS ?? 700) * round);
     run = await runImport(env, runId, 600);
   }
-  if (run && total != null && run.retrieved < total) {
+  if (run && total != null && run.retrieved + (run.unavailable || []).length < total) {
     await write(env, data => { const r = data.runs.find(x => x.id === runId); for (const w of r.windows || []) Object.assign(w, { state:"pending", attempts:0, error:"", claimUntil:undefined }); summarizeRun(r); });
     run = await runImport(env, runId, 600);
     for (let round = 1; round <= 3 && run && !["reconciled", "zero_results"].includes(run.coverage); round++) { await sleep(Number(env.RETRY_BASE_MS ?? 700) * round); run = await completeRun(env, runId, { rounds:1 }); }
@@ -1800,7 +1806,7 @@ const decodeXml = value => String(value || "").replace(/&lt;/g, "<").replace(/&g
 const xmlText = value => decodeXml(String(value || "").replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
 function parsePubmedXml(xml) {
   const out = {};
-  for (const block of xml.split("<PubmedArticle>").slice(1)) {
+  for (const block of xml.split(/<Pubmed(?:Book)?Article>/).slice(1)) {
     const pmid = /<PMID[^>]*>(\d+)<\/PMID>/.exec(block)?.[1];
     if (!pmid) continue;
     const abstract = [...block.matchAll(/<AbstractText([^>]*)>([\s\S]*?)<\/AbstractText>/g)]
@@ -1833,7 +1839,8 @@ async function fetchPubmedDetails(env, ids, xmlOut) {
   // A busy PubMed can answer with an HTML page or a cut-off reply; that is retried rather than read as "no articles".
   if (!/<PubmedArticleSet[\s>]/.test(xml) || !/<\/PubmedArticleSet>\s*$/.test(xml.trim())) throw new Error("PubMed efetch answer incomplete");
   // The original XML of each article is handed back too, so it can be stored untouched.
-  if (xmlOut) for (const block of xml.split("<PubmedArticle>").slice(1)) { const pmid = /<PMID[^>]*>(\d+)<\/PMID>/.exec(block)?.[1]; if (pmid) xmlOut[pmid] = '<?xml version="1.0" encoding="UTF-8"?>\n<PubmedArticleSet><PubmedArticle>' + block.replace(/<\/PubmedArticleSet>\s*$/, "").trimEnd() + "</PubmedArticleSet>"; }
+  // PubMed returns journal articles as <PubmedArticle> and book chapters (LiverTox, other NCBI Bookshelf records) as <PubmedBookArticle>; both are kept.
+  if (xmlOut) for (const m of xml.matchAll(/<(PubmedArticle|PubmedBookArticle)>([\s\S]*?)<\/\1>/g)) { const pmid = /<PMID[^>]*>(\d+)<\/PMID>/.exec(m[2])?.[1]; if (pmid) xmlOut[pmid] = '<?xml version="1.0" encoding="UTF-8"?>\n<PubmedArticleSet><' + m[1] + '>' + m[2] + '</' + m[1] + '></PubmedArticleSet>'; }
   return parsePubmedXml(xml);
 }
 const epmcBase = "https://www.ebi.ac.uk/europepmc/webservices/rest";
@@ -5510,7 +5517,10 @@ async function apiCore(request, env, path) {
           let imported = 0; if (fresh.length) { const got = await importPmidList(env, fresh.map(pmid => ({ pmid })), w.portfolio, w.molecule); imported = (got.run?.ids || []).length; run.ids = [...new Set([...(run.ids || []), ...(got.run?.ids || [])])]; }
           pmc = { found:hit.count, withPmid:hit.pmids.length, added:imported }; } catch (error) { pmc = { error:String(error.message || error).slice(0, 120) }; } }
         const site = broadQuery ? await countAny(cfg, allDates ? broadQuery : searchTerm(broadQuery, body.from, body.to, "any")) : null;
-        results[slot] = { molecule:w.molecule, portfolio:w.portfolio, mode:broad ? "broad" : "precise", pmc, siteCount:site, missing:wins.reduce((n, x) => n + ((x.missing || []).length), 0), failedWindows:wins.filter(x => x.state === "failed").length, names:full.added.length, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, expected, retrieved:got, coverage:run.coverage || run.status, complete:["reconciled", "zero_results"].includes(run.coverage) && (pubmedTotal == null || got >= pubmedTotal), gaps:(run.gaps || []).length };
+        results[slot] = { molecule:w.molecule, portfolio:w.portfolio, mode:broad ? "broad" : "precise", pmc, siteCount:site, missing:wins.reduce((n, x) => n + ((x.missing || []).length), 0), failedWindows:wins.filter(x => x.state === "failed").length, names:full.added.length, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, expected, retrieved:got, coverage:run.coverage || run.status,
+          unavailable:(run.unavailable || []).length, notStored:Math.max(0, expected - got - (run.unavailable || []).length), missingSample:uniq(wins.flatMap(x => x.missing || [])).slice(0, 6),
+          term:allDates ? query : searchTerm(query, body.from, body.to, "any"), pubmedUrl:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(allDates ? query : searchTerm(query, body.from, body.to, "any")),
+          complete:["reconciled", "zero_results"].includes(run.coverage) && (pubmedTotal == null || got + (run.unavailable || []).length >= pubmedTotal), gaps:(run.gaps || []).length };
       } catch (error) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, error:String(error.message || error).slice(0, 160) }; }
     };
     // A few molecules at a time; the shared NCBI gate keeps the request rate within the allowed limit.
@@ -5560,7 +5570,10 @@ async function apiCore(request, env, path) {
       await audit(env, { by:email, action:"pull.mine", target:portfolio + " · " + molecule, detail:{ from:allDates ? "all dates" : body.from, to:allDates ? "" : body.to, count:run.count ?? 0 } });
       const wins = run.windows || [];
       return { molecule, portfolio, mode:body.searchMode === "precise" ? "precise" : "broad", names:names.length - 1, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, mine:(run.ids || []).filter(id => !before.has(id)).length,
-        expected:pubmedTotal ?? run.expected ?? wins.reduce((n, x) => n + (x.expected || 0), 0), retrieved:uniq(run.ids || []).length, coverage:run.coverage, complete:["reconciled", "zero_results"].includes(run.coverage) && (pubmedTotal == null || uniq(run.ids || []).length >= pubmedTotal), id:run.id };
+        expected:pubmedTotal ?? run.expected ?? wins.reduce((n, x) => n + (x.expected || 0), 0), retrieved:uniq(run.ids || []).length, coverage:run.coverage, unavailable:(run.unavailable || []).length,
+        notStored:Math.max(0, (pubmedTotal ?? run.expected ?? 0) - uniq(run.ids || []).length - (run.unavailable || []).length), missingSample:uniq(wins.flatMap(x => x.missing || [])).slice(0, 6),
+        term:allDates ? query : searchTerm(query, body.from, body.to, "any"), pubmedUrl:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(allDates ? query : searchTerm(query, body.from, body.to, "any")),
+        complete:["reconciled", "zero_results"].includes(run.coverage) && (pubmedTotal == null || uniq(run.ids || []).length + (run.unavailable || []).length >= pubmedTotal), id:run.id };
     };
     const wrap = async () => { const r = await work(); return { client:"", allDates, results:[r], total:r.count || 0, added:r.added || 0, complete:!!r.complete, ...r }; };
     if (body.background === true && env.DEFER_EVIDENCE === "1") {
@@ -9429,17 +9442,26 @@ function cpSettings(){
 }
 // Runs pulls (three at a time, each in the background on the server) and draws one row per molecule as it finishes.
 async function runPullJobs(btn,list,bodyFor,route,done){
-  btn.disabled=true;const rows=new Array(list.length).fill(null),prog=new Array(list.length).fill(null),started=Date.now();let fin=0,found=0,added=0,incomplete=0,failed=0;
-  const draw=()=>{cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+fin+' of '+list.length+' molecule'+(list.length===1?"":"s")+' done · '+found+' article'+(found===1?"":"s")+' stored, '+added+' new this time</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(incomplete?' · '+incomplete+' not yet complete, retried automatically':"")+(failed?' · '+failed+' failed':"")+'</span></div>'+
-    table(["Molecule","In PubMed","Stored here","New this time","Check"],list.map((it,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||it.name)+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · +'+x.names+' other name'+(x.names===1?"":"s"):"")+(x.mode?' · '+(x.mode==="broad"?"broad":"precise"):"")+'</div>':""),x.error?"-":String(x.expected),x.error?"-":String(x.retrieved),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("All "+x.expected+" stored","green"):badge(x.failedWindows?"Incomplete: "+x.failedWindows+" search window"+(x.failedWindows===1?"":"s")+" failed, retried automatically":x.missing?"Incomplete: "+x.missing+" citation"+(x.missing===1?"":"s")+" still to fetch, retried automatically":"Incomplete: "+x.retrieved+" of "+x.expected+", retried automatically","amber"))+(x.pmc?(x.pmc.error?'<div class="sub" style="color:var(--amber)">PubMed Central: '+esc(x.pmc.error)+'</div>':'<div class="sub">PubMed Central: '+x.pmc.found+' found, '+x.pmc.added+' new</div>'):"")+(x.mode==="precise"&&x.siteCount!=null&&x.siteCount>(x.retrieved||0)*1.15?'<div class="sub" style="color:var(--amber)">The broad search finds '+x.siteCount+'. Choose Broad to pull them.</div>':"")]:(()=>{const p=prog[i];const st=!p?"Starting…":p.stage==="names"?"Collecting every name…":p.stage==="counting"?"Asking PubMed how many…"+(p.expected!=null?" "+p.expected:""):p.stage==="finishing"?"Storing…":"Pulling: "+p.articles+" article"+(p.articles===1?"":"s")+(p.windows?" · "+p.windowsDone+" of "+p.windows+" search windows":"")+(p.expected!=null?" of about "+p.expected:"");return ['<b>'+esc(it.name)+'</b>',p&&p.expected!=null?String(p.expected):'',p&&p.articles?String(p.articles):'','','<span class="sub">'+esc(st)+'</span>'];})();}),"");
+  btn.disabled=true;const rows=new Array(list.length).fill(null),prog=new Array(list.length).fill(null),started=Date.now();
+  const tot=k=>rows.reduce((n,x)=>n+(x&&!x.error?(x[k]||0):0),0);
+  const check=x=>{
+    if(x.error)return badge(x.error,"red");
+    if(x.complete)return badge("All "+x.expected+" stored","green")+(x.unavailable?'<div class="sub">'+x.unavailable+' listed by PubMed but withdrawn or not released, so nothing to store</div>':"");
+    return badge(x.notStored+" of "+x.expected+" not stored","amber")+(x.missingSample&&x.missingSample.length?'<div class="sub">PMIDs '+esc(x.missingSample.join(", "))+(x.notStored>x.missingSample.length?" …":"")+'</div>':"");};
+  const draw=()=>{const done0=rows.filter(Boolean).length,late=rows.filter(x=>x&&!x.error&&!x.complete).length,bad=rows.filter(x=>x&&x.error).length;
+    cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+done0+' of '+list.length+' molecule'+(list.length===1?"":"s")+' done · '+tot("retrieved")+' article'+(tot("retrieved")===1?"":"s")+' stored, '+tot("added")+' new this time</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(late?' · '+late+' not complete: press Try again on the row':"")+(bad?' · '+bad+' failed':"")+'</span></div>'+
+    table(["Molecule","In PubMed","Stored here","New this time","Check",""],list.map((it,i)=>{const x=rows[i];
+      if(x)return ['<b>'+esc(x.molecule||it.name)+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · +'+x.names+' other name'+(x.names===1?"":"s"):"")+(x.mode?' · '+x.mode:"")+'</div>':"")+(x.pubmedUrl?'<div class="sub"><a href="'+esc(x.pubmedUrl)+'" target="_blank" rel="noopener">Same search on PubMed</a></div>':""),x.error?"-":String(x.expected),x.error?"-":String(x.retrieved),x.error?"-":String(x.added),check(x)+(x.pmc?(x.pmc.error?'<div class="sub" style="color:var(--amber)">PubMed Central: '+esc(x.pmc.error)+'</div>':'<div class="sub">PubMed Central: '+x.pmc.found+' found, '+x.pmc.added+' new</div>'):"")+(x.mode==="precise"&&x.siteCount!=null&&x.siteCount>(x.retrieved||0)*1.15?'<div class="sub" style="color:var(--amber)">The broad search finds '+x.siteCount+'. Choose Broad to pull them.</div>':""),(x.error||!x.complete)?'<button type="button" class="btn outline sm" data-cpretry="'+i+'">Try again</button>':""];
+      const p=prog[i];const st=!p?"Starting…":p.stage==="names"?"Preparing the search…":p.stage==="counting"?"Asking PubMed how many…":p.stage==="finishing"?"Storing…":"Pulling: "+p.articles+" stored"+(p.windows?" · "+p.windowsDone+" of "+p.windows+" search windows":"");
+      return ['<b>'+esc(it.name)+'</b>',p&&p.expected!=null?String(p.expected):'',p&&p.articles?String(p.articles):'','','<span class="sub">'+esc(st)+'</span>',''];}),"");
     if($("cpout"))$("cpout").innerHTML=cpState.out;};
-  draw();let next=0;
-  const lane=async()=>{while(next<list.length){const i=next++;try{let r=await api(route,{...bodyFor(list[i]),background:true});
+  const runOne=async i=>{try{let r=await api(route,{...bodyFor(list[i]),background:true});
       while(r.job){await new Promise(ok=>setTimeout(ok,1500));const pj=await api("pull-job",{id:r.job});prog[i]=(pj.progress||[])[0]||null;draw();if(pj.state==="failed")throw new Error(pj.error||"The pull failed.");if(pj.state==="done"){r=pj.payload;break;}}
-      const x=r.results[0];rows[i]=x;found+=x.retrieved||0;added+=x.added||0;if(x.error)failed++;else if(!x.complete)incomplete++;}
-    catch(err){rows[i]={molecule:list[i].name,error:err.message};failed++;}fin++;draw();}};
-  await Promise.all(Array.from({length:Math.min(((data.config||{}).ncbi||{}).keySet?3:2,list.length)},lane));
-  try{await refresh();}catch(_){}btn.disabled=false;if(done)done({found,added,failed});
+      rows[i]=r.results[0];}catch(err){rows[i]={molecule:list[i].name,error:err.message};}draw();};
+  draw();let next=0;
+  await Promise.all(Array.from({length:Math.min(((data.config||{}).ncbi||{}).keySet?3:2,list.length)},async()=>{while(next<list.length){await runOne(next++);}}));
+  cpState.retry=async(i,b)=>{if(!list[i])return;b.disabled=true;rows[i]=null;prog[i]=null;draw();await runOne(i);try{await refresh();}catch(_){}};
+  try{await refresh();}catch(_){}btn.disabled=false;if(done)done({found:tot("retrieved"),added:tot("added"),failed:rows.filter(x=>x&&x.error).length});
 }
 async function runClientPull(btn){
   const st=cpSettings();if(st._lim&&(!st.from||!st.to))return message("Choose both dates, or clear both to pull all dates.",true);delete st._lim;
@@ -9918,7 +9940,7 @@ document.addEventListener("click",event=>{
   const lc=event.target.closest&&event.target.closest("[data-llcsv]");
   if(lc){fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:"csv"})}).then(async res=>{if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"Nothing to export.");const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-line-listing-"+new Date().toISOString().slice(0,10)+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}).catch(e=>message(e.message,true));return;}
   const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-syncmode],[data-showkey],[data-wsuse],[data-wsrun],[data-wsall],[data-wsadd],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-mqby],[data-addmol],[data-cpsweeks],[data-cpsexport],[data-moldates],[data-clientrange],[data-wlby],[data-cppull],[data-cpcompare],[data-sptab],[data-sprange],[data-btclient],[data-clientpull],[data-go-clients],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-syncmode],[data-showkey],[data-wsuse],[data-wsrun],[data-wsall],[data-wsadd],[data-person],[data-teamrole],[data-chpf],[data-mqwf],[data-mqview],[data-mqby],[data-addmol],[data-cpsweeks],[data-cpsexport],[data-moldates],[data-clientrange],[data-wlby],[data-cppull],[data-cpcompare],[data-cpretry],[data-sptab],[data-sprange],[data-btclient],[data-clientpull],[data-go-clients],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -10012,6 +10034,7 @@ document.addEventListener("click",event=>{
   if(target.dataset.wlby){wlState.by=target.dataset.wlby;if($("autobox"))loadAutoPull();return;}
   if(target.dataset.sptab){spState.tab=target.dataset.sptab;cpState.out="";render();return;}
   if(target.dataset.sprange){const k=target.dataset.sprange;if(k==="all"){spState.from="";spState.to="";}else{spState.to=new Date().toISOString().slice(0,10);spState.from=new Date(Date.now()-Number(k)*864e5).toISOString().slice(0,10);}render();return;}
+  if(target.dataset.cpretry!==undefined){if(cpState.retry)cpState.retry(Number(target.dataset.cpretry),target);return;}
   if(target.dataset.cppull){runClientPull(target);return;}
   if(target.dataset.cpcompare){runClientCompare(target);return;}
   if(target.dataset.btclient){btState.client=target.dataset.btclient==="all"?"":target.dataset.btclient;render();return;}

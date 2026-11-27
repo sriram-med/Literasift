@@ -255,3 +255,18 @@ test("the same pull gives the same result every time, even when PubMed randomly 
   assert.ok(seen[0].split(" | ").every(x => x.endsWith(":57:57:true")), seen[0]);
   assert.equal(Object.keys((await t.state()).articles).length, 57);
 });
+
+test("book chapters, records without an English title, and PMIDs PubMed cannot supply no longer leave a pull incomplete", async () => {
+  const t = await makeEnv({ watches: [W1] });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; s.watches[0].client = "k1"; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const recs = [{ pmid: "11", date: dAgo(2) }, { pmid: "12", date: dAgo(3) }, { pmid: "13", date: dAgo(4) }, { pmid: "14", date: dAgo(5) }], ncbi = fakeNcbi(recs);
+  const book = '<PubmedBookArticle><BookDocument><PMID Version="1">12</PMID><ArticleTitle>Aciclovir</ArticleTitle><Book><BookTitle>LiverTox</BookTitle></Book><Abstract><AbstractText>Liver injury overview.</AbstractText></Abstract></BookDocument></PubmedBookArticle>';
+  const handler = async (u, i) => { const url = new URL(String(u)), op = url.pathname.split("/").pop();
+    if (op === "esummary.fcgi") { const res = await (await ncbi.handler(u, i)).json(); if (res.result["12"]) res.result["12"] = { booktitle: "LiverTox", title: "" }; if (res.result["13"]) res.result["13"] = { vernaculartitle: "Aciclovir und Leber", title: "" }; if (res.result["14"] || (url.searchParams.get("id") || "").includes("14")) res.result["14"] = { uid: "14", error: "cannot get document summary" }; return Response.json(res); }
+    if (op === "efetch.fcgi") { const xml = await (await ncbi.handler(u, i)).text(); return new Response(xml.replace(/<PubmedArticle>(?:(?!<\/PubmedArticle>)[\s\S])*?<PMID[^>]*>12<\/PMID>[\s\S]*?<\/PubmedArticle>/, book)); }
+    return ncbi.handler(u, i); };
+  const r = await withFetch(handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(10), to: dAgo(0), searchMode: "precise" })); assert.equal(r.status, 200, JSON.stringify(r.body));
+  const x = r.body.results[0]; assert.equal(x.complete, true, JSON.stringify(x)); assert.equal(x.expected, 4); assert.equal(x.retrieved, 3); assert.equal(x.unavailable, 1); assert.equal(x.notStored, 0);
+  const st = await t.state(); assert.ok(st.articles["12"] && /LiverTox|Aciclovir/.test(st.articles["12"].title), "the book chapter is stored"); assert.ok(st.articles["13"], "the record without an English title is stored");
+  assert.ok(x.pubmedUrl.startsWith("https://pubmed.ncbi.nlm.nih.gov/?term=") && decodeURIComponent(x.pubmedUrl).includes("[crdt]"), "a link to exactly the same search");
+});

@@ -351,3 +351,10 @@ Pulls gave different numbers from one try to the next because a busy PubMed made
 - **Requests are paced to what PubMed allows**: without an NCBI API key two molecules and two windows run at a time (with a key, three and four), so PubMed refuses far fewer requests.
 - **The results table shows the same columns every time**: *In PubMed* (PubMed's own total for the search), *Stored here* (all of them for this molecule), *New this time*, and a check that reads "All N stored" only when the two match. A repeat pull shows the same In PubMed and Stored numbers with 0 new.
 - A test pulls the same client five times against a PubMed that randomly fails a third of its requests and gets the identical, complete result each time.
+
+## No more "retried automatically": concrete, complete pulls
+
+- **Book chapters are read.** PubMed returns NCBI Bookshelf records (for drugs, typically LiverTox chapters) as `<PubmedBookArticle>`, not `<PubmedArticle>`. They were not read, so every search that matched one stayed "incomplete" forever. They are now stored like articles.
+- **Records without an English title** (only a vernacular or book title) are stored instead of being counted as missing.
+- **PMIDs PubMed lists but cannot supply** (withdrawn, merged, not yet released) are asked for again once; if PubMed still has no record, they are counted as such and no longer hold the pull open.
+- **Concrete results.** Each row shows *In PubMed*, *Stored here*, *New this time* and a check: "All N stored" (plus how many PubMed listed but could not supply), or "X of N not stored" with the PMIDs concerned and a **Try again** button for that molecule only. Each row links to **Same search on PubMed**: the exact query and dates the app used, to compare on the website.
