@@ -294,3 +294,11 @@ The top of the Clients page shows a table of how many articles each client recei
 ## Client pulls search every name (recall fix)
 
 A pull for a client used each molecule's stored query, which usually held only the name it was added with, so it found a fraction of what a single-molecule pull (with the INN, generics, salts and brands) finds. It now searches the stored query OR every other known name: the portfolio's product dictionary and the drug name list (INN, salts, synonyms, up to 40 brands; the name list is asked online when the molecule is not in it yet). Each result row says how many extra names were searched, a manager's pull saves the broader query as the molecule's search so the automatic daily pull is equally thorough, and new molecules added from the Clients page start from the broad search. One-off filters (humans, case reports, English, no reviews) apply on top and are never saved.
+
+## Broad search and "Compare with PubMed"
+
+The PubMed website searches a bare word in every field and maps it to MeSH, which finds several times more than the app's precise search (title, abstract and MeSH only). For a client:
+
+- **Search style** (Watchlists, on each client card): *Precise* or *Broad, like PubMed*. Switching rewrites each molecule's search (a new query version from today) so the automatic daily pull follows it.
+- **Search & Pull > Pull for a client** has a **Broad search** box (on by default) and **Compare with PubMed**, which shows for each molecule what the precise search finds, what the website style finds, the website style with no date limit, how many are stored here, and a link that opens the same search on pubmed.ncbi.nlm.nih.gov. A pull's result rows also say when the website style would have found noticeably more.
+- Routes: `/api/client-compare`; `/api/client-auto` takes `searchMode`; `/api/pull-client` takes `searchMode`.

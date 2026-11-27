@@ -135,3 +135,22 @@ test("a client pull searches every name known for a molecule (dictionary and dru
   assert.ok(decodeURIComponent(n2.calls.join(" ").replace(/\+/g, " ")).includes("case reports"));
   assert.ok(!(await t.state()).watches.some(x => /case reports/.test(x.query)));
 });
+
+test("broad search style: bare names like the PubMed website, a client switch that rewrites its searches, and a comparison with PubMed", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "CNS", molecule: "sertraline", query: '"sertraline"[tiab]' }], NCBI_GAP_MS: 0, RETRY_BASE_MS: 1 });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Square" }]; s.watches[0].client = "k1"; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  await t.BUCKET.put("drugkb.json", JSON.stringify({ version: 1, ingredients: { sertraline: { name: "sertraline", rxcui: "1", brands: ["Zoloft"], salts: ["sertraline hydrochloride"], synonyms: [], atc: [], sources: [], enrichedAt: "x" } }, sync: {} }));
+  const ncbi = fakeNcbi([{ pmid: "1", date: dAgo(2) }, { pmid: "2", date: dAgo(3) }]);
+  const term = () => decodeURIComponent(ncbi.calls.filter(c => c.startsWith("esearch")).join(" ").replace(/\+/g, " "));
+  const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(6), to: dAgo(0), dateField: "crdt", searchMode: "broad", online: false })); assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.results[0].mode, "broad"); assert.ok(/\(\(sertraline OR /.test(term()) && term().includes("Zoloft") && term().includes('"sertraline hydrochloride"') && !term().includes("[tiab]"), term().slice(0, 300));
+  assert.equal(typeof r.body.results[0].siteCount, "number", "the website-style count is reported");
+  assert.equal((await t.call(MANAGER, "/api/client-auto", { client: "k1", searchMode: "nope" })).status, 400);
+  const sw = await t.call(MANAGER, "/api/client-auto", { client: "k1", searchMode: "broad" }); assert.equal(sw.status, 200); assert.equal(sw.body.restyled, 1);
+  let st = await t.state(); assert.equal(st.clients[0].searchMode, "broad"); assert.ok(!/\[tiab\]/.test(st.watches[0].query) && /Zoloft/.test(st.watches[0].query), st.watches[0].query);
+  assert.equal((await status(t)).perClient.find(c => c.id === "k1").searchMode, "broad");
+  await t.call(MANAGER, "/api/client-auto", { client: "k1", searchMode: "precise" }); st = await t.state(); assert.ok(/\[tiab\]/.test(st.watches[0].query) && st.clients[0].searchMode === undefined);
+  const cmp = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/client-compare", { client: "k1", from: dAgo(6), to: dAgo(0) })); assert.equal(cmp.status, 200, JSON.stringify(cmp.body));
+  const row = cmp.body.rows[0]; assert.equal(row.molecule, "sertraline"); assert.equal(row.site, 2); assert.ok(row.allTime === null || row.allTime === 2, "the undated count is asked for"); assert.ok(row.link.startsWith("https://pubmed.ncbi.nlm.nih.gov/?term="));
+  assert.equal((await t.call(SCREENER, "/api/client-compare", { client: "k1" })).status, 403);
+});
