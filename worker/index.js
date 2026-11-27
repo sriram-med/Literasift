@@ -7648,17 +7648,19 @@ async function apiCore(request, env, path) {
       // so the search terms the client uses can be found.
       const missed = onlyClient.filter(o => o.reason.startsWith("the app's search")).slice(0, 25);
       if (missed.length) {
-        const xmlOut = {}; let details = {}; try { details = await withRetry(cfg, () => fetchPubmedDetails(cfg, missed.map(o => o.pmid), xmlOut)); } catch { /* reasons stay general */ }
-        for (const o of missed) {
-          try {
-            const inDates = await countAny(cfg, o.pmid + "[uid] AND " + searchTerm("all[sb]", body.from, body.to, basis).replace(/^\(all\[sb\]\) AND /, ""));
-            const d = details[o.pmid] || {}, title = /<ArticleTitle[^>]*>([\s\S]*?)<\/ArticleTitle>/.exec(xmlOut[o.pmid] || "")?.[1] || "";
-            const text = (title + " " + (d.abstract || "") + " " + (d.keywords || []).join(" ") + " " + (d.meshTerms || []).join(" ")).toLowerCase().replace(/<[^>]+>/g, " ");
-            o.title = title.replace(/<[^>]+>/g, "").slice(0, 160);
-            if (inDates === 0) { o.reason = "outside these dates in PubMed (its publication date differs)"; continue; }
-            o.reason = "dates match; the app's search words do not";
-            o.words = REPORT_WORDS.filter(x => new RegExp("\\b" + x.replace(/[-]/g, "[- ]") + "\\b").test(text)).slice(0, 12);
-          } catch { /* keep the general reason */ }
+        // Dates first: an article outside the dates in PubMed is a date difference, not a word difference.
+        const anyOf = list => "(" + list.map(o => o.pmid + "[uid]").join(" OR ") + ")";
+        const idsFor = async q => { const { esearchresult: r } = await withRetry(cfg, () => pubmed(cfg, "esearch", { term:q, retmode:"json", retmax:"100" }), { tries:3 }); return new Set((r?.idlist || []).map(String)); };
+        let inDates = null; try { inDates = await idsFor(anyOf(missed) + " AND " + searchTerm("all[sb]", body.from, body.to, basis).replace(/^\(all\[sb\]\) AND /, "")); } catch (error) { for (const o of missed) o.diagError = "PubMed did not answer: " + String(error.message || error).slice(0, 80); }
+        if (inDates) for (const o of missed) o.reason = inDates.has(o.pmid) ? "dates match; the app's search words do not" : "outside these dates in PubMed (its publication date differs)";
+        const byWords = missed.filter(o => !inDates || inDates.has(o.pmid));
+        // Titles, from the same summary service the pulls use.
+        try { const { result } = await withRetry(cfg, () => pubmed(cfg, "esummary", { id:byWords.map(o => o.pmid).join(","), retmode:"json" }), { tries:3 }); for (const o of byWords) o.title = String(result?.[o.pmid]?.title || "").slice(0, 160); } catch { /* titles are optional */ }
+        // Each candidate word asked of PubMed itself, in all fields (as a client's [All Fields] search does), for all missed articles at once.
+        if (byWords.length) for (const o of byWords) o.words = [];
+        if (byWords.length) for (const word of REPORT_WORDS) {
+          try { const hit = await idsFor(anyOf(byWords) + ' AND "' + word + '"[All Fields]'); for (const o of byWords) if (hit.has(o.pmid)) o.words.push(word); }
+          catch (error) { for (const o of byWords) o.diagError = "PubMed did not answer: " + String(error.message || error).slice(0, 80); break; }
         }
       }
       const wordCount = {}; for (const o of missed) for (const x of o.words || []) wordCount[x] = (wordCount[x] || 0) + 1;
@@ -11065,7 +11067,7 @@ document.addEventListener("click",event=>{
     api("report-compare",{client:$("dwclient").value,from,to,by:$("dwby").value==="ird"?"pdat":$("dwby").value,asOf:$("dwasof").value,text}).then(r=>{
       const link=id=>'<a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(id)+'/" target="_blank" rel="noopener">'+esc(id)+'</a>';
       $("rcout").innerHTML='<div class="sub" style="margin:8px 0">'+esc(r.from)+' to '+esc(r.to)+' · '+esc(r.dateBasisLabel)+(r.asOf?" · as PubMed was on "+esc(r.asOf):"")+'</div>'+table(["Drug","Client report","App","In both","Only in the client report","Only in the app"],r.rows.map(x=>x.error?['<b>'+esc(x.molecule)+'</b>',String(x.client),"-","-",'<span style="color:var(--red)">'+esc(x.error)+'</span>',""]:
-        ['<b>'+esc(x.molecule)+'</b>',String(x.client),String(x.app),String(x.both),x.onlyClient.length?x.onlyClient.map(o=>link(o.pmid)+' <span class="sub">'+esc(o.reason)+'</span>'+(o.title?'<div class="sub" style="margin-left:8px">'+esc(o.title)+'</div>':"")+(o.words&&o.words.length?'<div class="sub" style="margin-left:8px">contains: <b>'+esc(o.words.join(", "))+'</b></div>':"")).join("<br>")+(x.commonWords&&x.commonWords.length?'<div class="sub" style="margin-top:6px;color:var(--amber)">Words in the missed articles: '+esc(x.commonWords.map(c=>c.word+" ("+c.n+" of "+x.missedByWords+")").join(", "))+'</div>':""):badge("none","green"),x.onlyApp.length?x.onlyApp.map(link).join(", "):badge("none","green")]),"");})
+        ['<b>'+esc(x.molecule)+'</b>',String(x.client),String(x.app),String(x.both),x.onlyClient.length?x.onlyClient.map(o=>link(o.pmid)+' <span class="sub">'+esc(o.reason)+'</span>'+(o.diagError?'<div class="sub" style="margin-left:8px;color:var(--red)">'+esc(o.diagError)+'</div>':"")+(o.title?'<div class="sub" style="margin-left:8px">'+esc(o.title)+'</div>':"")+(o.words&&o.words.length?'<div class="sub" style="margin-left:8px">contains: <b>'+esc(o.words.join(", "))+'</b></div>':"")).join("<br>")+(x.commonWords&&x.commonWords.length?'<div class="sub" style="margin-top:6px;color:var(--amber)">Words in the missed articles: '+esc(x.commonWords.map(c=>c.word+" ("+c.n+" of "+x.missedByWords+")").join(", "))+'</div>':""):badge("none","green"),x.onlyApp.length?x.onlyApp.map(link).join(", "):badge("none","green")]),"");})
       .catch(err=>{$("rcout").innerHTML='<div class="sub" style="color:var(--red)">'+esc(err.message)+'</div>';}).finally(()=>{target.disabled=false;});return;}
   if(target.dataset.dwbuild){dwBuild(target,target.dataset.dwbuild==="pubmed");return;}
   if(target.dataset.dwrange){const k=target.dataset.dwrange,today=new Date().toISOString().slice(0,10),mon=dwMonday();let f,t;

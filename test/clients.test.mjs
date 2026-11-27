@@ -1,6 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { makeEnv, MANAGER, SCREENER } from "./helpers.mjs";
+// Simulated PubMed answers for "(PMID[uid] OR ...) AND dates" and "(PMID[uid] OR ...) AND "word"[All Fields]" questions.
+function uidAware(records, ncbi) {
+  return async (u, i) => {
+    const url = new URL(String(u)), term = url.searchParams.get("term") || "";
+    if (!url.pathname.endsWith("esearch.fcgi") || !term.includes("[uid]")) return ncbi.handler(u, i);
+    const uids = [...term.matchAll(/(\d+)\[uid\]/g)].map(m => m[1]), range = /(\d{4}\/\d{2}\/\d{2})\[(?:crdt|dp)\]:(\d{4}\/\d{2}\/\d{2})/.exec(term), word = /"([^"]+)"\[All Fields\]/.exec(term)?.[1];
+    let ids = records.filter(r => uids.includes(r.pmid));
+    if (range) ids = ids.filter(r => r.date >= range[1].replaceAll("/", "-") && r.date <= range[2].replaceAll("/", "-"));
+    if (word) ids = ids.filter(r => ((r.title || "") + " " + (r.abstract || "")).toLowerCase().includes(word));
+    return new Response(JSON.stringify({ esearchresult: { count: String(ids.length), idlist: ids.map(r => r.pmid) } }));
+  };
+}
+
 
 const seed = async () => {
   const t = await makeEnv({ watches: [{ portfolio:"CNS", molecule:"aripiprazole", query:"aripiprazole", versions:[] }, { portfolio:"CNS", molecule:"aciclovir", query:"aciclovir", versions:[] }],
@@ -205,12 +218,12 @@ test("a client report is compared article by article with the app for the same d
     articles: { 101: { pmid: "101" }, 103: { pmid: "103" } },
     assignments: [{ id: "a", pmid: "101", portfolio: "Laurus", molecules: ["metformin"] }, { id: "b", pmid: "103", portfolio: "Laurus", molecules: ["metformin"] }] });
   // PubMed: 101 and 102 match in the week (102 not pulled yet); 103 is stored but published outside the week; 104 is in the report only
-  const ncbi = fakeNcbi([{ pmid: "101", date: "2026-11-10" }, { pmid: "102", date: "2026-11-12" }, { pmid: "103", date: "2026-10-01" }]);
-  const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/report-compare", { client: "l", from: "2026-11-09", to: "2026-11-15", text: "metformin: 101, 102, 104\natorvastatin: -\nunknown: 1" }));
+  const recs = [{ pmid: "101", date: "2026-11-10" }, { pmid: "102", date: "2026-11-12" }, { pmid: "103", date: "2026-10-01" }], ncbi = fakeNcbi(recs);
+  const r = await withFetch(uidAware(recs, ncbi), () => t.call(MANAGER, "/api/report-compare", { client: "l", from: "2026-11-09", to: "2026-11-15", text: "metformin: 101, 102, 104\natorvastatin: -\nunknown: 1" }));
   assert.equal(r.status, 200, JSON.stringify(r.body));
   const m = r.body.rows[0];
   assert.deepEqual([m.client, m.app, m.both], [3, 1, 1]); assert.ok(m.term.includes("[dp]"));
-  assert.deepEqual(m.onlyClient, [{ pmid: "102", reason: "found by the search, not pulled yet" }, { pmid: "104", reason: "dates match; the app's search words do not", title: "", words: [] }]);
+  assert.deepEqual(m.onlyClient, [{ pmid: "102", reason: "found by the search, not pulled yet" }, { pmid: "104", reason: "outside these dates in PubMed (its publication date differs)" }]);
   assert.deepEqual(m.onlyApp, []);
   assert.deepEqual([r.body.rows[1].client, r.body.rows[1].app], [0, 0]); assert.match(r.body.rows[2].error, /No molecule/);
   assert.equal((await t.call(SCREENER, "/api/report-compare", { client: "l", from: "2026-11-09", to: "2026-11-15", text: "metformin: 1" })).status, 403);
@@ -219,13 +232,17 @@ test("a client report is compared article by article with the app for the same d
   assert.ok(asOf.body.rows[0].term.endsWith("AND (1800/01/01[crdt]:2026/11/15[crdt])"), asOf.body.rows[0].term); assert.equal(asOf.body.asOf, "2026-11-15");
 });
 
-test("for a client article the app's search misses, the compare lists the safety words it contains", async () => {
+test("for a client article the app's search misses, the compare asks PubMed which safety words it matches", async () => {
   const { fakeNcbi, withFetch } = await import("./helpers.mjs");
   const t = await makeEnv({ clients: [{ id: "l", name: "Laurus" }], schema: { grouping: "client" }, watches: [{ portfolio: "Laurus", molecule: "metformin", query: "((metformin))", names: [], client: "l" }] });
-  const ncbi = fakeNcbi([{ pmid: "201", date: "2026-11-10" }, { pmid: "204", date: "2026-12-01", title: "Metformin cytotoxicity in HepG2 cells", abstract: "The safety and toxicity of metformin were studied in vitro." }]);
-  const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/report-compare", { client: "l", from: "2026-11-09", to: "2026-11-15", text: "metformin: 204" }));
+  const recs = [{ pmid: "201", date: "2026-11-10" }, { pmid: "204", date: "2026-11-11", title: "Metformin cytotoxicity in HepG2 cells", abstract: "The safety and toxicity of metformin were studied in vitro." }];
+  const base = fakeNcbi(recs), ncbi = { handler: async (u, i) => { const url = new URL(String(u)), term = url.searchParams.get("term") || "";
+    // the app's own search (no [uid]) finds only 201 in the week: 204 is missed because of its words
+    if (url.pathname.endsWith("esearch.fcgi") && !term.includes("[uid]")) return new Response(JSON.stringify({ esearchresult: { count: "1", idlist: ["201"] } }));
+    return base.handler(u, i); } };
+  const r = await withFetch(uidAware(recs, ncbi), () => t.call(MANAGER, "/api/report-compare", { client: "l", from: "2026-11-09", to: "2026-11-15", text: "metformin: 204" }));
   const o = r.body.rows[0].onlyClient[0];
-  assert.equal(o.pmid, "204"); assert.match(o.title, /cytotoxicity/);
+  assert.equal(o.pmid, "204"); assert.equal(o.reason, "dates match; the app's search words do not"); assert.equal(o.title, "Metformin cytotoxicity in HepG2 cells");
   for (const w of ["toxicity", "safety", "cytotoxicity", "in vitro", "cells"]) assert.ok(o.words.includes(w), w + " in " + o.words);
   assert.ok(r.body.rows[0].commonWords.some(c => c.word === "toxicity" && c.n === 1));
 });
