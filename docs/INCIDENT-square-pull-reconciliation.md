@@ -124,7 +124,20 @@ It deletes nothing and does not clear coverage.
 | Query version change inside a scheduled range | Each window keeps its own version; created-or-published is a single deduplicated search |
 | Compare | Only the ticked molecules; the executed term, translation and warnings shown; a pull with the same settings runs the identical term |
 
-Full suite: 244 passed, 0 failed, 1 skipped (optional PDF parser). Production build and artifact validation pass.
+Full suite after merging the parallel commits on the branch (`4a0e2e1`, `2de27ba`, `931a7e9`): 247 passed, 0 failed, 1 skipped (optional PDF parser). Production build and artifact validation pass.
+
+**Merge notes.** The parallel work is kept:
+- window claim tokens;
+- query-version boundaries inside date windows;
+- an idempotency key hashed over the executed terms;
+- stricter ESearch count checks;
+- AI screening of abstracts;
+- a Library that also lists stored literature with no run and keeps re-pulled ranges.
+
+Where the two sides disagreed, the incident contract above was followed:
+- **Spelling variants** (its built-in list, for example methimazole/thiamazole) are offered as suggestions to approve. They are not added to PubMed-default searches automatically.
+- **PubMed default** sends names bare, for PubMed's automatic term mapping, without extra field-tagged copies.
+- **Its comparison test** now checks the unified term. Its PMID-level missing list is part of Compare.
 
 ## Calcium Acetate: the queries the app now generates
 

@@ -68,3 +68,17 @@ test("library: client layout groups Client / Molecule / range, and picks up clie
   assert.ok(worker.libraryLayout(state, "client").some(e => e.folder.startsWith("Beta/metformin/")));
   assert.ok(worker.libraryLayout(state).every(e => e.folder.startsWith("PubMed/")), "the default layout is unchanged");
 });
+
+test("the Library includes stored assignments and partial pulls without losing repulled ranges", () => {
+  const portfolio = "Renal", molecule = "Calcium acetate";
+  const state = { watches:[{ portfolio,molecule,client:"square" }], clients:[{ id:"square",name:"Square" }],
+    articles:{ "1":{ id:"1" }, "2":{ id:"2" }, "3":{ id:"3" } },
+    runs:[{ status:"Running", portfolio,molecule,from:"2026-11-21",to:"2026-11-24",ids:["1","2"] },
+      { status:"Imported", portfolio,molecule,from:"2026-11-20",to:"2026-11-22",ids:["1"] }],
+    assignments:[{ portfolio,molecules:[molecule],pmid:"1",ird:"2026-11-22" },{ portfolio,molecules:[molecule],pmid:"3",ird:"2026-11-23" }] };
+  const entries = worker.libraryLayout(state,"client");
+  assert.equal(entries.filter(e => e.pmid === "1").length,2);
+  assert.equal(entries.find(e => e.pmid === "2").range,"2026-11-21_to_2026-11-24");
+  assert.equal(entries.find(e => e.pmid === "3").range,"Received 2026-11");
+  assert.ok(entries.every(e => e.client === "Square"));
+});

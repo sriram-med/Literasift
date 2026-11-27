@@ -130,7 +130,8 @@ test("a pull searches only the molecule name and the names someone gave it: neve
     const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(5), to: dAgo(0), searchMode })); assert.equal(r.status, 200, JSON.stringify(r.body));
     const terms = decodeURIComponent(ncbi.calls.filter(c => c.startsWith("esearch")).join(" ").replace(/\+/g, " "));
     for (const name of ["aciclovir", "Zovirax", "sertraline"]) assert.ok(terms.includes(name), searchMode + ": " + name + " is searched");
-    for (const name of ["Herpex", "acyclovir", "aciclovir sodium", "Zoloft", "Lustral", "sertraline hydrochloride", "Antivirals", "CNS", "Acme"]) assert.ok(!terms.includes(name), searchMode + ": " + name + " is not searched; got " + terms.slice(0, 300));
+    assert.equal(r.body.results.find(x => x.molecule === "aciclovir").term.includes("acyclovir"), false, "a spelling variant is searched only once approved");
+    for (const name of ["Herpex", "aciclovir sodium", "Zoloft", "Lustral", "sertraline hydrochloride", "Antivirals", "CNS", "Acme"]) assert.ok(!terms.includes(name), searchMode + ": " + name + " is not searched; got " + terms.slice(0, 300));
   }
   // names given when the molecule is added (or later from Search & Pull) are searched
   const none = async () => new Response("{}", { status: 404 });
@@ -283,4 +284,29 @@ test("the final PMID-by-PMID check finds an article the window searches missed a
   const r = await withFetch(handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from, to, searchMode: "precise" })); assert.equal(r.status, 200, JSON.stringify(r.body));
   const x = r.body.results[0]; assert.equal(x.idCheck, true, JSON.stringify(x)); assert.equal(x.filledByCheck, 1); assert.equal(x.retrieved, 13); assert.equal(x.complete, true);
   const st = await t.state(); assert.ok(st.articles["699"]); assert.ok(st.assignments.some(a => a.pmid === "699"), "it is in the queue too"); assert.ok(st.runs[0].ids.includes("699"), "and in the same pull");
+});
+
+
+test("comparison checks exact PMIDs under the selected molecule, date basis and filters", async () => {
+  const molecule = "Calcium acetate", watch = { portfolio:"Renal medicines", molecule, names:[], query:'"calcium acetate"[tiab]', client:"square" };
+  const t = await makeEnv({ watches:[watch,{ ...W2, client:"square" }], clients:[{ id:"square", name:"Square" }],
+    articles:{ "11":{ id:"11", citationXmlKey:"existing.xml" }, "22":{ id:"22", citationXmlKey:"other.xml" } },
+    assignments:[{ pmid:"11", portfolio:watch.portfolio, molecules:[molecule] },{ pmid:"22", portfolio:watch.portfolio, molecules:["Calcium chloride"] }] });
+  const ncbi = fakeNcbi([{ pmid:"11", date:dAgo(2) },{ pmid:"22", date:dAgo(2) },{ pmid:"33", date:dAgo(3) }]);
+  const options = { client:"square", from:dAgo(6), to:dAgo(0), dateField:"pdat", english:true, searchMode:"broad", molecules:["Renal%20medicines|Calcium%20acetate"] };
+  const compared = await withFetch(ncbi.handler, () => t.call(MANAGER,"/api/compare-client",options));
+  assert.equal(compared.status,200,JSON.stringify(compared.body));
+  assert.equal(compared.body.rows.length,1);
+  const row = compared.body.rows[0];
+  assert.deepEqual([row.site,row.stored,row.missing,row.missingSample],[3,1,2,["22","33"]]);
+  assert.match(row.term,/\(Calcium acetate\)/); assert.ok(!/\(Calcium\)|"Calcium"/.test(row.term), "the salt is not reduced to calcium");
+  assert.match(row.term,/\[dp\].*\[dp\]/);
+  assert.match(row.term,/english\[lang\]/);
+  assert.doesNotMatch(row.term,/\[crdt\]|Renal medicines|Square/);
+  assert.equal(new URL(row.link).searchParams.get("term"),row.term);
+  const pull = await withFetch(ncbi.handler, () => t.call(MANAGER,"/api/pull-client",options));
+  assert.equal(pull.body.results[0].term,row.term);
+  assert.equal(pull.body.results[0].added,2);
+  assert.equal(pull.body.results[0].complete,true);
+  assert.equal((await t.state()).assignments.filter(a => a.pmid === "22").length,1);
 });
