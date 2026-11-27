@@ -107,3 +107,13 @@ test("fast pulls lose nothing: windows run side by side, split under a cap, and 
   assert.ok(st.runs.every(run => run.windows.every(w => ["reconciled", "zero_results"].includes(w.state))), "every window, including the split halves, is reconciled");
   assert.ok(Date.now() - t0 < 20000, "no waiting when the gap is zero");
 });
+
+test("a manual pull always fetches again: after pulled articles are cleared, pulling the same dates brings them back", async () => {
+  const t = await makeEnv({ watches: [W1], NCBI_GAP_MS: 0, RETRY_BASE_MS: 1 });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; s.watches[0].client = "k1"; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const from = dAgo(10), to = dAgo(0), ncbi = fakeNcbi([{ pmid: "11", date: dAgo(3) }, { pmid: "12", date: dAgo(5) }]);
+  const pull = () => withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from, to, dateField: "crdt" })).then(r => r.body.results[0]);
+  assert.equal((await pull()).added, 2); assert.equal((await pull()).added, 0, "a repeat adds nothing new");
+  assert.equal((await t.call(MANAGER, "/api/pulled-purge", { reason: "free space", confirm: "DELETE 2" })).status, 200); assert.equal(Object.keys((await t.state()).articles).length, 0);
+  const again = await pull(); assert.equal(again.added, 2, JSON.stringify(again)); assert.equal(Object.keys((await t.state()).articles).length, 2); assert.equal((await t.state()).assignments.length, 2);
+});

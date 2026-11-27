@@ -490,7 +490,10 @@ async function execute(env, watch, from, to, { mode = "monitor", dateField, forc
   // The check and the insert happen in one transaction, so overlapping callers share a single run instead of creating twins.
   let target = run.id, reused = null;
   await write(env, data => { const ex = data.runs.find(r => r.idem === key); if (ex && !force) { target = ex.id; reused = ex; return; } data.runs.unshift(run); });
-  if (reused && ["reconciled", "zero_results"].includes(reused.coverage)) return { ...reused, replayed:true };
+  // A repeat of a finished import is a replay, unless its articles have since been cleared: then it fetches them again.
+  const cleared = reused && (reused.ids || []).length < (reused.windows || []).reduce((n, w) => n + (w.retrieved || 0), 0);
+  if (reused && !cleared && ["reconciled", "zero_results"].includes(reused.coverage)) return { ...reused, replayed:true };
+  if (cleared) { await write(env, data => { const r = data.runs.find(x => x.id === target); for (const w of r.windows || []) Object.assign(w, { state:"pending", attempts:0, error:"", claimUntil:undefined }); summarizeRun(r); }); }
   return runImport(env, target);
 }
 // ---- Product dictionaries and watchlist versions. A portfolio dictionary lists, for each product, its generic names, brands, salts and approved aliases; a watchlist query is built from them.
@@ -5345,7 +5348,7 @@ async function apiCore(request, env, path) {
       if (query.length > 1500) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, error:"The search became too long; use fewer filters." }; return; }
       const before = new Set(state.assignments.filter(a => a.portfolio === w.portfolio).map(a => a.pmid));
       try {
-        let run = await execute(env, narrow.length || body.noReviews === true ? { portfolio:w.portfolio, molecule:w.molecule, query } : w, body.from, body.to, { mode:"backfill", dateField:body.dateField });
+        let run = await execute(env, narrow.length || body.noReviews === true ? { portfolio:w.portfolio, molecule:w.molecule, query } : w, body.from, body.to, { mode:"backfill", dateField:body.dateField, force:true });
         // Nothing may be missed: a window that did not reconcile (PubMed's count against what came back) is run again before the answer is given, and it stays on the retry list if it still has gaps.
         for (let again = 0; again < 2 && !["reconciled", "zero_results"].includes(run.coverage); again++) run = await runImport(env, run.id, 12);
         if (!isMgr) await write(env, d => { for (const a of d.assignments) if (a.portfolio === w.portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
@@ -5372,7 +5375,7 @@ async function apiCore(request, env, path) {
     if (query.length > 1500) return json({ error:"The search became too long; use fewer synonyms or filters." }, 400);
     if (!valid(body.from) || !valid(body.to) || body.from > body.to || body.to > day()) return json({ error:"Choose a valid date range through today." }, 400);
     if ((Date.parse(body.to) - Date.parse(body.from)) / 864e5 > 366) return json({ error:"Pull one year at a time or less." }, 400);
-    const before = new Set(state.assignments.filter(a => a.portfolio === portfolio).map(a => a.pmid)), run = await execute(env, { portfolio, molecule, query }, body.from, body.to, { mode:"backfill", dateField:body.dateField });
+    const before = new Set(state.assignments.filter(a => a.portfolio === portfolio).map(a => a.pmid)), run = await execute(env, { portfolio, molecule, query }, body.from, body.to, { mode:"backfill", dateField:body.dateField, force:true });
     await write(env, d => { for (const a of d.assignments) if (a.portfolio === portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
     await settleEvidence(env, run.ids);
     await audit(env, { by:email, action:"pull.mine", target:portfolio + " · " + molecule, detail:{ from:body.from, to:body.to, count:run.count ?? 0 } });
@@ -7006,7 +7009,7 @@ async function apiCore(request, env, path) {
     const clientId = (state.clients || []).some(c => c.id === body.client) ? String(body.client) : "";
     const watch = { portfolio, molecule, query, ...(owner ? { owner } : {}), ...(clientId ? { client:clientId } : {}) };
     await write(env, data => { keepOwner(data, watch); commitWatch(data, watch, email); });
-    const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField });
+    const run = await execute(env, watch, body.from, body.to, { mode:"backfill", dateField:body.dateField, force:true });
     await settleEvidence(env, run.ids);
     return json(run);
   } else if (path === "/api/social-add") {
@@ -9152,7 +9155,7 @@ function timelinesPanel(){
   return panel("Timelines",'<form class="grid" data-route="timelines-save"><label>Screen and route to QC<input type="number" name="screenDays" min="0" max="60" value="'+t.screenDays+'"></label><label>QC<input type="number" name="qcDays" min="0" max="60" value="'+t.qcDays+'"></label><label>Medical review<input type="number" name="medicalDays" min="0" max="60" value="'+t.medicalDays+'"></label><label class="wide">Holidays (dates, YYYY-MM-DD, separated by spaces)<textarea name="holidays" rows="2">'+esc((t.holidays||[]).join(" "))+'</textarea></label><div><button class="btn">Save timelines</button></div></form>',"Working days counted from the IRD, the day LiteraSift received an item. Weekends and listed holidays do not count. A molecule below can have its own days, and one item can be given a new date on the Planner.");
 }
 function drugFinderHtml(){return '<div class="wide drugfind"><span class="sub">Find the drug by</span><span class="seg" role="group" aria-label="Search by">'+[["inn","INN"],["generic","Generic name"],["brand","Brand name"]].map(k=>'<button type="button" class="segb'+(drugKind===k[0]?" on":"")+'" data-drugkind="'+k[0]+'">'+k[1]+'</button>').join("")+'</span><div class="drugrow"><input id="dname" autocomplete="off" placeholder="'+({inn:"e.g. aciclovir",generic:"e.g. acyclovir sodium",brand:"e.g. Zovirax"})[drugKind]+'"><button type="button" class="btn" data-drugresolve="1">Look up</button></div><div id="drugcard"></div></div>';}
-let btState={client:""}, cpState={client:"",sel:null,last:null};
+let btState={client:""}, cpState={client:"",sel:null,last:null,out:""};
 const wClient=(pf,mol)=>{const w=(data.watches||[]).find(x=>x.portfolio===pf&&(x.molecule||"")===(mol||""));return w?(w.client||""):"";};
 const clientBar=attr=>{const cur=btState.client,all=[["","All clients"],...(data.clients||[]).map(c=>[c.id,c.name]),["none","No client"]];return '<div class="fbar" style="margin:0 0 12px">'+all.map(x=>'<button type="button" class="fchip'+(cur===x[0]?" on":"")+'" '+attr+'="'+esc(x[0]||"all")+'">'+esc(x[1])+'</button>').join("")+'</div>';};
 function clientSections(items,cidOf,render,empty){
@@ -9161,23 +9164,24 @@ function clientSections(items,cidOf,render,empty){
   return groups.length?groups.map(g=>'<div class="btgroup"><h3 class="mqh" style="display:flex;gap:8px;align-items:center"><span class="tile3d" aria-hidden="true">'+esc(g.name.slice(0,1).toUpperCase())+'</span>'+esc(g.name)+' <span class="badge">'+g.list.length+'</span></h3>'+render(g.list)+'</div>').join(""):'<div class="empty">'+empty+'</div>';
 }
 function clientMols(clientId){const mine=(data.config&&data.config.myPortfolios)||[],mgr=data.viewer.role==="manager";return(data.watches||[]).filter(w=>w.molecule&&(clientId==="none"?!w.client:w.client===clientId)&&(mgr||mine.includes(w.portfolio)));}
-function clientPullHtml(title,sub){
+function clientPullHtml(title,sub,def){
+  def=def||"crdt";
   const mgr=data.viewer.role==="manager",today=new Date().toISOString().slice(0,10),start=new Date(Date.now()-30*864e5).toISOString().slice(0,10);
   const opts=[...(data.clients||[]).map(c=>[c.id,c.name]),["none","No client"]].filter(x=>clientMols(x[0]).length);
   if(!cpState.client||!opts.some(x=>x[0]===cpState.client))cpState.client=opts.length?opts[0][0]:"";
   if(!opts.length)return panel(title,'<div class="empty">No client has molecules yet.'+(mgr?" Add a client and its molecules on the Clients page.":" Ask a manager to add clients and molecules.")+'</div>',sub);
   return panel(title,'<form class="grid" id="cpform" data-own="1"><label>Client<select name="client" id="cpclient">'+opts.map(x=>'<option value="'+esc(x[0])+'"'+(x[0]===cpState.client?" selected":"")+'>'+esc(x[1])+' ('+clientMols(x[0]).length+')</option>').join("")+'</select></label>'+
-    '<label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Date field<select name="dateField"><option value="pdat">Publication date</option><option value="crdt">Create date (when added to PubMed)</option></select></label>'+
+    '<label>From<input name="from" type="date" required value="'+start+'" max="'+today+'"></label><label>Through<input name="to" type="date" required value="'+today+'" max="'+today+'"></label><label>Date field<select name="dateField"><option value="crdt"'+(def==="crdt"?" selected":"")+'>Create date: when added to PubMed (recommended, misses nothing new)</option><option value="pdat"'+(def==="pdat"?" selected":"")+'>Publication date</option></select></label>'+
     '<div class="wide"><span class="sub">Molecules to pull</span><div class="pfpick" id="cpmols"></div></div>'+
     '<div class="wide filtrow"><label class="check"><input type="checkbox" name="humans">&nbsp;Humans</label><label class="check"><input type="checkbox" name="caseReports">&nbsp;Case reports</label><label class="check"><input type="checkbox" name="english">&nbsp;English</label><label class="check"><input type="checkbox" name="noReviews">&nbsp;No reviews</label></div>'+
-    '<div class="wide"><button type="button" class="btn" data-cppull="1">Pull this client</button></div></form><div id="cpout"></div>',sub);
+    '<div class="wide"><button type="button" class="btn" data-cppull="1">Pull this client</button></div></form><div id="cpout">'+(cpState.out||"")+'</div>',sub);
 }
 function cpMolsFill(){const box=$("cpmols");if(!box)return;const c=$("cpclient").value;cpState.client=c;box.innerHTML=clientMols(c).map(w=>{const k=encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule||"");return '<label class="pfchip"><input type="checkbox" data-cpmol="'+esc(k)+'" checked><span>'+esc(w.molecule)+'</span></label>';}).join("");}
 async function runClientPull(btn){
   const f=$("cpform");if(!f.reportValidity())return;const sel=[...f.querySelectorAll("[data-cpmol]")].filter(x=>x.checked).map(x=>x.dataset.cpmol);if(!sel.length)return message("Tick at least one molecule.",true);
   btn.disabled=true;const e=f.elements,common={client:e.client.value,from:e.from.value,to:e.to.value,dateField:e.dateField.value,humans:e.humans.checked,caseReports:e.caseReports.checked,english:e.english.checked,noReviews:e.noReviews.checked};
   const rows=new Array(sel.length).fill(null),name=k=>decodeURIComponent(k.split("|")[1]||""),started=Date.now();let done=0,found=0,added=0,incomplete=0,failed=0;
-  const draw=()=>{$("cpout").innerHTML='<div class="purgesum" style="margin-top:12px"><b>'+done+' of '+sel.length+' molecules done · '+found+' article'+(found===1?"":"s")+' found, '+added+' new</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(incomplete?' · '+incomplete+' not yet complete, retried automatically':"")+(failed?' · '+failed+' failed':"")+'</span></div>'+table(["Molecule","Found","New","Checked against PubMed"],sel.map((k,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||name(k))+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+'</div>':""),x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("Complete: "+x.retrieved+" of "+x.expected,"green"):badge("Incomplete: "+x.retrieved+" of "+x.expected+", will retry","amber"))]:['<b>'+esc(name(k))+'</b>','','','<span class="sub">Pulling…</span>'];}),"");};
+  const draw=()=>{cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+done+' of '+sel.length+' molecules done · '+found+' article'+(found===1?"":"s")+' found, '+added+' new</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(incomplete?' · '+incomplete+' not yet complete, retried automatically':"")+(failed?' · '+failed+' failed':"")+'</span></div>'+table(["Molecule","Found","New","Checked against PubMed"],sel.map((k,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||name(k))+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+'</div>':""),x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("Complete: "+x.retrieved+" of "+x.expected,"green"):badge("Incomplete: "+x.retrieved+" of "+x.expected+", will retry","amber"))]:['<b>'+esc(name(k))+'</b>','','','<span class="sub">Pulling…</span>'];}),"");if($("cpout"))$("cpout").innerHTML=cpState.out;};
   draw();let next=0;
   const lane=async()=>{while(next<sel.length){const i=next++;try{const r=await api("pull-client",{...common,molecules:[sel[i]]}),x=r.results[0];rows[i]=x;found+=x.count||0;added+=x.added||0;if(x.error)failed++;else if(!x.complete)incomplete++;}catch(err){rows[i]={molecule:name(sel[i]),error:err.message};failed++;}done++;draw();}};
   await Promise.all(Array.from({length:Math.min(3,sel.length)},lane));
@@ -9451,7 +9455,7 @@ function render() {
   if(tab==="Dashboard")html='<div id="dbbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Line Listing")html='<div id="llbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Team")html=teamHtml();
-  if(tab==="Batches") html=clientPullHtml("Backfill a client","Import a date range for every molecule of a client. Tick the molecules to include.")+
+  if(tab==="Batches") html=clientPullHtml("Backfill a client","Import a date range for every molecule of a client. Tick the molecules to include.","pdat")+
     panel("Batch archive",'<form data-route="evidence" style="margin:0 0 8px"><button class="btn outline">Process pending evidence</button></form>'+clientSections(data.runs,r=>wClient(r.portfolio,r.molecule),list=>table(["Molecule","Date range","Citations","Status","Manifest"],list.map(r=>[esc(r.molecule||r.portfolio)+'<div class="sub">'+esc(r.portfolio)+'</div>',esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-export="'+esc(r.id)+'">CSV</button> <button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF</button> <button class="btn outline sm" data-zip="'+esc(r.id)+'">ZIP</button>':""]),"No batches yet."),"No batches yet."));
   if(tab==="Batches"){
     html=clientBar("data-btclient")+panel("Scheduler and missed windows",'<div id="schedbox"><div class="empty">Loading…</div></div>',"The unattended scheduler leaves a heartbeat every time it runs. A day only counts as covered when its search window was reconciled.")+(data.viewer.role==="manager"?panel("Clear pulled articles",'<div class="row"><span>Delete pulled articles, and optionally the cases, to free space.</span><button type="button" class="btn outline" data-clearpulled="1">Clear pulled articles…</button></div>'):"")+panel("Import coverage and batch readiness",'<div id="batchcov"><div class="empty">Loading…</div></div>',"Each import is cut into date windows. A window is reconciled when the number of unique PMIDs retrieved equals the count PubMed reported for it. Windows that are not reconciled stay listed as gaps until they are resolved. Evidence readiness counts the citation XML, full text and snapshot of every matched PMID.")+html;

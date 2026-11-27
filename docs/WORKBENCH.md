@@ -284,3 +284,9 @@ The top of the Clients page shows a table of how many articles each client recei
 - **Checked against PubMed.** Every window compares PubMed's count with what came back. A client pull re-runs any window that did not reconcile (up to two more times) before answering, shows "Complete: N of N" or "Incomplete, will retry" per molecule, and an incomplete window stays on the retry list. Articles are stored once and never assigned twice in a portfolio.
 - **Live Search & Pull.** Pull for a client now pulls molecule by molecule, three at a time, and each row appears as it finishes with the running totals.
 - **Dashboard.** Each client card on the Dashboard shows how many articles were pulled for the client (all time) and in the last 7 days, even when nothing is open.
+
+## Search & Pull for a client: fixes
+
+- **A manual pull always fetches again.** Pulling dates that were pulled before used to reuse the old run, so after pulled articles were cleared a repeat pull brought nothing back. Manual pulls (client, single molecule, my own) now always go to PubMed; an old finished import is only replayed when its articles are still there.
+- **Create date is the default** for Search & Pull (articles are found when PubMed received them, so nothing new is skipped); publication date is still one click away, and the Batches backfill keeps publication date as its default.
+- **Results stay on screen.** The per-molecule results table used to disappear when the page refreshed at the end of a pull; it now stays until the next pull.
