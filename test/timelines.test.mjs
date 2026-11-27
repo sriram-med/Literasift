@@ -80,3 +80,14 @@ test("screeners and QC checkers search and pull into their own queue, in their o
   const qc = await withFetch(fakeNcbi([{ pmid: "71", date: D }]).handler, () => t.call(QC, "/api/pull-mine", { ...body, molecule: "oseltamivir", synonyms: "" })); assert.equal(qc.status, 200, JSON.stringify(qc.body));
   assert.equal((await t.state()).assignments.find(a => a.pmid === "71").reviewer, QC);
 });
+
+test("the state sent to the page carries the IRD, the stage due date and working days left for articles and cases, and the line listing has IRD columns", async () => {
+  const f = x => ({ value: x, state: "edited", evidence: [] });
+  const t = await makeEnv({ profiles: PROFILES, memberships: MEMBERS, watches: [{ portfolio: "Antivirals", molecule: "aciclovir", query: "q", client: "cl1" }], clients: [{ id: "cl1", name: "Acme" }], articles: { 1: { id: "1", title: "Aciclovir rash", abstract: "x", authors: ["A"] } },
+    assignments: [{ id: "a1", pmid: "1", portfolio: "Antivirals", molecules: ["aciclovir"], reviewer: SCREENER, status: "Pending", ird: dAgo(1), dueAt: dAgo(1) }],
+    cases: [{ id: "c1", number: "LS-1", pmid: "1", portfolio: "Antivirals", molecule: "aciclovir", status: "Draft", stage: "screening", assignee: SCREENER, createdAt: dAgo(3) + "T09:00:00Z", assignedAt: dAgo(3) + "T09:00:00Z", updatedAt: dAgo(3), history: [], versions: [], data: worker.normalizeCase({ patient: { age: f("50") }, products: [{ role: "suspect", name: f("aciclovir") }], events: [{ verbatim: f("rash") }] }) }] });
+  const res = await worker.fetch(new Request("http://localhost/api/state", { headers: { "oai-authenticated-user-email": MANAGER } }), t.env), st = await res.json();
+  const a = st.assignments.find(x => x.id === "a1"), m = st.caseMeta.c1; assert.equal(a.ird, dAgo(1)); assert.ok(a.wdLeft < 0 || a.wdLeft === 0, "yesterday's due date is not in the future");
+  assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(m.ird) && /^\d{4}-\d{2}-\d{2}$/.test(m.stageDue)); assert.equal(m.client, "cl1"); assert.equal(typeof m.wdLeft, "number");
+  const ll = (await t.call(MANAGER, "/api/line-listing", {})).body, head = ll.head; assert.ok(head.includes("IRD") && head.includes("Stage due")); assert.equal(ll.rows[0][head.indexOf("IRD")], m.ird); assert.equal(ll.rows[0][head.indexOf("Stage due")], m.stageDue);
+});
