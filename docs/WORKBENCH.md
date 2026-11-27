@@ -224,3 +224,7 @@ When OpenAI refuses a request, the app now says why instead of only "HTTP 400". 
 ## Start pulling from a date
 
 Settings > Automatic PubMed pull has a "Start pulling from" date. From that day on, every day not yet covered is pulled for every molecule (including days before the first pull), in the usual weekly windows. A future date holds the pull back until it arrives. Clearing it restores the default (from the first day already covered, or yesterday for a new molecule). The setting is `autoPullFrom` on `/api/settings`.
+
+## Clearing pulled articles (and cases)
+
+Batches > Clear pulled articles (manager only) deletes pulled articles in bulk: all of them, or those of one portfolio, molecule, or pulled before a date. It removes their full texts, screenshots and queue items. By default cases stay and so does any article a case was made from. Tick "Also delete the cases" to remove cases too (every case when no scope is chosen); signed or approved cases need an extra acknowledgement, and a tombstone and audit entry record each one. Tick "forget which days were covered" if the automatic pull should fetch those days again. Settings, people and the AI key are untouched. Routes: `/api/pulled-purge-preview`, `/api/pulled-purge`.

@@ -6220,6 +6220,42 @@ async function apiCore(request, env, path) {
     }
     return new Response(lineListing(list, state.articles, state), { headers:{ "Content-Type":"text/csv; charset=utf-8", "Cache-Control":"private, no-store", "Content-Disposition":'attachment; filename="literasift-line-listing-' + stamp + '.csv"' } });
   }
+  if (["/api/pulled-purge", "/api/pulled-purge-preview"].includes(path) && viewer) {
+    // Clears pulled articles in bulk (all, or one portfolio, molecule or date range) and nothing else. Articles behind a case are kept, because the case and its signatures refer to them.
+    if (viewer.role !== "manager") return json({ error:"Manager access required." }, 403);
+    const portfolio = String(body.portfolio || "").trim(), molecule = String(body.molecule || "").trim().toLowerCase(), before = /^\d{4}-\d{2}-\d{2}$/.test(String(body.before || "")) ? String(body.before) : "";
+    const withCase = new Set((state.cases || []).map(c => c.pmid)), names = ["pubmed.png", "fulltext.txt", "fulltext.json", "parsed.json", "pmc.pdf", "pmc.xml", "europepmc.xml", "unpaywall.pdf", "wiley.pdf", "elsevier.xml", "core.pdf", "core.txt", "rxiv.xml", "preprint.xml", "uploaded.pdf", "uploaded.xml", "uploaded.txt"];
+    const where = id => { const as = (state.assignments || []).filter(a => a.pmid === id), rs = (state.runs || []).filter(r => (r.ids || []).includes(id)); return { portfolios:[...as.map(a => a.portfolio), ...rs.map(r => r.portfolio)], molecules:[...as.map(a => String(a.molecule || "").toLowerCase()), ...rs.map(r => String(r.molecule || "").toLowerCase())] }; };
+    const picked = Object.keys(state.articles || {}).filter(id => { const w = where(id); if (portfolio && !w.portfolios.includes(portfolio)) return false; if (molecule && !w.molecules.includes(molecule)) return false; if (before && String(irdOf(state, { pmid:id }) || "").slice(0, 10) >= before) return false; return true; });
+    // With "also delete cases", the cases go too: every case when no scope is chosen, otherwise the cases made from the matching articles.
+    const withCases = body.includeCases === true, scoped = Boolean(portfolio || molecule || before), pickedSet = new Set(picked);
+    const doomedCases = withCases ? (state.cases || []).filter(c => !scoped || pickedSet.has(c.pmid)) : [], caseIds = new Set(doomedCases.map(c => c.id));
+    const stillUsed = new Set((state.cases || []).filter(c => !caseIds.has(c.id)).map(c => c.pmid));
+    const kept = picked.filter(id => stillUsed.has(id)), doomed = picked.filter(id => !stillUsed.has(id));
+    const signedOf = c => (c.signatures || []).filter(x => !x.superseded), protectedOf = c => signedOf(c).length > 0 || Boolean(c.approval || c.data?.approval) || (c.versions || []).some(x => x.action === "exported" || x.action === "approved");
+    const caseKeys = c => { const k = new Set((c.versions || []).map(x => x.key).filter(Boolean)); for (const sg of c.signatures || []) if (c.approval?.hash) k.add("synchrony-packs/" + c.id + "/" + c.approval.hash + "-" + sg.id + ".zip"); return [...k]; };
+    const protectedCases = doomedCases.filter(protectedOf);
+    const files = new Set(); for (const c of doomedCases) for (const key of caseKeys(c)) files.add(key); for (const id of doomed) { const a = state.articles[id]; for (const key of [a.fullTextKey, a.fullTextTextKey, a.screenshotKey]) if (key) files.add(key); for (const n of names) files.add("evidence/" + id + "/" + n); }
+    let bytes = 0; for (const key of files) { try { const o = await env.BUCKET.get(key); if (o) bytes += Number(o.size) || 0; } catch { /* absent */ } }
+    const open = new Set((state.assignments || []).filter(a => doomed.includes(a.pmid) && !["Done", "Closed"].includes(a.status)).map(a => a.pmid));
+    if (path === "/api/pulled-purge-preview") return json({ cases:doomedCases.length, protectedCases:protectedCases.length, articles:doomed.length, keptBecauseOfCases:kept.length, inProgress:open.size, files:files.size, bytes });
+    const reason = String(body.reason || "").trim(); if (reason.length < 5) return json({ error:"Give a reason of at least 5 characters. It is recorded in the audit trail." }, 400);
+    if (!doomed.length && !doomedCases.length) return json({ error:"Nothing matches." }, 400);
+    if (String(body.confirm || "").trim() !== "DELETE " + (doomed.length + doomedCases.length)) return json({ error:"Type DELETE " + (doomed.length + doomedCases.length) + " to confirm." }, 400);
+    if (protectedCases.length && body.acknowledgeSigned !== true) return json({ error:protectedCases.length + " case" + (protectedCases.length === 1 ? " was" : "s were") + " approved, signed or exported. Confirm that you understand this removes a regulatory record.", needsAck:true }, 409);
+    const gone = new Set(doomed), at = new Date().toISOString(), tombs = doomedCases.map(c => ({ id:c.id, number:c.number, pmid:c.pmid, portfolio:c.portfolio || "", molecule:c.molecule || "", status:c.status, hash:(c.versions || []).at(-1)?.hash || "", approvalHash:c.approval?.hash || "", signed:signedOf(c).map(x => ({ signer:x.signer_id || "", at:x.signed_at || "", meaning:x.meaning || "", contentSha256:x.content_sha256 || "" })), createdAt:c.createdAt, deletedAt:at, deletedBy:email, reason:reason.slice(0, 300), purged:true }));
+    await write(env, data => {
+      if (caseIds.size) { data.cases = data.cases.filter(c => !caseIds.has(c.id)); (data.deletedCases ||= []).push(...tombs); const pm = new Set(doomedCases.map(c => c.pmid + "|" + c.portfolio)); for (const a of data.assignments) if (pm.has(a.pmid + "|" + a.portfolio)) a.synchronyOff = true; }
+      for (const id of gone) delete data.articles[id];
+      data.assignments = data.assignments.filter(a => !gone.has(a.pmid));
+      for (const run of data.runs || []) if ((run.ids || []).some(id => gone.has(id))) { run.ids = run.ids.filter(id => !gone.has(id)); run.count = run.ids.length; }
+      // Optionally forget which days were covered, so the scheduler pulls them again; otherwise those days stay marked as done.
+      if (body.forgetCoverage === true) data.runs = (data.runs || []).filter(r => (r.ids || []).length || (portfolio && r.portfolio !== portfolio) || (molecule && String(r.molecule || "").toLowerCase() !== molecule));
+    });
+    let removed = 0; if (typeof env.BUCKET.delete === "function") for (const key of files) { try { await env.BUCKET.delete(key); removed++; } catch { /* already gone */ } }
+    await audit(env, { by:email, action:"pulled.purged", target:doomed.length + " article" + (doomed.length === 1 ? "" : "s"), detail:{ scope:[portfolio, molecule, before && "before " + before].filter(Boolean).join(", ") || "all", reason:reason.slice(0, 300), freedBytes:bytes, filesRemoved:removed, casesDeleted:doomedCases.length, casesSignedOrApproved:protectedCases.length, keptBecauseOfCases:kept.length, coverageForgotten:body.forgetCoverage === true } });
+    return json({ ok:true, deleted:doomed.length, casesDeleted:doomedCases.length, kept:kept.length, freedBytes:bytes, filesRemoved:removed });
+  }
   if (path === "/api/library-delete" && viewer) {
     if (!manager) return json({ error:"Manager access required." }, 403);
     const reason = String(body.reason || "").trim();
@@ -7975,6 +8011,22 @@ async function deleteCases(list,afterClose){
   };
   try{await load();}catch(err){$("purgebody").innerHTML="";$("purgeerr").textContent=err.message;}
 }
+async function clearPulled(){
+  const old=$("pulldlg");if(old)old.remove();
+  const pfs=(typeof allPortfolios==="function"?allPortfolios():[]);
+  document.body.insertAdjacentHTML("beforeend",'<dialog id="pulldlg" style="width:min(560px,96vw)"><h3 style="margin:0 0 4px">Clear pulled articles</h3><p class="sub" style="margin:0 0 12px">Removes pulled articles, their full texts and screenshots, and their queue items. Tick the cases box to remove cases as well; otherwise cases are kept, and so is any article a case was made from.</p>'+
+    '<form id="pullform" data-own="1" class="impgrid"><label>Portfolio<select name="portfolio"><option value="">All portfolios</option>'+pfs.map(x=>'<option>'+esc(x)+'</option>').join("")+'</select></label><label>Molecule (optional)<input name="molecule" placeholder="all molecules"></label>'+
+    '<label class="wide">Only articles pulled before (optional)<input type="date" name="before"></label><div class="wide purgesum" id="pullsum"><span class="sub">Checking…</span></div>'+
+    '<label class="check wide"><input type="checkbox" name="cases">&nbsp;Also delete the cases (every case when no portfolio, molecule or date is chosen)</label><label class="check wide" id="pullackrow" style="display:none"><input type="checkbox" name="ack">&nbsp;<span id="pullacktxt"></span></label><label class="check wide"><input type="checkbox" name="forget">&nbsp;Also forget which days were covered, so the automatic pull fetches them again</label>'+
+    '<label class="wide">Reason (recorded in the audit log)<textarea name="reason" rows="2" required></textarea></label><label class="wide"><span id="pullcf">Type DELETE and the number shown</span><input name="confirm" autocomplete="off"></label><div class="wide" id="pullerr" style="color:#b3261e"></div>'+
+    '<div class="wide" style="display:flex;gap:8px;justify-content:flex-end"><button type="button" class="btn outline" id="pullno">Cancel</button><button class="btn" id="pullgo" style="background:#b3261e;border-color:#b3261e">Delete permanently</button></div></form></dialog>');
+  const d=$("pulldlg");d.showModal();let pre=null;const f=$("pullform");
+  const scope=()=>({portfolio:f.elements.portfolio.value,molecule:f.elements.molecule.value,before:f.elements.before.value,includeCases:f.elements.cases.checked});
+  const load=async()=>{try{pre=await api("pulled-purge-preview",scope());$("pullsum").innerHTML='<b>'+pre.articles+' article'+(pre.articles===1?"":"s")+(f.elements.cases.checked?' and '+pre.cases+' case'+(pre.cases===1?"":"s"):"")+'</b> to delete · frees about '+esc(fmtBytes(pre.bytes))+(pre.keptBecauseOfCases?' · '+pre.keptBecauseOfCases+' kept (a case uses them)':"")+(pre.inProgress?' · '+pre.inProgress+' still waiting in a queue':"");$("pullcf").innerHTML='Type <b>DELETE '+(pre.articles+(pre.cases||0))+'</b> to confirm';$("pullackrow").style.display=pre.protectedCases?"":"none";$("pullacktxt").textContent=pre.protectedCases+" case"+(pre.protectedCases===1?" is":"s are")+" approved, signed or exported. Deleting removes a regulatory record.";}catch(e){$("pullerr").textContent=e.message;}};
+  ["portfolio","molecule","before","cases"].forEach(n=>f.elements[n].addEventListener("change",load));$("pullno").onclick=()=>{d.close();d.remove();};
+  f.onsubmit=async e=>{e.preventDefault();$("pullgo").disabled=true;$("pullerr").textContent="";try{const r=await api("pulled-purge",{...scope(),reason:f.elements.reason.value,confirm:f.elements.confirm.value,forgetCoverage:f.elements.forget.checked,acknowledgeSigned:f.elements.ack.checked});d.close();d.remove();await refresh();render();message(r.deleted+" pulled article"+(r.deleted===1?"":"s")+(r.casesDeleted?" and "+r.casesDeleted+" case"+(r.casesDeleted===1?"":"s"):"")+" deleted, "+fmtBytes(r.freedBytes)+" freed.");}catch(err){$("pullerr").textContent=err.message;$("pullgo").disabled=false;}};
+  load();
+}
 async function rowSelect(el){
   const [kind,id]=el.dataset.rowsel.split("|"),v=el.value;
   try{
@@ -9145,7 +9197,7 @@ function render() {
     '<div class="empty">Save a watchlist before importing a batch.</div>')+
     panel("Batch archive",'<form data-route="evidence" style="margin:0 0 8px"><button class="btn outline">Process pending evidence</button></form>'+table(["Watchlist","Date range","Citations","Status","Manifest"],data.runs.map(r=>[esc(r.portfolio+(r.molecule?" · "+r.molecule:"")),esc(r.from)+" → "+esc(r.to),r.count,badge(r.error||r.status,r.status==="Imported"?"green":"red"),r.status==="Imported"?'<button class="btn outline sm" data-export="'+esc(r.id)+'">CSV</button> <button class="btn outline sm" data-pdfrun="'+esc(r.id)+'">PDF</button> <button class="btn outline sm" data-zip="'+esc(r.id)+'">ZIP</button>':""]),"No batches yet."));
   if(tab==="Batches"){
-    html=panel("Scheduler and missed windows",'<div id="schedbox"><div class="empty">Loading…</div></div>',"The unattended scheduler leaves a heartbeat every time it runs. A day only counts as covered when its search window was reconciled.")+panel("Import coverage and batch readiness",'<div id="batchcov"><div class="empty">Loading…</div></div>',"Each import is cut into date windows. A window is reconciled when the number of unique PMIDs retrieved equals the count PubMed reported for it. Windows that are not reconciled stay listed as gaps until they are resolved. Evidence readiness counts the citation XML, full text and snapshot of every matched PMID.")+html;
+    html=panel("Scheduler and missed windows",'<div id="schedbox"><div class="empty">Loading…</div></div>',"The unattended scheduler leaves a heartbeat every time it runs. A day only counts as covered when its search window was reconciled.")+(data.viewer.role==="manager"?panel("Clear pulled articles",'<div class="row"><span>Delete pulled articles, and optionally the cases, to free space.</span><button type="button" class="btn outline" data-clearpulled="1">Clear pulled articles…</button></div>'):"")+panel("Import coverage and batch readiness",'<div id="batchcov"><div class="empty">Loading…</div></div>',"Each import is cut into date windows. A window is reconciled when the number of unique PMIDs retrieved equals the count PubMed reported for it. Windows that are not reconciled stay listed as gaps until they are resolved. Evidence readiness counts the citation XML, full text and snapshot of every matched PMID.")+html;
     const closedList=Object.values(data.articles).filter(a=>!a.fullTextKey&&a.title&&data.assignments.some(x=>x.pmid===a.id)).slice(0,200), prefix=data.config.proxyPrefix||"";
     html+=panel("Closed articles waiting for a full text ("+closedList.length+(closedList.length===200?"+":"")+")",
       '<div class="row"><span>Download the PDFs you are licensed to use, name each file with its PMID or DOI, and add them all at once.</span><span style="display:flex;gap:8px;flex-wrap:wrap"><input type="file" id="bulkft" multiple accept=".pdf,.xml"><button type="button" class="btn" data-bulkft="1">Match and upload</button></span></div><div id="bulkftresult" class="sub" style="padding:6px 0"></div>'+
@@ -9311,6 +9363,7 @@ document.addEventListener("click",event=>{
   }
   const ak=event.target.closest&&event.target.closest("[data-aikeyremove]");
   if(ak){api("settings",{openaiKey:null}).then(()=>refresh()).then(()=>message("Key removed.")).catch(e=>message(e.message,true));return;}
+  if(event.target.closest&&event.target.closest("[data-clearpulled]")){clearPulled();return;}
   const ar=event.target.closest&&event.target.closest("[data-autorun]");
   if(ar){ar.disabled=true;message("Pulling new articles…");api("scheduled",{force:true}).then(r=>{message("Pull finished: "+r.results.length+" batch"+(r.results.length===1?"":"es")+(r.remaining?", "+r.remaining+" more waiting":"")+".");return refresh();}).catch(e=>message(e.message,true)).finally(()=>{ar.disabled=false;});return;}
   const lc=event.target.closest&&event.target.closest("[data-llcsv]");

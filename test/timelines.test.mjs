@@ -204,3 +204,20 @@ test("cases at any stage can be permanently deleted to free space: stored versio
   const st = s.deletedCases.find(x => x.number === "LS-s1"); assert.equal(st.signed[0].signer, MEDICAL); assert.equal(st.signed[0].contentSha256, "abc"); assert.equal(st.approvalHash, "apphash"); assert.equal(s.articles[1].fullTextStatus, "Removed to free space");
   const audit = (await t.call(MANAGER, "/api/audit", {})).body; assert.ok(JSON.stringify(audit).includes("case.purged"), "the audit log records it");
 });
+
+test("clear pulled articles: removes pulled articles, keeps cases unless asked, and removes both together with a confirmation", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "P1", molecule: "m1", query: "m1" }] });
+  const s = await t.state();
+  s.articles = { "1": { id: "1", title: "A" }, "2": { id: "2", title: "B" } };
+  s.assignments = [{ id: "a1", pmid: "1", portfolio: "P1", molecule: "m1", status: "Open" }, { id: "a2", pmid: "2", portfolio: "P1", molecule: "m1", status: "Open" }];
+  s.cases = [{ id: "c1", number: "LS-1", pmid: "2", portfolio: "P1", molecule: "m1", status: "Draft", versions: [], history: [], data: {} }];
+  await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const pre = (await t.call(MANAGER, "/api/pulled-purge-preview", {})).body; assert.equal(pre.articles, 1); assert.equal(pre.keptBecauseOfCases, 1);
+  assert.equal((await t.call(SCREENER, "/api/pulled-purge", {})).status, 403);
+  assert.equal((await t.call(MANAGER, "/api/pulled-purge", { reason: "free space", confirm: "DELETE 9" })).status, 400);
+  const r = await t.call(MANAGER, "/api/pulled-purge", { reason: "free space", confirm: "DELETE 1" }); assert.equal(r.body.deleted, 1);
+  let st = await t.state(); assert.deepEqual(Object.keys(st.articles), ["2"]); assert.equal(st.cases.length, 1);
+  const both = (await t.call(MANAGER, "/api/pulled-purge-preview", { includeCases: true })).body; assert.equal(both.articles, 1); assert.equal(both.cases, 1);
+  const d = await t.call(MANAGER, "/api/pulled-purge", { includeCases: true, reason: "start clean", confirm: "DELETE 2" }); assert.equal(d.body.casesDeleted, 1, JSON.stringify(d.body));
+  st = await t.state(); assert.equal(Object.keys(st.articles).length, 0); assert.equal(st.cases.length, 0); assert.equal(st.deletedCases.length, 1); assert.equal(st.assignments.length, 0);
+});
