@@ -190,3 +190,10 @@ test("the per-drug week count by PubMed date counts the stored articles PubMed d
   const ird = await t.call(MANAGER, "/api/drug-week-stats", { client: "a", from: "2026-11-16", to: "2026-11-22", by: "ird" });
   assert.equal(ird.body.rows[0].pulled, 0, "by the day it reached the app, nothing arrived that week");
 });
+
+test("Remove on a client's molecule deletes exactly that molecule, not a namesake that once belonged to the client", async () => {
+  const t = await makeEnv({ clients: [{ id: "u", name: "USV" }, { id: "s", name: "Square" }], schema: { grouping: "client" },
+    watches: [{ portfolio: "USV", molecule: "metformin", query: "m", client: "u" }, { portfolio: "Square", formerPortfolio: "USV", molecule: "metformin", query: "m", client: "s" }] });
+  const r = await t.call(MANAGER, "/api/delete-watch", { watch: "USV|metformin" }); assert.equal(r.status, 200);
+  const st = await t.state(); assert.deepEqual(st.watches.map(w => w.portfolio + "/" + w.molecule), ["Square/metformin"]);
+});
