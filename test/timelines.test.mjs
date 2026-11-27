@@ -316,3 +316,20 @@ test("client pull figures: articles per client per week, totals, and a CSV with 
   const lines = csv.replace("﻿", "").trim().split("\r\n"); assert.ok(lines[0].startsWith('"Client","Articles pulled ('));
   assert.ok(lines.some(l => l.startsWith('"Acme",3,')), csv); assert.ok(lines.some(l => l.startsWith('"Beta, Inc",1,')), "a comma in a name is quoted"); assert.ok(lines.at(-1).startsWith('"Total",4,'));
 });
+
+test("search and pull rework: one molecule is reused when already watched, takes an owner, and a personal pull runs without dates in the background", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "Renal", molecule: "calcium acetate", query: '"calcium acetate"[tiab]' }] }, { DEFER_EVIDENCE: "1" });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Square" }]; s.memberships = [{ email: SCREENER, portfolio: "Renal", role: "screener" }]; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const none = async () => new Response("{}", { status: 404 });
+  const r = await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { list: "Calcium Acetate, PhosLo", client: "k1", owner: SCREENER, reuse: true })); assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.results[0].status, "exists"); assert.equal(r.body.results[0].watch, "Renal|calcium%20acetate"); assert.equal(r.body.results[0].client, "k1");
+  const w = (await t.state()).watches[0]; assert.equal(w.client, "k1", "the client is set on a molecule that had none"); assert.equal(w.owner, SCREENER); assert.ok(/PhosLo/.test(w.query), "the new name is added to its search");
+  assert.equal((await withFetch(none, () => t.call(MANAGER, "/api/molecule-add", { list: "x", owner: "nobody@x.org", reuse: true }))).status, 400);
+  const ncbi = fakeNcbi([{ pmid: "31", date: "2004-02-02" }, { pmid: "32", date: dAgo(1) }]);
+  await withFetch(ncbi.handler, async () => {
+    const start = await t.call(SCREENER, "/api/pull-mine", { molecule: "calcium acetate", portfolio: "Renal", background: true, online: false }); assert.ok(start.body.job, JSON.stringify(start.body));
+    let p; for (let i = 0; i < 200; i++) { p = (await t.call(SCREENER, "/api/pull-job", { id: start.body.job })).body; if (p.state !== "running") break; await new Promise(x => setTimeout(x, 25)); }
+    assert.equal(p.state, "done", JSON.stringify(p)); assert.equal(p.payload.allDates, true); assert.equal(p.payload.results[0].count, 2, "articles of every date"); assert.ok(p.payload.results[0].complete);
+  });
+  assert.ok((await t.state()).assignments.filter(a => a.portfolio === "Renal").every(a => a.reviewer === SCREENER || a.pulledBy === SCREENER));
+});

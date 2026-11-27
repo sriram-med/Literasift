@@ -312,3 +312,14 @@ A long pull could outlast the time limit of the web server in front of the app, 
 - **No date field.** The Create date / Publication date choice is gone from Search & Pull, Batches backfill and the Watchlists custom-date pulls. A client pull now pulls **every article PubMed has for the molecule, whatever its dates**: one search with no date limit, which the app splits only where PubMed would cut the list short, so none is dropped. Tick **Only articles from a date range** to limit it; a limited pull matches articles created in PubMed *or* published in those dates. A molecule with more than 10,000 articles is reported with its count rather than pulled by accident (pull it with dates).
 - **NCBI PubMed Central** is added: a source in the worldwide Search (PubMed Central, with the full-text archive) and a **Also search NCBI PubMed Central** option on the client pull, which finds articles whose full text names the drug and feeds those that have a PMID back through the PubMed pipeline.
 - **Two-word names such as calcium acetate**: the broad search quoted the phrase bare, which finds nothing when PubMed does not know the phrase. It now searches the phrase in All Fields, MeSH terms and supplementary concepts.
+
+## Search & Pull, reworked
+
+One page, one engine. At the top, choose what to pull: **By client**, **One molecule**, **PMID list**, **Other sources** (Europe PMC, OpenAlex, trials, regulators, PubMed Central), **Patient posts**. For client and molecule pulls the settings card is shared and kept while you switch:
+
+- **Dates**: All dates (the default), Last 30 days, Last 3 months, Last 12 months, or your own From / Through. There is no date-field choice any more: with dates, an article counts if it was added to PubMed or published in them; with no dates, every article PubMed has is pulled, whatever its dates (a molecule with more than 10,000 articles is reported instead of pulled whole).
+- **Search**: Broad (like the PubMed website, the default) or Precise (title, abstract and MeSH). Every known name is searched either way.
+- **NCBI sources**: PubMed, plus PubMed Central for drugs named only in full texts.
+- **Filters**: humans, case reports, English, no reviews (and safety articles only for one molecule).
+
+**By client** pulls the ticked molecules three at a time in the background, with a per-molecule check against PubMed's count, and **Compare with PubMed** shows the precise, broad and any-date counts. **One molecule** (managers) saves the molecule to its client, reusing it if it is already watched and adding any new names, sets the owner, then pulls it with the same engine; for data-entry and QC people it pulls into their own queue in their portfolio without creating a watchlist. Every pull writes one results table that stays on the page.
