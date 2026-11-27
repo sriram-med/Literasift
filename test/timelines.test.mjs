@@ -266,3 +266,18 @@ test("add molecule: the portfolio follows the drug class (valsartan joins Cardio
   const q = await withFetch(rx, () => t.call(MANAGER, "/api/molecule-add", { molecule: "zzzquine" })).then(r => r.body); assert.equal(q.portfolio, "Oncology and immunology"); assert.equal(q.classification.source, "RxNorm ATC");
   assert.equal((await add({ molecule: "valsartan2x", portfolio: "Mine" })).portfolio, "Mine", "an explicit portfolio always wins");
 });
+
+test("pull by client: pulls every molecule of a client (or a chosen subset); non-managers only in their portfolios; molecule pull can set the client", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "CNS", molecule: "aripiprazole", query: "a" }, { portfolio: "CNS", molecule: "sertraline", query: "b" }, { portfolio: "Other", molecule: "metformin", query: "c" }] });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; s.watches.forEach(w => { w.client = "k1"; }); await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const today = new Date(Date.now() + 5.5 * 3600000).toISOString().slice(0, 10), from = new Date(Date.now() + 5.5 * 3600000 - 5 * 86400000).toISOString().slice(0, 10);
+  const ncbi = fakeNcbi([{ pmid: "11", date: from }]);
+  assert.equal((await t.call(MANAGER, "/api/pull-client", { client: "nope", from, to: today })).status, 400);
+  assert.equal((await t.call(MANAGER, "/api/pull-client", { client: "k1", from: today, to: from })).status, 400);
+  const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from, to: today, dateField: "pdat" })); assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.results.length, 3); assert.ok(r.body.results.every(x => !x.error), JSON.stringify(r.body.results));
+  const one = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from, to: today, molecules: [encodeURIComponent("CNS") + "|" + encodeURIComponent("sertraline")] })); assert.equal(one.body.results.length, 1);
+  const none = await withFetch(ncbi.handler, () => t.call(SCREENER, "/api/pull-client", { client: "k1", from, to: today })); assert.ok(none.status === 200 || none.status === 400);
+  const mol = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull", { molecule: "warfarin", portfolio: "Blood", client: "k1", from, to: today })); assert.equal(mol.status, 200, JSON.stringify(mol.body));
+  assert.equal((await t.state()).watches.find(w => w.molecule === "warfarin").client, "k1");
+});

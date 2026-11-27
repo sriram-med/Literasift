@@ -248,3 +248,9 @@ With the portfolio left on Auto, Add molecule classifies the molecule by its WHO
 ## Pulling by client
 
 The Watchlists page is organised by client. Each client has its own card: its molecules with articles, last pulled and status, a **Pause client / Resume client** switch, **+ Molecule**, and **Pull this client now**. Molecules with no client are listed last with a prompt to assign them. The automatic pull takes the waiting day-ranges of all clients in turn, so one client's backlog cannot hold up the others; a paused client is skipped (a manual pull still works for it). The add-watchlist and bulk forms start with the client. Routes: `/api/client-auto`; `/api/scheduled` accepts `client` (an id, or `none`); `/api/scheduler-status` returns `perClient`.
+
+## Batches and Search & Pull by client
+
+- **Batches** has a client filter bar at the top. The scheduler's missed windows, the import coverage table and the batch archive are grouped by client (the letter badge shows the client, and the filter narrows every table). The old single-molecule backfill form is replaced by **Backfill a client**: choose a client, tick the molecules, set the date range and press Pull this client.
+- **Search & Pull** starts with **Pull for a client** (managers pull any client; data-entry and QC people pull only the client's molecules in their own portfolios, into their own queue). The single-molecule search is kept below it and now has an optional **Client** field, so a molecule pulled there is filed under that client.
+- Route: `/api/pull-client` (client, optional molecule list, dates, date field, and the humans / case reports / English / no reviews filters); up to 25 molecules per pull, one year at most.
