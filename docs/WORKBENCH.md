@@ -228,3 +228,7 @@ Settings > Automatic PubMed pull has a "Start pulling from" date. From that day 
 ## Clearing pulled articles (and cases)
 
 Batches > Clear pulled articles (manager only) deletes pulled articles in bulk: all of them, or those of one portfolio, molecule, or pulled before a date. It removes their full texts, screenshots and queue items. By default cases stay and so does any article a case was made from. Tick "Also delete the cases" to remove cases too (every case when no scope is chosen); signed or approved cases need an extra acknowledgement, and a tombstone and audit entry record each one. Tick "forget which days were covered" if the automatic pull should fetch those days again. Settings, people and the AI key are untouched. Routes: `/api/pulled-purge-preview`, `/api/pulled-purge`.
+
+## Quicker case deletion
+
+Tick any number of cases (or "Select all shown") and press Delete. For cases that are not signed, approved or exported, the dialog needs no reason and no typed confirmation: one button deletes them all and the reason is recorded as "Removed to free space" unless you write one. Signed or approved cases still need a reason, the typed confirmation and an acknowledgement.

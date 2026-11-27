@@ -221,3 +221,15 @@ test("clear pulled articles: removes pulled articles, keeps cases unless asked, 
   const d = await t.call(MANAGER, "/api/pulled-purge", { includeCases: true, reason: "start clean", confirm: "DELETE 2" }); assert.equal(d.body.casesDeleted, 1, JSON.stringify(d.body));
   st = await t.state(); assert.equal(Object.keys(st.articles).length, 0); assert.equal(st.cases.length, 0); assert.equal(st.deletedCases.length, 1); assert.equal(st.assignments.length, 0);
 });
+
+test("case deletion is quick for unsigned cases (no typing, many at once) and still strict for signed ones", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "P1", molecule: "m1", query: "m1" }] });
+  const s = await t.state(); const mk = (n, extra = {}) => ({ id: "c" + n, number: "LS-" + n, pmid: String(n), portfolio: "P1", molecule: "m1", status: "Draft", versions: [], history: [], data: {}, ...extra });
+  s.cases = [mk(1), mk(2), mk(3), mk(4, { signatures: [{ id: "s1", signer_id: MANAGER, signed_at: "2026-01-01", meaning: "approved" }] })];
+  await t.BUCKET.put("bench.json", JSON.stringify(s));
+  assert.equal((await t.call(MANAGER, "/api/cases-purge", { ids: ["c1", "c2", "c3"] })).status, 400, "without quick it still asks for a reason");
+  const r = await t.call(MANAGER, "/api/cases-purge", { ids: ["c1", "c2", "c3"], quick: true }); assert.equal(r.body.deleted, 3, JSON.stringify(r.body));
+  assert.equal((await t.state()).deletedCases.length, 3);
+  const sig = await t.call(MANAGER, "/api/cases-purge", { ids: ["c4"], quick: true }); assert.equal(sig.status, 400, "a signed case is never quick-deleted");
+  assert.equal((await t.state()).cases.length, 1);
+});
