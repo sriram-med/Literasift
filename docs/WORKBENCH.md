@@ -270,3 +270,5 @@ The Watchlists page opens with the global automatic pull, then a **By client | B
 - The dictionaries, query versions, add-a-watchlist, bulk, assign-by-employee and assign-by-number panels remain below, unchanged.
 
 Every molecule row on the Watchlists page now has a switch for its automatic pull: flip it and the change is saved at once, with no page reload.
+
+A stop date is optional. With no stop date, pulling continues every day until a manager pauses the client or the molecule; the page says "continuing until paused". Pause and Resume on a client card are saved immediately and the card shows its Paused state.
