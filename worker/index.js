@@ -5125,6 +5125,43 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"pull.mine", target:portfolio + " · " + molecule, detail:{ from:body.from, to:body.to, count:run.count ?? 0 } });
     return json({ ...run, mine:(run.ids || []).filter(id => !before.has(id)).length });
   }
+  if (path === "/api/portfolio-change" && viewer) {
+    // A manager moves articles, cases or a whole molecule watchlist to another portfolio. Holders who have no role in the new portfolio are replaced by the usual routing; nothing is duplicated.
+    if (viewer.role !== "manager") return json({ error:"Manager access required." }, 403);
+    const to = String(body.to || "").trim().slice(0, 100), kind = ["assignment", "case", "watch"].includes(body.kind) ? body.kind : ""; if (!to || !kind) return json({ error:"Choose what to move and the new portfolio." }, 400);
+    const ids = (Array.isArray(body.ids) ? body.ids : []).map(String).slice(0, 300), at = new Date().toISOString(), moved = [], skipped = [];
+    const eligible = (d, e, pf) => { const p = d.profiles.find(x => x.email === e && x.active); return Boolean(p) && (p.role === "manager" || rolesIn(d, e, pf).size > 0); };
+    const note = (rec, from) => (rec.history ||= []).push({ at, by:email, status:rec.status, action:"Portfolio changed from " + from + " to " + to, note:"Portfolio changed from " + from + " to " + to });
+    const moveAssignment = (d, a) => {
+      const from = a.portfolio; if (from === to) return;
+      if (d.assignments.some(x => x !== a && x.pmid === a.pmid && x.portfolio === to)) { skipped.push({ id:a.id, reason:"This article is already in " + to }); return; }
+      a.portfolio = to; note(a, from); if (a.reviewer && !eligible(d, a.reviewer, to)) { a.reviewer = ""; allocate(d, a); }
+      if (a.qc?.reviewer && !eligible(d, a.qc.reviewer, to)) { const q = pickArticleQc(d, a); if (q) a.qc.reviewer = q; }
+      if (a.medicalReviewer && !eligible(d, a.medicalReviewer, to)) a.medicalReviewer = pickMedical(d, to, a.reviewer, (a.molecules || [])[0] || "") || undefined;
+      for (const c of d.cases || []) if (c.portfolio === from && !c.locked && (c.provenance?.assignmentId === a.id || (c.pmid === a.pmid && (!c.molecule || (a.molecules || []).includes(c.molecule))))) moveCase(d, c, true);
+      moved.push(a.id);
+    };
+    const moveCase = (d, c, quiet) => {
+      const from = c.portfolio; if (from === to) return; c.portfolio = to; note(c, from);
+      if (c.assignee && !eligible(d, c.assignee, to)) { const st = stageOf(c), next = pickRole(d, to, st === "qc" ? "qc" : st === "medical_review" ? "medical_reviewer" : "screener", "", c.molecule || ""); if (next) { c.assignee = next; c.assignedAt = at; c.history.push({ at, by:email, action:"Reassigned to " + next + " because the holder has no role in " + to }); } }
+      refreshDue(d, c); c.updatedAt = at; if (!quiet) moved.push(c.id);
+    };
+    const out = await write(env, d => {
+      if (kind === "assignment") for (const id of ids) { const a = d.assignments.find(x => x.id === id); if (a) moveAssignment(d, a); }
+      else if (kind === "case") for (const id of ids) { const c = d.cases.find(x => x.id === id); if (c && !c.locked) moveCase(d, c); else if (c) skipped.push({ id, reason:"A signed case cannot change portfolio" }); }
+      else {
+        const [pf, mol = ""] = String(body.watch || "").split("|").map(decodeURIComponent), w = d.watches.find(x => x.portfolio === pf && (x.molecule || "") === mol); if (!w) return "missing";
+        if (pf === to) return "same"; if (d.watches.some(x => x.portfolio === to && (x.molecule || "") === mol)) return "exists";
+        for (const a of d.assignments) if (a.portfolio === pf && (!mol || (a.molecules || []).includes(mol))) moveAssignment(d, a);
+        for (const c of d.cases || []) if (c.portfolio === pf && (!mol || c.molecule === mol) && !c.locked) moveCase(d, c, true);
+        w.portfolio = to; moved.push("watch");
+      }
+      return "ok";
+    });
+    if (out === "missing") return json({ error:"Watchlist not found." }, 404); if (out === "same") return json({ error:"It is already in that portfolio." }, 400); if (out === "exists") return json({ error:"That portfolio already has a watchlist for this molecule." }, 409);
+    await audit(env, { by:email, action:"portfolio.changed", entityType:kind === "case" ? "Case" : kind === "watch" ? "Watchlist" : "Assignment", entityId:kind === "watch" ? String(body.watch) : moved.length + " item(s)", detail:{ to, moved:moved.length, skipped:skipped.length } });
+    return json({ ok:true, moved:moved.length, skipped });
+  }
   if (path === "/api/synchrony-import" && viewer) {
     // A document goes straight into Synchrony: a Discover result, a PDF or XML, or pasted OCR text. It becomes an article, a "potential ICSR" assignment in the chosen portfolio, stored full text, and a prepared draft.
     const portfolio = String(body.portfolio || "").trim().slice(0, 100), molecule = String(body.molecule || "").trim().slice(0, 100), rec = body.record && typeof body.record === "object" ? body.record : {};
@@ -7635,7 +7672,7 @@ function bulkBar(cls,opts){
     grp("Classify",'<select id="bk_ser" aria-label="Set seriousness"><option value="__">Seriousness…</option><option value="serious">Serious</option><option value="nonserious">Non-serious</option><option value="">From case data</option></select><select id="bk_lis" aria-label="Set listedness"><option value="__">Listedness…</option><option value="listed">Listed</option><option value="unlisted">Unlisted</option><option value="unknown">Unknown</option><option value="">From case data</option></select>'+b("classify","Apply"))+
     grp("Tags",'<select id="bk_tag" aria-label="Tag">'+(data.standardTags||[]).map(t=>'<option>'+esc(t)+'</option>').join("")+'</select><input id="bk_custom" placeholder="own tag" style="width:90px">'+b("tag","Add")+b("untag","Remove"))+
     grp("Folder",'<select id="bk_folder" aria-label="Folder"><option value="">No folder</option>'+fl.map(f=>'<option value="'+esc(f.id)+'">'+esc(f.name)+'</option>').join("")+'</select>'+b("folder","Move"))+
-    (!opts.archive||canMedical()||mgr?grp("More",(!opts.archive?b("route","Route…"):"")+(canMedical()&&!opts.archive?b("archive","Archive"):"")+(opts.archive&&canMedical()?b("restore","Restore"):"")+(mgr?b("delcase","Delete…",' style="color:var(--red)"'):"")):"")+'</div>';
+    (!opts.archive||canMedical()||mgr?grp("More",(!opts.archive?b("route","Route…"):"")+(mgr&&!opts.archive?b("chportfolio","Portfolio…"):"")+(canMedical()&&!opts.archive?b("archive","Archive"):"")+(opts.archive&&canMedical()?b("restore","Restore"):"")+(mgr?b("delcase","Delete…",' style="color:var(--red)"'):"")):"")+'</div>';
 }
 const canEditCase=c=>{const me=data.viewer.email;return canMedical()||c.assignee===me||c.createdBy===me;};
 function rowSelects(c){
@@ -7643,7 +7680,7 @@ function rowSelects(c){
   const ser=ed?'<select data-rowsel="ser|'+esc(c.id)+'" aria-label="Seriousness">'+opt("","Auto: "+(cl.serious?"serious":"non-serious"),m.serious||"")+opt("serious","Serious",m.serious)+opt("nonserious","Non-serious",m.serious)+'</select>':(cl.serious?badge("Serious","red"):badge("Non-serious",""));
   const lis=ed?'<select data-rowsel="lis|'+esc(c.id)+'" aria-label="Listedness">'+opt("","Auto: "+cl.listed,m.listedness||"")+opt("listed","Listed",m.listedness)+opt("unlisted","Unlisted",m.listedness)+opt("unknown","Unknown",m.listedness)+'</select>':(cl.listed==="listed"?badge("Listed","green"):cl.listed==="unlisted"?badge("Unlisted","amber"):badge("Unknown",""));
   const fl=data.caseFolders||[],fold=ed?'<select data-rowsel="fold|'+esc(c.id)+'" aria-label="Folder"><option value="">No folder</option>'+fl.map(f=>'<option value="'+esc(f.id)+'"'+(f.id===c.folderId?" selected":"")+'>'+esc(f.name)+'</option>').join("")+'</select>':esc((fl.find(f=>f.id===c.folderId)||{}).name||"");
-  const acts=[c.archived?["restore","Restore from archive"]:["archive","Archive…"],["open","Open case"]].concat(canMedical()&&!c.archived?[["route","Route…"]]:[]).concat(data.viewer.role==="manager"?[["delete","Delete…"]]:[]);
+  const acts=[c.archived?["restore","Restore from archive"]:["archive","Archive…"],["open","Open case"]].concat(canMedical()&&!c.archived?[["route","Route…"]]:[]).concat(data.viewer.role==="manager"&&!c.locked?[["portfolio","Change portfolio…"]]:[]).concat(data.viewer.role==="manager"?[["delete","Delete…"]]:[]);
   const act=(ed&&canMedical())||data.viewer.role==="manager"?'<select data-rowsel="act|'+esc(c.id)+'" aria-label="Actions"><option value="">Actions…</option>'+acts.filter(a=>canMedical()||a[0]==="open").map(a=>'<option value="'+a[0]+'">'+a[1]+'</option>').join("")+'</select>':'<button class="btn outline sm" data-opencase="'+esc(c.id)+'">Open</button>';
   return{ser,lis,fold,act,crit:cl.crit.length?'<div class="sub">'+esc(cl.crit.map(x=>x.replace(/_/g," ")).join(", "))+'</div>':""};
 }
@@ -7697,6 +7734,7 @@ async function rowSelect(el){
       if(v==="archive"){const r=await archivePicker(1);if(!r)return;await api("case-archive",{ids:[id],category:r.category,note:r.note});await afterCaseChange("Archived.");return;}
       if(v==="restore"){await api("case-restore",{ids:[id]});await afterCaseChange("Restored.");return;}
       if(v==="route"){await routeItems("case",[id]);return;}
+      if(v==="portfolio"){openPortfolioChange("case",[id],"","");return;}
       if(v==="delete"){await deleteCases([id]);return;}}
   }catch(e){message(e.message,true);}
 }
@@ -7739,6 +7777,7 @@ async function p5action(target){
     if(act==="tag"||act==="untag"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const tag=($("bk_custom").value||"").trim()||$("bk_tag").value;const r=await api("case-tag",{ids:list,tag,remove:act==="untag"});await again(r.changed+" case"+(r.changed===1?"":"s")+(act==="tag"?" tagged ":" untagged ")+tag+".");return;}
     if(act==="folder"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const r=await api("case-folder",{ids:list,folderId:$("bk_folder").value});await again(r.moved+" moved.");return;}
     if(act==="route"){await routeItems("case",ids(a1));return;}
+    if(act==="chportfolio"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);openPortfolioChange("case",list,"",list.length+" case"+(list.length===1?"":"s")+".");return;}
     if(act==="classify"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const body={ids:list},sv=$("bk_ser").value,lv=$("bk_lis").value;if(sv!=="__")body.serious=sv;if(lv!=="__")body.listedness=lv;if(body.serious===undefined&&body.listedness===undefined)return message("Choose a seriousness or listedness value.",true);const r=await api("case-classify",body);await again(r.changed+" updated.");return;}
     if(act==="archive"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const pick=await archivePicker(list.length);if(!pick)return;const r=await api("case-archive",{ids:list,category:pick.category,note:pick.note});await again(r.changed+" archived.");return;}
     if(act==="restore"){const list=ids(a1);if(!list.length)return message("Tick the cases first.",true);const r=await api("case-restore",{ids:list});await again(r.changed+" restored.");return;}
@@ -8307,7 +8346,7 @@ function queueRows(items){
       '<div class="ac-side">'+badge(a.status,statusColor[a.status]||(a.status==="QC returned"?"red":a.status==="Awaiting QC"?"blue":""))+
       '<div class="ac-who">'+(rev?'<span class="av" aria-hidden="true">'+esc(rev.slice(0,1).toUpperCase())+'</span><span>'+esc(rev)+'</span>':badge("Unassigned","amber"))+'</div>'+
       (a.dueAt?'<div class="sub"'+(late?' style="color:var(--red);font-weight:600"':"")+'>'+(late?"Overdue · ":"Due ")+esc(a.dueAt)+'</div>':"")+
-      '<button class="btn sm" data-review="'+esc(a.id)+'">Review</button></div></article>';
+      (data.viewer.role==="manager"?'<button type="button" class="btn outline sm" data-chpf="assignment|'+esc(a.id)+'|" title="Move to another portfolio">Portfolio</button>':"")+'<button class="btn sm" data-review="'+esc(a.id)+'">Review</button></div></article>';
   }).join("");
   return '<div class="acards">'+cards+'</div>'+(items.length>200?'<p class="sub" style="padding:10px 14px">Showing 200 of '+items.length+". Refine the filters to narrow the list.</p>":"");
 }
@@ -8424,7 +8463,7 @@ function pfPicker(name,selected,hint){
 function openImport(pre){
   pre=pre||{};const old=$("impdlg");if(old)old.remove();
   const rec=pre.record||{}, pfs=allPortfolios();
-  document.body.insertAdjacentHTML("beforeend",'<dialog id="impdlg" style="width:min(720px,96vw)"><h3 style="margin:0 0 4px">Add to Synchrony</h3><p class="sub" style="margin:0 0 14px">Upload a PDF or XML, or paste the article or its OCR text. It becomes a potential ICSR in the portfolio you choose, is read for patients, events and authors, and a draft is prepared.</p><form id="impform" class="impgrid">'+
+  document.body.insertAdjacentHTML("beforeend",'<dialog id="impdlg" style="width:min(720px,96vw)"><h3 style="margin:0 0 4px">Add to Synchrony</h3><p class="sub" style="margin:0 0 14px">Upload a PDF or XML, or paste the article or its OCR text. It becomes a potential ICSR in the portfolio you choose, is read for patients, events and authors, and a draft is prepared.</p><form id="impform" data-own="1" class="impgrid">'+
     '<label class="wide">Title'+'<input name="title" value="'+esc(rec.title||"")+'" placeholder="Article or report title"></label>'+
     '<label>PMID or DOI<input name="id" value="'+esc(rec.pmid||rec.doi||"")+'" placeholder="Optional"></label><label>Molecule<input name="molecule" value="'+esc(pre.molecule||"")+'" placeholder="e.g. aciclovir"></label>'+
     '<label>Portfolio<input name="portfolio" list="pfopts" autocomplete="off" required value="'+esc(pre.portfolio||(pfs.length===1?pfs[0]:""))+'" placeholder="Choose, or type a new one"></label><label>Authors (optional, comma separated)<input name="authors" placeholder="Read from the text when empty"></label>'+
@@ -8445,6 +8484,15 @@ function openImport(pre){
       tab="Synchrony";render();
     }catch(err){$("imperr").textContent=err.message;$("impgo").disabled=false;}
   };
+}
+function openPortfolioChange(kind,ids,watchKey,label){
+  const old=$("pfdlg");if(old)old.remove();const pfs=allPortfolios();
+  document.body.insertAdjacentHTML("beforeend",'<dialog id="pfdlg" style="width:min(520px,96vw)"><h3 style="margin:0 0 4px">Change portfolio</h3><p class="sub" style="margin:0 0 12px">'+esc(label||"")+' Anyone without a role in the new portfolio is replaced by the usual routing. Signed cases stay where they are.</p><form id="pfform" data-own="1" style="display:grid;gap:12px"><label>Move to<input name="to" list="pfopts" autocomplete="off" required placeholder="Choose, or type a new portfolio"></label>'+(pfs.length?'<div class="chips">'+pfs.map(x=>'<button type="button" class="btn outline sm" data-pfpick2="'+esc(x)+'">'+esc(x)+'</button>').join("")+'</div>':"")+'<div style="display:flex;gap:8px;justify-content:flex-end"><button type="button" class="btn outline" id="pfno">Cancel</button><button class="btn" id="pfgo">Move</button></div></form><p id="pferr" class="msg" style="color:var(--red)" role="alert"></p></dialog>');
+  const d=$("pfdlg");d.showModal();$("pfno").onclick=()=>{d.close();d.remove();};
+  d.addEventListener("click",e=>{const b=e.target.closest("[data-pfpick2]");if(b){$("pfform").elements.to.value=b.dataset.pfpick2;}});
+  $("pfform").onsubmit=async e=>{e.preventDefault();const to=e.target.elements.to.value.trim();if(!to)return;$("pfgo").disabled=true;
+    try{const r=await api("portfolio-change",{kind,ids,watch:watchKey,to});d.close();d.remove();await refresh();render();message(r.moved+" moved"+(r.skipped&&r.skipped.length?"; "+r.skipped.length+" skipped: "+r.skipped.slice(0,2).map(x=>x.reason).join("; "):"")+".");}
+    catch(err){$("pferr").textContent=err.message;$("pfgo").disabled=false;}};
 }
 function caseBoard(list){
   const cols=[["screening","Data entry"],["qc","QC"],["medical_review","Medical review"],["signed","Signed"],["closed","Sent or closed"]], signedOf=c=>(c.signatures||[]).some(x=>!x.superseded), people=data.people||data.profiles||[], today=todayStr();
@@ -8477,7 +8525,7 @@ function caseCard(c, o){
     (clockHtml(c)||(c.dueAt?'<div class="sub"'+(late?' style="color:var(--red);font-weight:600"':"")+'>'+(late?Math.abs(left)+" d overdue":left===0?"Due today":left+" d left")+' · '+esc(c.dueAt)+'</div>':'<div class="sub">no date</div>'))+
     (o.noWho?"":'<div class="ac-who">'+(who?'<span class="av" aria-hidden="true">'+esc(who.slice(0,1).toUpperCase())+'</span><span>'+esc(who)+'</span>':badge("Unassigned","amber"))+'</div>')+
     (o.valid?(a.valid?badge("Valid ICSR","green"):'<span class="badge amber" title="'+esc((a.missing||[]).join(", "))+'">Missing '+((a.missing||[]).length)+'</span>'):"")+
-    '<button type="button" class="btn sm" data-opencase="'+esc(c.id)+'">'+esc(o.action||"Open")+'</button></div></article>';
+    (data.viewer.role==="manager"&&!c.locked?'<button type="button" class="btn outline sm" data-chpf="case|'+esc(c.id)+'|" title="Move to another portfolio">Portfolio</button>':"")+'<button type="button" class="btn sm" data-opencase="'+esc(c.id)+'">'+esc(o.action||"Open")+'</button></div></article>';
 }
 function groupedCards(list,by,cardOf,empty){
   const wrap=(title,items)=>'<section class="cgroup">'+(title?'<h3 class="cg-title">'+title+' <span class="sub">'+items.length+'</span></h3>':"")+'<div class="acards flat">'+items.map(cardOf).join("")+'</div></section>';
@@ -8530,7 +8578,7 @@ function molTable(list,removable){
     '<label class="mr-f"><span class="sub">Screener</span>'+sel(w,"screener",w.owner,"Auto-assign")+'</label><label class="mr-f"><span class="sub">QC</span>'+sel(w,"qc",w.qcOwner,"Auto-assign")+'</label><label class="mr-f"><span class="sub">Medical review</span>'+sel(w,"medical",w.medicalOwner,"Auto-assign")+'</label>'+
     '<label class="mr-f"><span class="sub">Priority</span><select data-wcfg="'+esc(wk(w))+'|priority" aria-label="Priority">'+[["high","High"],["normal","Normal"],["low","Low"]].map(o=>'<option value="'+o[0]+'"'+((w.priority||"normal")===o[0]?" selected":"")+'>'+o[1]+'</option>').join("")+'</select></label>'+
     '<div class="mr-f"><span class="sub">Working days (screen · QC · medical)</span><span class="mr-days">'+num(w,"screenDays",tl.screenDays)+num(w,"qcDays",tl.qcDays)+num(w,"medicalDays",tl.medicalDays)+'</span></div>'+
-    (removable?'<form data-route="client-assign" class="mr-x"><input type="hidden" name="watch" value="'+esc(wk(w))+'"><input type="hidden" name="client" value=""><button class="btn outline sm" title="Remove from this client">Remove</button></form>':"")+'</div>').join("")+'</div>';
+    (data.viewer.role==="manager"?'<button type="button" class="btn outline sm mr-pf" data-chpf="watch||'+esc(wk(w))+'" title="Move this molecule, its articles and cases to another portfolio">Move portfolio</button>':"")+(removable?'<form data-route="client-assign" class="mr-x"><input type="hidden" name="watch" value="'+esc(wk(w))+'"><input type="hidden" name="client" value=""><button class="btn outline sm" title="Remove from this client">Remove</button></form>':"")+'</div>').join("")+'</div>';
 }
 function timelinesPanel(){
   const t=(data.config&&data.config.timelines)||{screenDays:2,qcDays:2,medicalDays:3,holidays:[],weekend:[0,6]};
@@ -8924,7 +8972,7 @@ document.addEventListener("click",event=>{
   const lc=event.target.closest&&event.target.closest("[data-llcsv]");
   if(lc){fetch("/api/cases-export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({format:"csv"})}).then(async res=>{if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"Nothing to export.");const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-line-listing-"+new Date().toISOString().slice(0,10)+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}).catch(e=>message(e.message,true));return;}
   const sl=event.target.closest&&event.target.closest("[data-setsec]");if(sl){setSec=sl.dataset.setsec;render();return;}
-  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-mqwf],[data-mqview],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
+  const target=event.target.closest("[data-pickevent],[data-codesuggest],[data-codeapply],[data-libmode],[data-imeup],[data-imeclear],[data-imepromo],[data-imeunpromo],[data-masave],[data-pvremove],[data-opencase],[data-newcase],[data-icsrintake],[data-synfilter],[data-synview],[data-plwf],[data-chpf],[data-mqwf],[data-mqview],[data-dvf],[data-godash],[data-drugkind],[data-drugresolve],[data-plview],[data-plday],[data-planchor],[data-pldate],[data-dbwf],[data-plgo],[data-impdoc],[data-discsyn],[data-aireview],[data-aiflag],[data-refack],[data-ftupload],[data-memremove],[data-monitor],[data-clearspecial],[data-dispsave],[data-qcdec],[data-exdec],[data-p3],[data-p4],[data-p5],[data-p6],[data-p7],[data-p8],[data-p9],[data-syncat],[data-synfolder],[data-reassign],[data-resume],[data-evretry],[data-batchzip],[data-dictedit],[data-wpreview],[data-wapply],[data-libdel],[data-articledel],[data-memdel],[data-unfetched],[data-keyremove],[data-bulkft],[data-authornote],[data-ftpaste],[data-backtolit],[data-autoassign],[data-synexport],[data-caseact],[data-ncbiremove],[data-rkadd],[data-rkdel],[data-rkpreview],[data-rkapply],[data-auditcsv],[data-auditverify],[data-auditanchor],[data-signopen],[data-signgo],[data-signsup],[data-tab],[data-export],[data-review],[data-pdf],[data-pdfrun],[data-zip],[data-cite],[data-retrieval],[data-suggest],[data-addsyn],[data-resetlink],[data-revoke],[data-libopen],[data-libzip],[data-libpdf],[data-libris],[data-delwatch]");
   if(!target)return;
   if(target.dataset.codesuggest!==undefined){
     collectCase();const i=Number(target.dataset.codesuggest),ev=curCase.data.events[i],box=$("codesug"+i);
@@ -9012,6 +9060,7 @@ document.addEventListener("click",event=>{
   if(target.dataset.dvf!==undefined){const v=target.dataset.dvf;if(v==='clear')deskFilter={on:false,client:'',molecule:''};else{const i=v.indexOf('|'),cid=v.slice(0,i),mol=v.slice(i+1);deskFilter=deskFilter.on&&deskFilter.client===cid&&deskFilter.molecule===mol?{on:false,client:'',molecule:''}:{on:true,client:cid,molecule:mol};}render();return;}
   if(target.dataset.mqwf){mqState.wf=target.dataset.mqwf;loadMyQueue();return;}
   if(target.dataset.mqview){mqState.view=target.dataset.mqview;render();return;}
+  if(target.dataset.chpf){const cp=target.dataset.chpf.split('|'),kind=cp[0],id=cp[1],wk=cp.slice(2).join('|');openPortfolioChange(kind,id?[id]:[],wk,kind==='watch'?'The molecule, its articles and its cases move.':'');return;}
   if(target.dataset.plwf!==undefined){plState.wf=target.dataset.plwf;loadPlanner();return;}
   if(target.dataset.plview){plState.view=target.dataset.plview;loadPlanner();return;}
   if(target.dataset.plday){plState.sel=plState.sel===target.dataset.plday?"":target.dataset.plday;if(tab!=="Planner"){tab="Planner";render();return;}loadPlanner();return;}
@@ -9287,6 +9336,7 @@ $("linkcopy").onclick=async()=>{try{await navigator.clipboard.writeText($("linkv
 $("linkshare").onclick=()=>navigator.share({title:"LiteraSift",url:$("linkvalue").value}).catch(()=>{});
 document.addEventListener("submit",async event=>{
   if(event.target.getAttribute("action")==="/logout")return;   // a normal form post (host sign-out); the app must not intercept it
+  if(event.target.dataset&&event.target.dataset.own!==undefined)return;   // a dialog form that handles its own submit
   event.preventDefault();
   const form=event.target, button=form.querySelector("button");
   const body=Object.fromEntries(new FormData(form));

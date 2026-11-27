@@ -91,3 +91,20 @@ test("the state sent to the page carries the IRD, the stage due date and working
   assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(m.ird) && /^\d{4}-\d{2}-\d{2}$/.test(m.stageDue)); assert.equal(m.client, "cl1"); assert.equal(typeof m.wdLeft, "number");
   const ll = (await t.call(MANAGER, "/api/line-listing", {})).body, head = ll.head; assert.ok(head.includes("IRD") && head.includes("Stage due")); assert.equal(ll.rows[0][head.indexOf("IRD")], m.ird); assert.equal(ll.rows[0][head.indexOf("Stage due")], m.stageDue);
 });
+
+test("a manager changes the portfolio of articles, cases and a whole watchlist; holders without a role there are replaced and nothing is duplicated", async () => {
+  const f = x => ({ value: x, state: "edited", evidence: [] });
+  const profiles = [...PROFILES, { email: "onco@example.org", name: "Olga", role: "reviewer", portfolio: "Oncology", active: true, capacity: 50 }];
+  const t = await makeEnv({ profiles, memberships: [...MEMBERS, { email: "onco@example.org", portfolio: "Oncology", role: "qc" }], watches: [{ portfolio: "Antivirals", molecule: "aciclovir", query: "q" }, { portfolio: "Oncology", molecule: "imatinib", query: "q2" }],
+    articles: { 1: { id: "1", title: "A", abstract: "x", authors: ["A"] }, 2: { id: "2", title: "B", abstract: "y", authors: ["B"] } },
+    assignments: [{ id: "a1", pmid: "1", portfolio: "Antivirals", molecules: ["aciclovir"], reviewer: SCREENER, status: "Pending", ird: dAgo(1) }, { id: "a2", pmid: "2", portfolio: "Antivirals", molecules: ["aciclovir"], reviewer: SCREENER, status: "Pending", ird: dAgo(1) }, { id: "dup", pmid: "2", portfolio: "Oncology", molecules: ["imatinib"], reviewer: "onco@example.org", status: "Pending", ird: dAgo(1) }],
+    cases: [{ id: "c1", number: "LS-1", pmid: "1", portfolio: "Antivirals", molecule: "aciclovir", status: "Draft", stage: "screening", assignee: SCREENER, createdAt: dAgo(2) + "T09:00:00Z", updatedAt: dAgo(2), history: [], versions: [], data: worker.normalizeCase({ products: [{ role: "suspect", name: f("aciclovir") }], events: [{ verbatim: f("rash") }] }) }, { id: "c2", number: "LS-2", pmid: "2", portfolio: "Antivirals", molecule: "aciclovir", status: "Draft", stage: "screening", locked: true, assignee: SCREENER, createdAt: dAgo(2) + "T09:00:00Z", updatedAt: dAgo(2), history: [], versions: [], data: worker.normalizeCase({}) }] });
+  assert.equal((await t.call(SCREENER, "/api/portfolio-change", { kind: "assignment", ids: ["a1"], to: "Oncology" })).status, 403, "managers only");
+  const r = await t.call(MANAGER, "/api/portfolio-change", { kind: "assignment", ids: ["a1", "a2"], to: "Oncology" }); assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal(r.body.moved, 1); assert.equal(r.body.skipped[0].id, "a2", "already in Oncology, not duplicated");
+  const s = await t.state(), a1 = s.assignments.find(x => x.id === "a1"); assert.equal(a1.portfolio, "Oncology"); assert.notEqual(a1.reviewer, SCREENER, "the screener has no role in Oncology, so routing picked someone eligible"); assert.ok(a1.history.some(h => /Portfolio changed from Antivirals to Oncology/.test(h.action)));
+  assert.equal(s.cases.find(x => x.id === "c1").portfolio, "Oncology", "the case made from the article moved with it"); assert.equal(s.assignments.filter(x => x.pmid === "2").length, 2);
+  const c = await t.call(MANAGER, "/api/portfolio-change", { kind: "case", ids: ["c2"], to: "Oncology" }); assert.equal(c.body.moved, 0); assert.match(c.body.skipped[0].reason, /signed/);
+  assert.equal((await t.call(MANAGER, "/api/portfolio-change", { kind: "watch", watch: "Antivirals|aciclovir", to: "Oncology" })).status, 200); const s2 = await t.state(); assert.ok(s2.watches.some(w => w.portfolio === "Oncology" && w.molecule === "aciclovir"));
+  assert.equal((await t.call(MANAGER, "/api/portfolio-change", { kind: "watch", watch: "Oncology|aciclovir", to: "Oncology" })).status, 400);
+  assert.equal((await t.call(MANAGER, "/api/portfolio-change", { kind: "assignment", ids: ["a1"], to: "" })).status, 400);
+});
