@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { MANAGER, fakeNcbi, withFetch, makeEnv } from "./helpers.mjs";
+import { MANAGER, SCREENER, fakeNcbi, withFetch, makeEnv } from "./helpers.mjs";
 
 const dAgo = n => new Date(Date.now() + 5.5 * 3600000 - n * 86400000).toISOString().slice(0, 10);
 const W1 = { portfolio: "Antivirals", molecule: "aciclovir", query: '"aciclovir"[tiab]' }, W2 = { portfolio: "CNS", molecule: "aripiprazole", query: '"aripiprazole"[tiab]' };
@@ -53,4 +53,17 @@ test("automatic pull: a start date makes earlier uncovered days wait, a future d
   assert.equal((await status(t)).perWatch[0].missing, 0, "a start date in the future waits");
   assert.equal((await t.call(MANAGER, "/api/settings", { autoPullFrom: "soon" })).status, 400);
   await t.call(MANAGER, "/api/settings", { autoPullFrom: "" }); assert.equal((await status(t)).autoPullFrom, ""); assert.ok(base >= 1);
+});
+
+test("pulling is organised by client: a client can be paused, pulled alone, and clients are taken in turn", async () => {
+  const t = await makeEnv({ watches: [W1, W2] });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }, { id: "k2", name: "Beta" }]; s.watches[0].client = "k1"; s.watches[1].client = "k2"; await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const st = await status(t); assert.deepEqual(st.perClient.map(c => c.name).sort(), ["Acme", "Beta"]); assert.ok(st.perClient.every(c => c.auto && c.molecules === 1 && c.waiting >= 1));
+  assert.equal((await t.call(SCREENER, "/api/client-auto", { client: "k2", on: false })).status, 403);
+  await t.call(MANAGER, "/api/client-auto", { client: "k2", on: false });
+  const ncbi = fakeNcbi([{ pmid: "1", date: dAgo(1) }]);
+  await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/scheduled", {}));
+  let a = await status(t); assert.equal(a.perClient.find(c => c.id === "k1").waiting, 0, "the running client was pulled"); assert.ok(a.perClient.find(c => c.id === "k2").waiting >= 1, "the paused client was not");
+  await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/scheduled", { force: true, client: "k2" }));
+  a = await status(t); assert.equal(a.perClient.find(c => c.id === "k2").waiting, 0, "pull now for one client pulls that client even when paused");
 });

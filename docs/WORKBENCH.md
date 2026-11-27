@@ -244,3 +244,7 @@ The Add molecule dialog's portfolio defaults to **Auto**: the portfolio the chos
 ### Portfolio by drug class
 
 With the portfolio left on Auto, Add molecule classifies the molecule by its WHO ATC class and files it under the matching therapeutic area (for example valsartan, an angiotensin II receptor blocker, goes to Cardiovascular). A built-in table of drug-name endings and common drugs answers instantly; RxNorm's ATC classes are asked when the name is not in the table. If a portfolio that covers the area already exists ("Cardiovascular", "Hypertension Products", "CNS"), it is reused instead of creating a new one. If the molecule cannot be classified, the client's usual portfolio, the client's name or "General" is used. Picking a portfolio yourself always wins, and the confirmation says how it was classified.
+
+## Pulling by client
+
+The Watchlists page is organised by client. Each client has its own card: its molecules with articles, last pulled and status, a **Pause client / Resume client** switch, **+ Molecule**, and **Pull this client now**. Molecules with no client are listed last with a prompt to assign them. The automatic pull takes the waiting day-ranges of all clients in turn, so one client's backlog cannot hold up the others; a paused client is skipped (a manual pull still works for it). The add-watchlist and bulk forms start with the client. Routes: `/api/client-auto`; `/api/scheduled` accepts `client` (an id, or `none`); `/api/scheduler-status` returns `perClient`.
