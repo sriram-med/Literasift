@@ -148,3 +148,19 @@ test("an older profile that was given QC or medical review is shown, and routed,
   await withFetch(ncbi.handler, () => worker.execute(t.env, { portfolio: "Antivirals", molecule: "aciclovir", query: "q" }, D, D));
   assert.deepEqual([...new Set((await t.state()).assignments.map(a => a.reviewer))], [SCREENER], "only the screener is given screening");
 });
+
+test("the dashboard counts serious and non-serious cases at each stage, divides them by listedness, and carries their IRD and due dates", async () => {
+  const f = x => ({ value: x, state: "edited", evidence: [] });
+  const mk = (id, stage, serious, listed, assignee = SCREENER) => ({ id, number: "LS-" + id, pmid: "1", portfolio: "Antivirals", molecule: "aciclovir", status: "Draft", stage, assignee, createdAt: dAgo(4) + "T09:00:00Z", assignedAt: dAgo(4) + "T09:00:00Z", updatedAt: dAgo(4), history: [], versions: [],
+    data: worker.normalizeCase({ products: [{ role: "suspect", name: f("aciclovir") }], events: [{ verbatim: f("rash"), seriousness: serious ? { serious: true, hospitalization: true } : {}, listedness: listed ? f(listed) : undefined }] }) });
+  const t = await makeEnv({ profiles: PROFILES, memberships: MEMBERS, watches: [{ portfolio: "Antivirals", molecule: "aciclovir", query: "q" }], articles: { 1: { id: "1", title: "Aciclovir rash", abstract: "x", authors: ["A"] } },
+    assignments: [{ id: "a1", pmid: "1", portfolio: "Antivirals", molecules: ["aciclovir"], reviewer: SCREENER, status: "Complete", ird: dAgo(6) }],
+    cases: [mk("1", "screening", true, "Listed"), mk("2", "screening", true, "Unlisted"), mk("3", "screening", false, "Listed"), mk("4", "screening", false, ""), mk("5", "screening", false, "Unlisted", "other@example.org"), mk("6", "qc", true, "Listed", QC)] });
+  const d = (await t.call(SCREENER, "/api/dashboard", { workflow: "screening" })).body, m = d.casesMix;
+  assert.equal(m.total, 4, "only this person's cases at this stage"); assert.equal(m.serious, 2); assert.equal(m.nonSerious, 2);
+  assert.deepEqual(m.flow.serious, { listed: 1, unlisted: 1, unknown: 0 }); assert.deepEqual(m.flow.nonserious, { listed: 1, unlisted: 0, unknown: 1 });
+  const cell = m.cells["serious|listed"]; assert.equal(cell.n, 1); assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(cell.oldestIrd)); assert.ok(cell.overdue >= 1, "4 days in a stage with a 2 working day limit is late");
+  assert.ok(m.rows.every(r => r.ird && r.due && typeof r.wd === "number")); assert.equal(m.rows[0].wd <= m.rows.at(-1).wd, true, "most urgent first");
+  const mgr = (await t.call(MANAGER, "/api/dashboard", { workflow: "screening" })).body.casesMix; assert.equal(mgr.total, 5, "a manager sees everyone's");
+  const qc = (await t.call(QC, "/api/dashboard", { workflow: "qc" })).body.casesMix; assert.equal(qc.total, 1); assert.equal(qc.serious, 1); assert.equal(qc.flow.serious.listed, 1);
+});

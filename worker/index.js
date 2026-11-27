@@ -123,7 +123,19 @@ function dashboardFor(state, viewer, workflow, person) {
   const mineDone = person ? done.filter(d => d.by === person) : done;
   const people = {}; for (const i of all.filter(x => x.workflow === workflow)) { const p = (people[i.owner || ""] ||= { email:i.owner || "", name:nameOf(i.owner), open:0, overdue:0, high:0 }); p.open++; if (i.overdue) p.overdue++; if (i.priority.level === "high") p.high++; }
   for (const p of Object.values(people)) { const prof = profiles.find(x => x.email === p.email); p.capacity = prof?.capacity || null; p.completed7d = done.filter(d => d.by === p.email).length; }
-  return { workflow, label:WORKFLOW_LABEL[workflow], timeline:{ days:{ screening:tl.screenDays, qc:tl.qcDays, medical:tl.medicalDays }[workflow], holidays:tl.holidays.length }, kpi, completed7d:mineDone.length, onTimeRate:mineDone.length ? Math.round(mineDone.filter(d => d.ontime).length / mineDone.length * 100) : null, next:mine.slice(0, 12), days, byClient, people:Object.values(people).sort((a, b) => b.overdue - a.overdue || b.open - a.open) };
+  // Cases at this workflow's stage: how many are serious, how listedness divides them, and how their IRDs and due dates stand.
+  const stageKey = { screening:"screening", qc:"qc", medical:"medical_review" }[workflow], caseRows = [], flow = { serious:{ listed:0, unlisted:0, unknown:0 }, nonserious:{ listed:0, unlisted:0, unknown:0 } }, cells = {};
+  for (const c of state.cases || []) {
+    if (c.archived || c.locked || ["Sent to PV Nexus", "Closed: not a valid ICSR"].includes(c.status) || stageOf(c) !== stageKey || !caseVisible(state, viewer, c) || (person && c.assignee !== person)) continue;
+    const cls = caseClass(c), sev = cls.serious ? "serious" : "nonserious", lis = ["listed", "unlisted"].includes(cls.listedness) ? cls.listedness : "unknown", ird = caseIrd(state, c), due = caseStageDue(state, c), wd = due ? workingDaysBetween(today, due, tl) : null;
+    flow[sev][lis]++;
+    const cell = (cells[sev + "|" + lis] ||= { n:0, overdue:0, soon:0, oldestIrd:"", nextDue:"" }); cell.n++; if (wd !== null && wd < 0) cell.overdue++; else if (wd !== null && wd <= 1) cell.soon++; if (!cell.oldestIrd || ird < cell.oldestIrd) cell.oldestIrd = ird; if (due && (!cell.nextDue || due < cell.nextDue)) cell.nextDue = due;
+    caseRows.push({ id:c.id, number:c.number, title:state.articles[c.pmid]?.title || "PMID " + c.pmid, molecule:c.molecule || "", serious:cls.serious, listedness:lis, ird, due, wd, owner:nameOf(c.assignee) });
+  }
+  caseRows.sort((a, b) => (a.wd ?? 999) - (b.wd ?? 999) || (b.serious - a.serious));
+  const sTot = Object.values(flow.serious).reduce((a, b) => a + b, 0), nTot = Object.values(flow.nonserious).reduce((a, b) => a + b, 0);
+  const casesMix = { total:sTot + nTot, serious:sTot, nonSerious:nTot, flow, cells, rows:caseRows.slice(0, 20) };
+  return { casesMix, workflow, label:WORKFLOW_LABEL[workflow], timeline:{ days:{ screening:tl.screenDays, qc:tl.qcDays, medical:tl.medicalDays }[workflow], holidays:tl.holidays.length }, kpi, completed7d:mineDone.length, onTimeRate:mineDone.length ? Math.round(mineDone.filter(d => d.ontime).length / mineDone.length * 100) : null, next:mine.slice(0, 12), days, byClient, people:Object.values(people).sort((a, b) => b.overdue - a.overdue || b.open - a.open) };
 }
 // Who may screen in a portfolio. Profiles made before roles existed screen their one portfolio (or all). Profiles with an explicit role list screen only where they hold the screener role.
 // A profile made before role lists existed screens, unless a manager gave it QC or medical review and no screener role: those are what the person is for.
@@ -6905,6 +6917,9 @@ details.tools{margin:0 0 14px}details.tools>summary{cursor:pointer;color:var(--b
 .pc-meter{display:grid;gap:4px}.pc-foot{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.roleboxes{display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin-top:6px}.rolebox{display:flex;flex-direction:row;gap:10px;align-items:flex-start;border:1px solid var(--border);border-radius:12px;padding:10px 12px;cursor:pointer;font-weight:400}.rolebox span{display:grid}.rolebox input{margin-top:3px}.acctbox{border-top:1px dashed var(--border);margin-top:12px;padding-top:12px}
 .wsgrid{display:grid;gap:14px}.wsfields{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
 .wsg{margin-bottom:10px}.wsrc{display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-top:6px}.wsbar{display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin:10px 0}.wslist{display:grid;gap:8px}.wsrow{display:flex;flex-direction:row;gap:12px;align-items:flex-start;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 14px;font-weight:400;cursor:pointer}.wsrow input{margin-top:4px}.ws-b{display:grid;gap:5px;min-width:0}.ws-b b{font-size:14px;line-height:1.35}
+.casemix{margin-bottom:14px}.cm-top{display:flex;gap:14px;align-items:stretch;flex-wrap:wrap;margin:10px 0}.cm-big{border:2px solid;border-radius:14px;padding:10px 18px;display:grid;min-width:130px}.cm-big b{font-size:30px;line-height:1.1}.cm-bar{flex:1;min-width:140px;align-self:center;height:12px;background:#0e6a5d;border-radius:999px;overflow:hidden}.cm-bar span{display:block;height:100%;background:#c62f35}
+.cm-flow{overflow-x:auto}.flowsvg{width:100%;min-width:560px;height:auto;display:block}.fl-t{font:600 12.5px Inter,system-ui,sans-serif;fill:var(--fg)}
+.cm-cells{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));margin:6px 0 14px}.cm-cell{background:var(--accent);border-radius:12px;padding:10px 12px;font-size:13px}.cm-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.cmtable{min-width:640px}
 .pbadge{display:inline-block;min-width:62px;text-align:center;padding:3px 10px;border-radius:999px;font-size:11.5px;font-weight:600;border:1px solid var(--border);flex:none;align-self:flex-start}.p-high.pbadge{background:var(--red);border-color:var(--red);color:#fff}.p-medium.pbadge{background:#fbecd0;border-color:#f3d79a;color:#9a5b05}.p-low.pbadge{background:var(--accent);color:var(--muted)}
 .plist{display:grid;gap:10px;margin-bottom:12px}.plitem{display:flex;gap:14px;align-items:flex-start;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:14px;padding:14px 16px}.plitem.late{border-left-color:var(--red)}.pl-main{flex:1;min-width:0}.pl-main b{display:block;font-size:14.5px;line-height:1.35}.pl-side{text-align:right;display:grid;gap:8px;justify-items:end}.pl-btns{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .wf{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600}.wf-teal{background:#d8f1ec;color:#0b5b50}.wf-blue{background:#dbe8fb;color:#1d4f9a}.wf-violet{background:#e9e0fa;color:#58349a}
@@ -8068,6 +8083,32 @@ async function loadPlanner(){
   }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
 }
 function wfAllowed(){const m=data.viewer.role==="manager",roles=data.viewerRoles||[];return [["screening",m||roles.includes("screener")||!roles.length],["qc",m||roles.includes("qc")],["medical",m||roles.includes("medical_reviewer")]].filter(x=>x[1]).map(x=>x[0]);}
+const LIS_NAME={listed:"Listed",unlisted:"Unlisted",unknown:"Not assessed"}, LIS_COL={listed:"#2e8b57",unlisted:"#d98b1b",unknown:"#8a949c"};
+// Serious and non-serious cases flowing into listed, unlisted and not-assessed, drawn as bands whose width is the number of cases.
+function casesFlowSvg(m){
+  const total=m.total;if(!total)return "";const W=720,H=290,pad=28,gap=30,nw=16,xL=0,xM=300,xR=W-nw-150,k=(H-2*pad-2*gap)/total,cats=[["serious","Serious","#c62f35"],["nonserious","Non-serious","#0e6a5d"]],lis=["listed","unlisted","unknown"];
+  const sum=o=>o.listed+o.unlisted+o.unknown,midH={serious:sum(m.flow.serious)*k,nonserious:sum(m.flow.nonserious)*k};
+  const midY={serious:pad,nonserious:pad+midH.serious+gap},leftY=pad+(H-2*pad-2*gap-total*k)/2+gap;
+  const rightTot=Object.fromEntries(lis.map(l=>[l,m.flow.serious[l]+m.flow.nonserious[l]])),rightY={};let y=pad;lis.forEach(l=>{rightY[l]=y;y+=rightTot[l]*k+gap;});
+  const link=(x1,y1,x2,y2,h,col)=>'<path d="M'+x1+','+y1+' C'+(x1+(x2-x1)/2)+','+y1+' '+(x1+(x2-x1)/2)+','+y2+' '+x2+','+y2+' L'+x2+','+(y2+h)+' C'+(x1+(x2-x1)/2)+','+(y2+h)+' '+(x1+(x2-x1)/2)+','+(y1+h)+' '+x1+','+(y1+h)+' Z" fill="'+col+'" opacity=".28"></path>';
+  let out='<svg class="flowsvg" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Flow of cases from serious or non-serious to listed, unlisted or not assessed">',off=leftY;
+  cats.forEach(([key,label,col])=>{const h=midH[key];if(!h)return;out+=link(xL+nw,off,xM,midY[key],h,col)+'<rect x="'+xL+'" y="'+off+'" width="'+nw+'" height="'+h+'" fill="'+col+'" rx="3"></rect>';off+=h;});
+  const inR={};lis.forEach(l=>{inR[l]=rightY[l];});
+  cats.forEach(([key,label,col])=>{const sy=midY[key];let o=sy;lis.forEach(l=>{const n=m.flow[key][l],h=n*k;if(!h)return;out+=link(xM+nw,o,xR,inR[l],h,col);o+=h;inR[l]+=h;});
+    const mh=midH[key];if(mh){out+='<rect x="'+xM+'" y="'+sy+'" width="'+nw+'" height="'+mh+'" fill="'+col+'" rx="3"></rect><text x="'+(xM+nw+8)+'" y="'+(sy-6)+'" class="fl-t" fill="'+col+'">'+label+' '+(m[key==="serious"?"serious":"nonSerious"])+' ('+Math.round(m[key==="serious"?"serious":"nonSerious"]/total*100)+'%)</text>';}});
+  lis.forEach(l=>{const h=rightTot[l]*k;if(!h)return;out+='<rect x="'+xR+'" y="'+rightY[l]+'" width="'+nw+'" height="'+h+'" fill="'+LIS_COL[l]+'" rx="3"></rect><text x="'+(xR+nw+8)+'" y="'+(rightY[l]+Math.min(h,22)/2+4)+'" class="fl-t" fill="'+LIS_COL[l]+'">'+LIS_NAME[l]+' '+rightTot[l]+'</text>';});
+  out+='<text x="'+(xL+nw+8)+'" y="'+(leftY-6)+'" class="fl-t">All cases '+total+'</text></svg>';return out;
+}
+function casesMixHtml(r){
+  const m=r.casesMix;if(!m||!m.total)return '<section><div class="body"><h3 style="margin:0 0 6px">Serious and non-serious cases</h3><div class="empty">No cases at this stage.</div></div></section>';
+  const pct=Math.round(m.serious/m.total*100),big=(l,n,c)=>'<div class="cm-big" style="border-color:'+c+'"><span class="sub">'+l+'</span><b style="color:'+c+'">'+n+'</b></div>';
+  const cell=(sev,lis)=>{const c=m.cells[sev+"|"+lis];if(!c)return "";return '<div class="cm-cell"><span class="cm-dot" style="background:'+(sev==="serious"?"#c62f35":"#0e6a5d")+'"></span><b>'+(sev==="serious"?"Serious":"Non-serious")+' · '+LIS_NAME[lis]+'</b> '+c.n+'<div class="sub">Oldest IRD '+esc(c.oldestIrd)+(c.nextDue?' · next due '+esc(c.nextDue):"")+(c.overdue?' · <b style="color:var(--red)">'+c.overdue+' late</b>':"")+(c.soon?' · <b style="color:var(--amber)">'+c.soon+' due soon</b>':"")+'</div></div>';};
+  const rows=m.rows.map(c=>'<tr><td><a href="#" data-opencase="'+esc(c.id)+'"><b>'+esc(c.number)+'</b></a><div class="sub">'+esc(c.molecule)+'</div></td><td>'+(c.serious?'<span class="badge red">Serious</span>':'<span class="badge">Non-serious</span>')+'</td><td><span class="badge" style="border-color:'+LIS_COL[c.listedness]+'">'+LIS_NAME[c.listedness]+'</span></td><td>'+esc(c.ird)+'</td><td>'+irdLine("",c.due,c.wd,"Due").replace('<span class="irdtag" title="Initial receipt date: the day LiteraSift received it">IRD -</span>',"")+'</td><td>'+esc(c.owner)+'</td></tr>').join("");
+  return '<section class="casemix"><div class="body"><div class="dd-head"><h3 style="margin:0">Serious and non-serious cases</h3><span class="sub">Cases at this stage, with listedness, IRD and due date</span></div>'+
+    '<div class="cm-top">'+big("Serious",m.serious,"#c62f35")+big("Non-serious",m.nonSerious,"#0e6a5d")+'<div class="cm-bar" title="'+pct+'% serious"><span style="width:'+pct+'%"></span></div></div>'+
+    '<div class="cm-flow">'+casesFlowSvg(m)+'</div><div class="cm-cells">'+["serious","nonserious"].map(sv=>["listed","unlisted","unknown"].map(l=>cell(sv,l)).join("")).join("")+'</div>'+
+    '<div class="tablewrap"><table class="lltable cmtable"><thead><tr><th>Case</th><th>Seriousness</th><th>Listedness</th><th>IRD</th><th>Due</th><th>Holder</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+(m.total>m.rows.length?'<div class="sub">Showing '+m.rows.length+' of '+m.total+', most urgent first.</div>':"")+'</div></section>';
+}
 async function loadDashboard(){
   const box=$("dbbox");if(!box)return;const mgr=data.viewer.role==="manager",allowed=wfAllowed();if(!allowed.includes(dbState.wf))dbState.wf=allowed[0];
   try{
@@ -8081,7 +8122,7 @@ async function loadDashboard(){
     const clSec='<section><div class="body"><h3 style="margin:0 0 6px">By client and molecule</h3>'+(cl||'<div class="empty">Nothing open.</div>')+'</div></section>';
     const ppl=mgr?'<section><div class="body"><h3 style="margin:0 0 6px">People</h3>'+table(["Person","Open","Overdue","High","Done 7d","Capacity"],r.people.map(p=>['<b>'+esc(p.name)+'</b>',String(p.open),p.overdue?'<b style="color:var(--red)">'+p.overdue+'</b>':"0",String(p.high),String(p.completed7d),p.capacity?String(p.capacity):"-"]),"No one has work here.")+'</div></section>':"";
     const nx='<h3 class="cg-title">Next up</h3>'+(r.next.length?'<div class="plist">'+r.next.map(i=>planItem(i,mgr,[])).join("")+'</div>':'<div class="empty">Nothing waiting.</div>');
-    box.innerHTML=tabs+who+strip+'<p class="sub" style="margin:0 0 12px">'+esc(r.label)+': '+r.timeline.days+' working days from the IRD'+(r.workflow==="screening"?" to screen and route to QC":"")+'. Managers can change the days per molecule on the Clients page.</p><div class="dgrid">'+bars+clSec+'</div>'+ppl+nx;
+    box.innerHTML=tabs+who+strip+'<p class="sub" style="margin:0 0 12px">'+esc(r.label)+': '+r.timeline.days+' working days from the IRD'+(r.workflow==="screening"?" to screen and route to QC":"")+'. Managers can change the days per molecule on the Clients page.</p>'+casesMixHtml(r)+'<div class="dgrid">'+bars+clSec+'</div>'+ppl+nx;
   }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
 }
 async function loadLineListing(){
