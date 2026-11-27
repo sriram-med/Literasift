@@ -117,3 +117,21 @@ test("a manual pull always fetches again: after pulled articles are cleared, pul
   assert.equal((await t.call(MANAGER, "/api/pulled-purge", { reason: "free space", confirm: "DELETE 2" })).status, 200); assert.equal(Object.keys((await t.state()).articles).length, 0);
   const again = await pull(); assert.equal(again.added, 2, JSON.stringify(again)); assert.equal(Object.keys((await t.state()).articles).length, 2); assert.equal((await t.state()).assignments.length, 2);
 });
+
+test("a client pull searches every name known for a molecule (dictionary and drug list), like a single-molecule pull does", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "Antivirals", molecule: "aciclovir", query: '"aciclovir"[tiab]' }, { portfolio: "CNS", molecule: "sertraline", query: '"sertraline"[tiab]' }], NCBI_GAP_MS: 0, RETRY_BASE_MS: 1 });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; s.watches.forEach(w => { w.client = "k1"; });
+  s.dictionaries = { Antivirals: { version: 1, products: [{ name: "aciclovir", generics: ["acyclovir"], brands: ["Zovirax"], salts: ["aciclovir sodium"], aliases: [] }] } };
+  await t.BUCKET.put("bench.json", JSON.stringify(s));
+  await t.BUCKET.put("drugkb.json", JSON.stringify({ version: 1, ingredients: { sertraline: { name: "sertraline", rxcui: "36437", brands: ["Zoloft", "Lustral"], salts: ["sertraline hydrochloride"], synonyms: [], atc: [], sources: [], enrichedAt: "2026-01-01" } }, sync: {} }));
+  const ncbi = fakeNcbi([{ pmid: "1", date: dAgo(2) }]);
+  const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(5), to: dAgo(0), dateField: "crdt", online: false })); assert.equal(r.status, 200, JSON.stringify(r.body));
+  const terms = decodeURIComponent(ncbi.calls.filter(c => c.startsWith("esearch")).join(" ").replace(/\+/g, " "));
+  for (const name of ["Zovirax", "acyclovir", "aciclovir sodium", "Zoloft", "Lustral", "sertraline hydrochloride"]) assert.ok(terms.includes('"' + name + '"'), name + " is searched; got " + terms.slice(0, 400));
+  assert.ok(r.body.results.every(x => x.names > 0), "the result says how many extra names were searched");
+  const w = (await t.state()).watches.find(x => x.molecule === "aciclovir"); assert.ok(/Zovirax/.test(w.query), "the broader search is kept for the automatic pull");
+  // filters apply on top of the broad search and are not saved into the watch
+  const n2 = fakeNcbi([{ pmid: "2", date: dAgo(2) }]); await withFetch(n2.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(5), to: dAgo(0), caseReports: true, online: false }));
+  assert.ok(decodeURIComponent(n2.calls.join(" ").replace(/\+/g, " ")).includes("case reports"));
+  assert.ok(!(await t.state()).watches.some(x => /case reports/.test(x.query)));
+});

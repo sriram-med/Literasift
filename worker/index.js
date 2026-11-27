@@ -3157,6 +3157,22 @@ async function loadKb(env) {
   Object.defineProperty(kb, "index", { value:index, enumerable:false });
   return kb;
 }
+// The search a molecule really deserves: the stored query OR-ed with every other name known for it (the portfolio's product dictionary, and the drug name list: INN, salts, synonyms, brands),
+// so a pull for a client finds what a pull for the single molecule with all its names finds. Names already in the stored query are not repeated.
+async function fullSearch(env, state, kb, w, base, { online = true } = {}) {
+  const have = String(base).toLowerCase(), extra = [];
+  const add = n => { const t = String(n || "").replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim(); if (t.length > 1 && t.length <= 100 && !have.includes('"' + t.toLowerCase() + '"') && !extra.some(x => x.toLowerCase() === t.toLowerCase())) extra.push(t); };
+  namesWithDictionary(state, w.portfolio, [w.molecule]).forEach(add);
+  if (kb) {
+    let hit = kbLookup(kb, w.molecule);
+    if ((!hit || !hit.enriched) && online) { try { if (await kbPull(env, kb, w.molecule)) kb.__dirty = true; } catch { /* the stored query is still searched */ } hit = kbLookup(kb, w.molecule); }
+    if (hit) [hit.name, ...hit.salts, ...hit.synonyms, ...hit.brands.slice(0, 40)].forEach(add);
+  }
+  if (!extra.length) return { query:base, added:[] };
+  const safety = String(base).includes(safetyFilter), more = buildQuery(extra.slice(0, 30), safety);
+  const query = more ? "(" + base + ") OR (" + more + ")" : base;
+  return query.length > 1500 ? { query:base, added:[] } : { query, added:extra.slice(0, 30) };
+}
 const saveKb = async (env, kb) => { kb.updatedAt = new Date().toISOString(); await env.BUCKET.put(KB_KEY, JSON.stringify(kb), { httpMetadata:{ contentType:"application/json" } }); };
 function kbLookup(kb, text) {
   const hit = kb.index.get(kbName(text)); if (!hit) return null;
@@ -5218,7 +5234,7 @@ async function apiCore(request, env, path) {
       : [{ molecule:String(body.molecule || "").trim().slice(0, 100), synonyms:splitNames(body.synonyms) }];
     if (items.length > 100) return json({ error:"Add up to 100 molecules at a time." }, 400);
     if (!items.some(i => i.molecule)) return json({ error:"Enter the molecule name." }, 400);
-    const cfg = withSettings(env, state), results = [], toSave = [], seen = new Set();
+    const cfg = withSettings(env, state), kb0 = await loadKb(env).catch(() => null), results = [], toSave = [], seen = new Set();
     for (const { molecule, synonyms } of items) {
       if (!molecule) continue;
       // Automatic portfolio: the drug class (an existing matching portfolio is reused), else the client's usual portfolio, the client's name, or "General".
@@ -5228,8 +5244,10 @@ async function apiCore(request, env, path) {
         portfolio = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || (state.clients || []).find(c => c.id === body.client)?.name?.slice(0, 100) || "General"; }
       const key = watchKey({ portfolio, molecule }), info = { molecule, portfolio, auto, classification:area ? { area:ATC_AREAS[area.letter], atc:area.atc || "", class:area.class || "", source:area.source } : null };
       if (state.watches.some(w => watchKey(w) === key) || seen.has(key)) { results.push({ ...info, status:"exists", error:molecule + " is already in " + portfolio + "." }); continue; }
-      const query = (items.length === 1 && String(body.query || "").trim()) || buildQuery([molecule, ...synonyms], body.safetyOnly === true);
+      let query = (items.length === 1 && String(body.query || "").trim()) || buildQuery([molecule, ...synonyms], body.safetyOnly === true);
       if (!query || query.length > 1500) { results.push({ ...info, status:"error", error:"The names could not be turned into a search. Shorten them." }); continue; }
+      // Start from the broad search: the portfolio's dictionary and the drug name list already known for this molecule are searched too.
+      if (!String(body.query || "").trim()) { const full = await fullSearch(cfg, state, kb0, { portfolio, molecule }, query, { online:false }).catch(() => null); if (full) query = full.query; }
       seen.add(key); const watch = { portfolio, molecule, query }; if (body.client) watch.client = String(body.client);
       state.watches.push(watch); toSave.push({ watch, names:[molecule, ...synonyms] }); results.push({ ...info, status:"added" });
     }
@@ -5343,22 +5361,27 @@ async function apiCore(request, env, path) {
     if (!watches.length) return json({ error:isMgr ? "This client has no molecules yet. Add one on the Clients page." : "This client has no molecules in your portfolios." }, 400);
     if (watches.length > 25) return json({ error:"A client pull covers up to 25 molecules at a time. Choose fewer." }, 400);
     const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean), results = new Array(watches.length);
+    const cfg = withSettings(env, state), kb = await loadKb(env).catch(() => null), grown = new Map();
     const one = async (w, slot) => {
-      let query = queryAt(w, day())?.query || w.query; if (narrow.length || body.noReviews === true) query = "(" + query + ")" + narrow.map(f => " AND " + f).join("") + (body.noReviews === true ? " NOT review[pt]" : "");
+      let query = queryAt(w, day())?.query || w.query; const full = await fullSearch(cfg, state, kb, w, query, { online:body.online !== false }).catch(() => ({ query, added:[] })); query = full.query; if (full.added.length) grown.set(watchKey(w), query);
+      if (narrow.length || body.noReviews === true) query = "(" + query + ")" + narrow.map(f => " AND " + f).join("") + (body.noReviews === true ? " NOT review[pt]" : "");
       if (query.length > 1500) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, error:"The search became too long; use fewer filters." }; return; }
       const before = new Set(state.assignments.filter(a => a.portfolio === w.portfolio).map(a => a.pmid));
       try {
-        let run = await execute(env, narrow.length || body.noReviews === true ? { portfolio:w.portfolio, molecule:w.molecule, query } : w, body.from, body.to, { mode:"backfill", dateField:body.dateField, force:true });
+        let run = await execute(env, { portfolio:w.portfolio, molecule:w.molecule, query }, body.from, body.to, { mode:"backfill", dateField:body.dateField, force:true });
         // Nothing may be missed: a window that did not reconcile (PubMed's count against what came back) is run again before the answer is given, and it stays on the retry list if it still has gaps.
         for (let again = 0; again < 2 && !["reconciled", "zero_results"].includes(run.coverage); again++) run = await runImport(env, run.id, 12);
         if (!isMgr) await write(env, d => { for (const a of d.assignments) if (a.portfolio === w.portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
         await settleEvidence(env, run.ids);
         const wins = run.windows || [], expected = run.expected ?? wins.reduce((n, x) => n + (x.expected || 0), 0), got = run.retrieved ?? (run.ids || []).length;
-        results[slot] = { molecule:w.molecule, portfolio:w.portfolio, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, expected, retrieved:got, coverage:run.coverage || run.status, complete:["reconciled", "zero_results"].includes(run.coverage), gaps:(run.gaps || []).length };
+        results[slot] = { molecule:w.molecule, portfolio:w.portfolio, names:full.added.length, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, expected, retrieved:got, coverage:run.coverage || run.status, complete:["reconciled", "zero_results"].includes(run.coverage), gaps:(run.gaps || []).length };
       } catch (error) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, error:String(error.message || error).slice(0, 160) }; }
     };
     // A few molecules at a time; the shared NCBI gate keeps the request rate within the allowed limit.
     let nextSlot = 0; await Promise.all(Array.from({ length:Math.min(Math.max(1, Number(env.PULL_LANES ?? 3)), watches.length) }, async () => { while (nextSlot < watches.length) { const slot = nextSlot++; await one(watches[slot], slot); } }));
+    if (kb?.__dirty) { delete kb.__dirty; await saveKb(env, kb).catch(() => {}); }
+    // The broader search becomes the molecule's search from now on, so the automatic daily pull is as thorough as this one (only when no one-off filters were applied).
+    if (isMgr && grown.size && !narrow.length && body.noReviews !== true) await write(env, data => { for (const [k, q] of grown) { const cur = data.watches.find(x => watchKey(x) === k); if (cur && cur.query !== q && q.length <= 1500) commitWatch(data, { ...cur, query:q }, email, "names added for a client pull"); } }).catch(() => {});
     const name = clientId === "none" ? "No client" : state.clients.find(c => c.id === clientId).name;
     await audit(env, { by:email, action:"pull.client", target:name, detail:{ from:body.from, to:body.to, molecules:results.length, articles:results.reduce((n, r) => n + (r.count || 0), 0), failed:results.filter(r => r.error).length } });
     return json({ client:name, from:body.from, to:body.to, results, complete:results.every(r => r.complete), total:results.reduce((n, r) => n + (r.count || 0), 0), added:results.reduce((n, r) => n + (r.added || 0), 0) });
@@ -9181,7 +9204,7 @@ async function runClientPull(btn){
   const f=$("cpform");if(!f.reportValidity())return;const sel=[...f.querySelectorAll("[data-cpmol]")].filter(x=>x.checked).map(x=>x.dataset.cpmol);if(!sel.length)return message("Tick at least one molecule.",true);
   btn.disabled=true;const e=f.elements,common={client:e.client.value,from:e.from.value,to:e.to.value,dateField:e.dateField.value,humans:e.humans.checked,caseReports:e.caseReports.checked,english:e.english.checked,noReviews:e.noReviews.checked};
   const rows=new Array(sel.length).fill(null),name=k=>decodeURIComponent(k.split("|")[1]||""),started=Date.now();let done=0,found=0,added=0,incomplete=0,failed=0;
-  const draw=()=>{cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+done+' of '+sel.length+' molecules done · '+found+' article'+(found===1?"":"s")+' found, '+added+' new</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(incomplete?' · '+incomplete+' not yet complete, retried automatically':"")+(failed?' · '+failed+' failed':"")+'</span></div>'+table(["Molecule","Found","New","Checked against PubMed"],sel.map((k,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||name(k))+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+'</div>':""),x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("Complete: "+x.retrieved+" of "+x.expected,"green"):badge("Incomplete: "+x.retrieved+" of "+x.expected+", will retry","amber"))]:['<b>'+esc(name(k))+'</b>','','','<span class="sub">Pulling…</span>'];}),"");if($("cpout"))$("cpout").innerHTML=cpState.out;};
+  const draw=()=>{cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+done+' of '+sel.length+' molecules done · '+found+' article'+(found===1?"":"s")+' found, '+added+' new</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(incomplete?' · '+incomplete+' not yet complete, retried automatically':"")+(failed?' · '+failed+' failed':"")+'</span></div>'+table(["Molecule","Found","New","Checked against PubMed"],sel.map((k,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||name(k))+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · searched with '+x.names+' more name'+(x.names===1?"":"s"):"")+'</div>':""),x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("Complete: "+x.retrieved+" of "+x.expected,"green"):badge("Incomplete: "+x.retrieved+" of "+x.expected+", will retry","amber"))]:['<b>'+esc(name(k))+'</b>','','','<span class="sub">Pulling…</span>'];}),"");if($("cpout"))$("cpout").innerHTML=cpState.out;};
   draw();let next=0;
   const lane=async()=>{while(next<sel.length){const i=next++;try{const r=await api("pull-client",{...common,molecules:[sel[i]]}),x=r.results[0];rows[i]=x;found+=x.count||0;added+=x.added||0;if(x.error)failed++;else if(!x.complete)incomplete++;}catch(err){rows[i]={molecule:name(sel[i]),error:err.message};failed++;}done++;draw();}};
   await Promise.all(Array.from({length:Math.min(3,sel.length)},lane));
