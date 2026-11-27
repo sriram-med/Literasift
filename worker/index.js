@@ -7530,14 +7530,23 @@ async function apiCore(request, env, path) {
     // for the same week with the drug's saved search, so the two can be compared side by side.
     if (viewer.role !== "manager" && viewer.canManageClients !== true) return json({ error:"Client figures are limited to managers and users a manager has allowed." }, 403);
     if (!isDate(body.from) || !isDate(body.to) || body.from > body.to || (Date.parse(body.to) - Date.parse(body.from)) / 864e5 > 92) return json({ error:"Choose a week (up to three months)." }, 400);
-    const clientId = String(body.client || "all"), basis = basisOf(body.dateField || "crdt"), cname = id => (state.clients || []).find(c => c.id === id)?.name || "No client";
+    // By default a week means the articles PubMed dates in that week (as a pull for those dates finds them), not the day they reached the app.
+    const by = ["ird", "any", "crdt", "pdat"].includes(body.by) ? body.by : "any";
+    const clientId = String(body.client || "all"), basis = by === "ird" ? basisOf(body.dateField || "crdt") : by, cname = id => (state.clients || []).find(c => c.id === id)?.name || "No client";
     const watches = state.watches.filter(w => w.molecule && (clientId === "all" || (clientId === "none" ? !w.client : w.client === clientId)))
       .sort((a, b) => cname(a.client).localeCompare(cname(b.client)) || String(a.molecule).localeCompare(String(b.molecule)));
-    if (body.pubmed === true && watches.length > 150) return json({ error:"PubMed counts cover up to 150 drugs at a time. Choose one client." }, 400);
+    if ((body.pubmed === true || by !== "ird") && watches.length > 150) return json({ error:"Counting by PubMed date covers up to 150 drugs at a time. Choose one client." }, 400);
     const cfg = withSettings(env, state), rows = [];
     for (const w of watches) {
       const linked = state.assignments.filter(a => samePf(w, a.portfolio) && (a.molecules || []).includes(w.molecule)), inWeek = linked.filter(a => { const d = irdOf(state, a).slice(0, 10); return d >= body.from && d <= body.to; });
       const row = { key:encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule), client:cname(w.client), molecule:w.molecule, pulled:inWeek.length, total:linked.length, auto:w.auto !== false };
+      if (by !== "ird") {
+        // PubMed's own PMID list for the drug's saved search in the week, matched with what is stored and linked to the drug here.
+        const spec = searchSpec(state, w, {}), term = searchTerm(spec.query, body.from, body.to, basis), held = new Set(linked.filter(a => state.articles[a.pmid]).map(a => a.pmid));
+        try { const { esearchresult: r } = await withRetry(cfg, () => pubmed(cfg, "esearch", { term, retmode:"json", retmax:"10000" }));
+          const ids = uniq((r?.idlist || []).map(String)); row.pulled = ids.filter(id => held.has(id)).length; row.pubmed = pubmedCount(r) ?? ids.length; row.notPulled = Math.max(0, row.pubmed - row.pulled); row.term = term; }
+        catch (error) { row.pulled = null; row.error = String(error.message || error).slice(0, 120); }
+      }
       if (body.pubmed === true) { const spec = searchSpec(state, w, {}), term = searchTerm(spec.query, body.from, body.to, basis), info = await esearchInfo(cfg, term);
         row.pubmed = info?.count ?? null; row.term = term; row.pubmedUrl = "https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(term); row.warnings = info?.warnings || []; }
       rows.push(row);
@@ -7545,12 +7554,12 @@ async function apiCore(request, env, path) {
     if (body.format === "xlsx") {
       // Client by client: each drug with its count, and the client's total under its drugs.
       const out = [], names = uniq(rows.map(r => r.client));
-      for (const n of names) { const mine = rows.filter(r => r.client === n); for (const r of mine) out.push([n, r.molecule, r.pulled]); out.push([n + " total", "", mine.reduce((k, r) => k + r.pulled, 0)]); }
+      for (const n of names) { const mine = rows.filter(r => r.client === n); for (const r of mine) out.push([n, r.molecule, r.pulled ?? "not available"]); out.push([n + " total", "", mine.reduce((k, r) => k + (r.pulled || 0), 0)]); }
       const file = xlsxFile("Drugs " + body.from, ["Client", "Drug", "Articles (" + body.from + " to " + body.to + ")"], out);
       return new Response(file, { headers:{ "Content-Type":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Content-Disposition":'attachment; filename="literasift-drugs-' + body.from + '.xlsx"' } });
     }
     return json({ from:body.from, to:body.to, client:clientId === "all" ? "All clients" : clientId === "none" ? "No client" : cname(clientId), dateField:basis, dateBasisLabel:DATE_BASIS_LABEL[basis], rows,
-      totals:{ pulled:rows.reduce((n, r) => n + r.pulled, 0), pubmed:body.pubmed === true ? rows.reduce((n, r) => n + (r.pubmed || 0), 0) : null } });
+      by, totals:{ pulled:rows.reduce((n, r) => n + (r.pulled || 0), 0), pubmed:body.pubmed === true ? rows.reduce((n, r) => n + (r.pubmed || 0), 0) : null } });
   }
   if (path === "/api/client-auto" && viewer) {
     // Automatic options of a client: on or off, the day pulling starts, and the day it stops. Each is optional in the request.
@@ -10283,7 +10292,7 @@ function openPersonDialog(email){
 }
 let cpsState={weeks:8};
 // ---- Articles per drug for one week: a table built on request, with optional PubMed counts and a CSV.
-let dwState={client:"all",from:"",basis:"crdt",out:null};
+let dwState={client:"all",from:"",by:"any",out:null};
 function dwMonday(d){const t=new Date((d||new Date().toISOString().slice(0,10))+"T00:00:00Z"),dow=(t.getUTCDay()+6)%7;t.setUTCDate(t.getUTCDate()-dow);return t.toISOString().slice(0,10);}
 function dwAdd(d,n){const t=new Date(d+"T00:00:00Z");t.setUTCDate(t.getUTCDate()+n);return t.toISOString().slice(0,10);}
 function drugWeekHtml(){
@@ -10293,18 +10302,19 @@ function drugWeekHtml(){
     '<label>Client<select id="dwclient">'+opts.map(o=>'<option value="'+esc(o[0])+'"'+(o[0]===dwState.client?" selected":"")+'>'+esc(o[1])+'</option>').join("")+'</select></label>'+
     '<label>Week starting (Monday)<input type="date" id="dwfrom" value="'+esc(dwState.from)+'"></label>'+
     '<button type="button" class="btn outline sm" data-dwshift="-7">Previous week</button><button type="button" class="btn outline sm" data-dwshift="7">Next week</button>'+
+    '<label>Week counted by<select id="dwby">'+[["any","PubMed date, as a pull finds it"],["crdt","PubMed create date [crdt]"],["pdat","Publication date [dp]"],["ird","Day it reached the app"]].map(o=>'<option value="'+o[0]+'"'+(o[0]===dwState.by?" selected":"")+'>'+o[1]+'</option>').join("")+'</select></label>'+
     '<button type="button" class="btn sm" data-dwbuild="1">Build table</button><button type="button" class="btn outline sm" data-dwxlsx="1">Excel</button><button type="button" class="btn outline sm" data-dwpng="1">Image</button><button type="button" class="btn outline sm" data-dwcsv="1">CSV</button></div>'+
     '<div id="dwout" style="margin-top:12px">'+(dwState.out?dwTable(dwState.out):'<div class="sub">Choose a week and press Build table.</div>')+'</div>',
-    "Each drug with the number of articles that reached the app in that week (Monday to Sunday).");
+    "Each drug with its number of articles in the app for that week (Monday to Sunday). By PubMed date, the app asks PubMed which articles the drug's saved search finds in the week and counts those stored here.");
 }
-function dwGroups(r){const out=[];for(const x of r.rows){let g=out.find(y=>y.client===x.client);if(!g)out.push(g={client:x.client,rows:[],total:0});g.rows.push(x);g.total+=x.pulled;}return out;}
+function dwGroups(r){const out=[];for(const x of r.rows){let g=out.find(y=>y.client===x.client);if(!g)out.push(g={client:x.client,rows:[],total:0});g.rows.push(x);g.total+=x.pulled||0;}return out;}
 function dwTable(r){
   if(!r.rows.length)return '<div class="empty">No drugs for this client.</div>';
-  return '<div class="sub" style="margin-bottom:6px">'+esc(r.from)+' to '+esc(r.to)+'</div>'+dwGroups(r).map(g=>'<h4 style="margin:12px 0 4px">'+esc(g.client)+' <span class="badge">'+g.total+'</span></h4>'+table(["Drug","Articles"],g.rows.map(x=>[esc(x.molecule),String(x.pulled)]),"")).join("");
+  return '<div class="sub" style="margin-bottom:6px">'+esc(r.from)+' to '+esc(r.to)+' · '+(r.by==="ird"?"by the day articles reached the app":"by "+esc(r.dateBasisLabel))+'</div>'+dwGroups(r).map(g=>'<h4 style="margin:12px 0 4px">'+esc(g.client)+' <span class="badge">'+g.total+'</span></h4>'+table(["Drug","Articles"],g.rows.map(x=>[esc(x.molecule),x.pulled==null?'<span class="sub" style="color:var(--red)">PubMed did not answer: '+esc(x.error||"")+'</span>':String(x.pulled)+(x.notPulled?' <span class="sub" style="color:var(--amber)">('+x.notPulled+' more in PubMed, not pulled yet)</span>':"")]),"")).join("");
 }
 async function dwXlsx(btn){
   const r=dwState.out;if(!r)return message("Build the table first.",true);btn.disabled=true;
-  try{const res=await fetch("/api/drug-week-stats",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({client:dwState.client,from:r.from,to:r.to,format:"xlsx"})});
+  try{const res=await fetch("/api/drug-week-stats",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({client:dwState.client,from:r.from,to:r.to,by:r.by,format:"xlsx"})});
     if(!res.ok)throw new Error((await res.json().catch(()=>({}))).error||"The Excel file could not be made.");
     const a=document.createElement("a");a.href=URL.createObjectURL(await res.blob());a.download="literasift-drugs-"+r.from+".xlsx";document.body.appendChild(a);a.click();a.remove();}
   catch(err){message(err.message,true);}btn.disabled=false;
@@ -10323,15 +10333,15 @@ function dwImage(){
     g.font="12px system-ui, sans-serif";g.fillStyle="#777";g.fillText("Drug",pad+10,y+19);g.textAlign="right";g.fillText("Articles",W-pad-10,y+19);g.textAlign="left";y+=rowH;
     for(const x of grp.rows){g.strokeStyle="#eee";g.beginPath();g.moveTo(pad,y);g.lineTo(W-pad,y);g.stroke();g.fillStyle="#111";g.font="14px system-ui, sans-serif";
       let name=String(x.molecule);while(g.measureText(name).width>W-pad*2-110&&name.length>4)name=name.slice(0,-2);if(name!==String(x.molecule))name+="…";
-      g.fillText(name,pad+10,y+20);g.textAlign="right";g.fillText(String(x.pulled),W-pad-10,y+20);g.textAlign="left";y+=rowH;}
+      g.fillText(name,pad+10,y+20);g.textAlign="right";g.fillText(x.pulled==null?"-":String(x.pulled),W-pad-10,y+20);g.textAlign="left";y+=rowH;}
     y+=10;
   }
   c.toBlob(b=>{const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="literasift-drugs-"+r.from+".png";document.body.appendChild(a);a.click();a.remove();},"image/png");
 }
 async function dwBuild(btn,pubmed){
-  dwState.client=$("dwclient").value;dwState.from=dwMonday($("dwfrom").value||undefined);
-  btn.disabled=true;$("dwout").innerHTML='<div class="sub">'+(pubmed?"Asking PubMed, one drug at a time…":"Counting…")+'</div>';
-  try{dwState.out=await api("drug-week-stats",{client:dwState.client,from:dwState.from,to:dwAdd(dwState.from,6),dateField:dwState.basis,pubmed:!!pubmed});$("dwout").innerHTML=dwTable(dwState.out);$("dwfrom").value=dwState.from;}
+  dwState.client=$("dwclient").value;dwState.by=$("dwby").value;dwState.from=dwMonday($("dwfrom").value||undefined);
+  btn.disabled=true;$("dwout").innerHTML='<div class="sub">'+(dwState.by!=="ird"?"Asking PubMed, one drug at a time…":"Counting…")+'</div>';
+  try{dwState.out=await api("drug-week-stats",{client:dwState.client,from:dwState.from,to:dwAdd(dwState.from,6),by:dwState.by});$("dwout").innerHTML=dwTable(dwState.out);$("dwfrom").value=dwState.from;}
   catch(err){$("dwout").innerHTML='<div class="sub" style="color:var(--red)">'+esc(err.message)+'</div>';}btn.disabled=false;
 }
 function dwCsv(){

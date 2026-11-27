@@ -151,7 +151,7 @@ test("articles per drug for one week: pulled into the app, and PubMed's count wi
     articles: { 1: { pmid: "1" }, 2: { pmid: "2" }, 3: { pmid: "3" } },
     assignments: [{ id: "a", pmid: "1", portfolio: "USV", molecules: ["acarbose"], ird: "2026-11-17T10:00:00Z" }, { id: "b", pmid: "2", portfolio: "USV", molecules: ["acarbose"], ird: "2026-11-23T10:00:00Z" },
       { id: "c", pmid: "3", portfolio: "USV", molecules: ["acarbose"], ird: "2026-11-24T10:00:00Z" }] });
-  const r = await t.call(MANAGER, "/api/drug-week-stats", { client: "u", from: "2026-11-16", to: "2026-11-22" });
+  const r = await t.call(MANAGER, "/api/drug-week-stats", { client: "u", from: "2026-11-16", to: "2026-11-22", by: "ird" });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.deepEqual(r.body.rows.map(x => [x.molecule, x.pulled, x.total]), [["acarbose", 1, 3], ["voglibose", 0, 0]]);
   assert.equal(r.body.totals.pulled, 1);
@@ -166,11 +166,27 @@ test("the per-drug week table downloads as Excel, client by client, with numeric
   const t = await makeEnv({ clients: [{ id: "u", name: "USV" }, { id: "s", name: "Square" }], schema: { grouping: "client" },
     watches: [{ portfolio: "USV", molecule: "acarbose", query: "a", client: "u" }, { portfolio: "Square", molecule: "omeprazole", query: "o", client: "s" }],
     articles: { 1: { pmid: "1" } }, assignments: [{ id: "a", pmid: "1", portfolio: "USV", molecules: ["acarbose"], ird: "2026-11-17T10:00:00Z" }] });
-  const res = await worker.fetch(new Request("http://localhost/api/drug-week-stats", { method: "POST", headers: { "oai-authenticated-user-email": MANAGER, "content-type": "application/json" }, body: JSON.stringify({ client: "all", from: "2026-11-16", to: "2026-11-22", format: "xlsx" }) }), t.env);
+  const res = await worker.fetch(new Request("http://localhost/api/drug-week-stats", { method: "POST", headers: { "oai-authenticated-user-email": MANAGER, "content-type": "application/json" }, body: JSON.stringify({ client: "all", from: "2026-11-16", to: "2026-11-22", by: "ird", format: "xlsx" }) }), t.env);
   assert.equal(res.status, 200); assert.match(res.headers.get("content-type"), /spreadsheetml/);
   const sheet = readZip(new Uint8Array(await res.arrayBuffer())).get("xl/worksheets/sheet1.xml").toString("utf8");
   const text = [...sheet.matchAll(/<t xml:space="preserve">([^<]*)<\/t>/g)].map(m => m[1]);
   assert.deepEqual(text.slice(0, 3), ["Client", "Drug", "Articles (2026-11-16 to 2026-11-22)"]);
   assert.deepEqual(text.slice(3), ["Square", "omeprazole", "Square total", "", "USV", "acarbose", "USV total", ""]);
   assert.deepEqual([...sheet.matchAll(/<v>(\d+)<\/v>/g)].map(m => m[1]), ["0", "0", "1", "1"]);
+});
+
+test("the per-drug week count by PubMed date counts the stored articles PubMed dates in that week, whenever they were pulled", async () => {
+  const { fakeNcbi, withFetch } = await import("./helpers.mjs");
+  const t = await makeEnv({ clients: [{ id: "a", name: "AET" }], schema: { grouping: "client" },
+    watches: [{ portfolio: "AET", molecule: "leflunomide", query: "((leflunomide))", names: [], client: "a" }],
+    articles: { 11: { pmid: "11" }, 12: { pmid: "12" } },
+    assignments: [{ id: "x", pmid: "11", portfolio: "AET", molecules: ["leflunomide"], ird: "2026-11-27T10:00:00Z" }, { id: "y", pmid: "12", portfolio: "AET", molecules: ["leflunomide"], ird: "2026-11-27T10:00:00Z" }] });
+  // pulled on the 27th; PubMed dates 11 and 13 in the week of the 16th, 12 the week after
+  const ncbi = fakeNcbi([{ pmid: "11", date: "2026-11-18" }, { pmid: "13", date: "2026-11-19" }, { pmid: "12", date: "2026-11-25" }]);
+  const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/drug-week-stats", { client: "a", from: "2026-11-16", to: "2026-11-22" }));
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const x = r.body.rows[0];
+  assert.equal(r.body.by, "any"); assert.equal(x.pulled, 1); assert.equal(x.pubmed, 2); assert.equal(x.notPulled, 1);
+  const ird = await t.call(MANAGER, "/api/drug-week-stats", { client: "a", from: "2026-11-16", to: "2026-11-22", by: "ird" });
+  assert.equal(ird.body.rows[0].pulled, 0, "by the day it reached the app, nothing arrived that week");
 });
