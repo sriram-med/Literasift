@@ -258,3 +258,13 @@ The Watchlists page is organised by client. Each client has its own card: its mo
 ### Several molecules at once
 
 The Add molecule dialog takes one molecule per line (brands and other names after commas), up to 100 at a time, for one client. With the portfolio on Auto each molecule is filed under its own drug-class portfolio; a chosen portfolio applies to all. Repeated or already-present molecules are skipped and reported, and one bad line does not stop the others. `/api/molecule-add` accepts `list`; the single `molecule` field still works.
+
+## Watchlists, redone: client first, then molecule
+
+The Watchlists page opens with the global automatic pull, then a **By client | By molecule** switch (client first).
+
+- **By client**: each client card has its automatic switch (Pause / Resume), **Start pulling from** and **Stop pulling after** dates, **+ Molecules**, **Pull new now**, and **Pull custom dates for this client** (any date range, publication or create date) for all its molecules at once. Below, each molecule shows its articles, last pulled, status and pulling window, with **Auto on/off** and **Dates…**.
+- **By molecule**: a searchable table of every molecule with its client, portfolio and the same controls.
+- **Dates…** on a molecule sets its own start and stop dates (they win over the client's, which win over the global start date; an empty date follows the next level up) and can pull any custom range for just that molecule.
+- Days before the start date, and after the stop date, are never pulled or reported as missed. Routes: `/api/client-auto` and `/api/watch-auto` take `on`, `startFrom` and `until`; `/api/pull-client` does the custom-date pulls.
+- The dictionaries, query versions, add-a-watchlist, bulk, assign-by-employee and assign-by-number panels remain below, unchanged.

@@ -67,3 +67,26 @@ test("pulling is organised by client: a client can be paused, pulled alone, and 
   await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/scheduled", { force: true, client: "k2" }));
   a = await status(t); assert.equal(a.perClient.find(c => c.id === "k2").waiting, 0, "pull now for one client pulls that client even when paused");
 });
+
+test("pulling dates: a client and a molecule can each have a start and stop date; the molecule's own dates win; bad dates are refused", async () => {
+  const t = await makeEnv({ watches: [W1, W2] });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; s.watches.forEach(w => { w.client = "k1"; }); await t.BUCKET.put("bench.json", JSON.stringify(s));
+  assert.equal((await t.call(SCREENER, "/api/client-auto", { client: "k1", startFrom: dAgo(9) })).status, 403);
+  assert.equal((await t.call(MANAGER, "/api/client-auto", { client: "k1", startFrom: "soon" })).status, 400);
+  assert.equal((await t.call(MANAGER, "/api/client-auto", { client: "k1", startFrom: dAgo(2), until: dAgo(9) })).status, 400, "start after stop");
+  assert.equal((await t.call(MANAGER, "/api/client-auto", { client: "k1", startFrom: dAgo(10) })).status, 200);
+  let st = await status(t); const c = st.perClient.find(x => x.id === "k1"); assert.equal(c.startFrom, dAgo(10)); assert.ok(st.perWatch.every(w => w.effective.from === dAgo(10)));
+  const waiting = st.perWatch[0].missing; assert.equal(waiting, 1);
+  // a stop date in the past leaves the days after it out
+  await t.call(MANAGER, "/api/client-auto", { client: "k1", until: dAgo(6) });
+  st = await status(t); assert.equal(st.perWatch[0].effective.until, dAgo(6));
+  const ncbi = fakeNcbi([{ pmid: "1", date: dAgo(8) }]);
+  await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/scheduled", {}));
+  st = await status(t); assert.equal(st.perWatch[0].missing, 0, "only the window up to the stop date was needed");
+  // the molecule's own dates win over the client's
+  await t.call(MANAGER, "/api/watch-auto", { watch: key(W1), startFrom: dAgo(30), until: "" });
+  st = await status(t); const w1 = st.perWatch.find(w => w.molecule === "aciclovir"), w2 = st.perWatch.find(w => w.molecule === "aripiprazole");
+  assert.equal(w1.effective.from, dAgo(30)); assert.equal(w1.effective.until, dAgo(6), "an empty stop date follows the client"); assert.equal(w2.effective.from, dAgo(10));
+  assert.equal((await t.call(MANAGER, "/api/watch-auto", { watch: key(W1), startFrom: "x" })).status, 400);
+  await t.call(MANAGER, "/api/watch-auto", { watch: key(W1), startFrom: "" }); assert.equal((await status(t)).perWatch.find(w => w.molecule === "aciclovir").effective.from, dAgo(10));
+});
