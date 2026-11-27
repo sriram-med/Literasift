@@ -65,3 +65,18 @@ test("a QC checker and a medical reviewer get their own workflow dashboards with
   const other = (await t.call("qc2@example.org", "/api/dashboard", { workflow: "qc" })).body; assert.equal(other.kpi.open, 0, "another checker sees none of it");
   const med = (await t.call(MEDICAL, "/api/dashboard", { workflow: "medical" })).body; assert.equal(med.kpi.open, 0); assert.equal(med.label, "Medical review");
 });
+
+test("screeners and QC checkers search and pull into their own queue, in their own portfolios only, without creating a watchlist or touching others' work", async () => {
+  const D = dAgo(1), ncbi = fakeNcbi([{ pmid: "61", date: D }, { pmid: "62", date: D }]);
+  const t = await makeEnv({ profiles: PROFILES, memberships: MEMBERS, watches: [{ portfolio: "Antivirals", molecule: "oseltamivir", query: "q" }, { portfolio: "Oncology", molecule: "imatinib", query: "q" }],
+    articles: { 61: { id: "61", title: "Existing", abstract: "x", authors: ["A"] } }, assignments: [{ id: "old", pmid: "61", portfolio: "Antivirals", molecules: ["aciclovir"], reviewer: "qc2@example.org", status: "Pending", ird: dAgo(3), dueAt: dAgo(-1) }] });
+  const body = { molecule: "aciclovir", synonyms: "acyclovir, Zovirax", portfolio: "Antivirals", from: dAgo(2), to: D };
+  const r = await withFetch(ncbi.handler, () => t.call(SCREENER, "/api/pull-mine", body)); assert.equal(r.status, 200, JSON.stringify(r.body));
+  const s = await t.state(); assert.equal(s.watches.length, 2, "no watchlist was created"); assert.equal(r.body.mine, 1, "only the new article is counted as mine");
+  assert.equal(s.assignments.find(a => a.pmid === "62").reviewer, SCREENER, "the new article is in my queue"); assert.equal(s.assignments.find(a => a.id === "old").reviewer, "qc2@example.org", "someone else's article is not taken over");
+  const dueOk = s.assignments.find(a => a.pmid === "62"); assert.equal(dueOk.dueAt, worker.addWorkingDays(dueOk.ird, 2, worker.timelines(s)));
+  assert.equal((await t.call(SCREENER, "/api/pull-mine", { ...body, portfolio: "Oncology" })).status, 403, "not their portfolio");
+  assert.equal((await t.call(SCREENER, "/api/pull-mine", { ...body, from: dAgo(500) })).status, 400, "a year at a time");
+  const qc = await withFetch(fakeNcbi([{ pmid: "71", date: D }]).handler, () => t.call(QC, "/api/pull-mine", { ...body, molecule: "oseltamivir", synonyms: "" })); assert.equal(qc.status, 200, JSON.stringify(qc.body));
+  assert.equal((await t.state()).assignments.find(a => a.pmid === "71").reviewer, QC);
+});
