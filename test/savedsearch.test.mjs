@@ -140,3 +140,19 @@ test("a custom search saved before anything was pulled applies to every date, so
   const again = await t.call(MANAGER, "/api/saved-search", { key: k, mode: "custom", customQuery: "(metformin) AND (Philippines[ad])", save: true });
   assert.equal(again.status, 200); assert.notEqual((await t.state()).watches[0].versions.at(-1).effectiveFrom, "0000-00-00");
 });
+
+test("a molecule's countries narrow its saved search for pulls, the daily pull and counts", async () => {
+  const watches = [{ id: "h", portfolio: "Laurus", molecule: "hydroxychloroquine", query: "((hydroxychloroquine))", names: [], client: "l" }, { id: "a", portfolio: "Laurus", molecule: "atorvastatin", query: "((atorvastatin))", names: ["atorvastatin calcium"], client: "l" }];
+  const t = await makeEnv({ watches, clients: [{ id: "l", name: "Laurus" }] });
+  const h = await t.call(MANAGER, "/api/saved-search", { key: "Laurus|hydroxychloroquine", countries: "Ghana, Philippines", save: true });
+  assert.equal(h.body.search.query, "(((hydroxychloroquine))) AND (Ghana OR Philippines)");
+  const a = await t.call(MANAGER, "/api/saved-search", { key: "Laurus|atorvastatin", countries: "UAE", save: true });
+  assert.equal(a.body.search.query, '(((atorvastatin) OR (atorvastatin calcium))) AND ("United Arab Emirates" OR UAE)');
+  assert.deepEqual(a.body.search.countries, ["UAE"]);
+  const st = await t.state(); assert.equal(st.watches.find(w => w.id === "a").query, a.body.search.query, "the stored search (and so the daily pull) includes the country");
+  const ncbi = fakeNcbi([{ pmid: "5", date: dAgo(2) }]);
+  const p = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "l", from: dAgo(5), to: dAgo(0), molecules: ["Laurus|hydroxychloroquine"] }));
+  assert.ok(p.body.results[0].term.includes("AND (Ghana OR Philippines)"), p.body.results[0].term);
+  const clear = await t.call(MANAGER, "/api/saved-search", { key: "Laurus|atorvastatin", countries: "", save: true });
+  assert.equal(clear.body.search.query, "((atorvastatin) OR (atorvastatin calcium))");
+});
