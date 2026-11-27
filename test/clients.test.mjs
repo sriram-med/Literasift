@@ -246,3 +246,30 @@ test("for a client article the app's search misses, the compare asks PubMed whic
   for (const w of ["toxicity", "safety", "cytotoxicity", "in vitro", "cells"]) assert.ok(o.words.includes(w), w + " in " + o.words);
   assert.ok(r.body.rows[0].commonWords.some(c => c.word === "toxicity" && c.n === 1));
 });
+
+test("the compare suggests the set of terms that finds the client's articles with the fewest others", async () => {
+  const { withFetch } = await import("./helpers.mjs");
+  const week = [{ pmid: "301", date: "2026-11-10", text: "metformin toxicity" }, { pmid: "302", date: "2026-11-11", text: "metformin case report" }, { pmid: "303", date: "2026-11-12", text: "metformin and death" },
+    { pmid: "304", date: "2026-11-12", text: "metformin death rates" }, { pmid: "305", date: "2026-11-13", text: "metformin safety" }, { pmid: "306", date: "2026-11-13", text: "metformin safety" }, { pmid: "307", date: "2026-11-14", text: "metformin toxicity" }];
+  const custom = '("Metformin"[All Fields]) AND ("CASE REPORT"[All Fields] OR "SAFETY"[All Fields])';
+  const t = await makeEnv({ clients: [{ id: "l", name: "Laurus" }], schema: { grouping: "client" },
+    watches: [{ portfolio: "Laurus", molecule: "metformin", query: custom, customQuery: custom, searchMode: "custom", names: [], client: "l" }],
+    articles: Object.fromEntries(week.map(r => [r.pmid, { pmid: r.pmid }])), assignments: week.map(r => ({ id: "a" + r.pmid, pmid: r.pmid, portfolio: "Laurus", molecules: ["metformin"] })) });
+  const handler = async u => {
+    const url = new URL(String(u)), term = url.searchParams.get("term") || "", op = url.pathname.split("/").pop();
+    if (op === "esummary.fcgi") return new Response(JSON.stringify({ result: {} }));
+    if (op !== "esearch.fcgi") return new Response("<PubmedArticleSet></PubmedArticleSet>");
+    let recs = week; const uids = [...term.matchAll(/(\d+)\[uid\]/g)].map(m => m[1]); if (uids.length) recs = recs.filter(r => uids.includes(r.pmid));
+    const words = [...term.matchAll(/"([^"]+)"\[All Fields\]/g)].map(m => m[1].toLowerCase()).filter(x => x !== "metformin");
+    const last = / AND "([^"]+)"\[All Fields\]$/.exec(term);
+    if (last) recs = recs.filter(r => r.text.includes(last[1].toLowerCase()));               // a candidate term asked on its own
+    else if (words.length) recs = recs.filter(r => words.some(x => r.text.includes(x)));     // the saved search itself
+    return new Response(JSON.stringify({ esearchresult: { count: String(recs.length), idlist: recs.map(r => r.pmid) } }));
+  };
+  const r = await withFetch(handler, () => t.call(MANAGER, "/api/report-compare", { client: "l", from: "2026-11-09", to: "2026-11-15", text: "metformin: 301, 302, 303" }));
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const g = r.body.rows[0].suggestion;
+  assert.ok(g && !g.error, JSON.stringify(g)); assert.equal(g.finds, 3); assert.equal(g.of, 3); assert.equal(g.weekArticles, 7);
+  assert.ok(g.terms.includes("CASE REPORT") && !g.terms.includes("SAFETY"), g.terms.join(","));
+  assert.ok(g.extra <= 2, "at most the two articles that share a word with the client's"); assert.ok(g.line.startsWith("metformin | countries: | query: (\"Metformin\"[All Fields]) AND ("));
+});

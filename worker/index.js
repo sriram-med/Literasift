@@ -651,6 +651,18 @@ const REPORT_WORDS = ["adverse drug reaction", "adverse event", "adverse events"
   "safety", "safe", "tolerability", "efficacy", "effectiveness", "complication", "complications", "risk", "risks", "harm", "death", "mortality", "overdose", "poisoning", "interaction", "interactions", "contraindication", "withdrawal", "dependence",
   "abuse", "misuse", "medication error", "off-label", "pregnancy", "pregnant", "lactation", "breastfeeding", "teratogenic", "congenital", "pediatric", "children", "elderly", "older adults", "case report", "drug-induced", "injury", "lactic acidosis",
   "hypoglycemia", "carcinogenic", "nitrosamine", "impurity", "impurities", "resistance", "outcomes", "treatment", "therapy", "patients", "cancer", "inhibitor", "mechanism", "in vitro", "mice", "rats", "cells"];
+const SUGGEST_WORDS = ["adverse event", "adverse events", "adverse effect", "adverse effects", "adverse reaction", "side effects", "toxicity", "toxic", "cytotoxicity", "hepatotoxicity", "nephrotoxicity", "toxicological",
+  "safety", "tolerability", "efficacy", "complication", "complications", "risk", "harm", "death", "mortality", "overdose", "poisoning", "interaction", "interactions", "contraindication", "withdrawal", "dependence",
+  "abuse", "misuse", "medication error", "off-label", "pregnancy", "pregnant", "lactation", "breastfeeding", "teratogenic", "congenital", "pediatric", "elderly", "case report", "drug-induced", "injury", "lactic acidosis",
+  "hypoglycemia", "carcinogenic", "nitrosamine", "impurity", "impurities", "resistance", "drug resistance", "chemoresistance"];
+// A custom search of the form (drug names) AND (term OR term ...) split into its two parts, so its terms can be weighed one by one.
+function splitTermQuery(q) {
+  const t = String(q || "").trim(); if (!t.startsWith("(")) return null;
+  let depth = 0, end = -1; for (let i = 0; i < t.length; i++) { if (t[i] === "(") depth++; else if (t[i] === ")") { depth--; if (depth === 0) { end = i; break; } } }
+  if (end < 0) return null; const rest = t.slice(end + 1).trim(); if (!/^AND \(/.test(rest)) return null;
+  const terms = [...rest.matchAll(/"([^"]+)"\[All Fields\]/g)].map(m => m[1]); if (!terms.length) return null;
+  return { drug:t.slice(0, end + 1), terms };
+}
 const asOfTerm = (term, asOf) => isDate(asOf) ? "(" + term + ") AND (1800/01/01[crdt]:" + asOf.replaceAll("-", "/") + "[crdt])" : term;
 const groupSchedule = (state, clientId) => clientId ? (state.clients || []).find(c => c.id === clientId)?.schedule : state.settings?.autoSchedule;
 function ledgerFor(state, watch, field = AUTO_FIELD) {
@@ -7667,9 +7679,32 @@ async function apiCore(request, env, path) {
           catch (error) { for (const o of byWords) o.diagError = "PubMed did not answer: " + String(error.message || error).slice(0, 80); break; }
         }
       }
+      // A suggested search: every article of the drug in the dates is weighed against each term (the client's own and safety words), and the smallest set that
+      // finds the client's articles with the fewest others is proposed. One week can overfit, so the suggestion should be checked on another week too.
+      let suggestion = null;
+      const parts = spec.mode === "custom" ? splitTermQuery(typeof w.customQuery === "string" ? w.customQuery : spec.base) : null;
+      if (parts && (onlyClient.length || app.length > given.length) && body.suggest !== false) {
+        try {
+          const scope = parts.drug + " AND " + asOfTerm(searchTerm("all[sb]", body.from, body.to, basis).replace(/^\(all\[sb\]\) AND /, ""), body.asOf);
+          const ids = async q => { const { esearchresult: r } = await withRetry(cfg, () => pubmed(cfg, "esearch", { term:q, retmode:"json", retmax:"10000" }), { tries:3 }); return new Set((r?.idlist || []).map(String)); };
+          const universe = await ids(scope), C = new Set(given.filter(id => universe.has(id))), candidates = uniq([...parts.terms, ...SUGGEST_WORDS.map(x => x.toUpperCase())]);
+          const hits = new Map(); for (const term of candidates) hits.set(term, await ids(scope + ' AND "' + term + '"[All Fields]'));
+          const covered = new Set(), extra = new Set(), chosen = [];
+          // the client's own terms that bring nothing outside the report are kept as they are
+          for (const term of parts.terms) { const h = hits.get(term); if ([...h].every(id => C.has(id))) { chosen.push(term); h.forEach(id => covered.add(id)); } }
+          for (let guard = 0; guard < 30 && [...C].some(id => !covered.has(id)); guard++) {
+            let best = null; for (const term of candidates) { if (chosen.includes(term)) continue; const h = hits.get(term), gain = [...h].filter(id => C.has(id) && !covered.has(id)).length; if (!gain) continue;
+              const fp = [...h].filter(id => !C.has(id) && !extra.has(id)).length, score = gain / (1 + 2 * fp); if (!best || score > best.score) best = { term, score, h }; }
+            if (!best) break; chosen.push(best.term); best.h.forEach(id => C.has(id) ? covered.add(id) : extra.add(id));
+          }
+          const query = parts.drug + " AND (" + chosen.map(x => '"' + x + '"[All Fields]').join(" OR ") + ")";
+          suggestion = { terms:chosen, query, finds:covered.size, of:given.length, reachable:C.size, extra:extra.size, missing:given.filter(id => !covered.has(id)), weekArticles:universe.size,
+            line:w.molecule + " | countries: | query: " + query };
+        } catch (error) { suggestion = { error:"PubMed did not answer: " + String(error.message || error).slice(0, 100) }; }
+      }
       const wordCount = {}; for (const o of missed) for (const x of o.words || []) wordCount[x] = (wordCount[x] || 0) + 1;
       rows.push({ molecule:w.molecule, client:given.length, app:app.length, both:given.filter(id => appSet.has(id)).length, onlyClient, onlyApp:app.filter(id => !given.includes(id)), term,
-        commonWords:Object.entries(wordCount).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([word, n]) => ({ word, n })), missedByWords:missed.filter(o => o.words).length });
+        suggestion, commonWords:Object.entries(wordCount).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([word, n]) => ({ word, n })), missedByWords:missed.filter(o => o.words).length });
     }
     return json({ from:body.from, to:body.to, by:basis, dateBasisLabel:DATE_BASIS_LABEL[basis], asOf:isDate(body.asOf) ? body.asOf : "", rows });
   }
@@ -8263,7 +8298,7 @@ details.tools{margin:0 0 14px}details.tools>summary{cursor:pointer;color:var(--b
 .cclist{display:flex;flex-direction:column;gap:8px}.cc{border:1px solid var(--border);border-radius:12px;background:var(--card)}.cc.open{box-shadow:0 6px 18px -10px #0d151233}.cc.off .cc-name b{color:var(--muted)}
 .cc-row{display:flex;align-items:center;gap:14px;padding:10px 14px;flex-wrap:wrap}.cc-toggle{display:flex;align-items:center;gap:10px;background:none;border:0;padding:0;cursor:pointer;text-align:left;color:inherit;flex:1 1 220px;min-width:0}.cc-chev{width:14px;color:var(--muted)}
 .cc-name{display:flex;flex-direction:column;min-width:0}.cc-name b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.cc-figs{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--muted)}.cc-figs b{color:var(--fg);font-variant-numeric:tabular-nums}
-.cc-sched{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0 4px;padding:8px 10px;border-radius:10px;background:var(--accent)}.cc-sched select{width:auto}.cc-time{width:auto!important}.cc-sw{display:flex!important;flex-direction:row;align-items:center;gap:8px;margin:0 0 0 auto!important;min-width:96px}.cc-sw .sub{margin:0}.cclist>.cc{margin:0}.cc-body{border-top:1px solid var(--border);padding:10px 14px 14px}.cc-tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}.cc-search{width:auto;min-width:220px;flex:0 1 280px}.cc-add{display:flex;gap:6px}.cc-add select{width:auto;max-width:220px}
+.rcsug{margin-top:12px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--accent)}.cc-sched{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0 4px;padding:8px 10px;border-radius:10px;background:var(--accent)}.cc-sched select{width:auto}.cc-time{width:auto!important}.cc-sw{display:flex!important;flex-direction:row;align-items:center;gap:8px;margin:0 0 0 auto!important;min-width:96px}.cc-sw .sub{margin:0}.cclist>.cc{margin:0}.cc-body{border-top:1px solid var(--border);padding:10px 14px 14px}.cc-tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}.cc-search{width:auto;min-width:220px;flex:0 1 280px}.cc-add{display:flex;gap:6px}.cc-add select{width:auto;max-width:220px}
 .cm-wrap{overflow-x:auto;max-height:520px;overflow-y:auto}.cm{width:100%;border-collapse:collapse;font-size:13px}.cm th{position:sticky;top:0;background:var(--card);text-align:left;font-weight:600;color:var(--muted);font-size:12px;padding:6px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
 .cm td{padding:5px 8px;border-bottom:1px solid var(--border);vertical-align:middle}.cm tr:hover td{background:var(--accent)}.cm .num{text-align:right;font-variant-numeric:tabular-nums}.cm-name{min-width:160px}.cm-sel{width:auto;min-width:88px;max-width:130px;padding:4px 6px;font-size:13px}.cm-act{white-space:nowrap;text-align:right}.cm-ctry.busy{border-color:var(--amber)}.cm-ctry.ok{border-color:var(--green);background:var(--green-soft)}.cm-ctry.bad{border-color:var(--red)}.cm-ctry{width:130px;padding:4px 6px;font-size:13px}.cm-days td{background:var(--accent)}.cm-day{display:inline-flex!important;align-items:center;gap:6px;margin:0 10px 0 6px}.cm-day .wnum{width:64px}.cm-act .btn{margin-left:4px}
 .switch.sm{display:inline-block;vertical-align:middle;width:36px;height:20px}.switch.sm .knob::after{width:14px;height:14px}.switch.sm input:checked+.knob::after{transform:translateX(16px)}.cc-head{display:flex;align-items:center;gap:12px;margin-bottom:14px}
@@ -11071,7 +11106,12 @@ document.addEventListener("click",event=>{
     api("report-compare",{client:$("dwclient").value,from,to,by:$("dwby").value==="ird"?"pdat":$("dwby").value,asOf:$("dwasof").value,text}).then(r=>{
       const link=id=>'<a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(id)+'/" target="_blank" rel="noopener">'+esc(id)+'</a>';
       $("rcout").innerHTML='<div class="sub" style="margin:8px 0">'+esc(r.from)+' to '+esc(r.to)+' · '+esc(r.dateBasisLabel)+(r.asOf?" · as PubMed was on "+esc(r.asOf):"")+'</div>'+table(["Drug","Client report","App","In both","Only in the client report","Only in the app"],r.rows.map(x=>x.error?['<b>'+esc(x.molecule)+'</b>',String(x.client),"-","-",'<span style="color:var(--red)">'+esc(x.error)+'</span>',""]:
-        ['<b>'+esc(x.molecule)+'</b>',String(x.client),String(x.app),String(x.both),x.onlyClient.length?x.onlyClient.map(o=>link(o.pmid)+' <span class="sub">'+esc(o.reason)+'</span>'+(o.diagError?'<div class="sub" style="margin-left:8px;color:var(--red)">'+esc(o.diagError)+'</div>':"")+(o.title?'<div class="sub" style="margin-left:8px">'+esc(o.title)+'</div>':"")+(o.words&&o.words.length?'<div class="sub" style="margin-left:8px">contains: <b>'+esc(o.words.join(", "))+'</b></div>':"")).join("<br>")+(x.commonWords&&x.commonWords.length?'<div class="sub" style="margin-top:6px;color:var(--amber)">Words in the missed articles: '+esc(x.commonWords.map(c=>c.word+" ("+c.n+" of "+x.missedByWords+")").join(", "))+'</div>':""):badge("none","green"),x.onlyApp.length?x.onlyApp.map(link).join(", "):badge("none","green")]),"");})
+        ['<b>'+esc(x.molecule)+'</b>',String(x.client),String(x.app),String(x.both),x.onlyClient.length?x.onlyClient.map(o=>link(o.pmid)+' <span class="sub">'+esc(o.reason)+'</span>'+(o.diagError?'<div class="sub" style="margin-left:8px;color:var(--red)">'+esc(o.diagError)+'</div>':"")+(o.title?'<div class="sub" style="margin-left:8px">'+esc(o.title)+'</div>':"")+(o.words&&o.words.length?'<div class="sub" style="margin-left:8px">contains: <b>'+esc(o.words.join(", "))+'</b></div>':"")).join("<br>")+(x.commonWords&&x.commonWords.length?'<div class="sub" style="margin-top:6px;color:var(--amber)">Words in the missed articles: '+esc(x.commonWords.map(c=>c.word+" ("+c.n+" of "+x.missedByWords+")").join(", "))+'</div>':""):badge("none","green"),x.onlyApp.length?x.onlyApp.map(link).join(", "):badge("none","green")]),"");
+      const sug=r.rows.filter(x=>x.suggestion);
+      if(sug.length)$("rcout").innerHTML+=sug.map(x=>{const g=x.suggestion;if(g.error)return '<div class="sub" style="color:var(--red)">'+esc(x.molecule)+': '+esc(g.error)+'</div>';
+        return '<div class="rcsug"><b>Suggested search for '+esc(x.molecule)+'</b> <span class="sub">finds '+g.finds+' of the '+g.of+' report articles'+(g.reachable<g.of?" ("+(g.of-g.reachable)+" not in these dates in PubMed)":"")+', with '+g.extra+' other article'+(g.extra===1?"":"s")+', out of '+g.weekArticles+' '+esc(x.molecule)+' articles in these dates</span>'+
+          '<div class="sub">Terms: '+esc(g.terms.join(", "))+'</div><textarea readonly rows="3" style="width:100%;font-family:ui-monospace,monospace;font-size:12px">'+esc(g.line)+'</textarea>'+
+          '<div class="sub">Paste this line in the paste box of this client to use it. Check it on another week before relying on it: one week can be matched by chance.</div></div>';}).join("");})
       .catch(err=>{$("rcout").innerHTML='<div class="sub" style="color:var(--red)">'+esc(err.message)+'</div>';}).finally(()=>{target.disabled=false;});return;}
   if(target.dataset.dwbuild){dwBuild(target,target.dataset.dwbuild==="pubmed");return;}
   if(target.dataset.dwrange){const k=target.dataset.dwrange,today=new Date().toISOString().slice(0,10),mon=dwMonday();let f,t;
