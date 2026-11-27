@@ -34,6 +34,17 @@ function allocate(state, item) {
     .filter(p => p.open < p.capacity).sort((a, b) => a.open - b.open || a.email.localeCompare(b.email))[0];
   if (reviewer) item.reviewer = reviewer.email;
 }
+function safetyPriority(title, abstract = "") {
+  const text = title + " " + abstract;
+  const rules = [
+    ["case report or case series", /\bcase (report|series)\b|\bwe report\b|\bwe describe\b/i],
+    ["suspected adverse reaction", /\badverse (drug )?(reaction|event|effect)s?\b|\bdrug.induced\b|\btoxicity\b|\btoxicities\b|\bassociated with\b/i],
+    ["serious outcome signal", /\b(anaphylaxis|death|fatal|life.threatening|hospitali[sz]ation|overdose|acute liver failure|status epilepticus)\b/i],
+    ["special situation", /\b(pregnancy exposure|medication error|off.label use|lack of efficacy|drug abuse|misuse)\b/i]
+  ];
+  const reasons = rules.filter(([,pattern])=>pattern.test(text)).map(([label])=>label);
+  return { level:reasons.length?"Priority review":"Routine review", reasons, source:abstract?"Title and abstract":"Title only", assessedAt:new Date().toISOString() };
+}
 async function importWatch(env, watch, from, to, mode = "manual") {
   const date = value => value.replaceAll("-", "/");
   const term = "(" + watch.query + ") AND (" + date(from) + ":" + date(to) + "[crdt])";
@@ -52,7 +63,7 @@ async function importWatch(env, watch, from, to, mode = "manual") {
       articles[id] = { id, title:citation.title, journal:citation.fulljournalname, date:citation.pubdate,
         doi:citation.articleids?.find(a => a.idtype === "doi")?.value || "",
         pmcid:citation.articleids?.find(a => a.idtype === "pmc")?.value || "",
-        url:"https://pubmed.ncbi.nlm.nih.gov/" + id + "/" };
+        url:"https://pubmed.ncbi.nlm.nih.gov/" + id + "/", priority:safetyPriority(citation.title) };
     }
   }
   return write(env, state => {
@@ -134,7 +145,8 @@ async function captureCitationXml(env, article) {
   }
   const key = "evidence/" + article.id + "/pubmed.xml";
   await env.BUCKET.put(key,xml,{httpMetadata:{contentType:"application/xml"}});
-  return {citationXmlKey:key,citationXmlStatus:"Captured"};
+  const abstract = [...xml.matchAll(/<AbstractText(?:\s[^>]*)?>([\s\S]*?)<\/AbstractText>/g)].map(m=>m[1].replace(/<[^>]+>/g," ")).join(" ");
+  return {citationXmlKey:key,citationXmlStatus:"Captured",priority:safetyPriority(article.title,abstract)};
 }
 async function collectEvidence(env, ids) {
   const {state} = await load(env);
@@ -142,7 +154,7 @@ async function collectEvidence(env, ids) {
   const enabled = Boolean(env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN);
   const needsFullText = a => !a.fullTextStatus || a.fullTextStatus === "Retry needed";
   const needsScreen = a => enabled && !a.screenshotKey;
-  const pending = articles.filter(a=>!a.citationXmlKey || needsFullText(a) || needsScreen(a))
+  const pending = articles.filter(a=>!a.citationXmlKey || !a.priority || needsFullText(a) || needsScreen(a))
     .sort((a,b)=>String(a.evidenceAttempt || "").localeCompare(String(b.evidenceAttempt || ""))).slice(0,4);
   for (const article of pending) {
     await new Promise(resolve => setTimeout(resolve,350));
@@ -150,6 +162,14 @@ async function collectEvidence(env, ids) {
     if (!article.citationXmlKey) {
       try { Object.assign(status,await captureCitationXml(env,article)); }
       catch { status.citationXmlStatus = "Retry needed"; }
+    }
+    if (article.citationXmlKey && !article.priority) {
+      try {
+        const saved = await env.BUCKET.get(article.citationXmlKey);
+        const xml = saved ? await saved.text() : "";
+        const abstract = [...xml.matchAll(/<AbstractText(?:\s[^>]*)?>([\s\S]*?)<\/AbstractText>/g)].map(m=>m[1].replace(/<[^>]+>/g," ")).join(" ");
+        status.priority = safetyPriority(article.title,abstract);
+      } catch {}
     }
     if (needsFullText(article)) {
       try { Object.assign(status,await captureFullText(env,article)); }
@@ -165,6 +185,78 @@ async function collectEvidence(env, ids) {
     screenshotConfigured:enabled};
 }
 
+const pushWorker = `self.addEventListener("push",event=>{
+  event.waitUntil((async()=>{
+    let payload={};try{payload=event.data?.json()||{}}catch{}
+    await self.registration.showNotification("LiteraSift",{
+      body:payload.priority?"A safety citation requires priority review.":"New literature is ready for review.",
+      tag:payload.id||"literasift",data:{url:"/"}
+    });
+  })());
+});
+self.addEventListener("notificationclick",event=>{
+  event.notification.close();event.waitUntil(clients.openWindow("/"));
+});`;
+function weeklyWindow(watch,today) {
+  const weekday = Number.isInteger(watch.triggerDay) && watch.triggerDay>=0 && watch.triggerDay<=6 ? watch.triggerDay : 2;
+  const delta = (new Date(today+"T00:00:00Z").getUTCDay()-weekday+7)%7;
+  const trigger = shiftDay(today,-delta);
+  return {trigger,from:shiftDay(trigger,-7),to:shiftDay(trigger,-1)};
+}
+async function reconcileExtended(env,watch,today,history) {
+  // Weekly 30 complete days, one slice per scheduler invocation per portfolio.
+  const anchor = weeklyWindow(watch,today).trigger;
+  const from = shiftDay(anchor,-30), to = shiftDay(anchor,-1);
+  for(let cursor=from;cursor<=to;cursor=shiftDay(cursor,7)){
+    const end = shiftDay(cursor,6)<to?shiftDay(cursor,6):to;
+    if(!history.some(r=>r.mode==="audit30" && r.from===cursor && r.to===end && r.time>=anchor+"T00:00:00")) {
+      return execute(env,watch,cursor,end,"audit30");
+    }
+  }
+  return null;
+}
+async function deliverAlerts(env) {
+  if (!env.ALERT_GATEWAY_URL || !env.ALERT_GATEWAY_TOKEN) return {configured:false,accepted:0,failed:0};
+  const endpoint = new URL(env.ALERT_GATEWAY_URL);
+  if(endpoint.protocol!=="https:" || endpoint.username || endpoint.password) throw new Error("Alert gateway must use HTTPS.");
+  const {state}=await load(env);
+  const pending=[];
+  for(const p of state.profiles.filter(p=>p.active)){
+    const prefs=state.alertPreferences?.[p.email];
+    if(!prefs)continue;
+    for(const a of state.assignments){
+      if(!a.discoveredAt || a.discoveredAt < prefs.enabledAt || (p.role!=="manager" && a.reviewer!==p.email))continue;
+      const priority=state.articles[a.pmid]?.priority?.level==="Priority review";
+      const events=priority?["new","priority"]:["new"];
+      for(const event of events){
+        for(const channel of ["email","mobile","push"]){
+          if(!prefs[channel] || (channel==="push"&&!prefs.subscription) || (channel==="mobile"&&!prefs.mobileDestination))continue;
+          const id=[a.id,p.email,event,channel].join("|");
+          const previous=state.alertDelivery?.[id];
+          if(previous?.accepted || (previous?.nextAttempt && previous.nextAttempt>Date.now()))continue;
+          pending.push({id,event,channel,priority:event==="priority",email:p.email,subscription:channel==="push"?prefs.subscription:undefined,mobileDestination:channel==="mobile"?prefs.mobileDestination:undefined});
+        }
+      }
+    }
+  }
+  let accepted=0,failed=0;
+  for(const job of pending.slice(0,8)){
+    let ok=false;
+    try {
+      // No case narratives, titles, client names or patient details leave the application.
+      const response=await fetch(endpoint,{method:"POST",redirect:"error",headers:{"Authorization":"Bearer "+env.ALERT_GATEWAY_TOKEN,"Content-Type":"application/json","Idempotency-Key":job.id},body:JSON.stringify({...job,title:"LiteraSift",body:job.priority?"A safety citation requires priority review.":"New literature is ready for review.",url:"https://literasift.tech/"}),signal:AbortSignal.timeout(5000)});
+      ok=response.ok;
+    } catch {}
+    await write(env,data=>{
+      data.alertDelivery ||= {};
+      const prior=data.alertDelivery[job.id]||{};
+      const attempts=(prior.attempts||0)+1;
+      data.alertDelivery[job.id]={accepted:ok,attempts,at:new Date().toISOString(),nextAttempt:ok?null:Date.now()+Math.min(3600000,60000*2**Math.min(attempts,6))};
+    });
+    if(ok)accepted++;else failed++;
+  }
+  return {configured:true,accepted,failed,pending:Math.max(0,pending.length-accepted)};
+}
 async function api(request, env, path) {
   const email = request.headers.get("oai-authenticated-user-email")?.toLowerCase();
   const service = env.RUN_TOKEN && request.headers.get("Authorization") === "Bearer " + env.RUN_TOKEN;
@@ -184,6 +276,8 @@ async function api(request, env, path) {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email);
     return json({ viewer, profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
+      alertConfig:{gateway:Boolean(env.ALERT_GATEWAY_URL && env.ALERT_GATEWAY_TOKEN),vapidPublicKey:env.VAPID_PUBLIC_KEY||"",preferences:state.alertPreferences?.[email]?{...state.alertPreferences[email],subscription:undefined}:null},
+      priorityAlerts:assignments.filter(a=>state.articles[a.pmid]?.priority?.level==="Priority review").map(a=>a.id),
       notifications: assignments.filter(a=>a.discoveredAt).map(a=>({id:a.id,pmid:a.pmid,portfolio:a.portfolio,at:a.discoveredAt,read:Boolean(a.notificationReadBy?.includes(email))})).sort((a,b)=>b.at.localeCompare(a.at)),
       articles:manager ? state.articles : Object.fromEntries(assignments.map(a => [a.pmid, state.articles[a.pmid]])) });
   }
@@ -202,6 +296,18 @@ async function api(request, env, path) {
   }
   if (request.method !== "POST") return json({ error:"Route unavailable." }, 404);
   const body = await request.json().catch(() => ({}));
+  if (path === "/api/alert-preferences" && viewer) {
+    const subscription=body.subscription;
+    if(subscription && (typeof subscription.endpoint!=="string" || !subscription.endpoint.startsWith("https://") || subscription.endpoint.length>2048 || !subscription.keys?.p256dh || !subscription.keys?.auth)) return json({error:"Invalid push subscription."},400);
+    const mobileDestination=String(body.mobileDestination||"").trim();
+    if(body.mobile===true && !/^\+[1-9]\d{7,14}$/.test(mobileDestination))return json({error:"Enter an international mobile number."},400);
+    await write(env,data=>{
+      data.alertPreferences ||= {};
+      const old=data.alertPreferences[email]||{};
+      data.alertPreferences[email]={email:body.email===true,mobile:body.mobile===true,push:body.push===true,mobileDestination:body.mobile===true?mobileDestination:"",subscription:body.push===true?(subscription||old.subscription||null):null,enabledAt:old.enabledAt||new Date().toISOString()};
+    });
+    return json({ok:true});
+  }
   if (path === "/api/notification-read" && viewer) {
     await write(env,data=>{ for (const a of data.assignments) if ((manager || a.reviewer===email) && (body.id===a.id || body.all===true) && a.discoveredAt) { a.notificationReadBy ||= []; if (!a.notificationReadBy.includes(email)) a.notificationReadBy.push(email); } });
     return json({ok:true});
@@ -238,7 +344,23 @@ async function api(request, env, path) {
         if (reconcile && through === today) results.push(await execute(env, watch, shiftDay(today,-7), today, "reconciliation"));
       } catch (error) { results.push({ portfolio:watch.portfolio, error:error.message }); }
     }
-    return json({ results, evidence:await collectEvidence(env) });
+    // Formal report is an actual reconciliation of the previous seven complete days.
+    // Process at most one extra historical job per invocation to limit load.
+    const refreshed=(await load(env)).state;
+    for(const watch of refreshed.watches){
+      if(watch.active===false)continue;
+      const history=refreshed.runs.filter(r=>r.portfolio===watch.portfolio&&r.query===watch.query&&r.status==="Imported");
+      const week=weeklyWindow(watch,today);
+      try{
+        if(!history.some(r=>r.mode==="weekly-report"&&r.from===week.from&&r.to===week.to)){
+          results.push(await execute(env,watch,week.from,week.to,"weekly-report"));break;
+        }
+        const audit=await reconcileExtended(env,watch,today,history);
+        if(audit){results.push(audit);break;}
+      }catch(error){results.push({portfolio:watch.portfolio,error:error.message});break;}
+    }
+    const alerts=await deliverAlerts(env);
+    return json({ results, alerts, evidence:await collectEvidence(env) });
   }
   if (!manager) return json({ error:"Manager access required." },403);
   if (path === "/api/evidence") return json(await collectEvidence(env));
@@ -255,8 +377,8 @@ async function api(request, env, path) {
       data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data,a));
     });
   } else if (path === "/api/watch") {
-    const watch = { portfolio:String(body.portfolio || "").trim(), query:String(body.query || "").trim(), client:String(body.client || "").trim(), active:body.active !== false };
-    if (!watch.portfolio || !watch.query || watch.query.length > 1500) return json({error:"Enter a portfolio and a PubMed query."},400);
+    const watch = { portfolio:String(body.portfolio || "").trim(), query:String(body.query || "").trim(), client:String(body.client || "").trim(), active:body.active !== false, triggerDay:body.triggerDay===undefined?2:Number(body.triggerDay) };
+    if (!watch.portfolio || !watch.query || watch.query.length > 1500 || !Number.isInteger(watch.triggerDay) || watch.triggerDay<0 || watch.triggerDay>6) return json({error:"Enter a portfolio and a PubMed query."},400);
     await write(env, data => {
       data.watches = data.watches.filter(w => w.portfolio !== watch.portfolio);
       data.watches.push(watch);
@@ -302,13 +424,13 @@ function queue(items) {
   return table(["Article","Portfolio","Reviewer","Status",""],items.map(a=>{
     const item=data.articles[a.pmid];
     return ['<a target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title)+'</a><br><small>PMID '+esc(a.pmid)+' · '+esc(item.journal)+'</small><br>'+(item.fullTextKey?'<a href="/api/full-text/'+esc(a.pmid)+'">Download PMC full text</a>':'<small>'+esc(item.fullTextStatus || "Full text pending")+'</small>')+' · '+(item.screenshotKey?'<a href="/api/screenshot/'+esc(a.pmid)+'">Screenshot</a>':'<small>'+esc(item.screenshotStatus || "Screenshot pending")+'</small>')+(item.citationXmlKey?' · <a href="/api/citation-xml/'+esc(a.pmid)+'">Citation XML</a>':''),
-      esc(a.portfolio),esc(a.reviewer || "Unassigned"),'<span class="tag">'+esc(a.status)+'</span>',
+      esc(a.portfolio)+(item.priority?.level==="Priority review"?"<br><small>Priority review (not a confirmed ICSR)</small>":""),esc(a.reviewer || "Unassigned"),'<span class="tag">'+esc(a.status)+'</span>',
       '<button data-review="'+esc(a.id)+'">Review</button>'];
   }),"No articles in this queue.");
 }
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=manager?["Overview","My Queue","Notifications","Batches","Clients","Watchlists","Team"]:["My Queue","Notifications"];
+  const tabs=manager?["Overview","My Queue","Notifications","Reports","Batches","Clients","Watchlists","Team"]:["My Queue","Notifications"];
   tab ||= tabs[0];
   $("identity").textContent=data.viewer.name+" · "+data.viewer.role+" · "+(data.notifications||[]).filter(n=>!n.read).length+" unread";
   $("nav").innerHTML=tabs.map(x=>'<button data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+x+'</button>').join("");
@@ -319,9 +441,10 @@ function render() {
     $("content").innerHTML='<div class="cards">'+metrics.map(([label,num])=>'<div class="card"><b>'+num+'</b><span>'+label+'</span></div>').join("")+'</div>'+panel("All assignments",queue(items));
   }
   if(tab==="My Queue") $("content").innerHTML=panel("My assignments",queue(items.filter(a=>a.reviewer===data.viewer.email)));
-  if(tab==="Notifications") $("content").innerHTML=panel("New article alerts",'<form data-route="notification-read"><input type="hidden" name="all" value="true"><button>Mark all as read</button></form>'+table(["Article","Portfolio","Detected","Status"],(data.notifications||[]).map(n=>['<a target="_blank" rel="noopener" href="https://pubmed.ncbi.nlm.nih.gov/'+esc(n.pmid)+'/">'+esc(data.articles[n.pmid]?.title||n.pmid)+'</a>',esc(n.portfolio),esc(new Date(n.at).toLocaleString()),n.read?"Read":"New"]),"No new article alerts."));
+  if(tab==="Reports") $("content").innerHTML=panel("Weekly reconciliation reports",table(["Portfolio","Coverage","Retrieved","New assignments","Generated","Export"],data.runs.filter(r=>r.mode==="weekly-report"&&r.status==="Imported").map(r=>[esc(r.portfolio),esc(r.from)+" to "+esc(r.to),r.count,r.newAssignments||0,esc(new Date(r.time).toLocaleString()),'<button data-export="'+esc(r.id)+'">CSV</button>']),"No completed weekly reports."))+panel("30-day reconciliation slices",table(["Portfolio","From","Through","Status"],data.runs.filter(r=>r.mode==="audit30").map(r=>[esc(r.portfolio),esc(r.from),esc(r.to),esc(r.error||r.status)]),"No audit slices yet."));
+  if(tab==="Notifications") $("content").innerHTML=panel("Alert preferences",'<p>'+ (data.alertConfig.gateway?"Delivery gateway configured.":"External delivery is not configured; in-app alerts remain available.") +'</p><form data-route="alert-preferences"><label>Email alerts<select name="email"><option value="false">Off</option><option value="true" '+(data.alertConfig.preferences?.email?'selected':'')+'>On</option></select></label><label>Mobile alerts<select name="mobile"><option value="false">Off</option><option value="true" '+(data.alertConfig.preferences?.mobile?'selected':'')+'>On</option></select></label><label>Mobile number<input name="mobileDestination" value="'+esc(data.alertConfig.preferences?.mobileDestination||"")+'" placeholder="+91..."></label><label>Browser push<select name="push"><option value="false">Off</option><option value="true" '+(data.alertConfig.preferences?.push?'selected':'')+'>On</option></select></label><button>Save alert preferences</button></form>')+panel("New article alerts",'<form data-route="notification-read"><input type="hidden" name="all" value="true"><button>Mark all as read</button></form>'+table(["Article","Portfolio","Priority","Detected","Status"],(data.notifications||[]).map(n=>['<a target="_blank" rel="noopener" href="https://pubmed.ncbi.nlm.nih.gov/'+esc(n.pmid)+'/">'+esc(data.articles[n.pmid]?.title||n.pmid)+'</a>',esc(n.portfolio),esc(data.articles[n.pmid]?.priority?.level||"Awaiting screening"),esc(new Date(n.at).toLocaleString()),n.read?"Read":"New"]),"No new article alerts."));
   if(tab==="Clients") $("content").innerHTML=panel("Client portfolios",table(["Client","Portfolio","Surveillance"],data.watches.map(w=>[esc(w.client||"Unassigned"),esc(w.portfolio),w.active===false?"Paused":"Every 15 min"]),"No clients yet. Set a client on a watchlist."));
-  if(tab==="Watchlists") $("content").innerHTML=panel("PubMed watchlists",'<form data-route="watch"><label>Client<input name="client" placeholder="Client name"></label><label>Portfolio<input name="portfolio" required></label><label>Surveillance<select name="active"><option value="true">Active</option><option value="false">Paused</option></select></label><label>PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><button>Save watchlist</button></form>'+table(["Client","Portfolio","Query","Status"],data.watches.map(w=>[esc(w.client||"Unassigned"),esc(w.portfolio),esc(w.query),w.active===false?"Paused":"Active"]),"Add a product or portfolio watchlist to start."));
+  if(tab==="Watchlists") $("content").innerHTML=panel("PubMed watchlists",'<form data-route="watch"><label>Client<input name="client" placeholder="Client name"></label><label>Portfolio<input name="portfolio" required></label><label>Surveillance<select name="active"><option value="true">Active</option><option value="false">Paused</option></select></label><label>Weekly trigger<select name="triggerDay"><option value="2">Tuesday</option><option value="1">Monday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="0">Sunday</option></select></label><label>PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><button>Save watchlist</button></form>'+table(["Client","Portfolio","Query","Status"],data.watches.map(w=>[esc(w.client||"Unassigned"),esc(w.portfolio),esc(w.query),w.active===false?"Paused":"Active"]),"Add a product or portfolio watchlist to start."));
   if(tab==="Team") $("content").innerHTML=panel("Reviewer profiles",'<form data-route="profile"><label>Name<input name="name" required></label><label>Sign-in email<input type="email" name="email" required></label><label>Portfolio<input name="portfolio" placeholder="All portfolios"></label><label>Open assignment limit<input type="number" name="capacity" min="1" max="500" value="25" required></label><label>Availability<select name="active"><option value="true">Active</option><option value="false">Unavailable</option></select></label><button>Save reviewer</button></form>'+table(["Name","Email","Role","Portfolio","Open"],data.profiles.map(p=>[esc(p.name),esc(p.email),esc(p.role),esc(p.portfolio||"All"),items.filter(a=>a.reviewer===p.email&&a.status!=="Complete").length]),"No profiles."));
   if(tab==="Batches") $("content").innerHTML=panel("Backfill a date range",watchOptions?
     '<form data-route="import"><label>Portfolio<select name="portfolio">'+watchOptions+'</select></label><label>From<input name="from" type="date" required></label><label>Through<input name="to" type="date" required></label><button>Import citations</button></form>':
@@ -362,7 +485,21 @@ document.addEventListener("submit",async event=>{
   const route=form.dataset.route || "review";
   if(route==="review")body.id=active.id;
   button.disabled=true;message(route==="import"?"Retrieving PubMed citations…":"Saving…");
-  try {await api(route,body);if(route==="review")$("dialog").close();await refresh();message(route==="import"?"Batch imported.":"Saved.");}
+  try {
+    if(route==="alert-preferences"){
+      for(const k of ["email","mobile","push"])body[k]=body[k]==="true";
+      if(body.push){
+        if(!data.alertConfig.gateway||!data.alertConfig.vapidPublicKey||!("serviceWorker" in navigator)||!("PushManager" in window)||!("Notification" in window))throw new Error("Browser push requires configured delivery, VAPID and a supported browser.");
+        if(await Notification.requestPermission()!=="granted")throw new Error("Notification permission was not granted.");
+        await navigator.serviceWorker.register("/sw.js");
+        const registration=await navigator.serviceWorker.ready;
+        const key=data.alertConfig.vapidPublicKey.replace(/-/g,"+").replace(/_/g,"/");
+        const bytes=Uint8Array.from(atob(key.padEnd(Math.ceil(key.length/4)*4,"=")),c=>c.charCodeAt(0));
+        const subscription=await registration.pushManager.getSubscription()||await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:bytes});
+        body.subscription=subscription.toJSON();
+      }
+    }
+    await api(route,body);if(route==="review")$("dialog").close();await refresh();message(route==="import"?"Batch imported.":"Saved.");}
   catch(error){message(error.message,true);if(route==="review")$("dialog").close();if(route==="import")await refresh().catch(()=>{});}
   finally{button.disabled=false;}
 });
@@ -372,7 +509,7 @@ setInterval(async()=>{if(document.hidden||$("dialog").open||document.activeEleme
 
 const importTool = {
   name: "run_pubmed_watchlists",
-  description: "Run saved Literature Bench watchlists through the last complete IST calendar day. Save the batch, deduplicate PMIDs and allocate reviewer work.",
+  description: "Run saved Literature Bench watchlists continuously, reconcile historical dates and deliver configured alerts. Save the batch, deduplicate PMIDs and allocate reviewer work.",
   inputSchema: { type:"object", properties:{}, additionalProperties:false }
 };
 async function mcp(request, env) {
@@ -395,6 +532,7 @@ async function mcp(request, env) {
 export default {
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
+    if (path === "/sw.js" && request.method === "GET") return new Response(pushWorker,{headers:{"Content-Type":"application/javascript; charset=utf-8","Cache-Control":"no-cache","Service-Worker-Allowed":"/"}});
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);
     if (!path.startsWith("/api/")) return new Response(html, { headers: { "Content-Type":"text/html; charset=utf-8" } });
     try { return await api(request, env, path); }
