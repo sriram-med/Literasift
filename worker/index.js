@@ -1,5 +1,6 @@
 const KEY = "bench.json";
 const blank = () => ({ profiles: [], watches: [], articles: {}, assignments: [], runs: [] });
+const shiftDay = (value, offset) => new Date(Date.parse(value) + offset * 86400000).toISOString().slice(0,10);
 const day = () => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date());
 const json = (data, status = 200) => Response.json(data, { status, headers: { "Cache-Control":"no-store" } });
 async function load(env) {
@@ -33,14 +34,16 @@ function allocate(state, item) {
     .filter(p => p.open < p.capacity).sort((a, b) => a.open - b.open || a.email.localeCompare(b.email))[0];
   if (reviewer) item.reviewer = reviewer.email;
 }
-async function importWatch(env, watch, from, to) {
+async function importWatch(env, watch, from, to, mode = "manual") {
   const date = value => value.replaceAll("-", "/");
-  const term = "(" + watch.query + ") AND (" + date(from) + "[crdt]:" + date(to) + "[crdt])";
+  const term = "(" + watch.query + ") AND (" + date(from) + ":" + date(to) + "[crdt])";
   const { esearchresult: result } = await pubmed(env,"esearch", { term, retmode: "json", retmax: "9999" });
   if (!result || Number(result.count) !== result.idlist.length) throw new Error("Search exceeds the batch limit or was incomplete. Use a shorter date range.");
+  const {state: existing} = await load(env);
   const articles = {};
-  for (let offset = 0; offset < result.idlist.length; offset += 100) {
-    const ids = result.idlist.slice(offset, offset + 100);
+  const fetchIds = result.idlist.filter(id => !existing.articles[id]?.title);
+  for (let offset = 0; offset < fetchIds.length; offset += 100) {
+    const ids = fetchIds.slice(offset, offset + 100);
     await new Promise(resolve => setTimeout(resolve, 350));
     const { result: summary } = await pubmed(env,"esummary", { id: ids.join(","), retmode: "json" });
     for (const id of ids) {
@@ -55,22 +58,24 @@ async function importWatch(env, watch, from, to) {
   return write(env, state => {
     for (const [id, article] of Object.entries(articles)) state.articles[id] = { ...state.articles[id], ...article };
     const run = { id:crypto.randomUUID(), portfolio:watch.portfolio, from, to, count:result.idlist.length,
-      ids:result.idlist, time:new Date().toISOString(), query:watch.query, status:"Imported" };
+      ids:result.idlist, time:new Date().toISOString(), query:watch.query, status:"Imported", mode, newAssignments:0 };
     state.runs.unshift(run);
     for (const id of result.idlist) {
       if (state.assignments.some(a => a.pmid === id && a.portfolio === watch.portfolio)) continue;
       const item = { id:crypto.randomUUID(), pmid:id, portfolio:watch.portfolio, reviewer:"", status:"Pending" };
       allocate(state, item);
+      item.discoveredAt = run.time;
       state.assignments.push(item);
+      run.newAssignments++;
     }
     return run;
   });
 }
-async function execute(env, watch, from, to) {
-  try { return await importWatch(env, watch, from, to); }
+async function execute(env, watch, from, to, mode = "manual") {
+  try { return await importWatch(env, watch, from, to, mode); }
   catch (error) {
     await write(env, state => state.runs.unshift({ id:crypto.randomUUID(), portfolio:watch.portfolio, from, to,
-      query:watch.query, status:"Failed", error:error.message, time:new Date().toISOString(), ids:[], count:0 }));
+      query:watch.query, mode, status:"Failed", error:error.message, time:new Date().toISOString(), ids:[], count:0 }));
     throw error;
   }
 }
@@ -179,6 +184,7 @@ async function api(request, env, path) {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email);
     return json({ viewer, profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
+      notifications: assignments.filter(a=>a.discoveredAt).map(a=>({id:a.id,pmid:a.pmid,portfolio:a.portfolio,at:a.discoveredAt,read:Boolean(a.notificationReadBy?.includes(email))})).sort((a,b)=>b.at.localeCompare(a.at)),
       articles:manager ? state.articles : Object.fromEntries(assignments.map(a => [a.pmid, state.articles[a.pmid]])) });
   }
   if (request.method === "GET" && (path.startsWith("/api/full-text/") || path.startsWith("/api/screenshot/") || path.startsWith("/api/citation-xml/"))) {
@@ -196,6 +202,10 @@ async function api(request, env, path) {
   }
   if (request.method !== "POST") return json({ error:"Route unavailable." }, 404);
   const body = await request.json().catch(() => ({}));
+  if (path === "/api/notification-read" && viewer) {
+    await write(env,data=>{ for (const a of data.assignments) if ((manager || a.reviewer===email) && (body.id===a.id || body.all===true) && a.discoveredAt) { a.notificationReadBy ||= []; if (!a.notificationReadBy.includes(email)) a.notificationReadBy.push(email); } });
+    return json({ok:true});
+  }
   if (path === "/api/review" && viewer) {
     if (!["Pending","In review","Complete","Full text needed"].includes(body.status)) return json({error:"Invalid status."},400);
     await write(env, data => {
@@ -209,13 +219,24 @@ async function api(request, env, path) {
   }
   if (path === "/api/scheduled" && (service || manager)) {
     const results = [];
+    const today = day();
+    const now = Date.now();
     for (const watch of state.watches) {
-      const previous = state.runs.filter(r => r.portfolio === watch.portfolio && r.query === watch.query && r.status === "Imported")
-        .reduce((latest, run) => run.to > latest ? run.to : latest, "");
-      const to = new Date(Date.parse(day()) - 86400000).toISOString().slice(0,10);
-      if (previous >= to) continue;
-      try { results.push(await execute(env, watch, previous || to, to)); }
-      catch (error) { results.push({ portfolio:watch.portfolio, error:error.message }); }
+      if (watch.active === false) continue;
+      const history = state.runs.filter(r => r.portfolio === watch.portfolio && r.query === watch.query && r.status === "Imported");
+      const last = history.filter(r => r.mode === "continuous").reduce((n,r)=>Math.max(n,Date.parse(r.time)||0),0);
+      if (now - last < 15 * 60000) continue;
+      const audit = history.filter(r => r.mode === "reconciliation").reduce((n,r)=>Math.max(n,Date.parse(r.time)||0),0);
+      const previous = history.reduce((latest,r)=>r.to > latest ? r.to : latest,"");
+      const reconcile = now - audit >= 86400000;
+      const from = shiftDay(today,reconcile ? -7 : -2);
+      const cursor = previous && previous < from ? previous : from;
+      try {
+        // Bound catch-up windows to avoid oversized searches and advance only on success.
+        const through = shiftDay(cursor, 7) < today ? shiftDay(cursor,7) : today;
+        results.push(await execute(env, watch, cursor, through, "continuous"));
+        if (reconcile && through === today) results.push(await execute(env, watch, shiftDay(today,-7), today, "reconciliation"));
+      } catch (error) { results.push({ portfolio:watch.portfolio, error:error.message }); }
     }
     return json({ results, evidence:await collectEvidence(env) });
   }
@@ -234,7 +255,7 @@ async function api(request, env, path) {
       data.assignments.filter(a => !a.reviewer).forEach(a => allocate(data,a));
     });
   } else if (path === "/api/watch") {
-    const watch = { portfolio:String(body.portfolio || "").trim(), query:String(body.query || "").trim() };
+    const watch = { portfolio:String(body.portfolio || "").trim(), query:String(body.query || "").trim(), client:String(body.client || "").trim(), active:body.active !== false };
     if (!watch.portfolio || !watch.query || watch.query.length > 1500) return json({error:"Enter a portfolio and a PubMed query."},400);
     await write(env, data => {
       data.watches = data.watches.filter(w => w.portfolio !== watch.portfolio);
@@ -287,9 +308,9 @@ function queue(items) {
 }
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=manager?["Overview","My Queue","Batches","Watchlists","Team"]:["My Queue"];
+  const tabs=manager?["Overview","My Queue","Notifications","Batches","Clients","Watchlists","Team"]:["My Queue","Notifications"];
   tab ||= tabs[0];
-  $("identity").textContent=data.viewer.name+" · "+data.viewer.role;
+  $("identity").textContent=data.viewer.name+" · "+data.viewer.role+" · "+(data.notifications||[]).filter(n=>!n.read).length+" unread";
   $("nav").innerHTML=tabs.map(x=>'<button data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+x+'</button>').join("");
   const items=data.assignments;
   const watchOptions=data.watches.map(w=>'<option>'+esc(w.portfolio)+'</option>').join("");
@@ -298,7 +319,9 @@ function render() {
     $("content").innerHTML='<div class="cards">'+metrics.map(([label,num])=>'<div class="card"><b>'+num+'</b><span>'+label+'</span></div>').join("")+'</div>'+panel("All assignments",queue(items));
   }
   if(tab==="My Queue") $("content").innerHTML=panel("My assignments",queue(items.filter(a=>a.reviewer===data.viewer.email)));
-  if(tab==="Watchlists") $("content").innerHTML=panel("PubMed watchlists",'<form data-route="watch"><label>Portfolio<input name="portfolio" required></label><label>PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><button>Save watchlist</button></form>'+table(["Portfolio","Query"],data.watches.map(w=>[esc(w.portfolio),esc(w.query)]),"Add a product or portfolio watchlist to start."));
+  if(tab==="Notifications") $("content").innerHTML=panel("New article alerts",'<form data-route="notification-read"><input type="hidden" name="all" value="true"><button>Mark all as read</button></form>'+table(["Article","Portfolio","Detected","Status"],(data.notifications||[]).map(n=>['<a target="_blank" rel="noopener" href="https://pubmed.ncbi.nlm.nih.gov/'+esc(n.pmid)+'/">'+esc(data.articles[n.pmid]?.title||n.pmid)+'</a>',esc(n.portfolio),esc(new Date(n.at).toLocaleString()),n.read?"Read":"New"]),"No new article alerts."));
+  if(tab==="Clients") $("content").innerHTML=panel("Client portfolios",table(["Client","Portfolio","Surveillance"],data.watches.map(w=>[esc(w.client||"Unassigned"),esc(w.portfolio),w.active===false?"Paused":"Every 15 min"]),"No clients yet. Set a client on a watchlist."));
+  if(tab==="Watchlists") $("content").innerHTML=panel("PubMed watchlists",'<form data-route="watch"><label>Client<input name="client" placeholder="Client name"></label><label>Portfolio<input name="portfolio" required></label><label>Surveillance<select name="active"><option value="true">Active</option><option value="false">Paused</option></select></label><label>PubMed query<input name="query" required placeholder="e.g. aciclovir OR acyclovir"></label><button>Save watchlist</button></form>'+table(["Client","Portfolio","Query","Status"],data.watches.map(w=>[esc(w.client||"Unassigned"),esc(w.portfolio),esc(w.query),w.active===false?"Paused":"Active"]),"Add a product or portfolio watchlist to start."));
   if(tab==="Team") $("content").innerHTML=panel("Reviewer profiles",'<form data-route="profile"><label>Name<input name="name" required></label><label>Sign-in email<input type="email" name="email" required></label><label>Portfolio<input name="portfolio" placeholder="All portfolios"></label><label>Open assignment limit<input type="number" name="capacity" min="1" max="500" value="25" required></label><label>Availability<select name="active"><option value="true">Active</option><option value="false">Unavailable</option></select></label><button>Save reviewer</button></form>'+table(["Name","Email","Role","Portfolio","Open"],data.profiles.map(p=>[esc(p.name),esc(p.email),esc(p.role),esc(p.portfolio||"All"),items.filter(a=>a.reviewer===p.email&&a.status!=="Complete").length]),"No profiles."));
   if(tab==="Batches") $("content").innerHTML=panel("Backfill a date range",watchOptions?
     '<form data-route="import"><label>Portfolio<select name="portfolio">'+watchOptions+'</select></label><label>From<input name="from" type="date" required></label><label>Through<input name="to" type="date" required></label><button>Import citations</button></form>':
@@ -335,6 +358,7 @@ document.addEventListener("submit",async event=>{
   const form=event.target, button=form.querySelector("button");
   const body=Object.fromEntries(new FormData(form));
   if(body.active)body.active=body.active==="true";
+  if(body.all)body.all=body.all==="true";
   const route=form.dataset.route || "review";
   if(route==="review")body.id=active.id;
   button.disabled=true;message(route==="import"?"Retrieving PubMed citations…":"Saving…");
@@ -343,6 +367,7 @@ document.addEventListener("submit",async event=>{
   finally{button.disabled=false;}
 });
 refresh().catch(error=>message(error.message,true));
+setInterval(async()=>{if(document.hidden||$("dialog").open||document.activeElement?.closest("form"))return;try{const next=await api("state");data=next;if(tab==="Notifications"||tab==="Overview"||tab==="My Queue")render();else $("identity").textContent=data.viewer.name+" · "+data.viewer.role+" · "+(data.notifications||[]).filter(n=>!n.read).length+" unread";}catch{}},60000);
 </script></html>`;
 
 const importTool = {
