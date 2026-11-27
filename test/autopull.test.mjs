@@ -154,3 +154,18 @@ test("broad search style: bare names like the PubMed website, a client switch th
   const row = cmp.body.rows[0]; assert.equal(row.molecule, "sertraline"); assert.equal(row.site, 2); assert.ok(row.allTime === null || row.allTime === 2, "the undated count is asked for"); assert.ok(row.link.startsWith("https://pubmed.ncbi.nlm.nih.gov/?term="));
   assert.equal((await t.call(SCREENER, "/api/client-compare", { client: "k1" })).status, 403);
 });
+
+test("a pull can run in the background: the request answers at once with a job, and progress is polled until it is done", async () => {
+  const t = await makeEnv({ watches: [W1, W2] }, { DEFER_EVIDENCE: "1" });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }]; s.watches.forEach(w => { w.client = "k1"; }); await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const ncbi = fakeNcbi([{ pmid: "1", date: dAgo(2) }, { pmid: "2", date: dAgo(3) }]);
+  await withFetch(ncbi.handler, async () => {
+    const start = await t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(6), to: dAgo(0), dateField: "crdt", background: true, online: false });
+    assert.equal(start.status, 200); assert.ok(start.body.job && start.body.total === 2, JSON.stringify(start.body)); assert.equal(start.body.results, undefined, "it answers before the work is done");
+    let p; for (let i = 0; i < 200; i++) { p = (await t.call(MANAGER, "/api/pull-job", { id: start.body.job })).body; if (p.state !== "running") break; await new Promise(r => setTimeout(r, 25)); }
+    assert.equal(p.state, "done", JSON.stringify(p)); assert.equal(p.payload.results.length, 2); assert.ok(p.payload.results.every(x => x.complete)); assert.equal(p.payload.total, 4);
+    assert.equal((await t.call(SCREENER, "/api/pull-job", { id: start.body.job })).status, 404, "another user cannot read the job");
+    assert.equal((await t.call(MANAGER, "/api/pull-job", { id: "nope" })).status, 404);
+  });
+  const plain = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/pull-client", { client: "k1", from: dAgo(6), to: dAgo(0), online: false })); assert.equal(plain.body.job, undefined); assert.ok(plain.body.results, "without background it still answers with the results");
+});

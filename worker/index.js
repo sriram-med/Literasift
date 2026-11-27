@@ -981,6 +981,7 @@ const aiUsed = state => state.aiUsage?.month === aiMonth() ? Number(state.aiUsag
 const QC_PATH = /^(?:(?:patient|reporter|sender)\.[a-z_]+|(?:products|events|labs)\.\d{1,2}\.[a-z_]+|events\.\d{1,2}\.product_causality\.[A-Za-z0-9_-]+\.[a-z_]+|narrative)$/;
 const getCasePath = (data, path) => { if (path === "narrative") return String(data.narrative?.text || ""); const x = path.split(".").reduce((o, k) => o == null ? o : o[k], data); return x && typeof x === "object" && "value" in x ? String(x.value ?? "") : String(x ?? ""); };
 // One small, capped call. Returns the model's JSON text plus the tokens really used; refuses before sending when the monthly limit would be exceeded.
+const pullJobs = new Map();
 const OPENAI_SHAPES = new Map();
 const openaiShapeFor = model => /^(o\d|gpt-5)/i.test(String(model)) ? { completion:true, noTemp:true } : {};
 function openaiBody(model, messages, maxOut, shape = {}) {
@@ -5365,6 +5366,10 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"sources.add", target:portfolio + (molecule ? " · " + molecule : ""), detail:{ added:added.length, skipped:skipped.length } });
     return json({ ok:true, added:added.length, skipped });
   }
+  if (path === "/api/pull-job" && viewer) {
+    const job = pullJobs.get(String(body.id || "")); if (!job || (job.by !== email && viewer.role !== "manager")) return json({ error:"That pull is no longer listed. Open Batches to see what was pulled." }, 404);
+    return json({ state:job.state, total:job.total, done:job.results.filter(Boolean).length, results:job.results.map(x => x || null), payload:job.payload || null, error:job.error || "" });
+  }
   if (path === "/api/pull-client" && viewer) {
     // Pulls the articles of every molecule a client has, for a date range, in one step. A manager pulls any client; everyone else pulls only the molecules in portfolios they work in, into their own queue.
     const valid = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
@@ -5376,7 +5381,8 @@ async function apiCore(request, env, path) {
     let watches = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule && (isMgr || allowed.includes(w.portfolio)) && (!only.size || only.has(encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || ""))));
     if (!watches.length) return json({ error:isMgr ? "This client has no molecules yet. Add one on the Clients page." : "This client has no molecules in your portfolios." }, 400);
     if (watches.length > 25) return json({ error:"A client pull covers up to 25 molecules at a time. Choose fewer." }, 400);
-    const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean), results = new Array(watches.length);
+    const results = new Array(watches.length), work = async () => {
+    const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
     const cfg = withSettings(env, state), kb = await loadKb(env).catch(() => null), grown = new Map();
     const clientRec = (state.clients || []).find(c => c.id === clientId), broad = body.searchMode ? body.searchMode === "broad" : clientRec?.searchMode === "broad";
     const one = async (w, slot) => {
@@ -5405,7 +5411,15 @@ async function apiCore(request, env, path) {
     if (isMgr && grown.size && !narrow.length && body.noReviews !== true) await write(env, data => { for (const [k, q] of grown) { const cur = data.watches.find(x => watchKey(x) === k); if (cur && cur.query !== q && q.length <= 1500) commitWatch(data, { ...cur, query:q }, email, "names added for a client pull"); } }).catch(() => {});
     const name = clientId === "none" ? "No client" : state.clients.find(c => c.id === clientId).name;
     await audit(env, { by:email, action:"pull.client", target:name, detail:{ from:body.from, to:body.to, molecules:results.length, articles:results.reduce((n, r) => n + (r.count || 0), 0), failed:results.filter(r => r.error).length } });
-    return json({ client:name, from:body.from, to:body.to, results, complete:results.every(r => r.complete), total:results.reduce((n, r) => n + (r.count || 0), 0), added:results.reduce((n, r) => n + (r.added || 0), 0) });
+    return ({ client:name, from:body.from, to:body.to, results, complete:results.every(r => r.complete), total:results.reduce((n, r) => n + (r.count || 0), 0), added:results.reduce((n, r) => n + (r.added || 0), 0) });
+    };
+    if (body.background === true && env.DEFER_EVIDENCE === "1") {
+      const id = crypto.randomUUID(), job = { id, by:email, state:"running", total:watches.length, results, startedAt:Date.now() }; pullJobs.set(id, job);
+      for (const [k0, v0] of pullJobs) if (Date.now() - v0.startedAt > 3600000) pullJobs.delete(k0);
+      work().then(payload => { job.payload = payload; job.state = "done"; }).catch(error => { job.state = "failed"; job.error = String(error.message || error).slice(0, 200); });
+      return json({ job:id, total:watches.length });
+    }
+    return json(await work());
   }
   if (path === "/api/pull-mine" && viewer) {
     // Data-entry and QC people search PubMed for a molecule and pull the articles into their own queue, in a portfolio they work in. No watchlist is created and nobody else's work is touched.
@@ -8902,7 +8916,8 @@ async function api(route, body) {
   const res = await fetch(route.startsWith("/")?route:"/api/"+route, body === undefined ? {} : {
     method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)
   });
-  const result = await res.json();
+  const text = await res.text().catch(() => ""); let result = null; try { result = text ? JSON.parse(text) : null; } catch (_) { result = null; }
+  if (!result) throw new Error(res.status === 502 || res.status === 504 || res.status === 408 ? "The server took too long to answer (HTTP "+res.status+"). The work may still be running; check again in a minute, or use a shorter date range." : res.ok ? "The server sent an empty answer. Try again." : "The server answered with an error (HTTP "+res.status+"). Try again in a moment.");
   if (!res.ok) throw new Error(result.error || "Request failed.");
   return result;
 }
@@ -9257,7 +9272,9 @@ async function runClientPull(btn){
   const rows=new Array(sel.length).fill(null),name=k=>decodeURIComponent(k.split("|")[1]||""),started=Date.now();let done=0,found=0,added=0,incomplete=0,failed=0;
   const draw=()=>{cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+done+' of '+sel.length+' molecules done · '+found+' article'+(found===1?"":"s")+' found, '+added+' new</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(incomplete?' · '+incomplete+' not yet complete, retried automatically':"")+(failed?' · '+failed+' failed':"")+'</span></div>'+table(["Molecule","Found","New","Checked against PubMed"],sel.map((k,i)=>{const x=rows[i];return x?['<b>'+esc(x.molecule||name(k))+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · searched with '+x.names+' more name'+(x.names===1?"":"s"):"")+'</div>':""),x.error?"-":String(x.count),x.error?"-":String(x.added),x.error?badge(x.error,"red"):(x.complete?badge("Complete: "+x.retrieved+" of "+x.expected,"green"):badge("Incomplete: "+x.retrieved+" of "+x.expected+", will retry","amber"))+(x.mode==="precise"&&x.siteCount!=null&&x.siteCount>(x.retrieved||0)*1.15?'<div class="sub" style="color:var(--amber)">The PubMed website style finds '+x.siteCount+'. Tick Broad search to pull them.</div>':"")]:['<b>'+esc(name(k))+'</b>','','','<span class="sub">Pulling…</span>'];}),"");if($("cpout"))$("cpout").innerHTML=cpState.out;};
   draw();let next=0;
-  const lane=async()=>{while(next<sel.length){const i=next++;try{const r=await api("pull-client",{...common,molecules:[sel[i]]}),x=r.results[0];rows[i]=x;found+=x.count||0;added+=x.added||0;if(x.error)failed++;else if(!x.complete)incomplete++;}catch(err){rows[i]={molecule:name(sel[i]),error:err.message};failed++;}done++;draw();}};
+  const lane=async()=>{while(next<sel.length){const i=next++;try{let r=await api("pull-client",{...common,molecules:[sel[i]],background:true});
+        while(r.job){await new Promise(ok=>setTimeout(ok,1500));const p=await api("pull-job",{id:r.job});if(p.state==="failed")throw new Error(p.error||"The pull failed.");if(p.state==="done"){r=p.payload;break;}}
+        const x=r.results[0];rows[i]=x;found+=x.count||0;added+=x.added||0;if(x.error)failed++;else if(!x.complete)incomplete++;}catch(err){rows[i]={molecule:name(sel[i]),error:err.message};failed++;}done++;draw();}};
   await Promise.all(Array.from({length:Math.min(3,sel.length)},lane));
   try{await refresh();}catch(_){}btn.disabled=false;
 }
