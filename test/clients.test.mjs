@@ -210,11 +210,22 @@ test("a client report is compared article by article with the app for the same d
   assert.equal(r.status, 200, JSON.stringify(r.body));
   const m = r.body.rows[0];
   assert.deepEqual([m.client, m.app, m.both], [3, 1, 1]); assert.ok(m.term.includes("[dp]"));
-  assert.deepEqual(m.onlyClient, [{ pmid: "102", reason: "found by the search, not pulled yet" }, { pmid: "104", reason: "the app's search does not find it with these dates" }]);
+  assert.deepEqual(m.onlyClient, [{ pmid: "102", reason: "found by the search, not pulled yet" }, { pmid: "104", reason: "dates match; the app's search words do not", title: "", words: [] }]);
   assert.deepEqual(m.onlyApp, []);
   assert.deepEqual([r.body.rows[1].client, r.body.rows[1].app], [0, 0]); assert.match(r.body.rows[2].error, /No molecule/);
   assert.equal((await t.call(SCREENER, "/api/report-compare", { client: "l", from: "2026-11-09", to: "2026-11-15", text: "metformin: 1" })).status, 403);
   // as PubMed was on a day: the search is limited to records created by then
   const asOf = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/report-compare", { client: "l", from: "2026-11-09", to: "2026-11-15", asOf: "2026-11-15", text: "metformin: 101" }));
   assert.ok(asOf.body.rows[0].term.endsWith("AND (1800/01/01[crdt]:2026/11/15[crdt])"), asOf.body.rows[0].term); assert.equal(asOf.body.asOf, "2026-11-15");
+});
+
+test("for a client article the app's search misses, the compare lists the safety words it contains", async () => {
+  const { fakeNcbi, withFetch } = await import("./helpers.mjs");
+  const t = await makeEnv({ clients: [{ id: "l", name: "Laurus" }], schema: { grouping: "client" }, watches: [{ portfolio: "Laurus", molecule: "metformin", query: "((metformin))", names: [], client: "l" }] });
+  const ncbi = fakeNcbi([{ pmid: "201", date: "2026-11-10" }, { pmid: "204", date: "2026-12-01", title: "Metformin cytotoxicity in HepG2 cells", abstract: "The safety and toxicity of metformin were studied in vitro." }]);
+  const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/report-compare", { client: "l", from: "2026-11-09", to: "2026-11-15", text: "metformin: 204" }));
+  const o = r.body.rows[0].onlyClient[0];
+  assert.equal(o.pmid, "204"); assert.match(o.title, /cytotoxicity/);
+  for (const w of ["toxicity", "safety", "cytotoxicity", "in vitro", "cells"]) assert.ok(o.words.includes(w), w + " in " + o.words);
+  assert.ok(r.body.rows[0].commonWords.some(c => c.word === "toxicity" && c.n === 1));
 });

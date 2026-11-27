@@ -646,6 +646,11 @@ function scheduleSlots(sched, now = new Date()) {
   return { last, next, schedule:s };
 }
 // "As PubMed was on" a day: only records PubMed had created by the end of that day, so a client's past search can be repeated as it was run.
+// Safety-related words looked for in a client's article that the app's search misses (title, abstract, keywords, MeSH), to find the client's search terms.
+const REPORT_WORDS = ["adverse drug reaction", "adverse event", "adverse events", "adverse effect", "adverse effects", "adverse reaction", "side effect", "side effects", "toxicity", "toxic", "cytotoxicity", "hepatotoxicity", "nephrotoxicity", "toxicological",
+  "safety", "safe", "tolerability", "efficacy", "effectiveness", "complication", "complications", "risk", "risks", "harm", "death", "mortality", "overdose", "poisoning", "interaction", "interactions", "contraindication", "withdrawal", "dependence",
+  "abuse", "misuse", "medication error", "off-label", "pregnancy", "pregnant", "lactation", "breastfeeding", "teratogenic", "congenital", "pediatric", "children", "elderly", "older adults", "case report", "drug-induced", "injury", "lactic acidosis",
+  "hypoglycemia", "carcinogenic", "nitrosamine", "impurity", "impurities", "resistance", "outcomes", "treatment", "therapy", "patients", "cancer", "inhibitor", "mechanism", "in vitro", "mice", "rats", "cells"];
 const asOfTerm = (term, asOf) => isDate(asOf) ? "(" + term + ") AND (1800/01/01[crdt]:" + asOf.replaceAll("-", "/") + "[crdt])" : term;
 const groupSchedule = (state, clientId) => clientId ? (state.clients || []).find(c => c.id === clientId)?.schedule : state.settings?.autoSchedule;
 function ledgerFor(state, watch, field = AUTO_FIELD) {
@@ -7639,7 +7644,26 @@ async function apiCore(request, env, path) {
       const stored = new Set(state.assignments.filter(a => samePf(w, a.portfolio) && (a.molecules || []).includes(w.molecule) && state.articles[a.pmid]).map(a => a.pmid));
       const app = [...found].filter(id => stored.has(id)), appSet = new Set(app);
       const onlyClient = given.filter(id => !appSet.has(id)).map(id => ({ pmid:id, reason:found.has(id) ? "found by the search, not pulled yet" : stored.has(id) ? "in the app, but the search with these dates does not find it now" : "the app's search does not find it with these dates" }));
-      rows.push({ molecule:w.molecule, client:given.length, app:app.length, both:given.filter(id => appSet.has(id)).length, onlyClient, onlyApp:app.filter(id => !given.includes(id)), term });
+      // Why the app's search misses a client's article: its dates, or its words. For a word miss, the safety-related words the article does contain are listed,
+      // so the search terms the client uses can be found.
+      const missed = onlyClient.filter(o => o.reason.startsWith("the app's search")).slice(0, 25);
+      if (missed.length) {
+        const xmlOut = {}; let details = {}; try { details = await withRetry(cfg, () => fetchPubmedDetails(cfg, missed.map(o => o.pmid), xmlOut)); } catch { /* reasons stay general */ }
+        for (const o of missed) {
+          try {
+            const inDates = await countAny(cfg, o.pmid + "[uid] AND " + searchTerm("all[sb]", body.from, body.to, basis).replace(/^\(all\[sb\]\) AND /, ""));
+            const d = details[o.pmid] || {}, title = /<ArticleTitle[^>]*>([\s\S]*?)<\/ArticleTitle>/.exec(xmlOut[o.pmid] || "")?.[1] || "";
+            const text = (title + " " + (d.abstract || "") + " " + (d.keywords || []).join(" ") + " " + (d.meshTerms || []).join(" ")).toLowerCase().replace(/<[^>]+>/g, " ");
+            o.title = title.replace(/<[^>]+>/g, "").slice(0, 160);
+            if (inDates === 0) { o.reason = "outside these dates in PubMed (its publication date differs)"; continue; }
+            o.reason = "dates match; the app's search words do not";
+            o.words = REPORT_WORDS.filter(x => new RegExp("\\b" + x.replace(/[-]/g, "[- ]") + "\\b").test(text)).slice(0, 12);
+          } catch { /* keep the general reason */ }
+        }
+      }
+      const wordCount = {}; for (const o of missed) for (const x of o.words || []) wordCount[x] = (wordCount[x] || 0) + 1;
+      rows.push({ molecule:w.molecule, client:given.length, app:app.length, both:given.filter(id => appSet.has(id)).length, onlyClient, onlyApp:app.filter(id => !given.includes(id)), term,
+        commonWords:Object.entries(wordCount).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([word, n]) => ({ word, n })), missedByWords:missed.filter(o => o.words).length });
     }
     return json({ from:body.from, to:body.to, by:basis, dateBasisLabel:DATE_BASIS_LABEL[basis], asOf:isDate(body.asOf) ? body.asOf : "", rows });
   }
@@ -11041,7 +11065,7 @@ document.addEventListener("click",event=>{
     api("report-compare",{client:$("dwclient").value,from,to,by:$("dwby").value==="ird"?"pdat":$("dwby").value,asOf:$("dwasof").value,text}).then(r=>{
       const link=id=>'<a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(id)+'/" target="_blank" rel="noopener">'+esc(id)+'</a>';
       $("rcout").innerHTML='<div class="sub" style="margin:8px 0">'+esc(r.from)+' to '+esc(r.to)+' · '+esc(r.dateBasisLabel)+(r.asOf?" · as PubMed was on "+esc(r.asOf):"")+'</div>'+table(["Drug","Client report","App","In both","Only in the client report","Only in the app"],r.rows.map(x=>x.error?['<b>'+esc(x.molecule)+'</b>',String(x.client),"-","-",'<span style="color:var(--red)">'+esc(x.error)+'</span>',""]:
-        ['<b>'+esc(x.molecule)+'</b>',String(x.client),String(x.app),String(x.both),x.onlyClient.length?x.onlyClient.map(o=>link(o.pmid)+' <span class="sub">'+esc(o.reason)+'</span>').join("<br>"):badge("none","green"),x.onlyApp.length?x.onlyApp.map(link).join(", "):badge("none","green")]),"");})
+        ['<b>'+esc(x.molecule)+'</b>',String(x.client),String(x.app),String(x.both),x.onlyClient.length?x.onlyClient.map(o=>link(o.pmid)+' <span class="sub">'+esc(o.reason)+'</span>'+(o.title?'<div class="sub" style="margin-left:8px">'+esc(o.title)+'</div>':"")+(o.words&&o.words.length?'<div class="sub" style="margin-left:8px">contains: <b>'+esc(o.words.join(", "))+'</b></div>':"")).join("<br>")+(x.commonWords&&x.commonWords.length?'<div class="sub" style="margin-top:6px;color:var(--amber)">Words in the missed articles: '+esc(x.commonWords.map(c=>c.word+" ("+c.n+" of "+x.missedByWords+")").join(", "))+'</div>':""):badge("none","green"),x.onlyApp.length?x.onlyApp.map(link).join(", "):badge("none","green")]),"");})
       .catch(err=>{$("rcout").innerHTML='<div class="sub" style="color:var(--red)">'+esc(err.message)+'</div>';}).finally(()=>{target.disabled=false;});return;}
   if(target.dataset.dwbuild){dwBuild(target,target.dataset.dwbuild==="pubmed");return;}
   if(target.dataset.dwrange){const k=target.dataset.dwrange,today=new Date().toISOString().slice(0,10),mon=dwMonday();let f,t;
