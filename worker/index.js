@@ -6661,9 +6661,39 @@ dialog form{display:grid;gap:14px}dialog h2{margin:0 0 4px}
 #toast.show{transform:none;opacity:1}#toast.err{background:var(--red);color:#fff}
 .skel{height:14px;border-radius:6px;background:linear-gradient(90deg,var(--accent),var(--border),var(--accent));background-size:200% 100%;animation:sh 1.2s infinite;margin:12px 0}@keyframes sh{to{background-position:-200% 0}}
 @media(max-width:860px){.shell{grid-template-columns:1fr}aside{position:static;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center}.brand{padding:4px 10px}.who,.spacer{display:none}.navbtn{width:auto}.grid2{grid-template-columns:1fr}.top,main{padding-left:16px;padding-right:16px}}
+@media(max-width:860px){
+.shell,.shell.collapsed{grid-template-columns:minmax(0,1fr)}
+aside,.shell.collapsed aside{position:fixed;top:0;left:0;bottom:0;width:min(300px,84vw);height:100vh;height:100dvh;z-index:60;transform:translateX(-105%);transition:transform .22s ease;flex-direction:column;flex-wrap:nowrap;align-items:stretch;padding:18px 14px;overflow-y:auto;box-shadow:0 0 40px #0006;visibility:hidden}
+.shell.navopen aside{transform:none;visibility:visible}
+.navscrim{display:none}.shell.navopen .navscrim{display:block;position:fixed;inset:0;background:#0007;z-index:55}
+.navbtn{width:100%}.who{display:block}.spacer{display:block;flex:1}
+.top{flex-wrap:wrap;padding:10px 14px;min-height:0;gap:8px 10px}.top h1{font-size:22px;line-height:1.2}#subhead{display:none}
+.top #gsearch{order:5;flex:1 1 100%;width:100%!important;margin:0!important}.top>.sub{display:none}
+main{padding:14px!important}
+section,.panel{overflow-x:auto}table{min-width:560px}th,td{padding:10px 12px}
+.setnav{overflow-x:auto;flex-wrap:nowrap}.setlink{white-space:nowrap}
+.qstrip{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.qstat{padding:12px 14px}
+.fbar{flex-wrap:nowrap;overflow-x:auto;padding-bottom:6px}.fchip{flex:0 0 auto}
+.steptiles{grid-template-columns:1fr}
+.filters.slim{align-items:stretch}.filters.slim>*{flex:1 1 100%}.menubox,.menubox.wide2{position:fixed;left:12px;right:12px;top:auto;bottom:12px;min-width:0;grid-template-columns:1fr 1fr}
+.board{grid-auto-columns:82%}
+.lltable{min-width:760px}
+.cw-top{padding:12px 14px 8px}.cw-actions{justify-content:flex-start}.cw-actions .btn{padding:8px 12px}
+.cw-main{padding:12px}.csec{padding:14px}
+dialog{max-width:100vw}dialog:not(.cwin){width:96vw!important}
+.cards{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+.clientgrid{grid-template-columns:1fr!important}
+form.grid{grid-template-columns:1fr}
+.sumrow{grid-template-columns:minmax(0,1fr)}.trkhead>span{flex-wrap:wrap;margin-left:0!important}.trkhead{align-items:center}
+.toolbar{display:grid!important;grid-template-columns:1fr;overflow:visible}.tbg{border-right:0;border-bottom:1px solid var(--border);padding:10px 4px}.tbg:last-child{border-bottom:0}
+.synsearch{border-radius:18px}.synsearch input{min-width:0}
+.serieslayout{grid-template-columns:minmax(0,1fr)}
+section,.panel{max-width:100%}
+}
+@media(max-width:420px){.qstrip{grid-template-columns:1fr 1fr}.top h1{font-size:20px}.acard{padding:14px}.btn{padding:8px 12px}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}.tile3d{transform:none}}
 </style>
-<div class="shell"><aside><div class="brand"><span class="logo"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18M6 12h12M10 19h4"/></svg></span><span class="bname">LiteraSift</span></div><nav id="nav" aria-label="LiteraSift"></nav><div class="spacer"></div><div class="who" id="identity"></div></aside>
+<div class="shell"><div class="navscrim" id="navscrim"></div><aside><div class="brand"><span class="logo"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18M6 12h12M10 19h4"/></svg></span><span class="bname">LiteraSift</span></div><nav id="nav" aria-label="LiteraSift"></nav><div class="spacer"></div><div class="who" id="identity"></div></aside>
 <div><div class="top"><button type="button" class="btn outline icon-btn" id="sidetoggle" aria-label="Collapse the side panel" title="Collapse or expand the side panel"></button><div style="margin-right:auto"><h1 id="heading">LiteraSift</h1><p id="subhead"></p></div><input id="gsearch" type="search" placeholder="Search drugs, brands, cases, citations…" aria-label="Search everything" style="margin-left:auto;margin-right:8px;width:min(340px,40vw);border-radius:999px;padding:9px 16px"><span class="sub" style="margin-right:8px;white-space:nowrap">v0.01 · Dr Sriram</span><button class="btn outline icon-btn" id="theme" aria-label="Toggle dark mode" title="Toggle dark mode"></button></div>
 <main id="content"><div class="skel"></div><div class="skel"></div><div class="skel"></div></main><footer class="sub" style="margin:28px 0 12px;text-align:center">LiteraSift v0.01 · Developed by Dr Sriram</footer></div></div>
 <div id="toast" role="status"></div><div id="navtip" role="tooltip"></div>
@@ -8485,7 +8515,11 @@ $("gsearch").addEventListener("keydown",e=>{if(e.key==="Enter")globalSearch();})
 (()=>{const shell=document.querySelector(".shell"),btn=$("sidetoggle");btn.innerHTML=ic("sidebar");
   const set=on=>{shell.classList.toggle("collapsed",on);btn.setAttribute("aria-label",on?"Expand the side panel":"Collapse the side panel");btn.setAttribute("aria-pressed",String(on));try{localStorage.setItem("literasift-side",on?"1":"0");}catch{}};
   set((()=>{try{return localStorage.getItem("literasift-side")==="1";}catch{return false;}})());
-  btn.onclick=()=>set(!shell.classList.contains("collapsed"));})();
+  const phone=window.matchMedia("(max-width:860px)"), close=()=>shell.classList.remove("navopen");
+  const sync=()=>{if(phone.matches){shell.classList.remove("collapsed");btn.setAttribute("aria-label","Open the menu");btn.removeAttribute("aria-pressed");}else{close();set((()=>{try{return localStorage.getItem("literasift-side")==="1";}catch{return false;}})());}};
+  btn.onclick=()=>{if(phone.matches){shell.classList.toggle("navopen");btn.setAttribute("aria-expanded",String(shell.classList.contains("navopen")));}else set(!shell.classList.contains("collapsed"));};
+  $("navscrim").onclick=close;$("nav").addEventListener("click",e=>{if(phone.matches&&e.target.closest(".navbtn"))close();});
+  phone.addEventListener("change",sync);sync();})();
 (()=>{const tip=$("navtip"),shell=document.querySelector(".shell");
   const show=el=>{if(!shell.classList.contains("collapsed")){tip.classList.remove("on");return;}const r=el.getBoundingClientRect();tip.textContent=el.dataset.tab||el.getAttribute("title")||"";tip.style.left=(r.right+10)+"px";tip.style.top=(r.top+r.height/2-14)+"px";tip.classList.add("on");};
   document.addEventListener("mouseover",e=>{const b=e.target.closest&&e.target.closest(".navbtn,.brand");if(b&&shell.contains(b)){if(b.classList.contains("brand"))b.dataset.tab="LiteraSift";show(b);}else tip.classList.remove("on");});
