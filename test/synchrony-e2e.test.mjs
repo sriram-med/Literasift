@@ -95,3 +95,21 @@ test("review desk checks find contradictory dates and the case gets an ordered t
   assert.ok(texts.some(x => /stop date of aciclovir is before its start/i.test(x)) && texts.some(x => /onset of rash is before the first suspect product/i.test(x)) && texts.some(x => /end of rash is before its onset/i.test(x)), texts.join(" | "));
   assert.ok(v.timeline.length >= 3); assert.equal(v.timeline[0].kind, "action", "stopping before the start sorts first, which is the contradiction"); assert.ok(v.timeline.some(x => x.kind === "onset"));
 });
+
+test("AI errors: OpenAI's real reason is surfaced, and parameter mismatches are retried with the shape the model wants", async () => {
+  const t = await scenario({ syncMode: "off", ai: { enabled: true, monthlyTokens: 5000 }, aiModel: "gpt-4o-mini" }, { OPENAI_API_KEY: "synthetic-test-key-1234567890" });
+  const bodies = [];
+  const strict = async (url, init) => { const b = JSON.parse(init.body); bodies.push(b);
+    if (b.max_tokens !== undefined) return Response.json({ error: { message: "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.", code: "unsupported_parameter", type: "invalid_request_error" } }, { status: 400 });
+    if (b.temperature !== undefined) return Response.json({ error: { message: "Unsupported value: 'temperature' does not support 0 with this model.", code: "unsupported_value" } }, { status: 400 });
+    return Response.json({ choices: [{ message: { content: JSON.stringify({ ok: true }) } }], usage: { total_tokens: 9 } }); };
+  const r = await withFetch(strict, () => t.call(MANAGER, "/api/ai-smoke", {})); assert.equal(r.body.ok, true, JSON.stringify(r.body));
+  const last = bodies[bodies.length - 1]; assert.ok(last.max_completion_tokens && last.max_tokens === undefined && last.temperature === undefined);
+  const quota = async () => Response.json({ error: { message: "You exceeded your current quota, sk-abcdef123456789 check billing.", code: "insufficient_quota" } }, { status: 429 });
+  const q = await withFetch(quota, () => t.call(MANAGER, "/api/ai-smoke", {})); assert.equal(q.body.available, false); assert.match(q.body.reason, /no credit or quota/i); assert.ok(!q.body.reason.includes("sk-abcdef123456789"));
+  const nomodel = async () => Response.json({ error: { message: "The model does not exist", code: "model_not_found" } }, { status: 404 });
+  const n = await withFetch(nomodel, () => t.call(MANAGER, "/api/ai-smoke", {})); assert.match(n.body.reason, /does not know the model/i);
+  const models = async () => Response.json({ data: [{ id: "gpt-4o" }, { id: "text-embedding-3-small" }, { id: "gpt-4o-audio-preview" }, { id: "o3-mini" }] });
+  const m = await withFetch(models, () => t.call(MANAGER, "/api/ai-models", {})); assert.deepEqual(m.body.models, ["gpt-4o", "o3-mini"]);
+  assert.equal((await t.call(SCREENER, "/api/ai-models", {})).status, 403);
+});

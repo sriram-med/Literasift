@@ -959,6 +959,26 @@ const aiUsed = state => state.aiUsage?.month === aiMonth() ? Number(state.aiUsag
 const QC_PATH = /^(?:(?:patient|reporter|sender)\.[a-z_]+|(?:products|events|labs)\.\d{1,2}\.[a-z_]+|events\.\d{1,2}\.product_causality\.[A-Za-z0-9_-]+\.[a-z_]+|narrative)$/;
 const getCasePath = (data, path) => { if (path === "narrative") return String(data.narrative?.text || ""); const x = path.split(".").reduce((o, k) => o == null ? o : o[k], data); return x && typeof x === "object" && "value" in x ? String(x.value ?? "") : String(x ?? ""); };
 // One small, capped call. Returns the model's JSON text plus the tokens really used; refuses before sending when the monthly limit would be exceeded.
+const OPENAI_SHAPES = new Map();
+const openaiShapeFor = model => /^(o\d|gpt-5)/i.test(String(model)) ? { completion:true, noTemp:true } : {};
+function openaiBody(model, messages, maxOut, shape = {}) {
+  const body = { model, messages }; if (!shape.noTemp) body.temperature = 0; if (!shape.noFormat) body.response_format = { type:"json_object" };
+  // reasoning models spend completion tokens thinking, so they are given room beyond the visible answer
+  if (shape.completion) body.max_completion_tokens = Math.max(maxOut * 4, 400); else body.max_tokens = maxOut;
+  return body;
+}
+async function readOpenaiError(res) { try { const j = await res.clone().json(); return { message:String(j?.error?.message || "").slice(0, 300), code:String(j?.error?.code || ""), type:String(j?.error?.type || "") }; } catch { return { message:"", code:"", type:"" }; } }
+// What OpenAI said, in words a person can act on. The key and the request are never included.
+function openaiFriendly(status, d, model) {
+  const m = d.message ? " OpenAI says: " + d.message.replace(/sk-[A-Za-z0-9._\-]{6,}/g, "sk-...") : "";
+  if (status === 401) return "OpenAI rejected the key (HTTP 401). Check that it was copied completely, has not been revoked, and belongs to the right organisation." + m;
+  if (status === 403) return "OpenAI refused access (HTTP 403). The key's project may not be allowed to use the model " + model + ", or the country or organisation is restricted." + m;
+  if (status === 404) return "OpenAI does not know the model " + model + " for this key (HTTP 404). Pick another model in Settings (Check available models lists the ones this key can use)." + m;
+  if (status === 429 && /quota|billing|credit/i.test(d.code + " " + d.message)) return "The OpenAI account has no credit or quota left (HTTP 429). Add billing or credit at platform.openai.com, then try again." + m;
+  if (status === 429) return "OpenAI is rate limiting this key (HTTP 429). Wait a minute and try again." + m;
+  if (status === 400) return "OpenAI rejected the request (HTTP 400)." + m;
+  return "The AI service refused the request (HTTP " + status + ")." + m;
+}
 async function aiChat(env, state, messages, maxOut, estimateChars, by, action, target, caseKey = target) {
   const cfg = aiConfig(env, state);
   if (cfg.paused) return { error:"AI is paused. Rules and dictionaries are used instead and no tokens are used.", status:409 };
@@ -975,8 +995,19 @@ async function aiChat(env, state, messages, maxOut, estimateChars, by, action, t
   if (!reservation) return { error:"The AI budget is unavailable or would be exceeded. No request was sent.", status:429 };
   let out, tokens = estimate;
   try {
-    const res = await fetch("https://api.openai.com/v1/chat/completions", { method:"POST", signal:AbortSignal.timeout(40000), headers:{ "Content-Type":"application/json", Authorization:"Bearer " + cfg.key }, body:JSON.stringify({ model:cfg.model, temperature:0, max_tokens:maxOut, response_format:{ type:"json_object" }, messages }) });
-    if (!res.ok) { tokens=0; return { error:"The AI service refused the request (HTTP " + res.status + ").", status:502 }; }
+    const call = async shape => fetch("https://api.openai.com/v1/chat/completions", { method:"POST", signal:AbortSignal.timeout(40000), headers:{ "Content-Type":"application/json", Authorization:"Bearer " + cfg.key }, body:JSON.stringify(openaiBody(cfg.model, messages, maxOut, shape)) });
+    // Newer models want max_completion_tokens and no temperature; older ones the reverse. Start from what this model needs, and adapt once or twice from what OpenAI says it rejected.
+    let shape = { ...(OPENAI_SHAPES.get(cfg.model) || openaiShapeFor(cfg.model)) }, res = await call(shape), detail = null;
+    for (let attempt = 0; attempt < 3 && !res.ok && res.status === 400; attempt++) {
+      detail = await readOpenaiError(res); const m = String(detail.message || "").toLowerCase(); let changed = false;
+      if (/max_tokens/.test(m) && /max_completion_tokens/.test(m) && !shape.completion) { shape.completion = true; changed = true; }
+      if (/temperature/.test(m) && !shape.noTemp) { shape.noTemp = true; changed = true; }
+      if (/response_format|json_object/.test(m) && !shape.noFormat) { shape.noFormat = true; changed = true; }
+      if (/max_completion_tokens/.test(m) && /unsupported|not supported/.test(m) && shape.completion && !shape.tokensBack) { shape.completion = false; shape.tokensBack = true; changed = true; }
+      if (!changed) break; res = await call(shape);
+    }
+    if (res.ok) OPENAI_SHAPES.set(cfg.model, shape);
+    if (!res.ok) { tokens = 0; detail = detail && res.status === 400 ? detail : await readOpenaiError(res); return { error:openaiFriendly(res.status, detail, cfg.model), status:502, detail:{ http:res.status, code:detail.code || "", type:detail.type || "" } }; }
     out = await res.json().catch(() => ({}));
     tokens = Number(out.usage?.total_tokens) || estimate;
   } catch (error) {
@@ -5507,6 +5538,17 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"case.source_reviewed", entityType:"Case", entityId:rec.number, detail:{ note:note.slice(0, 1000), changes:evidence.changes } });
     return json({ ok:true });
   }
+  if (path === "/api/ai-models" && viewer) {
+    // The chat models this key may use, so a model name never has to be guessed.
+    if (viewer.role !== "manager") return json({ error:"Manager access required." }, 403);
+    const cfg = aiConfig(env, state); if (!cfg.hasKey) return json({ error:"Save an OpenAI key first." }, 409);
+    try {
+      const res = await fetch("https://api.openai.com/v1/models", { signal:AbortSignal.timeout(15000), headers:{ Authorization:"Bearer " + cfg.key } });
+      if (!res.ok) return json({ error:openaiFriendly(res.status, await readOpenaiError(res), cfg.model) }, 502);
+      const j = await res.json(), ids = (j.data || []).map(x => String(x.id)).filter(id => /^(gpt-|o\d|chatgpt-)/.test(id) && !/(audio|realtime|transcribe|tts|image|embedding|moderation|search|instruct)/.test(id)).sort();
+      return json({ models:ids.slice(0, 80), current:cfg.model, currentAvailable:ids.includes(cfg.model) });
+    } catch (e) { return json({ error:"OpenAI could not be reached: " + String(e.message).slice(0, 120) }, 502); }
+  }
   if (path === "/api/ai-smoke" && viewer) {
     // A synthetic one-word request that proves the configured key works. It reports availability and usage only: never the key, never any case text.
     if (!manager) return json({ error:"Manager access required." }, 403);
@@ -5514,7 +5556,7 @@ async function apiCore(request, env, path) {
     if (!cfg.hasKey) return json({ ok:false, available:false, reason:"No API key is configured on the server or in Settings.", ...base });
     if (!raw.enabled || cfg.paused || !cfg.monthlyTokens) return json({ ok:false, available:false, reason:cfg.paused ? "AI is paused." : !raw.enabled ? "AI is switched off." : "The monthly token limit is 0.", ...base });
     const t0 = Date.now(), r = await aiChat(env, state, [{ role:"system", content:"Reply with the JSON {\"ok\":true}." }, { role:"user", content:"ping" }], 12, 40, email, "ai.smoke", "synthetic", "");
-    if (r.error) return json({ ok:false, available:false, reason:r.error, ...base });
+    if (r.error) return json({ ok:false, available:false, reason:r.error, detail:r.detail || null, ...base });
     return json({ ok:r.json?.ok === true, available:true, latencyMs:Date.now() - t0, tokens:r.tokens, ...base, used:r.used, limit:r.limit });
   }
   if (["/api/case-submit", "/api/case-qc", "/api/case-ai-fill", "/api/case-ai-review", "/api/case-automate"].includes(path) && viewer) {
@@ -9214,7 +9256,7 @@ document.addEventListener("click",event=>{
     collectCase();renderCase();return;
   }
   const sm=event.target.closest&&event.target.closest("[data-aismoke]");
-  if(sm){sm.disabled=true;$("aismokeout").textContent="Testing…";api("ai-smoke",{}).then(r=>{$("aismokeout").innerHTML=(r.ok?badge("Working","green"):badge("Not available","amber"))+" "+esc(r.ok?("Reply in "+r.latencyMs+" ms · "+r.tokens+" tokens · "+r.used+" of "+r.limit+" used this month · model "+r.model+" · key from "+r.keySource):(r.reason||""));return refresh();}).catch(e=>{$("aismokeout").textContent=e.message;}).finally(()=>{sm.disabled=false;});return;}
+  if(sm){sm.disabled=true;$("aismokeout").textContent="Testing…";api("ai-smoke",{}).then(r=>{$("aismokeout").innerHTML=(r.ok?badge("Working","green"):badge("Not available","amber"))+" "+esc(r.ok?("Reply in "+r.latencyMs+" ms · "+r.tokens+" tokens · "+r.used+" of "+r.limit+" used this month · model "+r.model+" · key from "+r.keySource):(r.reason||""));if(!r.ok&&/model/i.test(r.reason||"")){return api("ai-models",{}).then(m=>{$("aismokeout").innerHTML+="<div class=muted style=margin-top:6px>Models this key can use: "+esc((m.models||[]).slice(0,25).join(", "))+". Type one into the Model box and save.</div>";}).catch(()=>{});}return refresh();}).catch(e=>{$("aismokeout").textContent=e.message;}).finally(()=>{sm.disabled=false;});return;}
   const ks=event.target.closest&&event.target.closest("[data-aikeysave]");
   if(ks){const key=($("aikeyinline")||{}).value||"",lim=Number(($("ailimitinline")||{}).value)||0;if(!key.trim()){message("Paste the key first.",true);return;}ks.disabled=true;api("settings",{openaiKey:key.trim(),aiEnabled:"on",aiMonthlyTokens:lim}).then(()=>refresh()).then(()=>{if(curCase){const c=(data.cases||[]).find(x=>x.id===curCase.id);if(c){curCase=JSON.parse(JSON.stringify(c));renderCase();}}message("AI is on. Monthly limit "+lim.toLocaleString()+" tokens.");}).catch(e=>{message(e.message,true);ks.disabled=false;});return;}
   const rfa=event.target.closest&&event.target.closest("[data-refack]");if(rfa){const note=prompt("Note: what did you check in the revised label?","Listedness re-checked against the revised label")||"";if(note.length<5)return;api("synchrony",{id:curCase.id,action:"reference_ack",note}).then(async()=>{await refreshCase();message("Recorded.");}).catch(e=>message(e.message,true));return;}
