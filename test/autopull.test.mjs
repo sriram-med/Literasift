@@ -389,3 +389,19 @@ test("a client counted like PubMed alerts is pulled by the date articles enter P
   await t.call(M, "/api/saved-search-bulk", { client: "n", text: "schedule | every: weekly | day: Sunday | time: 06:00 | count: alerts" });
   assert.equal((await t.state()).clients[0].dateBasis, "crdt");
 });
+
+test("a date-range pull, comparison and count for a client counted like PubMed alerts use the date added to PubMed unless another basis is chosen", async () => {
+  const { makeEnv: mk, MANAGER: M, fakeNcbi: fk, withFetch: wf } = await import("./helpers.mjs");
+  const ago = n => new Date(Date.now() + 5.5 * 3600000 - n * 864e5).toISOString().slice(0, 10);
+  const t = await mk({ clients: [{ id: "n", name: "Navinta", dateBasis: "crdt" }], schema: { grouping: "client" }, watches: [{ portfolio: "Navinta", molecule: "carmustine", query: "((carmustine))", names: [], client: "n" }] });
+  const ncbi = fk([{ pmid: "1", date: ago(2) }]);
+  const p = await wf(ncbi.handler, () => t.call(M, "/api/pull-client", { client: "n", from: ago(7), to: ago(0) }));
+  assert.equal(p.body.results[0].dateBasis, "crdt"); assert.ok(p.body.results[0].term.includes("[crdt]") && !p.body.results[0].term.includes("[dp]"), p.body.results[0].term);
+  assert.match(p.body.results[0].dateBasisLabel, /like PubMed alerts/);
+  const c = await wf(ncbi.handler, () => t.call(M, "/api/compare-client", { client: "n", from: ago(7), to: ago(0) }));
+  assert.equal(c.body.dateField, "crdt");
+  const d = await wf(ncbi.handler, () => t.call(M, "/api/drug-week-stats", { client: "n", from: ago(7), to: ago(0) }));
+  assert.equal(d.body.by, "crdt");
+  const pub = await wf(ncbi.handler, () => t.call(M, "/api/pull-client", { client: "n", from: ago(7), to: ago(0), dateField: "pdat" }));
+  assert.equal(pub.body.results[0].dateBasis, "pdat", "an explicit choice still wins");
+});

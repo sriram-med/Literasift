@@ -3468,7 +3468,9 @@ async function namesFor(env, state, kb, w) { return ownNames(w); }
 // ---- The search contract. One builder for preview, comparison, manual pull, scheduled pull, retry and backfill.
 // Client, portfolio and therapeutic class are organisational metadata and never enter a query.
 const SEARCH_MODES = { pubmed:"PubMed default (automatic term mapping)", precise:"Precise (title/abstract, MeSH, supplementary concept)", custom:"Custom (approved Boolean expression)" };
-const DATE_BASIS_LABEL = { crdt:"Create date [crdt]", pdat:"Publication date [dp]", any:"Created or published ([crdt] OR [dp])" };
+// When a request names no date basis, a client counted like PubMed alerts is pulled by the date articles were added to PubMed.
+const clientBasis = (state, clientId, asked) => asked ? basisOf(asked) : (state.clients || []).find(c => c.id === clientId)?.dateBasis === "crdt" ? "crdt" : "any";
+const DATE_BASIS_LABEL = { crdt:"Date added to PubMed [crdt], like PubMed alerts", pdat:"Publication date [dp]", any:"Created or published ([crdt] OR [dp])" };
 // Filters sent with a request override the saved search only when the request names one; otherwise the saved search's own filters apply.
 // PubMed's automatic term mapping drops words it does not know. In a name of several words that turns, for example, "Pioz MF G-1" into a search for
 // "MF" and "G-1" and pulls thousands of unrelated articles. Such a search is refused until the saved search is fixed (add the generic name, or use Precise).
@@ -5895,7 +5897,7 @@ async function apiCore(request, env, path) {
     const mineOnly = viewer.role !== "manager" && viewer.canManageClients !== true, mine = myPortfolios(state, viewer), only = new Set((Array.isArray(body.molecules) ? body.molecules : []).map(String));
     const clientId = String(body.client || ""), list = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule && (!mineOnly || mine.includes(w.portfolio)) && (!only.size || (only.has(encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || "")) || (w.formerPortfolio && only.has(encodeURIComponent(w.formerPortfolio) + "|" + encodeURIComponent(w.molecule || "")))))).slice(0, 25);
     if (!list.length) return json({ error:"This client has no molecules." }, 400);
-    const allDates = body.allDates === true || (!body.from && !body.to), basis = basisOf(body.dateField), from = isDate(body.from) ? body.from : addDays(day(), -30), to = isDate(body.to) ? body.to : day(), cfg = withSettings(env, state), rows = [];
+    const allDates = body.allDates === true || (!body.from && !body.to), basis = clientBasis(state, clientId, body.dateField), from = isDate(body.from) ? body.from : addDays(day(), -30), to = isDate(body.to) ? body.to : day(), cfg = withSettings(env, state), rows = [];
     const filters = requestFilters(body), own = body.dates && typeof body.dates === "object" ? body.dates : {};
     for (const w of list) {   // one at a time: accuracy over speed
       // A molecule may have its own dates for this comparison; the others use the shared dates.
@@ -6159,7 +6161,7 @@ async function apiCore(request, env, path) {
     if (watches.length > 25) return json({ error:"A client pull covers up to 25 molecules at a time. Choose fewer." }, 400);
     let jobHook = null; const results = new Array(watches.length), progress = watches.map(w => ({ molecule:w.molecule, portfolio:w.portfolio, stage:"waiting", runId:"" })), work = async () => {
     const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
-    const cfg = withSettings(env, state), aligned = new Map(), basis = basisOf(body.dateField);
+    const cfg = withSettings(env, state), aligned = new Map(), basis = clientBasis(state, clientId, body.dateField);
     const filters = requestFilters(body);
     const one = async (w, slot) => {
       progress[slot].stage = "names";
@@ -7663,7 +7665,7 @@ async function apiCore(request, env, path) {
     // dates and date basis (its saved search, stored and linked). Each difference gets a reason: not pulled yet, not found by the app's search, or only in the app.
     if (viewer.role !== "manager" && viewer.canManageClients !== true) return json({ error:"Client figures are limited to managers and users a manager has allowed." }, 403);
     if (!isDate(body.from) || !isDate(body.to) || body.from > body.to || (Date.parse(body.to) - Date.parse(body.from)) / 864e5 > 366) return json({ error:"Choose a date range of up to one year." }, 400);
-    const clientId = String(body.client || ""), basis = ["any", "crdt", "pdat"].includes(body.by) ? body.by : "pdat", cfg = withSettings(env, state);
+    const clientId = String(body.client || ""), basis = ["any", "crdt", "pdat"].includes(body.by) ? body.by : clientBasis(state, clientId, "") === "crdt" ? "crdt" : "pdat", cfg = withSettings(env, state);
     const lines = String(body.text || "").split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith("#")).slice(0, 200);
     if (!lines.length) return json({ error:"Paste one line per drug: drug name, a colon, then its PMIDs (or - for none)." }, 400);
     const rows = [];
@@ -7731,7 +7733,7 @@ async function apiCore(request, env, path) {
     if (viewer.role !== "manager" && viewer.canManageClients !== true) return json({ error:"Client figures are limited to managers and users a manager has allowed." }, 403);
     if (!isDate(body.from) || !isDate(body.to) || body.from > body.to || (Date.parse(body.to) - Date.parse(body.from)) / 864e5 > 366) return json({ error:"Choose a date range of up to one year." }, 400);
     // By default a week means the articles PubMed dates in that week (as a pull for those dates finds them), not the day they reached the app.
-    const by = ["ird", "any", "crdt", "pdat"].includes(body.by) ? body.by : "pdat";
+    const by = ["ird", "any", "crdt", "pdat"].includes(body.by) ? body.by : clientBasis(state, String(body.client || ""), "") === "crdt" ? "crdt" : "pdat";
     const clientId = String(body.client || "all"), basis = by === "ird" ? basisOf(body.dateField || "crdt") : by, cname = id => (state.clients || []).find(c => c.id === id)?.name || "No client";
     const watches = state.watches.filter(w => w.molecule && (clientId === "all" || (clientId === "none" ? !w.client : w.client === clientId)))
       .sort((a, b) => cname(a.client).localeCompare(cname(b.client)) || String(a.molecule).localeCompare(String(b.molecule)));
@@ -10282,12 +10284,12 @@ function spTabsHtml(mgr){
   const tabs=[["client","Saved searches","One search per molecule, by client"],["molecule","One molecule","Look a drug up and pull it"],["query","PubMed query","Any PubMed search, or authors and topics"],...(mgr?[["pmids","PMID list","Articles you already have"]]:[]),["world","Other sources","Europe PMC, OpenAlex, trials, regulators"],...(mgr?[["posts","Patient posts","Forum and social posts, masked"]]:[])];
   return '<div class="steptiles sptabs">'+tabs.map((x,i)=>'<button type="button" class="steptile'+(spState.tab===x[0]?" on":"")+'" data-sptab="'+x[0]+'"><span class="st-n">'+(i+1)+'</span><span class="st-t"><b>'+x[1]+'</b><span class="sub">'+x[2]+'</span></span></button>').join("")+'</div>';
 }
-function spDateHint(){const b={any:"created in PubMed or published",crdt:"created in PubMed (Create date [crdt])",pdat:"published (Publication date [dp])"}[spState.basis||"pdat"];return spState.from||spState.to?"Articles "+b+" from "+(spState.from||"…")+" to "+(spState.to||"…")+", both days included.":"Every article PubMed has, whatever its dates.";}
+function spDateHint(){const b={any:"created in PubMed or published",crdt:"added to PubMed (Create date [crdt], like PubMed alerts)",pdat:"published (Publication date [dp])"}[spState.basis||"pdat"];return spState.from||spState.to?"Articles "+b+" from "+(spState.from||"…")+" to "+(spState.to||"…")+", both days included.":"Every article PubMed has, whatever its dates.";}
 function spSettingsHtml(withSafety,datesOnly){
   const today=typeof todayStr==="function"?todayStr():new Date().toISOString().slice(0,10),has=spState.from||spState.to,chip=(k,l)=>{const on=k==="all"?!has:spState.from===new Date(Date.now()-Number(k)*864e5).toISOString().slice(0,10)&&spState.to===today;return '<button type="button" class="fchip'+(on?" on":"")+'" data-sprange="'+k+'">'+l+'</button>';};
   const ck=(k,l)=>'<label class="check"><input type="checkbox" data-sp="'+k+'"'+(spState[k]?" checked":"")+'>&nbsp;'+l+'</label>';
   return '<section class="spset"><div class="body"><div class="sp-grid">'+
-    '<div class="sp-col"><span class="sp-h">Dates</span><div class="fbar" style="margin:0 0 8px">'+chip("all","All dates")+chip("7","Past week")+chip("30","Last 30 days")+chip("90","Last 3 months")+chip("365","Last 12 months")+'</div><div class="sp-row"><label>From<input type="date" data-sp="from" value="'+esc(spState.from)+'" max="'+today+'"></label><label>Through<input type="date" data-sp="to" value="'+esc(spState.to)+'" max="'+today+'"></label></div><span class="sp-h" style="margin-top:6px">Date basis</span>'+[["pdat","Publication date [dp]"],["any","Created or published"],["crdt","Create date [crdt]"]].map(x=>'<label class="check"><input type="radio" name="spbasis" data-sp="basis" value="'+x[0]+'"'+(spState.basis===x[0]?" checked":"")+'>&nbsp;'+x[1]+'</label>').join("")+'<span class="sub" id="spdatehint">'+spDateHint()+'</span></div>'+
+    '<div class="sp-col"><span class="sp-h">Dates</span><div class="fbar" style="margin:0 0 8px">'+chip("all","All dates")+chip("7","Past week")+chip("30","Last 30 days")+chip("90","Last 3 months")+chip("365","Last 12 months")+'</div><div class="sp-row"><label>From<input type="date" data-sp="from" value="'+esc(spState.from)+'" max="'+today+'"></label><label>Through<input type="date" data-sp="to" value="'+esc(spState.to)+'" max="'+today+'"></label></div><span class="sp-h" style="margin-top:6px">Date basis</span>'+[["pdat","Publication date [dp]"],["crdt","Date added to PubMed [crdt], like PubMed alerts"],["any","Created or published"]].map(x=>'<label class="check"><input type="radio" name="spbasis" data-sp="basis" value="'+x[0]+'"'+(spState.basis===x[0]?" checked":"")+'>&nbsp;'+x[1]+'</label>').join("")+'<span class="sub" id="spdatehint">'+spDateHint()+'</span></div>'+
     (datesOnly?'<div class="sp-col"><span class="sp-h">Search</span><span class="sub">Each molecule runs its own saved search: its names, its mode and its filters, shown below. The daily automatic pull runs the same saved search, so the two cannot differ. Only the dates are chosen here.</span></div>':'<div class="sp-col"><span class="sp-h">Search</span><label class="check"><input type="radio" name="spmode" data-sp="mode" value="broad"'+(spState.broad?" checked":"")+'>&nbsp;<b>PubMed default</b>: automatic term mapping, as on the website</label><label class="check"><input type="radio" name="spmode" data-sp="mode" value="precise"'+(spState.broad?"":" checked")+'>&nbsp;<b>Precise</b>: quoted names in title/abstract, MeSH, supplementary concept</label><span class="sub">Only the molecule and its approved names are searched, never its client or portfolio. A molecule with an approved custom expression always runs it as written (Custom).</span></div>')+
     '<div class="sp-col"><span class="sp-h">NCBI sources</span><label class="check"><input type="checkbox" checked disabled>&nbsp;PubMed</label>'+ck("pmc","PubMed Central (full texts)")+'<span class="sub">PubMed Central finds papers that name the drug only in the body text.</span></div>'+
     (datesOnly?"":'<div class="sp-col"><span class="sp-h">Filters (optional)</span>'+ck("humans","Humans")+ck("caseReports","Case reports")+ck("english","English")+ck("noReviews","No reviews")+(withSafety?ck("safety","Safety articles only"):"")+'</div>')+
@@ -10521,7 +10523,7 @@ function drugWeekHtml(){
     '<label>Client<select id="dwclient">'+opts.map(o=>'<option value="'+esc(o[0])+'"'+(o[0]===dwState.client?" selected":"")+'>'+esc(o[1])+'</option>').join("")+'</select></label>'+
     '<label>From<input type="date" id="dwfrom" value="'+esc(dwState.from)+'" max="'+today+'"></label><label>Through<input type="date" id="dwto" value="'+esc(dwState.to)+'" max="'+today+'"></label>'+
     '<span class="fbar" style="margin:0">'+[["lastweek","Last week"],["thisweek","This week"],["30","Last 30 days"],["90","Last 3 months"],["month","Last month"]].map(x=>'<button type="button" class="fchip" data-dwrange="'+x[0]+'">'+x[1]+'</button>').join("")+'</span>'+
-    '<label>Counted by<select id="dwby">'+[["pdat","Publication date [dp]"],["any","Created or published"],["crdt","PubMed create date [crdt]"],["ird","Day it reached the app"]].map(o=>'<option value="'+o[0]+'"'+(o[0]===dwState.by?" selected":"")+'>'+o[1]+'</option>').join("")+'</select></label>'+
+    '<label>Counted by<select id="dwby">'+[["pdat","Publication date [dp]"],["crdt","Date added to PubMed [crdt], like PubMed alerts"],["any","Created or published"],["ird","Day it reached the app"]].map(o=>'<option value="'+o[0]+'"'+(o[0]===dwState.by?" selected":"")+'>'+o[1]+'</option>').join("")+'</select></label>'+
     '<label title="Repeat a client search as PubMed was on the day it was run: articles PubMed added later are left out">As PubMed was on (optional)<input type="date" id="dwasof" value="'+esc(dwState.asOf||"")+'"></label>'+
     '<button type="button" class="btn sm" data-dwbuild="1">Build table</button><button type="button" class="btn outline sm" data-dwxlsx="1">Excel</button><button type="button" class="btn outline sm" data-dwpng="1">Image</button><button type="button" class="btn outline sm" data-dwcsv="1">CSV</button></div>'+
     '<details class="rcbox" style="margin-top:10px"><summary><b>Compare with a client report</b></summary><p class="sub">One line per drug: the drug name as in the app, a colon, then the PMIDs from the client report (or - for none). Uses the client, dates and Counted by above.</p>'+
