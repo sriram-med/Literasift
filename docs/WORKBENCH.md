@@ -373,3 +373,16 @@ Pulls are deliberately careful now; they take longer and are checked to the PMID
 - **Search & Pull > PubMed query**: paste any PubMed expression, exactly as on the PubMed website, or build one from **authors** (`[Author]`) and **topics** searched in title and abstract (`[Title/Abstract]`). Choose a portfolio and a label. The dates, date basis and filters of the settings card are added; nothing else changes the expression. It runs through the same engine as every other pull: date windows, retries, the run snapshot and the PMID-by-PMID check. Managers pull into any portfolio; others into their own portfolios and own queue.
 - **Excel (.xlsx)** next to Reconciliation (CSV) on every pull result: one row per stored article with PMID, Title, Abstract, Authors, Journal, Keywords (MeSH), URL, Affiliations (now every author's, not only the first), then molecule, portfolio, publication date and DOI.
 - Routes: `/api/pull-query`, `/api/build-query`, `/api/pull-xlsx`.
+
+## Clients replace portfolios
+
+The client is now the only grouping. On first load the stored data is migrated once: every molecule is filed under its client (or a client named after its former portfolio), queues, the Library, roles, runs and cases follow, and duplicate assignments are merged keeping the furthest-along review. Renaming, deleting or moving a client regroups automatically. A client, portfolio or drug class never enters a PubMed query.
+
+## Saved searches (Search & Pull)
+
+Every molecule has exactly one saved search: its own names (brands, salts, spellings), a mode (PubMed default, Precise or Custom) and its filters (Humans, Case reports, English, No reviews, Safety articles only).
+
+- **Search & Pull → Saved searches** lists them per client, with the exact PubMed query. *Count in PubMed* gives a live count for the chosen dates. Managers can *Edit* a saved search, *Preview and count* the draft, and *Save search*.
+- Saving creates a new query version effective from today. Past pulls keep the version they ran with (audit trail).
+- *Pull this client* and *Compare with PubMed* send only the dates, the date basis and the PubMed Central option. Each molecule runs its saved search. The daily automatic pull runs the same saved search, so manual and automatic pulls cannot differ.
+- Routes: `/api/saved-searches` (list for a client), `/api/saved-search` (preview/count, or `save:true` for managers).
