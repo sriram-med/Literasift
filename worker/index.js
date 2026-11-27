@@ -56,7 +56,7 @@ async function pubmed(env, operation, params) {
   const text = await response.text(); let body;
   try { body = JSON.parse(text); } catch { throw new Error("PubMed answer incomplete (" + text.replace(/\s+/g, " ").slice(0, 60) + ")"); }
   const err = body?.esearchresult?.ERROR || body?.error || body?.ERROR;
-  if (err && !body?.esearchresult?.idlist && !body?.result) throw new Error("PubMed answer incomplete: " + String(err).slice(0, 80));
+  if (err && (operation === "esearch" || !body?.result)) throw new Error("PubMed answer incomplete: " + String(err).slice(0, 80));
   return body;
 }
 // ---- Timelines. Every item starts from its IRD (the day LiteraSift received it). Screening and routing to QC take 2 working days by default, QC 2 more, medical review 3; a manager changes the defaults,
@@ -333,7 +333,9 @@ const searchTerm = (query, from, to, dateField) => {
 function makeWindows(watch, from, to, days, dateField) {
   const out = []; let start = from;
   while (start <= to) {
-    const end = addDays(start, days - 1) < to ? addDays(start, days - 1) : to, q = queryAt(watch, start);
+    const nextVersion = (watch.versions || []).map(v => v.effectiveFrom).filter(date => date > start).sort()[0];
+    const end = [to, addDays(start, days - 1), ...(nextVersion ? [addDays(nextVersion,-1)] : [])].sort()[0];
+    const q = queryAt(watch,start);
     out.push({ from:start, to:end, state:"pending", attempts:0, queryVersion:q.version, query:q.query, term:searchTerm(q.query, start, end, dateField) });
     start = addDays(end, 1);
   }
@@ -400,21 +402,28 @@ async function processWindow(env, runId, index) {
   if (!win) return null;
   // Several windows run at once and one of them may be split in two, so a window is found by its dates, never by its position.
   const at = r => r.windows.findIndex(x => x.from === win.from && x.to === win.to), winOf = r => r.windows[at(r)];
-  const mark = patch => write(env, data => { const r = data.runs.find(x => x.id === runId), w = r && winOf(r); if (!w) return; Object.assign(w, patch); summarizeRun(r); });
+  const claim = crypto.randomUUID();
+  const mark = patch => write(env, data => { const r = data.runs.find(x => x.id === runId), w = r && winOf(r); if (!w || w.claim !== claim) return; Object.assign(w,patch,{ claim:undefined }); summarizeRun(r); });
   try {
     // Claim the window atomically; an overlapping worker skips a window that another one is processing.
-    let claimed = false; const now = new Date().toISOString();
-    await write(env, data => { const r = data.runs.find(x => x.id === runId), w = r && winOf(r); if (!w || (w.state === "running" && w.claimUntil && w.claimUntil > now)) return;
-      w.state = "running"; w.claimUntil = new Date(Date.now() + 180000).toISOString(); w.attempts = (w.attempts || 0) + 1; w.lastAttemptAt = now; w.error = ""; claimed = true; summarizeRun(r); });
+    const now = new Date().toISOString();
+    const claimed = await write(env,data => {
+      const r = data.runs.find(x => x.id === runId), w = r && winOf(r);
+      if (!w || ["reconciled","zero_results"].includes(w.state) || (w.state === "running" && w.claimUntil > now)) return false;
+      Object.assign(w,{ state:"running", claim, claimUntil:new Date(Date.now()+180000).toISOString(), attempts:(w.attempts || 0)+1, lastAttemptAt:now, error:"" });
+      summarizeRun(r);
+      return true;
+    });
     if (!claimed) return { busy:true };
     const { esearchresult: result } = await withRetry(env, () => pubmed(env, "esearch", { term:win.term, retmode:"json", retmax:"9999" }));
-    if (!result?.idlist) throw new Error("PubMed search was incomplete.");
-    const expected = Number(result.count), ids = uniq(result.idlist);
+    if (!Array.isArray(result?.idlist) || pubmedCount(result) === null) throw new Error("PubMed search was incomplete.");
+    const expected = pubmedCount(result), ids = uniq(result.idlist.map(String)).filter(id => /^\d+$/.test(id));
     if (expected > ids.length && win.from < win.to) {
       // More records than one search can return: split the window in two. Both halves keep the same query version.
       const middle = addDays(win.from, Math.floor((Date.parse(win.to) - Date.parse(win.from)) / 86400000 / 2));
-      await write(env, data => { const r = data.runs.find(x => x.id === runId), i = at(r), w = r.windows[i];
-        const left = { ...w, claimUntil:undefined, to:middle, state:"pending", attempts:0, term:searchTerm(w.query, w.from, middle, run.dateField) }, right = { ...w, claimUntil:undefined, from:addDays(middle, 1), state:"pending", attempts:0, term:searchTerm(w.query, addDays(middle, 1), w.to, run.dateField) };
+      await write(env, data => { const r = data.runs.find(x => x.id === runId), i = r ? at(r) : -1, w = r?.windows[i];
+        if (w?.claim !== claim) return;
+        const left = { ...w, claim:undefined, claimUntil:undefined, to:middle, state:"pending", attempts:0, term:searchTerm(w.query, w.from, middle, run.dateField) }, right = { ...w, claim:undefined, claimUntil:undefined, from:addDays(middle, 1), state:"pending", attempts:0, term:searchTerm(w.query, addDays(middle, 1), w.to, run.dateField) };
         r.windows.splice(i, 1, left, right); summarizeRun(r); });
       return { split:true };
     }
@@ -428,7 +437,9 @@ async function processWindow(env, runId, index) {
     const missing = uniq([...fetched.missing, ...ids.filter(id => fetched.articles[id] && !fetched.xml[id]), ...(settled ? [] : unavailable)]);
     const reconciled = ids.length === expected && missing.length === 0;
     await write(env, data => {
-      const r = data.runs.find(x => x.id === runId), w = winOf(r), watch = data.watches.find(x => x.portfolio === r.portfolio && (x.molecule || "") === (r.molecule || "")) || { portfolio:r.portfolio, molecule:r.molecule };
+      const r = data.runs.find(x => x.id === runId), w = r && winOf(r);
+      if (w?.claim !== claim) return;
+      const watch = data.watches.find(x => x.portfolio === r.portfolio && (x.molecule || "") === (r.molecule || "")) || { portfolio:r.portfolio, molecule:r.molecule };
       let imported = 0;
       for (const [id, article] of Object.entries(fetched.articles)) {
         if (!data.articles[id]) imported++;
@@ -443,7 +454,7 @@ async function processWindow(env, runId, index) {
         allocate(data, item); data.assignments.push(item);
       }
       r.ids = uniq([...(r.ids || []), ...ids.filter(id => data.articles[id])]);
-      Object.assign(w, { expected, retrieved:ids.length, pmids:ids, imported, missing, unavailable, state:expected === 0 ? "zero_results" : reconciled ? "reconciled" : "partial", error:"", claimUntil:undefined, completedAt:new Date().toISOString() });
+      Object.assign(w, { expected, retrieved:ids.length, pmids:ids, imported, missing, unavailable, state:expected === 0 ? "zero_results" : reconciled ? "reconciled" : "partial", error:"", claim:undefined, claimUntil:undefined, completedAt:new Date().toISOString() });
       summarizeRun(r);
     });
     return { done:true };
@@ -463,9 +474,9 @@ const windowRetryable = (w, { ignoreBackoff = false } = {}) => (w.state === "fai
 // fetched now and added to the same run (and the same queue). Up to 9,999 PMIDs are checked this way; above that the per-window counts are the check.
 async function verifyIds(env, runId, term, total) {
   if (total == null || total > 9999) return { checked:false, filled:0, ids:null };
-  const { esearchresult: r } = await withRetry(env, () => pubmed(env, "esearch", { term, retmode:"json", retmax:String(Math.max(1, total)) }));
-  const listed = uniq(r?.idlist || []);
-  if (Number(r?.count) > listed.length) return { checked:false, filled:0, ids:null };
+  const { esearchresult: r } = await withRetry(env, () => pubmed(env, "esearch", { term, retmode:"json", retmax:"9999" }));
+  const listed = Array.isArray(r?.idlist) ? uniq(r.idlist.map(String)).filter(id => /^\d+$/.test(id)) : [];
+  if (!Array.isArray(r?.idlist) || pubmedCount(r) !== listed.length) return { checked:false, filled:0, ids:null };
   let run = (await load(env)).state.runs.find(x => x.id === runId); if (!run) return { checked:false, filled:0, ids:null };
   const have = new Set([...(run.ids || []), ...(run.unavailable || [])]), gap = listed.filter(id => !have.has(id));
   let filled = 0, unavailable = [];
@@ -480,11 +491,14 @@ async function verifyIds(env, runId, term, total) {
         if (existing) { if (watch.molecule && !(existing.molecules || []).includes(watch.molecule) && (existing.molecules || []).length < 20) (existing.molecules ||= []).push(watch.molecule); continue; }
         const item = { id:crypto.randomUUID(), pmid:id, portfolio:r2.portfolio, molecules:watch.molecule ? [watch.molecule] : [], reviewer:"", status:"Pending" }; allocate(data, item); data.assignments.push(item);
       }
-      r2.ids = uniq([...(r2.ids || []), ...Object.keys(fetched.articles)]); r2.verifiedUnavailable = uniq([...(r2.verifiedUnavailable || []), ...unavailable]); summarizeRun(r2); r2.unavailable = uniq([...(r2.unavailable || []), ...r2.verifiedUnavailable]);
+      r2.ids = uniq([...(r2.ids || []), ...Object.keys(evidence)]); r2.verifiedUnavailable = uniq([...(r2.verifiedUnavailable || []), ...unavailable]); summarizeRun(r2); r2.unavailable = uniq([...(r2.unavailable || []), ...r2.verifiedUnavailable]);
     });
-    filled = Object.keys(fetched.articles).length;
+    filled = Object.keys(evidence).length;
   }
-  return { checked:true, filled, listed:listed.length, ids:listed };
+  run = (await load(env)).state.runs.find(x => x.id === runId);
+  const current = new Set([...(run.ids || []), ...(run.unavailable || [])]);
+  const missing = listed.filter(id => !current.has(id));
+  return { checked:true, filled, listed:listed.length, ids:listed, missing };
 }
 async function completeRun(env, runId, { total = null, rounds = 6 } = {}) {
   let run = (await load(env)).state.runs.find(r => r.id === runId);
@@ -545,7 +559,7 @@ function missedWindows(state, watch, through, field = "crdt") {
 async function execute(env, watch, from, to, { mode = "monitor", dateField, force = false, windowDays = 0, onRun = null, budget = 12 } = {}) {
   env = withSettings(env, (await load(env)).state);
   const field = DATE_FIELDS[dateField] ? dateField : mode === "backfill" ? "pdat" : "crdt", windows = makeWindows(watch, from, to, windowDays || (mode === "backfill" ? 14 : 7), field);
-  const key = [watchKey(watch), mode, field, from, to, windows.map(w => w.queryVersion).join(",")].join("|");
+  const key = [watchKey(watch), mode, field, from, to, await sha256Hex(JSON.stringify(windows.map(w => [w.queryVersion,w.term])))].join("|");
   const run = { id:crypto.randomUUID(), source:"PubMed", portfolio:watch.portfolio, molecule:watch.molecule || "", from, to, mode, dateField:field, dateFieldLabel:DATE_FIELDS[field].label, windows, ids:[], count:0, time:new Date().toISOString(), searchedAt:new Date().toISOString(),
     query:windows[windows.length - 1].query, queryVersions:uniq(windows.map(w => w.queryVersion)), executedQueries:uniq(windows.map(w => w.term)).slice(0, 50), idem:key, status:"Running", coverage:"running" };
   // The check and the insert happen in one transaction, so overlapping callers share a single run instead of creating twins.
@@ -3240,17 +3254,22 @@ async function fullSearch(env, state, kb, w, base, { online = true } = {}) {
   return query.length > 1500 ? { query:base, added:[] } : { query, added:extra.slice(0, 30) };
 }
 // "Broad" is how the PubMed website itself searches: a bare word lets PubMed map it to MeSH and search every field (title, abstract, keywords, substances, ...), which finds
-// several times more than the precise title/abstract/MeSH search. Several words stay a quoted phrase.
+// more than the precise title/abstract/MeSH search. Multiword names also keep the exact indexed phrase as a separate match.
 function buildBroadQuery(names, safetyOnly) {
   const clean = [...new Set(names.map(n => String(n || "").replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim()).filter(x => x.length > 1))];
   if (!clean.length || clean.some(n => n.length > 100)) return "";
-  const term = n => /\s/.test(n) ? '("' + n + '"[All Fields] OR "' + n + '"[MeSH Terms] OR "' + n + '"[Supplementary Concept])' : n;
+  const term = n => /\s/.test(n) ? '(' + n + ' OR "' + n + '"[All Fields] OR "' + n + '"[MeSH Terms] OR "' + n + '"[Supplementary Concept])' : n;
   const take = clean.slice(0, 40), query = "(" + take.map(term).join(" OR ") + ")" + (safetyOnly ? " AND " + safetyFilter : "");
   return query.length <= 1500 ? query : "(" + take.slice(0, 12).map(term).join(" OR ") + ")" + (safetyOnly ? " AND " + safetyFilter : "");
 }
 // Every name known for a molecule: the name itself, the names already in its stored query, the portfolio dictionary, and the drug name list.
 // What a molecule is searched by: its own name, and only the other names (brands, salts, synonyms) someone gave it. Never its portfolio, and nothing added
 // automatically from the portfolio's dictionary or the drug name list. Older molecules keep the names they were created with (their first query).
+const moleculeSpellings = new Map([
+  ["aciclovir",["acyclovir"]], ["acyclovir",["aciclovir"]],
+  ["magnesium sulfate",["magnesium sulphate"]], ["magnesium sulphate",["magnesium sulfate"]],
+  ["methimazole",["thiamazole"]], ["thiamazole",["methimazole"]]
+]);
 const firstQuery = w => (w.versions || []).slice().sort((a, b) => a.version - b.version)[0]?.query || w.query || "";
 function ownNames(w) {
   const out = [], add = n => { const t = String(n || "").replace(/["\[\]()*]/g, " ").replace(/\s+/g, " ").trim(); if (t.length > 1 && t.length <= 100 && !out.some(x => x.toLowerCase() === t.toLowerCase())) out.push(t); };
@@ -3260,10 +3279,13 @@ function ownNames(w) {
   return out;
 }
 // A query someone wrote by hand (no field-tagged names in it) is searched exactly as written.
-const handQuery = w => !Array.isArray(w.names) && !queryTerms(firstQuery(w)).length && Boolean(w.query);
-const styledQuery = (w, broad, safety) => broad ? buildBroadQuery(ownNames(w), safety) : buildQuery(ownNames(w).slice(0, 30), safety);
+const handQuery = w => w.customQuery === true || (!Array.isArray(w.names) && !queryTerms(firstQuery(w)).length && Boolean(w.query));
+const broadNames = w => uniq([...ownNames(w), ...(moleculeSpellings.get(String(w.molecule || "").trim().toLowerCase()) || [])]);
+const styledQuery = (w, broad, safety) => broad ? buildBroadQuery(broadNames(w),safety) : buildQuery(ownNames(w).slice(0,30),safety);
+const requestedDateField = body => Object.hasOwn(DATE_FIELDS,body.dateField) ? body.dateField : "any";
+const pubmedCount = r => /^\d+$/.test(String(r?.count ?? "")) && Number.isSafeInteger(Number(r.count)) ? Number(r.count) : null;
 async function namesFor(env, state, kb, w) { return ownNames(w); }
-const countAny = async (env, term) => { try { const { esearchresult: r } = await withRetry(env, () => pubmed(env, "esearch", { term, retmode:"json", retmax:"0" }), { tries:5 }); return Number(r?.count ?? NaN); } catch { return null; } };
+const countAny = async (env, term) => { try { const { esearchresult: r } = await withRetry(env, () => pubmed(env, "esearch", { term, retmode:"json", retmax:"0" }), { tries:5 }); return pubmedCount(r); } catch { return null; } };
 const saveKb = async (env, kb) => { kb.updatedAt = new Date().toISOString(); await env.BUCKET.put(KB_KEY, JSON.stringify(kb), { httpMetadata:{ contentType:"application/json" } }); };
 function kbLookup(kb, text) {
   const hit = kb.index.get(kbName(text)); if (!hit) return null;
@@ -5356,9 +5378,11 @@ async function apiCore(request, env, path) {
         portfolio = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || (state.clients || []).find(c => c.id === body.client)?.name?.slice(0, 100) || "General"; }
       const key = watchKey({ portfolio, molecule }), info = { molecule, portfolio, auto, classification:area ? { area:ATC_AREAS[area.letter], atc:area.atc || "", class:area.class || "", source:area.source } : null };
       if (state.watches.some(w => watchKey(w) === key) || seen.has(key)) { results.push({ ...info, status:"exists", error:molecule + " is already in " + portfolio + "." }); continue; }
-      let query = (items.length === 1 && String(body.query || "").trim()) || buildQuery([molecule, ...synonyms], body.safetyOnly === true);
+      const custom = items.length === 1 && String(body.query || "").trim();
+      const mode = (state.clients || []).find(c => c.id === body.client)?.searchMode;
+      const query = custom || styledQuery({ molecule, names:synonyms },mode === "broad",body.safetyOnly === true);
       if (!query || query.length > 1500) { results.push({ ...info, status:"error", error:"The names could not be turned into a search. Shorten them." }); continue; }
-      seen.add(key); const watch = { portfolio, molecule, query, names:synonyms }; if (body.client) watch.client = String(body.client); if (owner) watch.owner = owner;
+      seen.add(key); const watch = { portfolio, molecule, query, names:synonyms, ...(custom ? { customQuery:true } : {}) }; if (body.client) watch.client = String(body.client); if (owner) watch.owner = owner;
       state.watches.push(watch); toSave.push({ watch, names:[molecule, ...synonyms] }); results.push({ ...info, status:"added", watch:keyOf(watch), client:body.client || "" });
     }
     if (!toSave.length && !toUpdate.length) { const first = results[0]; return json({ error:first ? first.error : "Enter the molecule name.", results }, first?.status === "exists" ? 409 : 400); }
@@ -5471,13 +5495,36 @@ async function apiCore(request, env, path) {
     // For each molecule of a client: what this app's search finds, what the PubMed website's own style of search finds (same dates, and with no date limit), and what is stored here.
     // Anyone may compare; people who are not managers see only the molecules in their own portfolios.
     const mineOnly = viewer.role !== "manager" && viewer.canManageClients !== true, mine = myPortfolios(state, viewer);
-    const clientId = String(body.client || ""), list = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule && (!mineOnly || mine.includes(w.portfolio))).slice(0, 25);
-    if (!list.length) return json({ error:"This client has no molecules." }, 400);
-    const allDates = body.allDates === true || (!body.from && !body.to), field = "any", from = isDate(body.from) ? body.from : addDays(day(), -30), to = isDate(body.to) ? body.to : day(), cfg = withSettings(env, state), kb = await loadKb(env).catch(() => null), rows = new Array(list.length);
-    let next = 0; await Promise.all(Array.from({ length:Math.min(3, list.length) }, async () => { while (next < list.length) { const i = next++, w = list[i];
-      const stored = queryAt(w, day())?.query || w.query || "", names = ownNames(w), safety = stored.includes(safetyFilter), broadQ = handQuery(w) ? stored : buildBroadQuery(names, safety), preciseQ = handQuery(w) ? stored : (buildQuery(names.slice(0, 30), safety) || stored);
-      const [precise, site, allTime] = await Promise.all([allDates ? countAny(cfg, preciseQ) : countAny(cfg, searchTerm(preciseQ, from, to, field)), allDates ? countAny(cfg, broadQ) : countAny(cfg, searchTerm(broadQ, from, to, field)), countAny(cfg, broadQ)]);
-      rows[i] = { molecule:w.molecule, portfolio:w.portfolio, names:names.length, precise, site, allTime, stored:state.assignments.filter(a => a.portfolio === w.portfolio && (a.molecules || []).includes(w.molecule)).length, link:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(broadQ) }; } }));
+    const clientId = String(body.client || ""), selected = new Set(Array.isArray(body.molecules) ? body.molecules : []);
+    const list = state.watches.filter(w => (clientId === "none" ? !w.client : w.client === clientId) && w.molecule && (!mineOnly || mine.includes(w.portfolio)) &&
+      (!selected.size || selected.has(encodeURIComponent(w.portfolio)+"|"+encodeURIComponent(w.molecule))));
+    if (!list.length || list.length > 25) return json({ error:"Select between 1 and 25 molecules for this client." },400);
+    const allDates = body.allDates === true || (!body.from && !body.to), field = requestedDateField(body);
+    const from = body.from, to = body.to, cfg = withSettings(env,state);
+    if (!allDates && (!isDate(from) || !isDate(to) || from > to || to > day())) return json({ error:"Choose a valid date range through today." },400);
+    const dated = q => allDates ? q : searchTerm(q,from,to,field);
+    const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
+    const filtered = q => narrow.length || body.noReviews === true ? "(" + q + ")" + narrow.map(f => " AND " + f).join("") + (body.noReviews === true ? " NOT review[pt]" : "") : q;
+    const rows = new Array(list.length);
+    let next = 0;
+    await Promise.all(Array.from({ length:Math.min(3,list.length) }, async () => {
+      while (next < list.length) {
+        const i = next++, w = list[i], stored = queryAt(w,day())?.query || w.query || "", safety = stored.includes(safetyFilter), names = ownNames(w);
+        const broadQ = handQuery(w) ? stored : styledQuery(w,true,safety) || stored;
+        const preciseQ = handQuery(w) ? stored : styledQuery(w,false,safety) || stored;
+        const term = dated(filtered(body.searchMode === "precise" ? preciseQ : broadQ));
+        const matches = new Set(state.assignments.filter(a => a.portfolio === w.portfolio && (a.molecules || []).includes(w.molecule) && efetchOf(state.articles[a.pmid])).map(a => a.pmid));
+        const [r, precise, allTime] = await Promise.all([
+          withRetry(cfg,async () => (await pubmed(cfg,"esearch",{ term, retmode:"json", retmax:"9999" })).esearchresult,{ tries:3 }).catch(() => null),
+          countAny(cfg,dated(filtered(preciseQ))),
+          countAny(cfg,filtered(broadQ))
+        ]);
+        const site = pubmedCount(r), ids = Array.isArray(r?.idlist) ? uniq(r.idlist.map(String)) : [], checked = site !== null && Array.isArray(r?.idlist) && ids.length === site;
+        const missing = checked ? ids.filter(id => !matches.has(id)) : null;
+        rows[i] = { molecule:w.molecule, portfolio:w.portfolio, names:names.length, precise, site, allTime, stored:missing ? ids.length-missing.length : null,
+          checked, missing:missing?.length ?? null, missingSample:missing?.slice(0,10) || [], term, link:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(term) };
+      }
+    }));
     return json({ from:allDates ? "" : from, to:allDates ? "" : to, allDates, dateField:field, rows });
   }
   if (path === "/api/pull-job" && viewer) {
@@ -5502,7 +5549,7 @@ async function apiCore(request, env, path) {
     const clientId = String(body.client || ""), isMgr = viewer.role === "manager", allowed = myPortfolios(state, viewer);
     if (clientId !== "none" && !(state.clients || []).some(c => c.id === clientId)) return json({ error:"Choose a client." }, 400);
     // No dates means every article PubMed has for the molecule, whatever its dates: one search with no date limit, split by the app only when PubMed would cut the list short.
-    const allDates = body.allDates === true || (!body.from && !body.to);
+    const allDates = body.allDates === true || (!body.from && !body.to), field = requestedDateField(body);
     if (allDates) { body.from = "1900-01-01"; body.to = day(); }
     else {
       if (!valid(body.from) || !valid(body.to) || body.from > body.to || body.to > day()) return json({ error:"Choose a valid date range through today." }, 400);
@@ -5518,13 +5565,13 @@ async function apiCore(request, env, path) {
     const clientRec = (state.clients || []).find(c => c.id === clientId), broad = body.searchMode ? body.searchMode === "broad" : clientRec?.searchMode === "broad";
     const one = async (w, slot) => {
       progress[slot].stage = "names"; const stored = queryAt(w, day())?.query || w.query, hand = handQuery(w), names = ownNames(w), safety = String(stored).includes(safetyFilter);
-      const broadQuery = hand ? "" : buildBroadQuery(names, safety), full = { query:hand ? stored : (styledQuery(w, broad, safety) || stored), added:hand ? [] : names.slice(1) };
+      const broadQuery = hand ? "" : styledQuery(w,true,safety), full = { query:hand ? stored : (styledQuery(w, broad, safety) || stored), added:hand ? [] : names.slice(1) };
       let query = full.query;
       // The molecule's daily search follows the client's search style and its own names, so a pull and the automatic pull search the same way.
-      if (isMgr && !hand) { const daily = styledQuery(w, clientRec?.searchMode === "broad", safety); if (daily && daily !== w.query) aligned.set(watchKey(w), daily); }
+      if (isMgr && !hand && clientRec?.searchMode === "broad") { const daily = styledQuery(w,true,safety); if (daily && daily !== w.query) aligned.set(watchKey(w), daily); }
       if (narrow.length || body.noReviews === true) query = "(" + query + ")" + narrow.map(f => " AND " + f).join("") + (body.noReviews === true ? " NOT review[pt]" : "");
       if (query.length > 1500) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, error:"The search became too long; use fewer filters." }; return; }
-      const before = new Set(state.assignments.filter(a => a.portfolio === w.portfolio).map(a => a.pmid));
+      const before = new Set(state.assignments.filter(a => a.portfolio === w.portfolio && (a.molecules || []).includes(w.molecule)).map(a => a.pmid));
       try {
         // A molecule with a very large literature is not pulled whole by accident: it is reported, and can be limited with dates.
         const cap = Math.min(50000, Math.max(100, Number(body.maxPerMolecule) || 25000));
@@ -5532,24 +5579,24 @@ async function apiCore(request, env, path) {
         if (allDates) { const total = await countAny(cfg, query); progress[slot].expected = total; if (total != null && total > cap) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, mode:broad ? "broad" : "precise", error:total + " articles in PubMed, more than the " + cap + " one pull takes. Choose Last 12 months, or your own dates, for this molecule." }; return; } }
         progress[slot].stage = "pulling";
         // Wide windows (a quarter at a time, or everything at once without dates) mean few searches; a window that holds more than PubMed returns in one go is split automatically.
-        let run = await execute(env, { portfolio:w.portfolio, molecule:w.molecule, query }, body.from, body.to, { mode:"backfill", dateField:"any", force:true, windowDays:allDates ? 40000 : 92, budget:600, onRun:id => { progress[slot].runId = id; } });
+        let run = await execute(env, { portfolio:w.portfolio, molecule:w.molecule, query }, body.from, body.to, { mode:"backfill", dateField:field, force:true, windowDays:allDates ? 40000 : 92, budget:600, onRun:id => { progress[slot].runId = id; } });
         // Nothing may be missed: a window that did not reconcile (PubMed's count against what came back) is run again before the answer is given, and it stays on the retry list if it still has gaps.
-        const pubmedTotal = allDates ? progress[slot].expected ?? null : await countAny(cfg, searchTerm(query, body.from, body.to, "any")); progress[slot].expected = pubmedTotal;
+        const pubmedTotal = allDates ? progress[slot].expected ?? null : await countAny(cfg, searchTerm(query, body.from, body.to, field)); progress[slot].expected = pubmedTotal;
         run = await completeRun(env, run.id, { total:pubmedTotal });
-        progress[slot].stage = "checking"; const check = await verifyIds(cfg, run.id, allDates ? query : searchTerm(query, body.from, body.to, "any"), pubmedTotal).catch(() => ({ checked:false, filled:0 }));
+        progress[slot].stage = "checking"; const check = await verifyIds(cfg, run.id, allDates ? query : searchTerm(query, body.from, body.to, field), pubmedTotal).catch(() => ({ checked:false, filled:0 }));
         run = (await load(env)).state.runs.find(x => x.id === run.id) || run;
-        if (!isMgr) await write(env, d => { for (const a of d.assignments) if (a.portfolio === w.portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
+        if (!isMgr) await write(env, d => { for (const a of d.assignments) if (a.portfolio === w.portfolio && (run.ids || []).includes(a.pmid) && !state.assignments.some(x => x.id === a.id)) { a.reviewer = email; a.pulledBy = email; } });
         progress[slot].stage = "finishing"; await settleEvidence(env, run.ids);
-        const wins = run.windows || [], got = uniq(run.ids || []).length, expected = pubmedTotal ?? run.expected ?? wins.reduce((n, x) => n + (x.expected || 0), 0);
+        const wins = run.windows || [], got = uniq(run.ids || []).length, expected = check.listed ?? pubmedTotal ?? run.expected ?? wins.reduce((n, x) => n + (x.expected || 0), 0);
         let pmc = null;
-        if (body.includePmc === true) { try { const hit = await pmcSearch(cfg, names, body.from, body.to, "any"), have = new Set([...(run.ids || []), ...Object.keys(state.articles)]), fresh = hit.pmids.filter(id => !have.has(id)).slice(0, 400);
+        if (body.includePmc === true) { try { const hit = await pmcSearch(cfg, names, body.from, body.to, field), have = new Set([...(run.ids || []), ...Object.keys(state.articles)]), fresh = hit.pmids.filter(id => !have.has(id)).slice(0, 400);
           let imported = 0; if (fresh.length) { const got = await importPmidList(env, fresh.map(pmid => ({ pmid })), w.portfolio, w.molecule); imported = (got.run?.ids || []).length; run.ids = [...new Set([...(run.ids || []), ...(got.run?.ids || [])])]; }
           pmc = { found:hit.count, withPmid:hit.pmids.length, added:imported }; } catch (error) { pmc = { error:String(error.message || error).slice(0, 120) }; } }
-        const site = broadQuery ? await countAny(cfg, allDates ? broadQuery : searchTerm(broadQuery, body.from, body.to, "any")) : null;
+        const site = broadQuery && broad ? expected : null;
         results[slot] = { molecule:w.molecule, portfolio:w.portfolio, mode:broad ? "broad" : "precise", pmc, siteCount:site, missing:wins.reduce((n, x) => n + ((x.missing || []).length), 0), failedWindows:wins.filter(x => x.state === "failed").length, names:full.added.length, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, expected, retrieved:got, coverage:run.coverage || run.status,
-          idCheck:check.checked, filledByCheck:check.filled || 0, unavailable:(run.unavailable || []).length, notStored:Math.max(0, expected - got - (run.unavailable || []).length), missingSample:uniq(wins.flatMap(x => x.missing || [])).slice(0, 6),
-          term:allDates ? query : searchTerm(query, body.from, body.to, "any"), pubmedUrl:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(allDates ? query : searchTerm(query, body.from, body.to, "any")),
-          complete:["reconciled", "zero_results"].includes(run.coverage) && (pubmedTotal == null || got + (run.unavailable || []).length >= pubmedTotal), gaps:(run.gaps || []).length };
+          idCheck:check.checked, filledByCheck:check.filled || 0, unavailable:(run.unavailable || []).length, notStored:check.missing?.length ?? Math.max(0,expected-got-(run.unavailable || []).length), missingSample:uniq([...(check.missing || []), ...wins.flatMap(x => x.missing || [])]).slice(0,6),
+          term:allDates ? query : searchTerm(query, body.from, body.to, field), pubmedUrl:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(allDates ? query : searchTerm(query, body.from, body.to, field)),
+          complete:["reconciled", "zero_results"].includes(run.coverage) && (check.checked ? check.missing.length === 0 : pubmedTotal == null || got + (run.unavailable || []).length === pubmedTotal), gaps:(run.gaps || []).length };
       } catch (error) { results[slot] = { molecule:w.molecule, portfolio:w.portfolio, error:String(error.message || error).slice(0, 160) }; }
     };
     // A few molecules at a time; the shared NCBI gate keeps the request rate within the allowed limit.
@@ -5571,18 +5618,18 @@ async function apiCore(request, env, path) {
   }
   if (path === "/api/pull-mine" && viewer) {
     // Data-entry and QC people search PubMed for a molecule and pull the articles into their own queue, in a portfolio they work in. No watchlist is created and nobody else's work is touched.
-    // Same engine as every other pull: no date-field choice (an article counts if created or published in the dates), no dates means all dates, broad or precise search, optionally in the background.
+    // Uses the selected date field, or all dates if the range is blank.
     const valid = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
     const molecule = String(body.molecule || "").trim().slice(0, 100), synonyms = String(body.synonyms || "").split(/[,;\n]/).map(x => x.trim()).filter(Boolean), portfolio = String(body.portfolio || "").trim().slice(0, 100), allowed = myPortfolios(state, viewer);
     if (!portfolio || !allowed.includes(portfolio)) return json({ error:"Choose one of your own portfolios" + (allowed.length ? " (" + allowed.join(", ") + ")." : ". You have none yet; ask a manager.") }, 403);
     if (!molecule) return json({ error:"Enter a molecule name." }, 400);
-    const allDates = body.allDates === true || (!body.from && !body.to);
+    const allDates = body.allDates === true || (!body.from && !body.to), field = requestedDateField(body);
     if (allDates) { body.from = "1900-01-01"; body.to = day(); }
     else { if (!valid(body.from) || !valid(body.to) || body.from > body.to || body.to > day()) return json({ error:"Choose a valid date range through today, or leave both dates empty for all dates." }, 400);
       if ((Date.parse(body.to) - Date.parse(body.from)) / 864e5 > 366) return json({ error:"Pull one year at a time or less, or leave both dates empty for all dates." }, 400); }
     const cfg = withSettings(env, state), safety = body.safetyOnly === true;
     const names = ownNames({ molecule, names:synonyms });
-    let query = body.searchMode === "precise" ? buildQuery(names.slice(0, 30), safety) : buildBroadQuery(names, safety);
+    let query = body.searchMode === "precise" ? buildQuery(names.slice(0, 30), safety) : buildBroadQuery(broadNames({ molecule, names:synonyms }),safety);
     if (!query) return json({ error:"Enter a molecule name (up to 30 names, 100 characters each)." }, 400);
     const narrow = [body.humans === true && "humans[mh]", body.caseReports === true && '"case reports"[pt]', body.english === true && "english[lang]"].filter(Boolean);
     if (narrow.length || body.noReviews === true) query = "(" + query + ")" + narrow.map(f => " AND " + f).join("") + (body.noReviews === true ? " NOT review[pt]" : "");
@@ -5591,20 +5638,20 @@ async function apiCore(request, env, path) {
     const work = async () => {
       if (allDates) { const total = await countAny(cfg, query); progress[0].expected = total; if (total != null && total > 25000) return { molecule, portfolio, error:total + " articles in PubMed, more than the 25000 one pull takes. Choose Last 12 months, or your own dates." }; }
       const before = new Set(state.assignments.filter(a => a.portfolio === portfolio).map(a => a.pmid)); progress[0].stage = "pulling";
-      let run = await execute(env, { portfolio, molecule, query }, body.from, body.to, { mode:"backfill", dateField:"any", force:true, windowDays:allDates ? 40000 : 92, budget:600, onRun:id => { progress[0].runId = id; } });
-      const pubmedTotal = allDates ? progress[0].expected ?? null : await countAny(cfg, searchTerm(query, body.from, body.to, "any"));
+      let run = await execute(env, { portfolio, molecule, query }, body.from, body.to, { mode:"backfill", dateField:field, force:true, windowDays:allDates ? 40000 : 92, budget:600, onRun:id => { progress[0].runId = id; } });
+      const pubmedTotal = allDates ? progress[0].expected ?? null : await countAny(cfg, searchTerm(query, body.from, body.to, field));
       run = await completeRun(env, run.id, { total:pubmedTotal });
-      progress[0].stage = "checking"; const check = await verifyIds(cfg, run.id, allDates ? query : searchTerm(query, body.from, body.to, "any"), pubmedTotal).catch(() => ({ checked:false, filled:0 }));
+      progress[0].stage = "checking"; const check = await verifyIds(cfg, run.id, allDates ? query : searchTerm(query, body.from, body.to, field), pubmedTotal).catch(() => ({ checked:false, filled:0 }));
       run = (await load(env)).state.runs.find(x => x.id === run.id) || run;
       await write(env, d => { for (const a of d.assignments) if (a.portfolio === portfolio && (run.ids || []).includes(a.pmid) && !before.has(a.pmid)) { a.reviewer = email; a.pulledBy = email; } });
       await settleEvidence(env, run.ids);
       await audit(env, { by:email, action:"pull.mine", target:portfolio + " · " + molecule, detail:{ from:allDates ? "all dates" : body.from, to:allDates ? "" : body.to, count:run.count ?? 0 } });
       const wins = run.windows || [];
       return { molecule, portfolio, mode:body.searchMode === "precise" ? "precise" : "broad", names:names.length - 1, count:run.count ?? 0, added:(run.ids || []).filter(id => !before.has(id)).length, mine:(run.ids || []).filter(id => !before.has(id)).length,
-        expected:pubmedTotal ?? run.expected ?? wins.reduce((n, x) => n + (x.expected || 0), 0), retrieved:uniq(run.ids || []).length, coverage:run.coverage, idCheck:check.checked, filledByCheck:check.filled || 0, unavailable:(run.unavailable || []).length,
-        notStored:Math.max(0, (pubmedTotal ?? run.expected ?? 0) - uniq(run.ids || []).length - (run.unavailable || []).length), missingSample:uniq(wins.flatMap(x => x.missing || [])).slice(0, 6),
-        term:allDates ? query : searchTerm(query, body.from, body.to, "any"), pubmedUrl:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(allDates ? query : searchTerm(query, body.from, body.to, "any")),
-        complete:["reconciled", "zero_results"].includes(run.coverage) && (pubmedTotal == null || uniq(run.ids || []).length + (run.unavailable || []).length >= pubmedTotal), id:run.id };
+        expected:check.listed ?? pubmedTotal ?? run.expected ?? wins.reduce((n, x) => n + (x.expected || 0), 0), retrieved:uniq(run.ids || []).length, coverage:run.coverage, idCheck:check.checked, filledByCheck:check.filled || 0, unavailable:(run.unavailable || []).length,
+        notStored:check.missing?.length ?? Math.max(0,(pubmedTotal ?? run.expected ?? 0)-uniq(run.ids || []).length-(run.unavailable || []).length), missingSample:uniq([...(check.missing || []), ...wins.flatMap(x => x.missing || [])]).slice(0,6),
+        term:allDates ? query : searchTerm(query, body.from, body.to, field), pubmedUrl:"https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(allDates ? query : searchTerm(query, body.from, body.to, field)),
+        complete:["reconciled", "zero_results"].includes(run.coverage) && (check.checked ? check.missing.length === 0 : pubmedTotal == null || uniq(run.ids || []).length + (run.unavailable || []).length === pubmedTotal), id:run.id };
     };
     const wrap = async () => { const r = await work(); return { client:"", allDates, results:[r], total:r.count || 0, added:r.added || 0, complete:!!r.complete, ...r }; };
     if (body.background === true && env.DEFER_EVIDENCE === "1") {
@@ -6887,7 +6934,14 @@ async function apiCore(request, env, path) {
     for (const q of queues.values()) q.sort((x, y) => x.m.from.localeCompare(y.m.from));
     const plan = []; for (let i = 0; plan.length < [...queues.values()].reduce((n, q) => n + q.length, 0); i++) for (const q of queues.values()) if (q[i]) plan.push(q[i]);
     for (const { watch, m } of plan.slice(0, maxWatchesPerRun)) {
-      try { results.push(slim(await execute(env, watch, m.from, m.to, { mode:"monitor" }))); }
+      try {
+        const client = (st.clients || []).find(c => c.id === watch.client), safety = String(watch.query || "").includes(safetyFilter);
+        const broad = watch.molecule && client?.searchMode === "broad" && !handQuery(watch) ? styledQuery(watch,true,safety) : "";
+        const current = queryAt(watch,through);
+        const effective = broad && current.query === watch.query ? { ...watch, query:broad,
+          versions:(watch.versions || [current]).map(v => v.version === current.version ? { ...v, query:broad } : v) } : watch;
+        results.push(slim(await execute(env,effective,m.from,m.to,{ mode:"monitor" })));
+      }
       catch (error) { results.push({ portfolio:watch.portfolio, molecule:watch.molecule || "", from:m.from, to:m.to, error:error.message }); }
     }
     const remaining = Math.max(0, plan.length - maxWatchesPerRun), failed = results.filter(r => r.error), good = results.filter(r => !r.error && r.runId && ["reconciled", "zero_results"].includes(r.coverage)).pop();
@@ -8466,7 +8520,7 @@ async function rowSelect(el){
       if(v==="delete"){await deleteCases([id]);return;}}
   }catch(e){message(e.message,true);}
 }
-document.addEventListener("change",e=>{const t=e.target;if(!t.dataset)return;if(t.dataset.pfitem){const box=t.closest(".pfpick");box.querySelector("input[type=hidden]").value=[...box.querySelectorAll("[data-pfitem]:checked")].map(x=>x.value).join(NL);}if(t.dataset.rowsel)rowSelect(t);if(t.dataset.wcfg){const [pf,mol,field]=t.dataset.wcfg.split("|"),body={watch:pf+"|"+mol};body[field]=t.value;api("watch-config",body).then(()=>{message("Saved.");return refresh();}).then(()=>{render();}).catch(e=>{message(e.message,true);});return;}if(t.dataset.tog){const body={};body[t.dataset.tog]=t.checked?t.dataset.on:t.dataset.off;api("settings",body).then(()=>refresh()).then(()=>{render();message("Saved.");}).catch(e=>{message(e.message,true);t.checked=!t.checked;});return;}if(t.dataset.wssrc){if(t.checked)wsState.src.add(t.dataset.wssrc);else wsState.src.delete(t.dataset.wssrc);}if(t.dataset.wsreg){if(t.checked)wsState.regions.add(t.dataset.wsreg);else wsState.regions.delete(t.dataset.wsreg);}if(t.dataset.wssel!==undefined){if(t.checked)wsState.sel.add(Number(t.dataset.wssel));else wsState.sel.delete(Number(t.dataset.wssel));}if(t.id==="mqclient"){mqState.client=t.value;loadMyQueue();}if(t.id==="plperson"){plState.person=t.value;loadPlanner();}if(t.id==="plclient"){plState.client=t.value;loadPlanner();}if(t.dataset.wtog){const on=t.checked;t.disabled=true;api("watch-auto",{watch:t.dataset.wtog,on}).then(()=>{message(on?"Automatic pull on.":"Automatic pull off.");return refresh();}).then(()=>{if($("autobox"))loadAutoPull();}).catch(err=>{t.checked=!on;message(err.message,true);}).finally(()=>{t.disabled=false;});return;}if(t.dataset.sp){const k=t.dataset.sp;if(k==="mode")spState.broad=t.value==="broad";else if(k==="from"||k==="to"){spState[k]=t.value;const h=$("spdatehint");if(h)h.textContent=spState.from||spState.to?"Articles added to PubMed or published between these dates.":"Every article PubMed has, whatever its dates.";}else spState[k]=t.checked;return;}if(t.id==="cplimit"){document.querySelectorAll(".cpdates").forEach(l=>{l.style.display=t.checked?"":"none";});return;}if(t.id==="cpclient"){cpMolsFill();return;}if(t.id==="dbclient"){dbState.client=t.value;loadDashboard();return;}if(t.id==="dbperson"){dbState.person=t.value;loadDashboard();}if(t.id==="syn_group"){synGroup=t.value;render();}if(t.id==="arc_group"){arcGroup=t.value;render();}if(t.id==="srch_group"){srchGroup=t.value;if(srch.res)$("sres").innerHTML=searchResults();}if(t.id==="arc_filter"){arcFilter=t.value;render();}});
+document.addEventListener("change",e=>{const t=e.target;if(!t.dataset)return;if(t.dataset.pfitem){const box=t.closest(".pfpick");box.querySelector("input[type=hidden]").value=[...box.querySelectorAll("[data-pfitem]:checked")].map(x=>x.value).join(NL);}if(t.dataset.rowsel)rowSelect(t);if(t.dataset.wcfg){const [pf,mol,field]=t.dataset.wcfg.split("|"),body={watch:pf+"|"+mol};body[field]=t.value;api("watch-config",body).then(()=>{message("Saved.");return refresh();}).then(()=>{render();}).catch(e=>{message(e.message,true);});return;}if(t.dataset.tog){const body={};body[t.dataset.tog]=t.checked?t.dataset.on:t.dataset.off;api("settings",body).then(()=>refresh()).then(()=>{render();message("Saved.");}).catch(e=>{message(e.message,true);t.checked=!t.checked;});return;}if(t.dataset.wssrc){if(t.checked)wsState.src.add(t.dataset.wssrc);else wsState.src.delete(t.dataset.wssrc);}if(t.dataset.wsreg){if(t.checked)wsState.regions.add(t.dataset.wsreg);else wsState.regions.delete(t.dataset.wsreg);}if(t.dataset.wssel!==undefined){if(t.checked)wsState.sel.add(Number(t.dataset.wssel));else wsState.sel.delete(Number(t.dataset.wssel));}if(t.id==="mqclient"){mqState.client=t.value;loadMyQueue();}if(t.id==="plperson"){plState.person=t.value;loadPlanner();}if(t.id==="plclient"){plState.client=t.value;loadPlanner();}if(t.dataset.wtog){const on=t.checked;t.disabled=true;api("watch-auto",{watch:t.dataset.wtog,on}).then(()=>{message(on?"Automatic pull on.":"Automatic pull off.");return refresh();}).then(()=>{if($("autobox"))loadAutoPull();}).catch(err=>{t.checked=!on;message(err.message,true);}).finally(()=>{t.disabled=false;});return;}if(t.dataset.sp){const k=t.dataset.sp;if(k==="mode")spState.broad=t.value==="broad";else if(["from","to","dateField"].includes(k))spState[k]=t.value;else spState[k]=t.checked;return;}if(t.id==="cplimit"){document.querySelectorAll(".cpdates").forEach(l=>{l.style.display=t.checked?"":"none";});return;}if(t.id==="cpclient"){cpMolsFill();return;}if(t.id==="dbclient"){dbState.client=t.value;loadDashboard();return;}if(t.id==="dbperson"){dbState.person=t.value;loadDashboard();}if(t.id==="syn_group"){synGroup=t.value;render();}if(t.id==="arc_group"){arcGroup=t.value;render();}if(t.id==="srch_group"){srchGroup=t.value;if(srch.res)$("sres").innerHTML=searchResults();}if(t.id==="arc_filter"){arcFilter=t.value;render();}});
 let srch={q:"",scope:"all",f:{},res:null};
 function searchHtml(){
   const pf=[...new Set((data.assignments||[]).map(a=>a.portfolio))].sort(),f=srch.f,sel=(id,label,opts)=>'<label>'+label+'<select id="'+id+'">'+opts.map(o=>'<option value="'+esc(o[0])+'"'+(String(f[id.slice(3)]||"")===o[0]?" selected":"")+'>'+esc(o[1])+'</option>').join("")+'</select></label>';
@@ -9428,18 +9482,18 @@ function clientPullHtml(title,sub,def){
     '<div class="wide" style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" data-cppull="1">Pull this client</button><button type="button" class="btn outline" data-cpcompare="1">Compare with PubMed</button></div></form><div id="cpout">'+(cpState.out||"")+'</div>',sub);
 }
 // ---- Search & Pull: one place, one engine. Pick what to pull (a client, one molecule, a PMID list, other sources, patient posts); the dates, search style,
-// NCBI sources and filters are shared and kept while you move between them. There is no date-field choice: an article counts if it was created in PubMed or published in the dates.
-let spState={tab:"client",from:"",to:"",broad:true,pmc:false,humans:false,caseReports:false,english:false,noReviews:false,safety:false};
+// NCBI sources and filters are shared and kept while you move between them. The selected date field also applies to PubMed reconciliation.
+let spState={tab:"client",from:"",to:"",dateField:"any",broad:true,pmc:false,humans:false,caseReports:false,english:false,noReviews:false,safety:false};
 function spTabsHtml(mgr){
   const tabs=[["client","By client","Every molecule of a client"],["molecule","One molecule","Look a drug up and pull it"],...(mgr?[["pmids","PMID list","Articles you already have"]]:[]),["world","Other sources","Europe PMC, OpenAlex, trials, regulators"],...(mgr?[["posts","Patient posts","Forum and social posts, masked"]]:[])];
   return '<div class="steptiles sptabs">'+tabs.map((x,i)=>'<button type="button" class="steptile'+(spState.tab===x[0]?" on":"")+'" data-sptab="'+x[0]+'"><span class="st-n">'+(i+1)+'</span><span class="st-t"><b>'+x[1]+'</b><span class="sub">'+x[2]+'</span></span></button>').join("")+'</div>';
 }
 function spSettingsHtml(withSafety){
-  const today=new Date().toISOString().slice(0,10),has=spState.from||spState.to,chip=(k,l)=>{const on=k==="all"?!has:spState.from===new Date(Date.now()-Number(k)*864e5).toISOString().slice(0,10)&&spState.to===today;return '<button type="button" class="fchip'+(on?" on":"")+'" data-sprange="'+k+'">'+l+'</button>';};
+  const today=typeof todayStr==="function"?todayStr():new Date().toISOString().slice(0,10),has=spState.from||spState.to,chip=(k,l)=>{const on=k==="all"?!has:spState.from===new Date(Date.now()-Number(k)*864e5).toISOString().slice(0,10)&&spState.to===today;return '<button type="button" class="fchip'+(on?" on":"")+'" data-sprange="'+k+'">'+l+'</button>';};
   const ck=(k,l)=>'<label class="check"><input type="checkbox" data-sp="'+k+'"'+(spState[k]?" checked":"")+'>&nbsp;'+l+'</label>';
   return '<section class="spset"><div class="body"><div class="sp-grid">'+
-    '<div class="sp-col"><span class="sp-h">Dates</span><div class="fbar" style="margin:0 0 8px">'+chip("all","All dates")+chip("7","Past week")+chip("30","Last 30 days")+chip("90","Last 3 months")+chip("365","Last 12 months")+'</div><div class="sp-row"><label>From<input type="date" data-sp="from" value="'+esc(spState.from)+'" max="'+today+'"></label><label>Through<input type="date" data-sp="to" value="'+esc(spState.to)+'" max="'+today+'"></label></div><span class="sub" id="spdatehint">'+(has?"Articles added to PubMed or published between these dates.":"Every article PubMed has, whatever its dates.")+'</span></div>'+
-    '<div class="sp-col"><span class="sp-h">Search</span><label class="check"><input type="radio" name="spmode" data-sp="mode" value="broad"'+(spState.broad?" checked":"")+'>&nbsp;<b>Broad</b>, like the PubMed website</label><label class="check"><input type="radio" name="spmode" data-sp="mode" value="precise"'+(spState.broad?"":" checked")+'>&nbsp;<b>Precise</b>: title, abstract and MeSH</label><span class="sub">Broad finds several times more. Only the molecule name and the other names given to it are searched, never its portfolio.</span></div>'+
+    '<div class="sp-col"><span class="sp-h">Dates</span><div class="fbar" style="margin:0 0 8px">'+chip("all","All dates")+chip("7","Past week")+chip("30","Last 30 days")+chip("90","Last 3 months")+chip("365","Last 12 months")+'</div><div class="sp-row"><label>From<input type="date" data-sp="from" value="'+esc(spState.from)+'" max="'+today+'"></label><label>Through<input type="date" data-sp="to" value="'+esc(spState.to)+'" max="'+today+'"></label></div><label>Date basis<select data-sp="dateField">'+[["any","Created or published"],["crdt","PubMed Create Date"],["pdat","Publication Date"]].map(([v,label])=>'<option value="'+v+'"'+(spState.dateField===v?" selected":"")+'>'+label+'</option>').join("")+'</select></label></div>'+
+    '<div class="sp-col"><span class="sp-h">Search</span><label class="check"><input type="radio" name="spmode" data-sp="mode" value="broad"'+(spState.broad?" checked":"")+'>&nbsp;<b>Broad</b>, like the PubMed website</label><label class="check"><input type="radio" name="spmode" data-sp="mode" value="precise"'+(spState.broad?"":" checked")+'>&nbsp;<b>Precise</b>: title, abstract and MeSH</label><span class="sub">Broad finds several times more. Search uses the molecule, its saved names and known spelling variants.</span></div>'+
     '<div class="sp-col"><span class="sp-h">NCBI sources</span><label class="check"><input type="checkbox" checked disabled>&nbsp;PubMed</label>'+ck("pmc","PubMed Central (full texts)")+'<span class="sub">PubMed Central finds papers that name the drug only in the body text.</span></div>'+
     '<div class="sp-col"><span class="sp-h">Filters (optional)</span>'+ck("humans","Humans")+ck("caseReports","Case reports")+ck("english","English")+ck("noReviews","No reviews")+(withSafety?ck("safety","Safety articles only"):"")+'</div>'+
   '</div>'+(((data.config||{}).ncbi||{}).keySet?"":'<div class="sp-tip"><b>Pull about three times faster:</b> PubMed allows 3 requests a second without a key and 10 with a free NCBI API key. <button type="button" class="btn outline sm" data-tab="Settings">Add the key in Settings</button></div>')+'</div></section>';
@@ -9469,7 +9523,7 @@ function cpSettings(){
   const f=$("cpform");
   if(f&&f.elements.limit){const e=f.elements,lim=e.limit.checked;return {...(lim?{from:e.from.value,to:e.to.value}:{allDates:true}),humans:e.humans.checked,caseReports:e.caseReports.checked,english:e.english.checked,noReviews:e.noReviews.checked,searchMode:e.broad.checked?"broad":"precise",includePmc:e.pmc.checked,_lim:lim};}
   const lim=!!(spState.from||spState.to);
-  return {...(lim?{from:spState.from,to:spState.to}:{allDates:true}),humans:spState.humans,caseReports:spState.caseReports,english:spState.english,noReviews:spState.noReviews,searchMode:spState.broad?"broad":"precise",includePmc:spState.pmc,_lim:lim};
+  return {...(lim?{from:spState.from,to:spState.to,dateField:spState.dateField}:{allDates:true}),humans:spState.humans,caseReports:spState.caseReports,english:spState.english,noReviews:spState.noReviews,searchMode:spState.broad?"broad":"precise",includePmc:spState.pmc,_lim:lim};
 }
 // Runs pulls (three at a time, each in the background on the server) and draws one row per molecule as it finishes.
 async function runPullJobs(btn,list,bodyFor,route,done){
@@ -9502,8 +9556,8 @@ async function runClientPull(btn){
 }
 async function runClientCompare(btn){
   const st=cpSettings();btn.disabled=true;cpState.out='<div class="sub" style="margin-top:10px">Asking PubMed…</div>';$("cpout").innerHTML=cpState.out;
-  try{const r=await api("compare-client",st._lim?{client:$("cpclient").value,from:st.from,to:st.to}:{client:$("cpclient").value,allDates:true}),n=x=>x==null?"?":String(x);
-    cpState.out='<div class="purgesum" style="margin-top:12px"><b>The app search against the PubMed website</b><span class="sub">'+(r.allDates?"all dates":esc(r.from)+' to '+esc(r.to))+'</span></div>'+table(["Molecule","Precise search","Broad (website style)","Broad, any date","Stored here",""],r.rows.map(x=>['<b>'+esc(x.molecule)+'</b><div class="sub">'+esc(x.portfolio)+' · '+x.names+' names</div>',n(x.precise),'<b>'+n(x.site)+'</b>',n(x.allTime),String(x.stored),'<a class="btn outline sm" href="'+esc(x.link)+'" target="_blank" rel="noopener">Open in PubMed</a>']),"")+'<p class="sub">If the broad search finds much more than the precise one, choose Broad. If only the any-date figure is large, clear the dates.</p>';
+  try{const molecules=[...document.querySelectorAll("[data-cpmol]:checked")].map(x=>x.dataset.cpmol);if(!molecules.length)throw new Error("Tick at least one molecule.");if(st._lim&&(!st.from||!st.to))throw new Error("Choose both dates.");delete st._lim;const r=await api("compare-client",{...st,client:$("cpclient").value,molecules}),n=x=>x==null?"—":String(x);
+    cpState.out='<div class="purgesum" style="margin-top:12px"><b>PubMed reconciliation</b><span class="sub">'+(r.allDates?"all dates":esc(r.from)+' to '+esc(r.to))+'</span></div>'+table(["Molecule","PubMed matches","Stored matches","Missing PMIDs",""],r.rows.map(x=>['<b>'+esc(x.molecule)+'</b><div class="sub">'+esc(x.portfolio)+'</div>',n(x.site),n(x.stored),n(x.missing)+(x.missingSample.length?'<div class="sub">'+esc(x.missingSample.join(", "))+'</div>':x.checked?"":'<div class="sub">PMID comparison unavailable. Try a shorter range.</div>'),'<a class="btn outline sm" href="'+esc(x.link)+'" target="_blank" rel="noopener">Open exact search in PubMed</a>']),"")+'<p class="sub">Matches use the selected date basis and filters. The Library displays cumulative counts across its stored date ranges.</p>';
     $("cpout").innerHTML=cpState.out;}catch(err){cpState.out='<div class="sub" style="color:var(--red);margin-top:10px">'+esc(err.message)+'</div>';$("cpout").innerHTML=cpState.out;}
   btn.disabled=false;
 }

@@ -17,12 +17,13 @@ export async function mirrorLibrary(worker, env, root) {
     const dir = join(root, ...folder.split("/"));
     expected.add(dir);
     await mkdir(dir, { recursive: true });
-    const rows = [["No.", "Source", "PMID", "Title", "DOI", "Full text", "Full-text source", "Licence", "Access", "Retraction check"]];
+    const rows = [["No.", "Source", "PMID", "Title", "DOI", "Full text", "Full-text source", "Licence", "Access", "Retraction check", "Citation XML", "Citation snapshot"]];
     for (const entry of entries) {
       const id = entry.pmid, tag = String(entry.n).padStart(entry.width, "0") + "_", a = state.articles[id];
       if (!a) continue;
       const ext = /\.(\w+)$/.exec(a.fullTextKey || "")?.[1] || "bin";
-      for (const [key, name] of [[a.fullTextKey, `${tag}PMID_${id}.${ext}`], [a.fullTextTextKey, `${tag}PMID_${id}_text.txt`], [a.screenshotKey, `${tag}PMID_${id}_record.png`]]) {
+      const citation = a.evidence?.efetch?.key || a.citationXmlKey, snapshot = a.evidence?.snapshot?.key;
+      for (const [key, name] of [[citation, `${tag}PMID_${id}_citation.xml`], [snapshot, `${tag}PMID_${id}_snapshot.svg`], [a.fullTextKey, `${tag}PMID_${id}.${ext}`], [a.fullTextTextKey, `${tag}PMID_${id}_text.txt`], [a.screenshotKey, `${tag}PMID_${id}_record.png`]]) {
         if (!key) continue;
         const target = join(dir, name), older = join(dir, name.slice(tag.length));
         // A record card is written again when the stored snapshot is newer than the copy on disk (the card layout changed, or it was re-taken).
@@ -33,7 +34,7 @@ export async function mirrorLibrary(worker, env, root) {
         await writeFile(target, Buffer.from(await object.arrayBuffer()));
         written++;
       }
-      rows.push([tag.slice(0, -1), a.source || "PubMed", id, a.title, a.doi, a.fullTextStatus || "", a.fullTextOrigin || "", a.fullTextLicense || "", a.oaStatus || "", a.retractionStatus || ""]);
+      rows.push([tag.slice(0, -1), a.source || "PubMed", id, a.title, a.doi, a.fullTextStatus || "", a.fullTextOrigin || "", a.fullTextLicense || "", a.oaStatus || "", a.retractionStatus || "", citation ? "Stored" : "", snapshot ? "Stored" : ""]);
     }
     await writeFile(join(dir, "_index.csv"), csv(rows));
   }
@@ -49,7 +50,7 @@ export async function mirrorLibrary(worker, env, root) {
         if (!expected.has(full) && rest.every(n => n === "_index.csv")) { await unlink(join(full, "_index.csv")).catch(() => {}); }
         await rmdir(full).catch(() => {});
       }
-      else if (entry.isFile()) { const m = /PMID_([A-Za-z0-9-]+?)(?:_text|_record)?\.[A-Za-z]+$/.exec(entry.name); if (m && !state.articles[m[1]]) await unlink(full).catch(() => {}); }
+      else if (entry.isFile()) { const m = /PMID_([A-Za-z0-9-]+?)(?:_text|_record|_citation|_snapshot)?\.[A-Za-z]+$/.exec(entry.name); if (m && !state.articles[m[1]]) await unlink(full).catch(() => {}); }
     }
   };
   await walk(root, 0);
