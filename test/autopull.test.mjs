@@ -322,3 +322,23 @@ test("a start date in the future is accepted, and nothing is pulled before it", 
   assert.equal(ncbi.calls.filter(c => c.startsWith("esearch")).length, 0, "no search before the start date");
   const s = await t.call(M, "/api/scheduler-status", {}); assert.equal(s.body.perWatch[0].missing, 0);
 });
+
+test("the automatic pull goes by publication date, and the daily late-arrival sweep picks up an article indexed after its publication day", async () => {
+  const { makeEnv: mk, MANAGER: M, fakeNcbi: fk, withFetch: wf } = await import("./helpers.mjs");
+  const ago = n => new Date(Date.now() + 5.5 * 3600000 - n * 864e5).toISOString().slice(0, 10);
+  const t = await mk({ watches: [{ portfolio: "P", molecule: "aspirin", query: "((aspirin))", names: [] }] });
+  // day 1: PubMed has one article published yesterday
+  const recs = [{ pmid: "81", date: ago(1) }], ncbi = fk(recs);
+  await wf(ncbi.handler, () => t.call(M, "/api/scheduled", { force: true }));
+  let st = await t.state();
+  assert.ok(st.articles["81"]); assert.ok(st.runs.some(r => r.mode === "monitor" && r.dateField === "pdat"), "monitoring runs on publication date");
+  assert.ok(ncbi.calls.some(c => c.includes("[dp]")) && !ncbi.calls.some(c => c.startsWith("esearch") && c.includes("[crdt]")), "no create-date searches");
+  // later: PubMed indexes an article whose publication date is 20 days back (its day was already monitored)
+  recs.push({ pmid: "82", date: ago(20) }); st.sweeps = {}; await t.BUCKET.put("bench.json", JSON.stringify(st));
+  await wf(ncbi.handler, () => t.call(M, "/api/scheduled", { force: true }));
+  st = await t.state();
+  assert.ok(st.articles["82"], "the late-indexed article was swept in"); assert.ok(st.assignments.some(a => a.pmid === "82" && a.molecules.includes("aspirin")));
+  // the sweep runs once a day per molecule
+  ncbi.calls.length = 0; await wf(ncbi.handler, () => t.call(M, "/api/scheduled", { force: true }));
+  assert.ok(!ncbi.calls.some(c => c.startsWith("esearch") && c.includes(ago(1 + 60).replaceAll("-", "/"))), "no second sweep the same day");
+});

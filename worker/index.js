@@ -628,10 +628,14 @@ async function runImport(env, runId, budget = 12, { respectBackoff = false } = {
 }
 // ---- The ledger of search windows. Coverage is tracked per watchlist, per day and per date field, from the windows that actually ran: a later success never hides an earlier failed or missing day. ----
 const daysIn = (from, to) => { const out = []; for (let d = from; d <= to && out.length < 3700; d = addDays(d, 1)) out.push(d); return out; };
-function ledgerFor(state, watch, field = "crdt") {
+// The automatic pull goes by publication date [dp], day by day, like the weekly reports clients receive. A daily late-arrival sweep (below)
+// catches articles PubMed indexes after their publication date, which a day-by-day publication-date pull would otherwise never see.
+const AUTO_FIELD = "pdat", SWEEP_DAYS = 60;
+function ledgerFor(state, watch, field = AUTO_FIELD) {
   const days = new Map();
   for (const r of state.runs) {
-    if (r.portfolio !== watch.portfolio || (r.molecule || "") !== (watch.molecule || "") || (r.dateField || "crdt") !== field) continue;
+    // Only automatic (monitor) runs count as coverage: a manual pull with other dates or settings does not mark a day as monitored.
+    if (r.portfolio !== watch.portfolio || (r.molecule || "") !== (watch.molecule || "") || (r.dateField || "crdt") !== field || (r.mode && r.mode !== "monitor")) continue;
     const wins = r.windows?.length ? r.windows : [{ from:r.from, to:r.to, state:r.status === "Imported" ? "reconciled" : "failed", attempts:0, error:r.error || "" }];
     for (const w of wins) { const covered = ["reconciled", "zero_results"].includes(w.state); for (const d of daysIn(w.from, w.to)) { const cur = days.get(d); if (cur?.covered) continue; days.set(d, { covered, state:w.state, attempts:w.attempts || 0, error:w.error || "", runId:r.id, expected:w.expected ?? null, retrieved:w.retrieved ?? null, lastAttemptAt:w.lastAttemptAt || r.time || "" }); } }
   }
@@ -644,7 +648,7 @@ function pullRange(state, watch) {
   const c = (state.clients || []).find(x => x.id === watch.client) || {};
   return { from:[watch.startFrom, c.startFrom, state.settings?.autoPullFrom].find(isDate) || "", until:[watch.until, c.until].find(isDate) || "" };
 }
-function missedWindows(state, watch, through, field = "crdt") {
+function missedWindows(state, watch, through, field = AUTO_FIELD) {
   const days = ledgerFor(state, watch, field), recorded = [...days.keys()].sort(), range = pullRange(state, watch), from = range.from, start = from || recorded[0] || through, out = [], end = range.until && range.until < through ? range.until : through;
   for (const d of daysIn(start, end)) {
     const e = days.get(d); if (e?.covered) continue;
@@ -656,7 +660,7 @@ function missedWindows(state, watch, through, field = "crdt") {
 }
 async function execute(env, watch, from, to, { mode = "monitor", dateField, force = false, windowDays = 0, onRun = null, budget = 12, snapshot = null } = {}) {
   env = withSettings(env, (await load(env)).state);
-  const field = DATE_FIELDS[dateField] ? dateField : mode === "backfill" ? "pdat" : "crdt", windows = makeWindows(watch, from, to, windowDays || (mode === "backfill" ? 14 : 7), field);
+  const field = DATE_FIELDS[dateField] ? dateField : mode === "backfill" ? "pdat" : AUTO_FIELD, windows = makeWindows(watch, from, to, windowDays || (mode === "backfill" ? 14 : 7), field);
   const key = [watchKey(watch), mode, field, from, to, await sha256Hex(JSON.stringify(windows.map(w => [w.queryVersion,w.term])))].join("|");
   const run = { id:crypto.randomUUID(), source:"PubMed", portfolio:watch.portfolio, molecule:watch.molecule || "", from, to, mode, ...(snapshot ? { snapshot, watchId:snapshot.watchId || "" } : {}), dateField:field, dateFieldLabel:DATE_FIELDS[field].label, windows, ids:[], count:0, time:new Date().toISOString(), searchedAt:new Date().toISOString(),
     query:windows[windows.length - 1].query, queryVersions:uniq(windows.map(w => w.queryVersion)), executedQueries:uniq(windows.map(w => w.term)).slice(0, 50), idem:key, status:"Running", coverage:"running" };
@@ -5997,6 +6001,8 @@ async function apiCore(request, env, path) {
       const r = await res.json().catch(() => ({}));
       out.push(res.ok ? { molecule:w.molecule, ok:true, mode:r.search?.mode, query:r.search?.query, countries:r.search?.countries || [] } : { molecule:w.molecule, ok:false, error:r.error || "Not saved." });
     }
+    // The client remembers the last block pasted for it, so it can be seen, corrected and applied again later.
+    if (clientId && clientId !== "none") await write(env, data => { const c = (data.clients || []).find(x => x.id === clientId); if (c) { c.lastPaste = String(body.text || "").slice(0, 60000); c.lastPasteAt = new Date().toISOString(); c.lastPasteBy = email; } });
     return json({ results:out, saved:out.filter(x => x.ok).length, failed:out.filter(x => !x.ok).length });
   }
   if ((path === "/api/saved-searches" || path === "/api/saved-search") && viewer) {
@@ -7237,12 +7243,12 @@ async function apiCore(request, env, path) {
     }
     const watch = state.watches.find(w => w.portfolio === body.portfolio && (w.molecule || "") === (body.molecule || ""));
     if (!watch || !/^\d{4}-\d{2}-\d{2}$/.test(body.from || "") || !/^\d{4}-\d{2}-\d{2}$/.test(body.to || "") || body.from > body.to) return json({ error:"Choose a watchlist and a date range." }, 400);
-    await write(env, data => { for (const r of data.runs) { if (r.portfolio !== watch.portfolio || (r.molecule || "") !== (watch.molecule || "") || (r.dateField || "crdt") !== "crdt") continue;
+    await write(env, data => { for (const r of data.runs) { if (r.portfolio !== watch.portfolio || (r.molecule || "") !== (watch.molecule || "") || (r.dateField || "crdt") !== AUTO_FIELD) continue;
       for (const w of r.windows || []) if (w.to >= body.from && w.from <= body.to && ["failed", "partial"].includes(w.state)) { w.attempts = 0; w.lastAttemptAt = ""; w.state = "pending"; w.error = ""; } summarizeRun(r); } });
     const fresh = (await load(env)).state, retried = [];
     for (const r of fresh.runs.filter(r => r.windows?.some(w => w.state === "pending"))) retried.push((await runImport(env, r.id, 12)).id);
     const stillMissing = missedWindows((await load(env)).state, watch, through).filter(m => m.state === "missing" && m.to >= body.from && m.from <= body.to);
-    for (const m of stillMissing) await execute(env, watch, m.from < body.from ? body.from : m.from, m.to > body.to ? body.to : m.to, { mode:"monitor" });
+    for (const m of stillMissing) await execute(env, watch, m.from < body.from ? body.from : m.from, m.to > body.to ? body.to : m.to, { mode:"monitor", dateField:AUTO_FIELD });
     await audit(env, { by:email, action:"import.missed_retry", target:watch.portfolio + (watch.molecule ? " · " + watch.molecule : ""), detail:{ from:body.from, to:body.to } });
     return json({ ok:true, missed:missedWindows((await load(env)).state, watch, through) });
   }
@@ -7486,14 +7492,36 @@ async function apiCore(request, env, path) {
       try {
         // The daily pull runs the molecule's saved search exactly as a manual pull does.
         const dspec = watch.molecule ? searchSpec(st, watch, {}) : null, daily = dspec ? dspec.query : "", broad = daily && daily !== watch.query && daily.length <= 1500 ? daily : "";
-        if (dspec && dspec.mode === "pubmed") { const pre = await esearchInfo(withSettings(env, st), searchTerm(daily, m.from, m.to, "crdt")), loose = looseNames(dspec, pre?.warnings);
+        if (dspec && dspec.mode === "pubmed") { const pre = await esearchInfo(withSettings(env, st), searchTerm(daily, m.from, m.to, AUTO_FIELD)), loose = looseNames(dspec, pre?.warnings);
           if (loose.length) { results.push({ portfolio:watch.portfolio, molecule:watch.molecule || "", from:m.from, to:m.to, error:looseError(loose) }); continue; } }
         const current = queryAt(watch,through);
         const effective = broad && current.query === watch.query ? { ...watch, query:broad,
           versions:(watch.versions || [current]).map(v => v.version === current.version ? { ...v, query:broad } : v) } : watch;
-        results.push(slim(await execute(env,effective,m.from,m.to,{ mode:"monitor" })));
+        results.push(slim(await execute(env,effective,m.from,m.to,{ mode:"monitor", dateField:AUTO_FIELD })));
       }
       catch (error) { results.push({ portfolio:watch.portfolio, molecule:watch.molecule || "", from:m.from, to:m.to, error:error.message }); }
+    }
+    // Late-arrival sweep, once a day per molecule: everything published in the last 60 days that the saved search finds and that is not stored and linked
+    // to the molecule yet is fetched now (only those PMIDs). An article indexed weeks after its publication date is therefore still pulled.
+    if (autoOn) {
+      const today = day(), cfgS = withSettings(env, st), done = { ...(st.sweeps || {}) }, swept = [];
+      const due = st.watches.filter(w => w.molecule && !(only && (only === "none" ? clientOf(w) : clientOf(w) !== only)) && !((w.auto === false || clientPaused(w)) && body.force !== true) && done[watchKey(w)] !== today).slice(0, Number(env.SWEEP_PER_TICK || 25));
+      for (const w of due) {
+        try {
+          // Within the molecule's own start and stop dates only.
+          const rng = pullRange(st, w), sFrom = [addDays(through, -SWEEP_DAYS), rng.from].filter(isDate).sort().pop(), sTo = rng.until && rng.until < through ? rng.until : through;
+          if (sFrom > sTo) { done[watchKey(w)] = today; continue; }
+          const spec = searchSpec(st, w, {}), term = searchTerm(spec.query, sFrom, sTo, AUTO_FIELD);
+          const { esearchresult: r } = await withRetry(cfgS, () => pubmed(cfgS, "esearch", { term, retmode:"json", retmax:"10000" }));
+          if (spec.mode === "pubmed" && looseNames(spec, warnList(r)).length) { done[watchKey(w)] = today; continue; }
+          const cur = (await load(env)).state, held = new Set(cur.assignments.filter(a => samePf(w, a.portfolio) && (a.molecules || []).includes(w.molecule) && cur.articles[a.pmid]).map(a => a.pmid));
+          const fresh = uniq((r?.idlist || []).map(String)).filter(id => /^\d+$/.test(id) && !held.has(id)).slice(0, 500);
+          let added = 0; if (fresh.length) { const got = await importPmidList(env, fresh.map(pmid => ({ pmid })), w.portfolio, w.molecule); added = (got.run?.ids || []).length; }
+          done[watchKey(w)] = today; swept.push({ molecule:w.molecule, portfolio:w.portfolio, found:fresh.length, added });
+        } catch (error) { swept.push({ molecule:w.molecule, portfolio:w.portfolio, error:String(error.message || error).slice(0, 120) }); }
+      }
+      if (due.length) await write(env, data => { data.sweeps = Object.fromEntries(Object.entries({ ...(data.sweeps || {}), ...done }).filter(([, d]) => d >= addDays(today, -7))); });
+      for (const x of swept) if (x.added || x.error) results.push({ portfolio:x.portfolio, molecule:x.molecule, sweep:true, added:x.added || 0, error:x.error });
     }
     const remaining = Math.max(0, plan.length - maxWatchesPerRun), failed = results.filter(r => r.error), good = results.filter(r => !r.error && r.runId && ["reconciled", "zero_results"].includes(r.coverage)).pop();
     await resumePullJobs(env).catch(() => []);
@@ -10131,7 +10159,7 @@ function spClientHtml(){
   if(!cpState.client||!opts.some(x=>x[0]===cpState.client))cpState.client=opts.length?opts[0][0]:"";
   if(!opts.length)return panel("Saved searches",'<div class="empty">No client has molecules yet.'+(mgr?" Add a client and its molecules on the Clients page.":" Ask a manager to add clients and molecules.")+'</div>');
   return panel("Saved searches",'<div class="grid"><label>Client<select id="cpclient">'+opts.map(x=>'<option value="'+esc(x[0])+'"'+(x[0]===cpState.client?" selected":"")+'>'+esc(x[1])+' ('+clientMols(x[0]).length+')</option>').join("")+'</select></label>'+
-    (mgr?'<details class="wide ssbulk"><summary><b>Paste settings for several molecules</b></summary><p class="sub">One line per molecule: <code>molecule | names: … | mode: pubmed, precise or custom | query: … | countries: … | safety: yes or no</code>. Leave out what should not change; an empty value clears it (for example <code>countries:</code>).</p><textarea id="ssbulktext" rows="8" style="width:100%;font-family:ui-monospace,monospace;font-size:12px" placeholder="metformin | names: metformine, dimethylbiguanide | countries:"></textarea><div style="display:flex;gap:8px;margin-top:6px"><button type="button" class="btn sm" data-ssbulk="1">Apply to the client chosen above</button></div><div id="ssbulkout"></div></details>':"")+
+    (mgr?'<div class="wide" id="ssbulkbox">'+(cpState.client&&cpState.client!=="none"?ssBulkHtml(cpState.client,"sp"):"")+'</div>':"")+
     '<div class="wide"><span class="sub">One saved search per molecule. Untick a molecule to leave it out of this pull.</span><div class="sslist" id="cpmols"><div class="sub">Loading the saved searches…</div></div></div>'+
     '<div class="wide" style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn" data-cppull="1">Pull this client</button><button type="button" class="btn outline" data-cpcompare="1">Compare with PubMed</button></div></div><div id="cpout">'+(cpState.out||"")+'</div>',mgr?"Every ticked molecule runs its saved search for the dates above, one at a time, and each row compares the stored PMIDs with the exact set PubMed returns. Edit a saved search to change what is searched; the change applies to pulls and to the daily automatic pull from today.":"The molecules of this client that you work on run their saved searches, into your own queue.");
 }
@@ -10269,7 +10297,7 @@ function ssStFor(key,st){const o=ssOwn(key);if(!o)return st;const v={...st,from:
 function ssOwnMap(sel){const m={};for(const k of sel){const o=ssOwn(k);if(o)m[k]={from:o.from,to:o.to};}return m;}
 function ssDates(key){const st=ssStFor(key,cpSavedSettings());return st.allDates?{}:{from:st.from,to:st.to,dateField:st.dateField};}
 function ssDraw(){const box=$("cpmols");if(!box)return;const list=cpState.ssList||[];box.innerHTML=list.length?list.map(ssCard).join(""):'<div class="empty">This client has no molecules yet.</div>';}
-async function cpMolsFill(){const box=$("cpmols");if(!box)return;const c=$("cpclient").value;if(cpState.client!==c){cpState.ssEdit="";cpState.ssCounts={};cpState.ssOff={};cpState.ssOwn={};}cpState.client=c;
+async function cpMolsFill(){const box=$("cpmols");if(!box)return;const c=$("cpclient").value;if(cpState.client!==c){cpState.ssEdit="";cpState.ssCounts={};cpState.ssOff={};cpState.ssOwn={};}cpState.client=c;if($("ssbulkbox"))$("ssbulkbox").innerHTML=c&&c!=="none"?ssBulkHtml(c,"sp"):"";
   try{const r=await api("saved-searches",{client:c});if($("cpclient").value!==c)return;cpState.ssList=r.searches||[];ssDraw();}catch(err){box.innerHTML='<div class="sub" style="color:var(--red)">'+esc(err.message)+'</div>';}}
 async function ssCount(key){cpState.ssCounts=cpState.ssCounts||{};cpState.ssCounts[key]={busy:true};ssDraw();
   try{const r=await api("saved-search",{key,...ssDates(key)});cpState.ssCounts[key]=r.count||{error:"No answer from PubMed."};}catch(err){cpState.ssCounts[key]={error:err.message};}ssDraw();}
@@ -10415,6 +10443,14 @@ async function loadPullStats(){
 // ---- Clients: one row per client (on/off switch, figures) that opens into a compact molecule list. Reports and settings sit below.
 let ccState={open:new Set(),q:{}};
 // A country is saved on its own, without reloading the page, so countries typed in other rows are not lost while one saves.
+// The paste box for a client's saved searches, prefilled with the last block pasted for that client.
+function ssBulkHtml(cid,where){
+  const c=(data.clients||[]).find(x=>x.id===cid)||{},last=c.lastPaste||"";
+  return '<details class="wide ssbulk"'+(where==="cc"?' style="margin:8px 0"':"")+'><summary><b>Paste settings for several molecules</b>'+(c.lastPasteAt?' <span class="sub">last pasted '+esc(c.lastPasteAt.slice(0,10))+(c.lastPasteBy?" by "+esc(c.lastPasteBy):"")+'</span>':"")+'</summary>'+
+    '<p class="sub">One line per molecule: <code>molecule | names: … | mode: pubmed, precise or custom | query: … | countries: … | safety: yes or no</code>. Leave out what should not change; an empty value clears it (for example <code>countries:</code>). The last block pasted for this client is kept here.</p>'+
+    '<textarea class="ssbulktext" data-bulkfor="'+esc(cid)+'" rows="8" style="width:100%;font-family:ui-monospace,monospace;font-size:12px" placeholder="metformin | names: metformine, dimethylbiguanide | countries:">'+esc(last)+'</textarea>'+
+    '<div style="display:flex;gap:8px;margin-top:6px"><button type="button" class="btn sm" data-ssbulk="'+esc(cid)+'">Apply to '+esc(c.name||"this client")+'</button></div><div class="ssbulkout"></div></details>';
+}
 function ccSaveCountry(t){
   const k=t.dataset.ccountry,v=t.value;if(t.dataset.saving===v)return;t.dataset.saving=v;t.classList.remove("ok","bad");t.classList.add("busy");
   api("saved-search",{key:k,countries:v,save:true}).then(r=>{const c=(r.search&&r.search.countries)||[],w=(data.watches||[]).find(x=>encodeURIComponent(x.portfolio)+"|"+encodeURIComponent(x.molecule||"")===k);
@@ -10454,7 +10490,7 @@ function clientsHtml(){
       (open?'<div class="cc-body"><div class="cc-tools"><input type="search" class="cc-search" data-ccq="'+esc(c.id)+'" value="'+esc(ccState.q[c.id]||"")+'" placeholder="Find a molecule in '+esc(c.name)+'"><button type="button" class="btn sm" data-addmol="'+esc(c.id)+'">+ Add molecules</button>'+
         (free.length?'<form data-route="client-assign" class="cc-add"><input type="hidden" name="client" value="'+esc(c.id)+'"><select name="watch" aria-label="Molecule without a client">'+watchOpts(free)+'</select><button class="btn outline sm">Assign</button></form>':"")+
         (mgr?'<form data-route="client-delete" style="margin-left:auto"><input type="hidden" name="id" value="'+esc(c.id)+'"><button class="btn outline sm" style="color:var(--red)">Remove client</button></form>':"")+'</div>'+
-        '<div class="bar" style="margin:4px 0 8px"><i style="width:'+pct+'%"></i></div><div data-cclist="'+esc(c.id)+'">'+ccMolRows(c,mols)+'</div></div>':"")+'</section>';
+        (mgr?ssBulkHtml(c.id,"cc"):"")+'<div class="bar" style="margin:4px 0 8px"><i style="width:'+pct+'%"></i></div><div data-cclist="'+esc(c.id)+'">'+ccMolRows(c,mols)+'</div></div>':"")+'</section>';
   }).join("");
   const top='<div class="cc-top"><form class="cc-new" data-route="client-save"><input name="name" required maxlength="80" placeholder="New client name"><input name="contact" maxlength="120" placeholder="Contact (optional)"><button class="btn sm">Add client</button></form>'+
     '<span class="cc-topbtns"><button type="button" class="btn outline sm" data-ccall="open">Open all</button><button type="button" class="btn outline sm" data-ccall="close">Close all</button><button type="button" class="btn sm" data-addmol="">+ Add molecules</button></span></div>';
@@ -10947,11 +10983,13 @@ document.addEventListener("click",event=>{
   if(target.dataset.ssdates){const st=cpSavedSettings(),today=new Date().toISOString().slice(0,10);cpState.ssOwn=cpState.ssOwn||{};cpState.ssOwn[target.dataset.ssdates]={from:st.from||new Date(Date.now()-30*864e5).toISOString().slice(0,10),to:st.to||today};ssDraw();return;}
   if(target.dataset.ssdatesoff){if(cpState.ssOwn)delete cpState.ssOwn[target.dataset.ssdatesoff];ssDraw();return;}
   if(target.dataset.ssrange){const k=target.dataset.sskey2,today=new Date().toISOString().slice(0,10);cpState.ssOwn=cpState.ssOwn||{};cpState.ssOwn[k]={from:new Date(Date.now()-Number(target.dataset.ssrange)*864e5).toISOString().slice(0,10),to:today};ssDraw();return;}
-  if(target.dataset.ssbulk){const text=$("ssbulktext").value;if(!text.trim())return message("Paste the lines first.",true);
-    const cs=$("cpclient"),cname=cs.options[cs.selectedIndex]?cs.options[cs.selectedIndex].text:"this client",n=text.split(String.fromCharCode(10)).filter(l=>l.trim()&&l.trim().charAt(0)!=="#").length;
-    if(!confirm("Apply "+n+" line"+(n===1?"":"s")+" to "+cname+"? Only molecules of "+cname+" are changed."))return;target.disabled=true;
-    api("saved-search-bulk",{client:$("cpclient").value,text}).then(async r=>{$("ssbulkout").innerHTML=table(["Molecule","Result"],r.results.map(x=>['<b>'+esc(x.molecule)+'</b>',x.ok?badge("Saved","green")+(x.countries&&x.countries.length?" "+badge("Country: "+x.countries.join(", "),""):"")+'<div class="sub"><code>'+esc(x.query||"")+'</code></div>':'<span style="color:var(--red)">'+esc(x.error)+'</span>']),"");
-      message(r.saved+" saved"+(r.failed?", "+r.failed+" not saved":"")+".",r.failed>0);await cpMolsFill();}).catch(err=>message(err.message,true)).finally(()=>{target.disabled=false;});return;}
+  if(target.dataset.ssbulk){const cid=target.dataset.ssbulk,box=target.closest(".ssbulk"),ta=box.querySelector(".ssbulktext"),out=box.querySelector(".ssbulkout"),text=ta.value;if(!text.trim())return message("Paste the lines first.",true);
+    const c=(data.clients||[]).find(x=>x.id===cid)||{name:"this client"},n=text.split(String.fromCharCode(10)).filter(l=>l.trim()&&l.trim().charAt(0)!=="#").length;
+    if(!confirm("Apply "+n+" line"+(n===1?"":"s")+" to "+c.name+"? Only molecules of "+c.name+" are changed."))return;target.disabled=true;
+    api("saved-search-bulk",{client:cid,text}).then(async r=>{const res=table(["Molecule","Result"],r.results.map(x=>['<b>'+esc(x.molecule)+'</b>',x.ok?badge("Saved","green")+(x.countries&&x.countries.length?" "+badge("Country: "+x.countries.join(", "),""):"")+'<div class="sub"><code>'+esc(x.query||"")+'</code></div>':'<span style="color:var(--red)">'+esc(x.error)+'</span>']),"");
+      message(r.saved+" saved"+(r.failed?", "+r.failed+" not saved":"")+" for "+c.name+".",r.failed>0);c.lastPaste=text;c.lastPasteAt=new Date().toISOString();
+      const keep=res;await refresh();if($("cpclient"))await cpMolsFill();const nb=document.querySelector('.ssbulk [data-ssbulk="'+CSS.escape(cid)+'"]');if(nb){const b2=nb.closest(".ssbulk");b2.open=true;b2.querySelector(".ssbulkout").innerHTML=keep;}})
+      .catch(err=>{message(err.message,true);target.disabled=false;});return;}
   if(target.dataset.sscount){ssCount(target.dataset.sscount);return;}
   if(target.dataset.ssedit){cpState.ssEdit=cpState.ssEdit===target.dataset.ssedit?"":target.dataset.ssedit;ssDraw();return;}
   if(target.dataset.sspreview){ssPreview(target.dataset.sspreview,false,target);return;}

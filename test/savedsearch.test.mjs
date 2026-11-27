@@ -171,4 +171,5 @@ test("pasted settings update several saved searches at once, line by line (Lauru
   assert.equal(w("trientine").query, "((trientine))");
   assert.equal(w("bictegravir and emtricitabine and tenofovir alafenamide").query, "((bictegravir AND emtricitabine AND tenofovir alafenamide))");
   assert.equal((await t.call(SCREENER, "/api/saved-search-bulk", { client: "l", text })).status, 403);
+  const c = (await t.state()).clients[0]; assert.equal(c.lastPaste, text, "the client remembers the last pasted block"); assert.ok(c.lastPasteAt); assert.equal(c.lastPasteBy, MANAGER);
 });

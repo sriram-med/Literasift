@@ -21,11 +21,11 @@ test("an import is cut into bounded windows, each reconciled, and counts are rep
   assert.match(await (await t.BUCKET.get("evidence/1000/efetch.xml")).text(), /<PubmedArticle>/);
 });
 
-test("scheduled monitoring uses Create Date, a backfill uses Publication Date, and the executed query and version are recorded", async () => {
+test("scheduled monitoring uses Publication Date (as the weekly reports do), and the executed query and version are recorded", async () => {
   const t = await makeEnv({ watches: [WATCH] }), ncbi = fakeNcbi(recs(["2026-11-10"]));
   const today = new Date().toISOString().slice(0, 10), yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
   const monitor = await withFetch(ncbi.handler, () => worker.execute({ ...t.env, RETRY_BASE_MS: 1 }, { ...WATCH, versions: [{ version: 1, query: WATCH.query, effectiveFrom: "0000-00-00" }] }, yesterday, yesterday, { mode: "monitor" }));
-  assert.equal(monitor.dateField, "crdt"); assert.match(monitor.executedQueries[0], /\[crdt\]/); assert.equal(monitor.mode, "monitor"); assert.deepEqual(monitor.queryVersions, [1]);
+  assert.equal(monitor.dateField, "pdat"); assert.match(monitor.executedQueries[0], /\[dp\]/); assert.equal(monitor.mode, "monitor"); assert.deepEqual(monitor.queryVersions, [1]);
   void today;
 });
 
