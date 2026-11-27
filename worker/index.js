@@ -54,10 +54,75 @@ async function pubmed(env, operation, params) {
   if (!response.ok) throw new Error("PubMed returned HTTP " + response.status);
   return response.json();
 }
+// ---- Timelines. Every item starts from its IRD (the day LiteraSift received it). Screening and routing to QC take 2 working days by default, QC 2 more, medical review 3; a manager changes the defaults,
+// the days for one molecule, or the date of a single item. Weekends and listed holidays do not count. ----
+const TL_DEFAULT = { screenDays:2, qcDays:2, medicalDays:3, holidays:[], weekend:[0, 6] };
+const timelines = state => { const t = state.settings?.timelines || {}; return { ...TL_DEFAULT, ...t, holidays:Array.isArray(t.holidays) ? t.holidays : [], weekend:Array.isArray(t.weekend) ? t.weekend : TL_DEFAULT.weekend }; };
+const isWorkDay = (iso, tl) => !tl.weekend.includes(new Date(iso + "T00:00:00Z").getUTCDay()) && !tl.holidays.includes(iso);
+function addWorkingDays(iso, n, tl) { let d = String(iso).slice(0, 10), left = Math.max(0, Math.round(Number(n) || 0)); while (left > 0) { d = new Date(Date.parse(d) + 86400000).toISOString().slice(0, 10); if (isWorkDay(d, tl)) left--; } return d; }
+function workingDaysBetween(from, to, tl) { // working days from `from` (not counted) up to `to` (counted); negative when `to` is earlier
+  let a = String(from).slice(0, 10), b = String(to).slice(0, 10), sign = 1; if (b < a) { [a, b] = [b, a]; sign = -1; }
+  let n = 0, d = a; for (let i = 0; i < 400 && d < b; i++) { d = new Date(Date.parse(d) + 86400000).toISOString().slice(0, 10); if (isWorkDay(d, tl)) n++; } return sign * n;
+}
+const watchFor = (state, portfolio, molecule) => state.watches.find(w => w.portfolio === portfolio && molecule && (w.molecule || "") === molecule) || state.watches.find(w => w.portfolio === portfolio && w.molecule && molecule && String(molecule).split(/,\s*/).includes(w.molecule)) || state.watches.find(w => w.portfolio === portfolio && !w.molecule) || null;
+const daysFor = (state, watch, which) => { const v = watch?.sla?.[which + "Days"]; return Number.isFinite(Number(v)) && v !== "" && v !== null && v !== undefined ? Number(v) : timelines(state)[which + "Days"]; };
+const irdOf = (state, a) => String(a.ird || state.articles?.[a.pmid]?.pullAt || a.createdAt || (state.runs || []).find(r => (r.ids || []).includes(a.pmid))?.time || new Date().toISOString()).slice(0, 10);
+const screenDueFor = (state, item, from) => { const w = watchFor(state, item.portfolio, (item.molecules || [])[0] || ""); return addWorkingDays(from || item.ird || day(), daysFor(state, w, "screen"), timelines(state)); };
+const PRIORITY_RANK = { high:3, normal:2, low:1 };
+function priorityOf(state, it, watch) {
+  const reasons = []; let score = PRIORITY_RANK[watch?.priority] || 2; if (watch?.priority === "high") reasons.push("High-priority molecule"); else if (watch?.priority === "low") reasons.push("Low-priority molecule");
+  if (it.overdue) { score += 3; reasons.push("Overdue"); } else if (it.daysLeft !== null && it.daysLeft <= 0) { score += 2; reasons.push("Due today"); } else if (it.daysLeft !== null && it.daysLeft <= 1) { score += 1; reasons.push("Due tomorrow"); }
+  if (it.flags?.includes("icsr")) { score += 2; reasons.push("Likely ICSR"); } if (it.flags?.includes("serious")) { score += 2; reasons.push("Serious"); } if (it.flags?.includes("returned")) { score += 1; reasons.push("Returned by QC"); }
+  return { score, level:score >= 6 ? "high" : score >= 4 ? "medium" : "low", reasons };
+}
+const WORKFLOW_OF = { screening:"screening", qc:"qc", medical_review:"medical" };
+const WORKFLOW_LABEL = { screening:"Screening", qc:"QC", medical:"Medical review" };
+// Everything the viewer may act on, one list: articles to screen or check, cases to enter, check or review. Each carries its start, its due date, its priority and who holds it.
+function workItems(state, viewer) {
+  const tl = timelines(state), today = day(), out = [], clients = new Map((state.clients || []).map(c => [c.id, c.name]));
+  const finish = (it, watch) => { it.due = it.override?.due || it.due; it.daysLeft = it.due ? workingDaysBetween(today, it.due, tl) : null; it.overdue = Boolean(it.due) && it.due < today; it.priority = priorityOf(state, it, watch); it.clientName = clients.get(it.client) || ""; return it; };
+  for (const a of state.assignments || []) {
+    if (!mayAccess(state, viewer, a)) continue;
+    const st = stageOf(a), wf = WORKFLOW_OF[st]; if (!wf || (st === "screening" && ["Complete", "Full text needed"].includes(a.status))) continue;
+    const watch = watchFor(state, a.portfolio, (a.molecules || [])[0] || ""), ird = irdOf(state, a), art = state.articles[a.pmid] || {};
+    const start = wf === "screening" ? ird : wf === "qc" ? String(a.qc?.requestedAt || a.disposition?.at || ird).slice(0, 10) : String(a.qc?.decidedAt || a.disposition?.at || ird).slice(0, 10);
+    const days = daysFor(state, watch, wf === "screening" ? "screen" : wf === "qc" ? "qc" : "medical"), override = a.timeline?.[wf] || null;
+    const due = wf === "screening" ? (a.dueAt || addWorkingDays(start, days, tl)) : addWorkingDays(start, days, tl);
+    const flags = [art.caseFacts?.minimum?.verdict === "Valid ICSR candidate" ? "icsr" : "", a.qc?.status === "returned" || a.returnedAt ? "returned" : ""].filter(Boolean);
+    out.push(finish({ kind:"article", id:a.id, ref:"PMID " + a.pmid, title:art.title || "PMID " + a.pmid, workflow:wf, owner:(wf === "screening" ? a.reviewer : wf === "qc" ? a.qc?.reviewer : a.medicalReviewer) || "", client:clientIdFor(state, a), molecule:(a.molecules || [])[0] || "", portfolio:a.portfolio, ird, start, due, status:a.status, flags, override }, watch));
+  }
+  for (const c of state.cases || []) {
+    if (c.archived || c.locked || ["Sent to PV Nexus", "Closed: not a valid ICSR"].includes(c.status) || !caseVisible(state, viewer, c)) continue;
+    const wf = WORKFLOW_OF[stageOf(c)]; if (!wf) continue;
+    const watch = watchFor(state, c.portfolio, c.molecule || ""), start = String(c.assignedAt || c.submittedAt || c.updatedAt || c.createdAt || new Date().toISOString()).slice(0, 10), override = c.timeline?.[wf] || null;
+    const due = addWorkingDays(start, daysFor(state, watch, wf === "screening" ? "screen" : wf === "qc" ? "qc" : "medical"), tl);
+    const cls = (c.data?.events || []).some(e => Object.values(e.seriousness || {}).some(x => x === true));
+    out.push(finish({ kind:"case", id:c.id, ref:c.number, title:state.articles[c.pmid]?.title || "PMID " + c.pmid, workflow:wf, owner:c.assignee || "", client:watch?.client || "", molecule:c.molecule || "", portfolio:c.portfolio, ird:start, start, due, regDue:c.dueAt || "", status:c.status, flags:[cls ? "serious" : "", c.qc?.status === "returned" ? "returned" : ""].filter(Boolean), override }, watch));
+  }
+  return out.sort((a, b) => b.priority.score - a.priority.score || String(a.due).localeCompare(String(b.due)));
+}
+// What the numbers on a dashboard mean: open work, what is due when, who holds it, and what was finished lately, for one workflow and optionally one person.
+function dashboardFor(state, viewer, workflow, person) {
+  const tl = timelines(state), today = day(), weekAgo = new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10), all = workItems(state, viewer), mine = all.filter(i => i.workflow === workflow && (!person || i.owner === person));
+  const profiles = state.profiles.filter(p => p.active), nameOf = e => profiles.find(p => p.email === e)?.name || e || "Unassigned";
+  const kpi = { open:mine.length, overdue:mine.filter(i => i.overdue).length, dueToday:mine.filter(i => !i.overdue && i.daysLeft <= 0).length, thisWeek:mine.filter(i => !i.overdue && i.daysLeft > 0 && i.daysLeft <= 5).length, high:mine.filter(i => i.priority.level === "high").length, unassigned:mine.filter(i => !i.owner).length };
+  const days = []; for (let i = 0, d = today; days.length < 10 && i < 30; i++, d = new Date(Date.parse(d) + 86400000).toISOString().slice(0, 10)) if (isWorkDay(d, tl)) days.push({ date:d, count:mine.filter(x => x.due === d).length, late:i === 0 ? mine.filter(x => x.overdue).length : 0 });
+  const byClient = {}; for (const i of mine) { const c = (byClient[i.clientName || "No client"] ||= {}), m = (c[i.molecule || i.portfolio] ||= { open:0, overdue:0 }); m.open++; if (i.overdue) m.overdue++; }
+  const done = [];
+  for (const a of state.assignments) { if (!mayAccess(state, viewer, a)) continue; const w = watchFor(state, a.portfolio, (a.molecules || [])[0] || "");
+    if (workflow === "screening" && a.disposition?.at && a.disposition.at.slice(0, 10) >= weekAgo && a.disposition.by !== "system") done.push({ by:a.disposition.by, ontime:!a.dueAt || a.disposition.at.slice(0, 10) <= a.dueAt });
+    if (workflow === "qc" && a.qc?.decidedAt && a.qc.decidedAt.slice(0, 10) >= weekAgo) done.push({ by:a.qc.decidedBy, ontime:a.qc.decidedAt.slice(0, 10) <= addWorkingDays(String(a.qc.requestedAt || a.qc.decidedAt).slice(0, 10), daysFor(state, w, "qc"), tl) }); }
+  for (const c of state.cases || []) { if (!caseVisible(state, viewer, c)) continue; for (const h of c.history || []) { if ((h.at || "").slice(0, 10) < weekAgo) continue;
+    if (workflow === "screening" && /submitted to QC/i.test(h.action || "")) done.push({ by:h.by, ontime:true }); if (workflow === "qc" && /^(approved|qc approved|sent to .*medical)/i.test(h.action || "")) done.push({ by:h.by, ontime:true }); if (workflow === "medical" && /(approved|signed)/i.test(h.action || "") && !/auto|qc/i.test(h.action || "")) done.push({ by:h.by, ontime:true }); } }
+  const mineDone = person ? done.filter(d => d.by === person) : done;
+  const people = {}; for (const i of all.filter(x => x.workflow === workflow)) { const p = (people[i.owner || ""] ||= { email:i.owner || "", name:nameOf(i.owner), open:0, overdue:0, high:0 }); p.open++; if (i.overdue) p.overdue++; if (i.priority.level === "high") p.high++; }
+  for (const p of Object.values(people)) { const prof = profiles.find(x => x.email === p.email); p.capacity = prof?.capacity || null; p.completed7d = done.filter(d => d.by === p.email).length; }
+  return { workflow, label:WORKFLOW_LABEL[workflow], timeline:{ days:{ screening:tl.screenDays, qc:tl.qcDays, medical:tl.medicalDays }[workflow], holidays:tl.holidays.length }, kpi, completed7d:mineDone.length, onTimeRate:mineDone.length ? Math.round(mineDone.filter(d => d.ontime).length / mineDone.length * 100) : null, next:mine.slice(0, 12), days, byClient, people:Object.values(people).sort((a, b) => b.overdue - a.overdue || b.open - a.open) };
+}
 function allocate(state, item) {
   // A molecule owner (set by a manager) receives every article for that molecule, regardless of capacity.
   const owned = state.watches.find(w => w.owner && w.portfolio === item.portfolio && (!w.molecule || (item.molecules || []).includes(w.molecule)));
-  if (owned && state.profiles.some(p => p.email === owned.owner && p.active)) { item.reviewer = owned.owner; item.dueAt ||= addDays(day(), Number(state.settings?.screeningSlaDays ?? 7)); return; }
+  if (owned && state.profiles.some(p => p.email === owned.owner && p.active)) { item.reviewer = owned.owner; item.ird ||= day(); item.dueAt ||= screenDueFor(state, item); return; }
   const matches = p => p.active && (!p.portfolio || p.portfolio.toLowerCase() === item.portfolio.toLowerCase());
   let candidates = state.profiles.filter(p => p.role === "reviewer" && matches(p));
   // With no reviewers yet, managers screen their own queue so nothing sits unassigned.
@@ -68,7 +133,7 @@ function allocate(state, item) {
   const open = p => state.assignments.filter(a => a.reviewer === p.email && isOpen(a)).length, overdue = p => state.assignments.filter(a => a.reviewer === p.email && isOpen(a) && a.dueAt && a.dueAt < today).length;
   const reviewer = candidates.filter(p => !away(p)).map(p => ({ ...p, open:open(p), late:overdue(p) }))
     .filter(p => p.open < p.capacity).sort((a, b) => a.late - b.late || a.open / a.capacity - b.open / b.capacity || a.email.localeCompare(b.email))[0];
-  item.dueAt ||= addDays(today, Number(state.settings?.screeningSlaDays ?? 7));
+  item.ird ||= today; item.dueAt ||= screenDueFor(state, item);
   if (reviewer) item.reviewer = reviewer.email;
 }
 const addDays = (value, days) => new Date(Date.parse(value) + days * 86400000).toISOString().slice(0, 10);
@@ -2957,18 +3022,22 @@ function stageOf(a) {
   if (a.qc?.status === "returned") return "screening";
   return a.disposition.value === "potential_icsr" ? "medical_review" : "closed";
 }
-function pickRole(state, portfolio, role, exclude = "") {
+const designatedOwner = (state, portfolio, molecule, key, exclude = "") => { const e = watchFor(state, portfolio, molecule || "")?.[key], today = day(), p = e && state.profiles.find(x => x.email === e && x.active); return !p || e === exclude || (p.awayFrom && p.awayFrom <= today && (!p.awayUntil || p.awayUntil >= today)) ? "" : e; };
+function pickRole(state, portfolio, role, exclude = "", molecule = "") {
+  const chosen = designatedOwner(state, portfolio, molecule, role === "qc" ? "qcOwner" : role === "medical_reviewer" ? "medicalOwner" : "owner", exclude); if (chosen) return chosen;
   const today = day(), away = p => p.awayFrom && p.awayFrom <= today && (!p.awayUntil || p.awayUntil >= today);
   const pool = state.profiles.filter(p => p.active && p.email !== exclude && !away(p) && (state.memberships || []).some(m => m.email === p.email && m.role === role && (m.portfolio === "*" || m.portfolio === portfolio)));
   const load = p => (state.cases || []).filter(c => c.assignee === p.email && !caseClosed(c)).length;
   return pool.map(p => ({ p, n:load(p) })).sort((x, y) => x.n - y.n || x.p.email.localeCompare(y.p.email))[0]?.p.email || state.profiles.find(p => p.role === "manager" && p.active && p.email !== exclude)?.email || "";
 }
 function pickArticleQc(state, item) {
+  const chosen = designatedOwner(state, item.portfolio, (item.molecules || [])[0] || "", "qcOwner", item.reviewer); if (chosen) return chosen;
   const pool = state.profiles.filter(p => p.active && p.email !== item.reviewer && rolesIn(state,p.email,item.portfolio).has("qc"));
   const load = p => state.assignments.filter(a => a.qc?.reviewer === p.email && a.qc.status === "pending").length;
   return pool.map(p => ({ p, n:load(p) })).sort((a,b) => a.n-b.n || a.p.email.localeCompare(b.p.email))[0]?.p.email || "";
 }
-function pickMedical(state, portfolio, exclude = "") {
+function pickMedical(state, portfolio, exclude = "", molecule = "") {
+  const chosen = designatedOwner(state, portfolio, molecule, "medicalOwner", exclude); if (chosen) return chosen;
   const today = day(), away = p => p.awayFrom && p.awayFrom <= today && (!p.awayUntil || p.awayUntil >= today);
   const pool = state.profiles.filter(p => p.active && p.email !== exclude && !away(p) && (state.memberships || []).some(m => m.email === p.email && m.role === "medical_reviewer" && (m.portfolio === "*" || m.portfolio === portfolio)));
   const load = p => state.assignments.filter(a => a.medicalReviewer === p.email && stageOf(a) === "medical_review").length + (state.cases || []).filter(c => c.assignee === p.email && !caseClosed(c)).length;
@@ -4313,7 +4382,7 @@ async function screenSynchrony(env, state, limit) {
       item.disposition = { value:"potential_icsr", reason:"", note, by:"system", at, evidence:evidenceRef(article) };
       item.status = needsQc ? "Awaiting QC" : "Complete";
       if (needsQc) item.qc = { status:"pending", reviewer, requestedAt:at, rounds:0, reason:"all potential ICSRs are checked" };
-      else item.medicalReviewer = pickMedical(fresh,item.portfolio,item.reviewer) || undefined;
+      else item.medicalReviewer = pickMedical(fresh,item.portfolio,item.reviewer,(item.molecules || [])[0] || "") || undefined;
       delete item.stage;
       delete item.routedToMedical;
       return { patients:result.patients.length, qc:needsQc };
@@ -4343,7 +4412,7 @@ async function escalateCases(env) {
       const at = new Date().toISOString(), holder = d.profiles.find(p => p.email === c.assignee), stage = stageOf(c);
       c.escalation = { level, at, reason:level === 2 ? "Overdue since " + c.dueAt : "Due " + c.dueAt };
       (c.history ||= []).push({ at, by:"system", action:"Escalated: " + c.escalation.reason });
-      if (!holder?.active) { const role = stage === "qc" ? "qc" : stage === "medical_review" ? "medical_reviewer" : "screener", next = pickRole(d, c.portfolio, role, c.assignee || ""); if (next) { c.assignee = next; c.assignedAt = at; c.history.push({ at, by:"system", action:"Reassigned to " + next + " because the holder is not active" }); } }
+      if (!holder?.active) { const role = stage === "qc" ? "qc" : stage === "medical_review" ? "medical_reviewer" : "screener", next = pickRole(d, c.portfolio, role, c.assignee || "", c.molecule || ""); if (next) { c.assignee = next; c.assignedAt = at; c.history.push({ at, by:"system", action:"Reassigned to " + next + " because the holder is not active" }); } }
       moved.push(c.number);
     }
     return moved;
@@ -4478,7 +4547,7 @@ function automaticQcReviewer(state, c) {
   if (!source || !syncEligible(state,a) || a.synchrony?.status !== "prepared" || a.synchrony.fingerprint !== syncFingerprint(state,a,source) || (a.synchrony.issues || []).length) return "";
   const nd = normalizeCase(c.data), la = localAssessment(nd);
   if (la.validity.missing.length || synchronyChecks(state,c).some(f => ["major","critical"].includes(f.severity)) || (c.qc?.flags || []).some(f => f.status === "open") || (c.aiReview?.issues || []).length) return "";
-  return pickRole(state,c.portfolio,"qc",c.assignee || "");
+  return pickRole(state,c.portfolio,"qc",c.assignee || "",c.molecule || "");
 }
 async function autoAdvance(env, number) {
   const next = await write(env, d => {
@@ -4987,6 +5056,44 @@ async function apiCore(request, env, path) {
   }
   if (path === "/api/synchrony-tick" && service) return json({ ...(await prepareSynchrony(env)), packages:await prepareSynchronyExports(env), reference:await checkReferenceSafety(env).catch(() => null), escalated:await escalateCases(env).catch(() => []) });
   if (path === "/api/synchrony" && viewer) return synchronyApi(env,state,viewer,body);
+  if (path === "/api/planner" && viewer) {
+    // The calendar and "do next" list: the viewer's own work, or anyone's for a manager.
+    const mgr = viewer.role === "manager", who = mgr ? String(body.person ?? email) : email, all = workItems(state, viewer), items = all.filter(i => (!who || who === "*" || i.owner === who) && (!body.workflow || i.workflow === body.workflow) && (!body.client || i.client === body.client || (body.client === "none" && !i.client)));
+    return json({ items:items.slice(0, 600), timelines:timelines(state), people:mgr ? state.profiles.filter(p => p.active).map(p => ({ email:p.email, name:p.name || p.email, role:p.role })) : [], clients:(state.clients || []).map(c => ({ id:c.id, name:c.name })), today:day(), manager:mgr });
+  }
+  if (path === "/api/dashboard" && viewer) {
+    const wf = ["screening", "qc", "medical"].includes(body.workflow) ? body.workflow : "screening", mgr = viewer.role === "manager";
+    return json(dashboardFor(state, viewer, wf, mgr ? String(body.person || "") : email));
+  }
+  if (["/api/timeline-set", "/api/timelines-save", "/api/watch-config"].includes(path) && viewer) {
+    if (viewer.role !== "manager") return json({ error:"Manager access required." }, 403);
+    const at = new Date().toISOString();
+    if (path === "/api/timelines-save") {
+      const n = (x, d) => { const v = Math.round(Number(x)); return Number.isFinite(v) && v >= 0 && v <= 60 ? v : d; }, hol = uniq(String(body.holidays || "").split(/[\s,;]+/).filter(x => /^\d{4}-\d{2}-\d{2}$/.test(x))).slice(0, 200), wk = Array.isArray(body.weekend) ? body.weekend.map(Number).filter(x => x >= 0 && x <= 6) : TL_DEFAULT.weekend;
+      await write(env, d => { d.settings = d.settings || {}; d.settings.timelines = { screenDays:n(body.screenDays, 2), qcDays:n(body.qcDays, 2), medicalDays:n(body.medicalDays, 3), holidays:hol.sort(), weekend:wk }; });
+      await audit(env, { by:email, action:"timelines.saved", entityType:"Settings", entityId:"timelines", detail:{ screen:body.screenDays, qc:body.qcDays, medical:body.medicalDays, holidays:hol.length } });
+      return json({ ok:true, timelines:timelines((await load(env)).state) });
+    }
+    if (path === "/api/watch-config") {
+      const [portfolio, molecule = ""] = String(body.watch || "").split("|").map(decodeURIComponent);
+      const out = await write(env, d => { const w = d.watches.find(x => x.portfolio === portfolio && (x.molecule || "") === molecule); if (!w) return null;
+        const ok = (e, role) => !e || d.profiles.some(p => p.email === e && p.active);
+        for (const [k, f] of [["owner", "screener"], ["qcOwner", "qc"], ["medicalOwner", "medical"]]) if (f in body) { if (!ok(body[f])) return "person"; w[k] = String(body[f] || ""); }
+        if ("priority" in body) w.priority = ["high", "normal", "low"].includes(body.priority) ? body.priority : "normal";
+        if ("screenDays" in body || "qcDays" in body || "medicalDays" in body) { w.sla = { ...(w.sla || {}) }; for (const k of ["screenDays", "qcDays", "medicalDays"]) if (k in body) { const v = body[k] === "" || body[k] === null ? "" : Math.round(Number(body[k])); if (v === "" ) delete w.sla[k]; else if (Number.isFinite(v) && v >= 0 && v <= 60) w.sla[k] = v; } }
+        return true; });
+      if (out === null) return json({ error:"Watchlist not found." }, 404); if (out === "person") return json({ error:"Choose an active person." }, 400);
+      await audit(env, { by:email, action:"watch.configured", entityType:"Watchlist", entityId:portfolio + (molecule ? " · " + molecule : ""), detail:Object.fromEntries(["screener", "qc", "medical", "priority", "screenDays", "qcDays", "medicalDays"].filter(k => k in body).map(k => [k, body[k]])) });
+      return json({ ok:true });
+    }
+    // one item's date
+    const due = String(body.due || ""), wf = ["screening", "qc", "medical"].includes(body.workflow) ? body.workflow : ""; if (!/^\d{4}-\d{2}-\d{2}$/.test(due) || !wf) return json({ error:"Give a date and a workflow." }, 400);
+    const note = String(body.reason || "").trim().slice(0, 200);
+    const out = await write(env, d => { const rec = body.kind === "case" ? d.cases.find(x => x.id === body.id) : d.assignments.find(x => x.id === body.id); if (!rec) return null; (rec.timeline ||= {})[wf] = { due, by:email, at, reason:note }; if (body.kind !== "case" && wf === "screening") rec.dueAt = due; (rec.history ||= []).push({ at, by:email, action:"Due date for " + WORKFLOW_LABEL[wf] + " set to " + due + (note ? ": " + note : "") }); return true; });
+    if (!out) return json({ error:"Item not found." }, 404);
+    await audit(env, { by:email, action:"timeline.set", entityType:body.kind === "case" ? "Case" : "Assignment", entityId:String(body.id), detail:{ workflow:wf, due, reason:note } });
+    return json({ ok:true });
+  }
   if (path === "/api/synchrony-import" && viewer) {
     // A document goes straight into Synchrony: a Discover result, a PDF or XML, or pasted OCR text. It becomes an article, a "potential ICSR" assignment in the chosen portfolio, stored full text, and a prepared draft.
     const portfolio = String(body.portfolio || "").trim().slice(0, 100), molecule = String(body.molecule || "").trim().slice(0, 100), rec = body.record && typeof body.record === "object" ? body.record : {};
@@ -5203,7 +5310,7 @@ async function apiCore(request, env, path) {
       if (!canEditCase(state, viewer, c)) return json({ error:"Only the person doing the data entry can submit it." }, 403);
       const a = localAssessment(normalizeCase(c.data)), problems = [...a.validity.missing.map(m => "Missing: " + m), ...a.qc.findings.filter(f => f.severity === "critical" || f.severity === "major").map(f => f.title), ...synchronyChecks(state,c).filter(f=>f.severity==="major"&&f.field==="source").map(f=>f.text)];
       if (problems.length) return json({ error:"Finish the data entry first: " + problems.slice(0, 6).join("; ") + ".", problems }, 409);
-      const next = pickRole(state, c.portfolio, "qc", email); if (!next) return json({ error:"No QC reviewer is set up. A manager must add one in Team." }, 409);
+      const next = pickRole(state, c.portfolio, "qc", email, c.molecule || ""); if (!next) return json({ error:"No QC reviewer is set up. A manager must add one in Team." }, 409);
       // Flagged fields QC returned: record which ones changed, and rebuild a narrative nobody edited so it follows the corrected fields.
       let recheck = null;
       if ((c.qc?.flags || []).some(f => f.status === "open")) { const nd = normalizeCase(c.data), flags = c.qc.flags.map(f => ({ ...f, status:f.status === "open" ? (getCasePath(nd, f.path) !== f.was ? "fixed" : "unchanged") : f.status })); recheck = { fixed:flags.filter(f => f.status === "fixed").length, unchanged:flags.filter(f => f.status === "unchanged").length, flags }; }
@@ -5218,7 +5325,7 @@ async function apiCore(request, env, path) {
     const flagPaths = (Array.isArray(body.fields) ? body.fields : []).slice(0, 30).map(f => ({ path:String(f?.path || ""), reason:String(f?.reason || "").trim().slice(0, 300) })).filter(f => QC_PATH.test(f.path));
     if (decision === "return" && note.length < 5 && !flagPaths.length) return json({ error:"Say what the screener must fix (at least 5 characters), or flag the fields.", }, 400);
     if (flagPaths.some(f => f.reason.length < 3)) return json({ error:"Give a reason for every flagged field." }, 400);
-    const target = decision === "approve" ? pickRole(state, c.portfolio, "medical_reviewer", email) : (c.screener || state.assignments.find(x => x.id === c.provenance?.assignmentId || (x.pmid === c.pmid && x.portfolio === c.portfolio))?.reviewer || c.createdBy || ""), tp = state.profiles.find(p => p.email === target && p.active);
+    const target = decision === "approve" ? pickRole(state, c.portfolio, "medical_reviewer", email, c.molecule || "") : (c.screener || state.assignments.find(x => x.id === c.provenance?.assignmentId || (x.pmid === c.pmid && x.portfolio === c.portfolio))?.reviewer || c.createdBy || ""), tp = state.profiles.find(p => p.email === target && p.active);
     if (!tp) return json({ error:decision === "approve" ? "No medical reviewer is set up. A manager must add one in Team." : "The screener is no longer active; route the case to someone with Route." }, 409);
     await write(env, data => { const x = data.cases.find(y => y.id === c.id); x.stage = decision === "approve" ? "medical_review" : "screening"; x.assignee = target; x.assignedAt = at; x.status = "Draft"; const q = x.qc ||= {}; q.status = decision === "approve" ? "approved" : "returned"; q.by = email; q.at = at; q.note = note; q.rounds = (q.rounds || 0) + (decision === "return" ? 1 : 0); refreshDue(data, x); x.updatedAt = at;
       if (decision === "return") { const nd = normalizeCase(x.data); q.flags = flagPaths.map(f => ({ path:f.path, reason:f.reason, was:getCasePath(nd, f.path), status:"open", by:email, at })); } else q.flags = (q.flags || []).map(f => ({ ...f, status:f.status === "open" ? "accepted" : f.status }));
@@ -5271,7 +5378,7 @@ async function apiCore(request, env, path) {
           refreshDue(data, c); c.updatedAt = at; (c.history ||= []).push({ at, by:email, action:"routed " + from + " to " + label + ": " + reason.slice(0, 200) }); moved.push(c.number + " " + from + " to " + label); continue; }
         const a = data.assignments.find(y => y.id === x.id), from = stageOf(a); (a.history ||= []).push({ status:a.status, note:"Routed " + STAGE_LABEL[from] + " to " + label + ": " + reason.slice(0, 200), by:email, at });
         a.stage = stage;
-        if (stage === "screening") { a.reviewer = to; a.qc = undefined; a.status = "Pending"; a.dueAt = addDays(day(), Number(data.settings?.screeningSlaDays ?? 7)); delete a.routedToMedical; }
+        if (stage === "screening") { a.reviewer = to; a.qc = undefined; a.status = "Pending"; a.dueAt = screenDueFor(data, a, day()); delete a.routedToMedical; }
         else if (stage === "qc") { a.qc = { status:"pending", reviewer:to, requestedAt:at, rounds:a.qc?.rounds || 0, reason:"routed by " + email }; a.status = "Awaiting QC"; delete a.routedToMedical; }
         else if (stage === "medical_review") { a.medicalReviewer = to; a.routedToMedical = { by:email, at, reason:reason.slice(0, 200) }; if (a.status === "Awaiting QC" || a.status === "QC returned") a.status = "Complete"; }
         moved.push("PMID " + a.pmid + " " + STAGE_LABEL[from] + " to " + label);
@@ -5397,7 +5504,7 @@ async function apiCore(request, env, path) {
       if (!["screening", "qc"].includes(to)) return json({ error:"Route back to screening or QC." }, 400);
       if (to === "qc" && !item.disposition) return json({ error:"There is no disposition to send back to QC." }, 409);
       await write(env, data => { const a = data.assignments.find(x => x.id === item.id); (a.history ||= []).push({ status:a.status, note:"Routed back to " + to + ": " + reason.slice(0, 200) + (to === "screening" && a.disposition ? " (previous disposition: " + a.disposition.value + ")" : ""), by:email, at });
-        if (to === "screening") { a.disposition = null; a.qc = null; a.status = "Pending"; a.returnedAt = at; a.dueAt = addDays(day(), Number(data.settings?.screeningSlaDays ?? 7)); } else { a.qc = { ...(a.qc || {}), status:"pending", returned:false, routedBackBy:email }; } });
+        if (to === "screening") { a.disposition = null; a.qc = null; a.status = "Pending"; a.returnedAt = at; a.dueAt = screenDueFor(data, a, day()); } else { a.qc = { ...(a.qc || {}), status:"pending", returned:false, routedBackBy:email }; } });
       await audit(env, { by:email, action:"review.routed_back", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ portfolio:item.portfolio, to, reason:reason.slice(0, 300) } });
       return json({ ok:true });
     }
@@ -5516,7 +5623,7 @@ async function apiCore(request, env, path) {
         a.status = value === "full_text_needed" ? "Full text needed" : needsQc ? "Awaiting QC" : "Complete";
         a.qc = needsQc ? { status:"pending", reviewer:qcReviewer, requestedAt:at, rounds:(a.qc?.rounds || 0) + (a.qc?.status === "returned" ? 1 : 0), reason:value === "potential_icsr" ? "all potential ICSRs are checked" : "sampled" } : undefined;
         delete a.stage; delete a.routedToMedical;
-        if (!needsQc && value === "potential_icsr") { a.medicalReviewer = pickMedical(data, a.portfolio, a.reviewer) || a.medicalReviewer || undefined; a.history.push({ status:a.status, note:"Routed to medical review" + (a.medicalReviewer ? ": " + a.medicalReviewer : " (no medical reviewer available)"), by:"routing", at }); } });
+        if (!needsQc && value === "potential_icsr") { a.medicalReviewer = pickMedical(data, a.portfolio, a.reviewer, (a.molecules || [])[0] || "") || a.medicalReviewer || undefined; a.history.push({ status:a.status, note:"Routed to medical review" + (a.medicalReviewer ? ": " + a.medicalReviewer : " (no medical reviewer available)"), by:"routing", at }); } });
       await audit(env, { by:email, action:"review.disposition", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ portfolio:item.portfolio, value, reason, qc:needsQc ? (qcReviewer || "no QC reviewer available") : "not required" } });
       return json({ ok:true, qc:needsQc ? { reviewer:qcReviewer } : null });
     }
@@ -5530,7 +5637,7 @@ async function apiCore(request, env, path) {
       if (!decision || (decision === "return" && note.length < 5)) return json({ error:"Approve, or return with a note of at least 5 characters." }, 400);
       await write(env, data => { const a = data.assignments.find(x => x.id === item.id); (a.history ||= []).push({ status:a.status, note:"QC " + (decision === "approve" ? "approved" : "returned") + (note ? ": " + note : ""), by:email, at });
         a.qc = { ...a.qc, status:decision === "approve" ? "approved" : "returned", decidedBy:email, decidedAt:at, note, reviewer:a.qc.reviewer || email, evidence:evidenceRef(data.articles[a.pmid]) }; a.status = decision === "approve" ? "Complete" : "QC returned"; delete a.stage;
-        if (decision === "approve" && a.disposition?.value === "potential_icsr") { a.medicalReviewer = pickMedical(data, a.portfolio, a.reviewer) || a.medicalReviewer || undefined; a.history.push({ status:a.status, note:"Routed to medical review" + (a.medicalReviewer ? ": " + a.medicalReviewer : " (no medical reviewer available)"), by:"routing", at }); } });
+        if (decision === "approve" && a.disposition?.value === "potential_icsr") { a.medicalReviewer = pickMedical(data, a.portfolio, a.reviewer, (a.molecules || [])[0] || "") || a.medicalReviewer || undefined; a.history.push({ status:a.status, note:"Routed to medical review" + (a.medicalReviewer ? ": " + a.medicalReviewer : " (no medical reviewer available)"), by:"routing", at }); } });
       await audit(env, { by:email, action:"review.qc", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ portfolio:item.portfolio, decision, note, screener:item.reviewer } });
       if (decision === "approve" && state.settings?.autoIcsr !== false) {
         const made = await write(env, data => icsrIntake(data, "system", a => syncModeFor(data, a.portfolio)!=="active" && a.id === item.id, 1));
@@ -9003,7 +9110,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  pdfToText, buildFullTextEvidence, autoAdvance, deskQueues, assessmentMatrix, formatAgreement, jobsBoard, evidenceKind, deadlineBasis, istStamp, extractInvestigations, extractClinical, zipFiles, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  pdfToText, buildFullTextEvidence, autoAdvance, addWorkingDays, workingDaysBetween, workItems, timelines, dashboardFor, deskQueues, assessmentMatrix, formatAgreement, jobsBoard, evidenceKind, deadlineBasis, istStamp, extractInvestigations, extractClinical, zipFiles, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);
