@@ -5166,17 +5166,20 @@ async function apiCore(request, env, path) {
   if (path === "/api/molecule-add" && viewer) {
     // Adds a molecule to a client's portfolio: a watch with a query built from its names, pulled automatically from then on.
     if (viewer.role !== "manager" && viewer.canManageClients !== true) return json({ error:"Adding molecules is limited to managers and users a manager has allowed." }, 403);
-    const molecule = String(body.molecule || "").trim().slice(0, 100), portfolio = String(body.portfolio || "").trim().slice(0, 100), synonyms = splitNames(body.synonyms);
+    const molecule = String(body.molecule || "").trim().slice(0, 100), synonyms = splitNames(body.synonyms);
     if (!molecule) return json({ error:"Enter the molecule name." }, 400);
-    if (!portfolio) return json({ error:"Choose or enter a portfolio." }, 400);
     if (body.client && !(state.clients || []).some(c => c.id === body.client)) return json({ error:"Choose a client from the list." }, 400);
+    // Automatic portfolio: the one the client already uses most, else the client's name, else "General".
+    let portfolio = String(body.portfolio || "").trim().slice(0, 100), auto = false;
+    if (!portfolio) { auto = true; const counts = new Map(); for (const w of state.watches) if (body.client && w.client === body.client) counts.set(w.portfolio, (counts.get(w.portfolio) || 0) + 1);
+      portfolio = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || (state.clients || []).find(c => c.id === body.client)?.name?.slice(0, 100) || "General"; }
     if (state.watches.some(w => watchKey(w) === watchKey({ portfolio, molecule }))) return json({ error:molecule + " is already in " + portfolio + "." }, 409);
     const query = String(body.query || "").trim() || buildQuery([molecule, ...synonyms], body.safetyOnly === true);
     if (!query || query.length > 1500) return json({ error:"The names could not be turned into a search. Shorten them or write the PubMed query." }, 400);
     const watch = { portfolio, molecule, query }; if (body.client) watch.client = String(body.client);
     await write(env, data => { keepOwner(data, watch); commitWatch(data, watch, email, "molecule added"); });
     await audit(env, { by:email, action:"molecule.added", target:portfolio + " · " + molecule, detail:{ client:body.client || "", names:[molecule, ...synonyms].slice(0, 20).join(", ") } });
-    return json({ ok:true, portfolio, molecule });
+    return json({ ok:true, portfolio, molecule, auto });
   }
   if (path === "/api/dashboard" && viewer) {
     const wf = ["screening", "qc", "medical"].includes(body.workflow) ? body.workflow : "screening", mgr = viewer.role === "manager";
@@ -8044,14 +8047,14 @@ function openAddMolecule(presetClient){
   const pfs=(typeof allPortfolios==="function"?allPortfolios():[]),cls=data.clients||[];
   document.body.insertAdjacentHTML("beforeend",'<dialog id="moldlg" style="width:min(520px,96vw)"><h3 style="margin:0 0 4px">Add molecule</h3><p class="sub" style="margin:0 0 12px">The molecule is searched in PubMed automatically from now on, and its articles appear in the queue.</p>'+
     '<form id="molform" data-own="1" class="impgrid"><label class="wide">Client<select name="client"><option value="">No client</option>'+cls.map(c=>'<option value="'+esc(c.id)+'"'+(c.id===presetClient?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select></label>'+
-    '<label>Portfolio<select name="portfolio">'+pfs.map(x=>'<option>'+esc(x)+'</option>').join("")+'<option value="__new">New portfolio…</option></select></label><label id="molnewpf" style="display:none">New portfolio name<input name="newpf" maxlength="100"></label>'+
+    '<label>Portfolio<select name="portfolio"><option value="">Auto (recommended)</option>'+pfs.map(x=>'<option>'+esc(x)+'</option>').join("")+'<option value="__new">New portfolio…</option></select></label><label id="molnewpf" style="display:none">New portfolio name<input name="newpf" maxlength="100"></label>'+
     '<label class="wide">Molecule (INN or generic name)<input name="molecule" required maxlength="100" placeholder="e.g. aciclovir"></label><label class="wide">Brands and other names (optional, separated by commas)<input name="synonyms" placeholder="Zovirax, acyclovir"></label>'+
     '<label class="check wide"><input type="checkbox" name="safety">&nbsp;Safety articles only (adverse events, toxicity, case reports)</label><div class="wide" id="molerr" style="color:#b3261e"></div>'+
     '<div class="wide" style="display:flex;gap:8px;justify-content:flex-end"><button type="button" class="btn outline" id="molno">Cancel</button><button class="btn" id="molgo">Add molecule</button></div></form></dialog>');
-  const d=$("moldlg"),f=$("molform");d.showModal();if(!pfs.length){f.elements.portfolio.value="__new";$("molnewpf").style.display="";}
+  const d=$("moldlg"),f=$("molform");d.showModal();
   f.elements.portfolio.onchange=()=>{$("molnewpf").style.display=f.elements.portfolio.value==="__new"?"":"none";};$("molno").onclick=()=>{d.close();d.remove();};
   f.onsubmit=async e=>{e.preventDefault();$("molgo").disabled=true;$("molerr").textContent="";const pf=f.elements.portfolio.value==="__new"?f.elements.newpf.value:f.elements.portfolio.value;
-    try{await api("molecule-add",{client:f.elements.client.value,portfolio:pf,molecule:f.elements.molecule.value,synonyms:f.elements.synonyms.value,safetyOnly:f.elements.safety.checked});d.close();d.remove();await refresh();render();message(f.elements.molecule.value+" added. Its articles will be pulled automatically.");}
+    try{const r=await api("molecule-add",{client:f.elements.client.value,portfolio:pf,molecule:f.elements.molecule.value,synonyms:f.elements.synonyms.value,safetyOnly:f.elements.safety.checked});d.close();d.remove();await refresh();render();message(f.elements.molecule.value+" added to "+r.portfolio+(r.auto?" (automatic portfolio)":"")+". Its articles will be pulled automatically.");}
     catch(err){$("molerr").textContent=err.message;$("molgo").disabled=false;}};
 }
 async function clearPulled(){

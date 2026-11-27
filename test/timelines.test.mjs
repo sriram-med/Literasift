@@ -245,3 +245,12 @@ test("add molecule: builds the watch for a client, refuses duplicates and non-ma
   assert.equal((await t.call(MANAGER, "/api/molecule-add", { client: "nope", portfolio: "P1", molecule: "x" })).status, 400);
   const d = (await t.call(MANAGER, "/api/dashboard", { workflow: "screening", client: "k1" })).body; assert.ok(Array.isArray(d.clientCards)); assert.ok(d.clients.some(c => c.id === "k1"));
 });
+
+test("add molecule: the portfolio is automatic (the client's own, else its name, else General)", async () => {
+  const t = await makeEnv({ watches: [{ portfolio: "CNS", molecule: "a", query: "a", client: "k1" }, { portfolio: "CNS", molecule: "b", query: "b", client: "k1" }] });
+  const s = await t.state(); s.clients = [{ id: "k1", name: "Acme" }, { id: "k2", name: "Beta Bio" }]; s.watches.forEach(w => { w.client = "k1"; }); await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const a = (await t.call(MANAGER, "/api/molecule-add", { client: "k1", molecule: "c" })).body; assert.equal(a.portfolio, "CNS"); assert.equal(a.auto, true);
+  assert.equal((await t.call(MANAGER, "/api/molecule-add", { client: "k2", molecule: "d" })).body.portfolio, "Beta Bio");
+  assert.equal((await t.call(MANAGER, "/api/molecule-add", { molecule: "e" })).body.portfolio, "General");
+  assert.equal((await t.call(MANAGER, "/api/molecule-add", { client: "k2", portfolio: "Own", molecule: "f" })).body.auto, false);
+});

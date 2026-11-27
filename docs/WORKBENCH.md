@@ -238,3 +238,5 @@ Tick any number of cases (or "Select all shown") and press Delete. For cases tha
 - **Add molecule** (Clients page: the Add a molecule panel, and a button on every client card that preselects that client; managers and users allowed to manage clients): choose the client and portfolio (or a new portfolio), type the molecule and optional brands; the PubMed query is built from the names and the molecule is pulled automatically from then on. Route: `/api/molecule-add`.
 - **My Queue > By client** groups the queue by client then molecule, most overdue client first, with open, overdue, due-soon and serious counts and the next deadline. "By deadline" keeps the week view.
 - **Dashboard > Clients and molecules** shows a card per client (open, overdue, high priority, serious, next due, and each molecule), with a client filter that applies to the whole dashboard (`/api/dashboard` takes `client`).
+
+The Add molecule dialog's portfolio defaults to **Auto**: the portfolio the chosen client already uses most, else the client's name, else "General". A portfolio can still be picked or typed.
