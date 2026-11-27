@@ -171,5 +171,9 @@ test("pasted settings update several saved searches at once, line by line (Lauru
   assert.equal(w("trientine").query, "((trientine))");
   assert.equal(w("bictegravir and emtricitabine and tenofovir alafenamide").query, "((bictegravir AND emtricitabine AND tenofovir alafenamide))");
   assert.equal((await t.call(SCREENER, "/api/saved-search-bulk", { client: "l", text })).status, 403);
-  const c = (await t.state()).clients[0]; assert.equal(c.lastPaste, text, "the client remembers the last pasted block"); assert.ok(c.lastPasteAt); assert.equal(c.lastPasteBy, MANAGER);
+  const c = (await t.state()).clients[0]; assert.equal(c.lastPaste, text, "the client remembers the last pasted block");
+  // an old block left in the box with a new one pasted before it: refused, nothing saved
+  const twice = await t.call(MANAGER, "/api/saved-search-bulk", { client: "l", text: "metformin | countries: India\n" + text });
+  assert.equal(twice.status, 400); assert.match(twice.body.error, /more than once.*metformin/);
+  assert.deepEqual((await t.state()).watches.find(w => w.molecule === "metformin").countries, []); assert.ok(c.lastPasteAt); assert.equal(c.lastPasteBy, MANAGER);
 });
