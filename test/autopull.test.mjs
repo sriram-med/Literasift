@@ -405,3 +405,18 @@ test("a date-range pull, comparison and count for a client counted like PubMed a
   const pub = await wf(ncbi.handler, () => t.call(M, "/api/pull-client", { client: "n", from: ago(7), to: ago(0), dateField: "pdat" }));
   assert.equal(pub.body.results[0].dateBasis, "pdat", "an explicit choice still wins");
 });
+
+test("PubMed alerts view: per product, the articles added to PubMed in the dates, with titles and whether each is already in the app", async () => {
+  const { makeEnv: mk, MANAGER: M, fakeNcbi: fk, withFetch: wf } = await import("./helpers.mjs");
+  const ago = n => new Date(Date.now() + 5.5 * 3600000 - n * 864e5).toISOString().slice(0, 10);
+  const t = await mk({ clients: [{ id: "n", name: "Navinta", dateBasis: "crdt" }], schema: { grouping: "client" },
+    watches: [{ portfolio: "Navinta", molecule: "carmustine", query: "((carmustine))", names: [], client: "n" }],
+    articles: { 11: { pmid: "11" } }, assignments: [{ id: "a", pmid: "11", portfolio: "Navinta", molecules: ["carmustine"] }] });
+  const ncbi = fk([{ pmid: "11", date: ago(2), title: "Carmustine wafer case" }, { pmid: "12", date: ago(3), title: "Carmustine toxicity" }, { pmid: "13", date: ago(30) }]);
+  const r = await wf(ncbi.handler, () => t.call(M, "/api/alerts-preview", { client: "n", from: ago(7), to: ago(0) }));
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.alerts, true); assert.equal(r.body.total, 2); assert.equal(r.body.notStored, 1);
+  const row = r.body.rows[0]; assert.equal(row.molecule, "carmustine"); assert.ok(row.term.includes("[crdt]"));
+  assert.deepEqual(row.articles.map(a => [a.pmid, a.stored, a.title]), [["11", true, "Carmustine wafer case"], ["12", false, "Carmustine toxicity"]]);
+  assert.equal((await t.call(M, "/api/alerts-preview", { client: "n", from: ago(0), to: ago(7) })).status, 400);
+});
