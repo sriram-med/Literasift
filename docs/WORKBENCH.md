@@ -505,3 +505,27 @@ The header shows the IRD range, who made it, and the date. The DE sees their art
 - **Mark QC done** is refused while any article in the document is still waiting for QC.
 - In the Word file, an article that has a QC comment but no decision is marked "[QC decision (Agree or Send back) still needed]".
 - When the DE's reason is "Other", the DE comment shows as "Other: <the explanation>".
+
+## Allocation (managers)
+
+Allocation is a manager-only tab for sharing articles out between DE and QC pairs.
+
+**How articles are numbered.** The articles are numbered 1, 2, 3 … in a fixed order: client, then drug, then IRD, then PMID. You can filter by client and IRD dates, and choose which articles to number:
+- not screened yet (the default);
+- without a DE;
+- all.
+
+**Ranges.** Each range is a pair of numbers (for example 1 to 20) with a **DE** and a **QC**. To build them:
+- use **Add range** for one at a time, or **Split into N equal ranges** to divide the list evenly;
+- each range is coloured in the table, so you can see which articles it covers.
+
+**Allocate.** Press **Allocate** to apply the ranges. For each article:
+- **DE:** the DE becomes its screener. Articles already screened keep their DE, unless QC sent them back.
+- **QC:** the QC is used when the DE finishes it. Articles already waiting for QC move to that QC straight away.
+
+**Rules.**
+- A DE and the QC of the same range must be different people.
+- Ranges cannot overlap.
+- Leave the DE empty to keep the current DE, or the QC as "automatic QC" to keep the usual QC routing.
+
+Each article's history records the allocation, and the audit trail records each allocation with its ranges.

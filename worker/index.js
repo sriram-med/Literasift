@@ -3405,6 +3405,8 @@ function pickRole(state, portfolio, role, exclude = "", molecule = "") {
   return pool.map(p => ({ p, n:load(p) })).sort((x, y) => x.n - y.n || x.p.email.localeCompare(y.p.email))[0]?.p.email || state.profiles.find(p => p.role === "manager" && p.active && p.email !== exclude)?.email || "";
 }
 function pickArticleQc(state, item) {
+  // A QC chosen by the manager in Allocation comes first, if that person is active and is not the screener.
+  if (item.qcPlanned && item.qcPlanned !== item.reviewer && state.profiles.some(p => p.email === item.qcPlanned && p.active)) return item.qcPlanned;
   const chosen = designatedOwner(state, item.portfolio, (item.molecules || [])[0] || "", "qcOwner", item.reviewer); if (chosen) return chosen;
   const pool = state.profiles.filter(p => p.active && p.email !== item.reviewer && rolesIn(state,p.email,item.portfolio).has("qc"));
   const load = p => state.assignments.filter(a => a.qc?.reviewer === p.email && a.qc.status === "pending").length;
@@ -6011,6 +6013,51 @@ async function apiCore(request, env, path) {
     await audit(env, { by:email, action:"review.disposition_bulk", target:done + " articles", detail:{ reason, note:note.slice(0, 200), skipped:skipped.length } });
     return json({ ok:true, done, skipped });
   }
+  if ((path === "/api/allocation-list" || path === "/api/allocation-apply") && viewer) {
+    // Allocation: the manager numbers the articles 1, 2, 3 ... in a fixed order and gives ranges of numbers to a DE and a QC.
+    if (viewer.role !== "manager") return json({ error:"Manager access required." }, 403);
+    const pname = e => state.profiles.find(p => p.email === e)?.name || e || "";
+    if (path === "/api/allocation-list") {
+      const from = isDate(body.from) ? body.from : "", to = isDate(body.to) ? body.to : "", client = String(body.client || "all"), only = ["open", "unassigned", "all"].includes(body.only) ? body.only : "open";
+      const cname = id => (state.clients || []).find(c => c.id === id)?.name || "No client";
+      const rows = [];
+      for (const a of state.assignments || []) {
+        const ird = irdOf(state, a), cid = clientIdFor(state, a);
+        if ((from && ird < from) || (to && ird > to) || (client !== "all" && cid !== client)) continue;
+        if (only === "open" && (a.disposition || a.status === "Complete")) continue;
+        if (only === "unassigned" && (a.reviewer || a.disposition)) continue;
+        const ms = a.molecules || [], drug = ms.length > 1 && overlapOf(state, cid) === "once" ? primaryMolecule(ms) : ms[0] || "";
+        rows.push({ id:a.id, pmid:a.pmid, client:cname(cid), drug, title:state.articles?.[a.pmid]?.title || "", ird, de:a.reviewer || "", deName:pname(a.reviewer), qc:a.qc?.status === "pending" ? a.qc.reviewer || a.qcPlanned || "" : a.qcPlanned || "", qcName:pname(a.qc?.status === "pending" ? a.qc.reviewer || a.qcPlanned : a.qcPlanned), status:a.status || "" });
+      }
+      rows.sort((p, q) => p.client.localeCompare(q.client) || p.drug.localeCompare(q.drug) || p.ird.localeCompare(q.ird) || p.pmid.localeCompare(q.pmid));
+      rows.forEach((r, i) => { r.no = i + 1; });
+      const people = state.profiles.filter(p => p.active).map(p => ({ email:p.email, name:p.name || p.email, de:p.role === "manager" || (state.memberships || []).some(m => m.email === p.email && m.role === "screener") || state.assignments.some(a => a.reviewer === p.email) || p.role === "reviewer", qc:(state.memberships || []).some(m => m.email === p.email && m.role === "qc") }));
+      return json({ rows, people, clients:(state.clients || []).map(c => ({ id:c.id, name:c.name })) });
+    }
+    const groups = (Array.isArray(body.groups) ? body.groups : []).slice(0, 50), at = new Date().toISOString(), active = e => !e || state.profiles.some(p => p.email === e && p.active);
+    if (!groups.length) return json({ error:"Add at least one range." }, 400);
+    const seen = new Set();
+    for (const g of groups) {
+      const ids = (Array.isArray(g.ids) ? g.ids : []).map(String);
+      if (!ids.length) return json({ error:"A range has no articles." }, 400);
+      if (!g.de && !g.qc) return json({ error:"Choose a DE or a QC for every range." }, 400);
+      if (!active(g.de) || !active(g.qc)) return json({ error:"Choose active team members." }, 400);
+      if (g.de && g.de === g.qc) return json({ error:"The DE and the QC of a range must be different people." }, 400);
+      for (const id of ids) { if (seen.has(id)) return json({ error:"Ranges overlap: an article is in two ranges." }, 400); seen.add(id); }
+    }
+    let moved = 0; const skipped = [];
+    await write(env, data => {
+      for (const g of groups) for (const id of g.ids.map(String)) {
+        const a = data.assignments.find(x => x.id === id); if (!a) { skipped.push({ id, why:"not found" }); continue; }
+        const notes = [];
+        if (g.de && a.reviewer !== g.de) { if (a.disposition && a.status !== "QC returned") { skipped.push({ id, pmid:a.pmid, why:"already screened" }); } else { a.reviewer = g.de; a.allocatedAt = at; notes.push("DE " + g.de); } }
+        if (g.qc) { if (g.qc === a.reviewer) skipped.push({ id, pmid:a.pmid, why:"the QC is this article's DE" }); else { a.qcPlanned = g.qc; if (a.qc?.status === "pending") a.qc.reviewer = g.qc; notes.push("QC " + g.qc); } }
+        if (notes.length) { (a.history ||= []).push({ status:a.status, note:"Allocated by manager: " + notes.join(", ") + (g.label ? " (" + g.label + ")" : ""), by:email, at }); moved++; }
+      }
+    });
+    await audit(env, { by:email, action:"review.allocation", target:moved + " articles", detail:{ ranges:groups.map(g => ({ label:g.label || "", count:g.ids.length, de:g.de || "", qc:g.qc || "" })), skipped:skipped.length } });
+    return json({ ok:true, moved, skipped });
+  }
   if (path === "/api/dashboard" && viewer) {
     const wf = ["screening", "qc", "medical"].includes(body.workflow) ? body.workflow : "screening", mgr = viewer.role === "manager";
     return json({ ...dashboardFor(state, viewer, wf, mgr ? String(body.person || "") : email, String(body.client || "")), clients:(state.clients || []).map(c => ({ id:c.id, name:c.name })) });
@@ -8534,7 +8581,7 @@ details.tools{margin:0 0 14px}details.tools>summary{cursor:pointer;color:var(--b
 .lltable{border-collapse:separate;border-spacing:0 8px;width:100%}.lltable th{background:none;border:0;padding:4px 14px}.lltable td{background:var(--card);padding:14px;vertical-align:top;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}.lltable td:first-child{border-left:4px solid var(--border);border-radius:12px 0 0 12px}.lltable td:last-child{border-right:1px solid var(--border);border-radius:0 12px 12px 0}.lltable tr.ser td:first-child{border-left-color:var(--red)}.lltable tr:hover td{background:var(--accent)}
 .board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(250px,1fr);gap:14px;overflow-x:auto;padding-bottom:10px;align-items:start}.bcol{background:var(--accent);border-radius:16px;padding:12px;min-height:160px}.bcol h4{display:flex;justify-content:space-between;align-items:center;margin:0 4px 10px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}.bcol h4 b{background:var(--card);border-radius:999px;padding:1px 9px;font-size:12px;color:var(--fg)}.bcards{display:grid;gap:10px}.bempty{padding:14px 6px;text-align:center}
 .bcard{display:grid;gap:6px;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:12px;padding:12px 14px;color:inherit;text-decoration:none;transition:box-shadow .15s,transform .15s}.bcard:hover{box-shadow:0 8px 22px #0e6a5d22;transform:translateY(-1px)}.bcard.ser{border-left-color:var(--red)}.bcard.late{border-left-color:var(--amber)}.bc-top{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.bc-title{font-size:13.5px;font-weight:600;line-height:1.35;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.bc-foot{display:flex;justify-content:space-between;align-items:center;margin-top:2px}
-.sccard{border:1px solid var(--border);border-radius:12px;padding:10px 14px;margin:0 0 8px;background:var(--card);display:grid;gap:4px}.schead{display:flex;justify-content:space-between;gap:10px;align-items:start}.scde mark{background:#fff59d;color:#222;padding:1px 4px;border-radius:3px}.scqc{display:flex;gap:6px;margin-top:4px}.scqc input{flex:1;min-width:160px}.scclient{margin:16px 0 8px;font-size:15px}.scdocs{border:1px solid var(--border);border-radius:12px;background:var(--card);padding:8px 12px;margin:0 0 12px}.scdocs summary{cursor:pointer}.scdocrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0;border-top:1px solid var(--border)}.scdocrow.on{background:var(--accent)}.scbanner{background:var(--accent);border-radius:10px;padding:10px 12px;margin:0 0 10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.acard.haspick{display:flex;gap:10px;align-items:flex-start}.acard.haspick>.mqpick{margin-top:4px;flex:none}.acard.haspick>.ac-main{flex:1}.dbcounts{margin:0 0 14px}.dbcounts #dbcout .pacounts{margin-top:10px}.pacounts{margin:0 0 12px}.pacounts summary{cursor:pointer;margin-bottom:6px}.paacts{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 8px}.pasum{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}#patable td{font-size:13px;vertical-align:top}#patable td:nth-child(8),#patable td:nth-child(9),#patable td:nth-child(5){white-space:nowrap}#patable td:nth-child(6){min-width:260px}.scttl{display:flex;gap:8px;align-items:start}.scttl input{margin-top:3px}.scbulk{display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:var(--accent);border-radius:12px;padding:10px 12px;margin:0 0 10px}.scbulk #scbulknote,.scbulk #mqnote{flex:1;min-width:240px}.scbulk .scall{display:flex!important;flex-direction:row!important;gap:6px;align-items:center;white-space:nowrap;font-size:13px;color:var(--muted);margin:0}.scbulk .scall input{width:auto;margin:0}
+.sccard{border:1px solid var(--border);border-radius:12px;padding:10px 14px;margin:0 0 8px;background:var(--card);display:grid;gap:4px}.schead{display:flex;justify-content:space-between;gap:10px;align-items:start}.scde mark{background:#fff59d;color:#222;padding:1px 4px;border-radius:3px}.scqc{display:flex;gap:6px;margin-top:4px}.scqc input{flex:1;min-width:160px}.scclient{margin:16px 0 8px;font-size:15px}.scdocs{border:1px solid var(--border);border-radius:12px;background:var(--card);padding:8px 12px;margin:0 0 12px}.scdocs summary{cursor:pointer}.scdocrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0;border-top:1px solid var(--border)}.scdocrow.on{background:var(--accent)}.scbanner{background:var(--accent);border-radius:10px;padding:10px 12px;margin:0 0 10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.acard.haspick{display:flex;gap:10px;align-items:flex-start}.acard.haspick>.mqpick{margin-top:4px;flex:none}.acard.haspick>.ac-main{flex:1}.dbcounts{margin:0 0 14px}.dbcounts #dbcout .pacounts{margin-top:10px}.pacounts{margin:0 0 12px}.pacounts summary{cursor:pointer;margin-bottom:6px}.alcranges{border:1px solid var(--border);border-radius:12px;background:var(--card);padding:10px 12px;margin:0 0 12px}.alch{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px}.alcrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:6px 10px;border-radius:8px;margin:0 0 6px;color:#222}.alcrow input[type=number]{width:70px}.alcrow select{min-width:160px}.alctable td{font-size:13px;vertical-align:top}.paacts{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 8px}.pasum{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}#patable td{font-size:13px;vertical-align:top}#patable td:nth-child(8),#patable td:nth-child(9),#patable td:nth-child(5){white-space:nowrap}#patable td:nth-child(6){min-width:260px}.scttl{display:flex;gap:8px;align-items:start}.scttl input{margin-top:3px}.scbulk{display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:var(--accent);border-radius:12px;padding:10px 12px;margin:0 0 10px}.scbulk #scbulknote,.scbulk #mqnote{flex:1;min-width:240px}.scbulk .scall{display:flex!important;flex-direction:row!important;gap:6px;align-items:center;white-space:nowrap;font-size:13px;color:var(--muted);margin:0}.scbulk .scall input{width:auto;margin:0}
 .seg{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden;background:var(--card)}.segb{border:0;background:none;padding:6px 16px;cursor:pointer;font:inherit;font-size:13px;color:var(--muted)}.segb.on{background:var(--brand);color:#fff}
 .impgrid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.impgrid .wide{grid-column:1/-1}
 .clientgrid{grid-template-columns:minmax(0,1fr)!important}.clientcard{min-width:0}
@@ -8721,6 +8768,7 @@ const paths = {
   "My Desk":'<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>',
   Dashboard:'<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
   Planner:'<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/>',
+  Allocation:'<path d="M3 6h7M3 12h7M3 18h7"/><path d="M14 6h7M14 12h7M14 18h7" opacity=".5"/><path d="M10 6l4 6-4 6"/>',
   Screened:'<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
   "Line Listing":'<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/><path d="M3 3v18" opacity=".0"/>',
   Admin:'<rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
@@ -8730,7 +8778,7 @@ const paths = {
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Screened:"Rejected and safety present articles by client, with the DE comment and the QC re-check. Download them as a Word file.",Dashboard:"Your workload by workflow: what is open, late and coming up, and for which clients and molecules.",Planner:"A calendar of what to screen, check or review, and when each is due. Dates run from the IRD.","My Desk":"Your work in three steps: data entry, QC, medical review. Each has its own list and its own actions.","Line Listing":"Every case in one table, built automatically from the cases and kept up to date. Download it any time.",Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across clients.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Pull by client or by molecule from PubMed and PubMed Central, with or without dates.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"People, their roles and clients, availability and sign-in access.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
+const subtitles = {Allocation:"Number the articles 1, 2, 3 ... and give ranges of numbers to a DE and a QC, such as 1 to 20 to one pair and 21 to 40 to another.",Screened:"Rejected and safety present articles by client, with the DE comment and the QC re-check. Download them as a Word file.",Dashboard:"Your workload by workflow: what is open, late and coming up, and for which clients and molecules.",Planner:"A calendar of what to screen, check or review, and when each is due. Dates run from the IRD.","My Desk":"Your work in three steps: data entry, QC, medical review. Each has its own list and its own actions.","Line Listing":"Every case in one table, built automatically from the cases and kept up to date. Download it any time.",Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across clients.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Pull by client or by molecule from PubMed and PubMed Central, with or without dates.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"People, their roles and clients, availability and sign-in access.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -10024,6 +10072,42 @@ function paImage(r){
   if(r.rows.length>400){g.fillStyle="#a15c00";g.fillText("Showing 400 of "+r.rows.length+". Narrow the dates or client, or use Excel for all of them.",pad,y+18);}
   c.toBlob(b=>{const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="literasift-pulled-"+(r.from||"all")+"-to-"+(r.to||"today")+".png";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);},"image/png");
 }
+// Allocation (managers): articles numbered 1, 2, 3 ... in a fixed order; ranges of numbers go to a DE and a QC.
+const alcState={client:"all",from:"",to:"",only:"open",ranges:[{start:1,end:20,de:"",qc:""}],out:null};
+async function loadAllocation(){
+  const box=$("alcbox");if(!box)return;
+  try{
+    const r=await api("allocation-list",{client:alcState.client,from:alcState.from,to:alcState.to,only:alcState.only});alcState.out=r;alcDraw();
+  }catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>';}
+}
+function alcRangeOf(no){return alcState.ranges.findIndex(g=>no>=g.start&&no<=g.end);}
+function alcDraw(){
+  const box=$("alcbox"),r=alcState.out;if(!box||!r)return;const n=r.rows.length,COL=["#e0f2f1","#e3f2fd","#fff3e0","#f3e5f5","#e8f5e9","#fce4ec","#ede7f6","#fffde7"];
+  const opt=(list,v,ph)=>'<option value="">'+ph+'</option>'+list.map(p=>'<option value="'+esc(p.email)+'"'+(p.email===v?" selected":"")+'>'+esc(p.name)+'</option>').join("");
+  const des=r.people.filter(p=>p.de),qcs=r.people.filter(p=>p.qc).length?r.people.filter(p=>p.qc):r.people;
+  const ctl='<div class="filters slim" style="border:0;padding:0 0 10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end">'+
+    '<label class="fl"><span class="sub">Client</span><select id="alcclient"><option value="all">All clients</option>'+r.clients.map(c=>'<option value="'+esc(c.id)+'"'+(alcState.client===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select></label>'+
+    '<label class="fl"><span class="sub">IRD from</span><input type="date" id="alcfrom" value="'+esc(alcState.from)+'"></label><label class="fl"><span class="sub">IRD to</span><input type="date" id="alcto" value="'+esc(alcState.to)+'"></label>'+
+    '<label class="fl"><span class="sub">Articles</span><select id="alconly"><option value="open"'+(alcState.only==="open"?" selected":"")+'>Not screened yet</option><option value="unassigned"'+(alcState.only==="unassigned"?" selected":"")+'>Without a DE</option><option value="all"'+(alcState.only==="all"?" selected":"")+'>All</option></select></label></div>';
+  const ranges='<div class="alcranges"><div class="alch"><b>Ranges</b><span class="sub">'+n+' article'+(n===1?"":"s")+' numbered 1 to '+n+'. Each range goes to one DE and one QC.</span><span style="margin-left:auto;display:flex;gap:6px;align-items:center"><label class="sub">Split into <input type="number" id="alcsplit" min="1" max="20" value="'+Math.max(1,alcState.ranges.length)+'" style="width:60px"> equal ranges</label><button type="button" class="btn outline sm" data-alcsplit="1">Split</button><button type="button" class="btn outline sm" data-alcadd="1">Add range</button></span></div>'+
+    alcState.ranges.map((g,i)=>{const cnt=Math.max(0,Math.min(g.end,n)-Math.max(g.start,1)+1);return '<div class="alcrow" style="border-left:6px solid '+COL[i%COL.length].replace("#e","#b").replace("#f","#d")+';background:'+COL[i%COL.length]+'"><b>Range '+(i+1)+'</b><label>No. <input type="number" min="1" max="'+n+'" data-alcf="start" data-i="'+i+'" value="'+g.start+'"></label><label>to <input type="number" min="1" max="'+n+'" data-alcf="end" data-i="'+i+'" value="'+g.end+'"></label><span class="sub">'+cnt+' article'+(cnt===1?"":"s")+'</span>'+
+      '<label>DE <select data-alcf="de" data-i="'+i+'">'+opt(des,g.de,"keep current DE")+'</select></label><label>QC <select data-alcf="qc" data-i="'+i+'">'+opt(qcs,g.qc,"automatic QC")+'</select></label><button type="button" class="btn outline sm" data-alcdel="'+i+'" title="Remove this range">&times;</button></div>';}).join("")+
+    '<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><button type="button" class="btn" data-alcapply="1">Allocate</button><span class="sub" id="alcmsg"></span></div></div>';
+  const tbl=n?'<div class="tablewrap"><table class="alctable"><thead><tr><th>No.</th><th>Client</th><th>Drug</th><th>PMID</th><th>Title</th><th>IRD</th><th>DE now</th><th>QC</th><th>Status</th></tr></thead><tbody>'+r.rows.map(x=>{const k=alcRangeOf(x.no);return '<tr'+(k>=0?' style="background:'+COL[k%COL.length]+'"':"")+'><td><b>'+x.no+'</b></td><td>'+esc(x.client)+'</td><td>'+esc(x.drug)+'</td><td><a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(x.pmid)+'/" target="_blank" rel="noopener">'+esc(x.pmid)+'</a></td><td>'+esc(x.title)+'</td><td style="white-space:nowrap">'+esc(x.ird)+'</td><td>'+esc(x.deName||"-")+'</td><td>'+esc(x.qcName||"auto")+'</td><td>'+esc(x.status)+'</td></tr>';}).join("")+'</tbody></table></div>':'<div class="empty">No articles match these filters.</div>';
+  box.innerHTML=ctl+ranges+tbl;
+  box.onchange=ev=>{const t=ev.target,m={alcclient:"client",alcfrom:"from",alcto:"to",alconly:"only"}[t.id];if(m){alcState[m]=t.value;return loadAllocation();}
+    if(t.dataset.alcf){const g=alcState.ranges[Number(t.dataset.i)];const f=t.dataset.alcf;g[f]=f==="start"||f==="end"?Math.max(1,Math.round(Number(t.value)||1)):t.value;alcDraw();}};
+  box.onclick=async ev=>{const t=ev.target.closest("[data-alcadd],[data-alcdel],[data-alcsplit],[data-alcapply]");if(!t)return;
+    if(t.dataset.alcadd){const last=alcState.ranges[alcState.ranges.length-1],s0=last?last.end+1:1;alcState.ranges.push({start:s0,end:Math.min(n,s0+19)||s0+19,de:"",qc:""});return alcDraw();}
+    if(t.dataset.alcdel){alcState.ranges.splice(Number(t.dataset.alcdel),1);if(!alcState.ranges.length)alcState.ranges.push({start:1,end:Math.min(20,n)||20,de:"",qc:""});return alcDraw();}
+    if(t.dataset.alcsplit){const k=Math.max(1,Math.min(20,Number(($("alcsplit")||{}).value)||1)),size=Math.ceil(n/k)||1,old=alcState.ranges;alcState.ranges=[];for(let i=0;i<k&&i*size<n;i++)alcState.ranges.push({start:i*size+1,end:Math.min(n,(i+1)*size),de:(old[i]||{}).de||"",qc:(old[i]||{}).qc||""});if(!alcState.ranges.length)alcState.ranges=[{start:1,end:1,de:"",qc:""}];return alcDraw();}
+    if(t.dataset.alcapply){
+      const groups=alcState.ranges.map((g,i)=>({label:"No. "+g.start+" to "+g.end,de:g.de,qc:g.qc,ids:r.rows.filter(x=>x.no>=g.start&&x.no<=g.end).map(x=>x.id)})).filter(g=>g.ids.length&&(g.de||g.qc));
+      if(!groups.length){alert("Choose a DE or a QC for at least one range with articles in it.");return;}
+      const name=e=>((r.people.find(p=>p.email===e)||{}).name||"");
+      if(!confirm(groups.map(g=>g.label+": "+g.ids.length+" articles"+(g.de?" to DE "+name(g.de):"")+(g.qc?", QC "+name(g.qc):"")).join(String.fromCharCode(10))+String.fromCharCode(10,10)+"Allocate?"))return;
+      t.disabled=true;try{const res=await api("allocation-apply",{groups});message("Allocated "+res.moved+" article"+(res.moved===1?"":"s")+(res.skipped.length?"; skipped "+res.skipped.length:"")+".");if(res.skipped.length)alert("Skipped: "+res.skipped.slice(0,10).map(x=>(x.pmid?"PMID "+x.pmid:x.id)+" ("+x.why+")").join(", "));await loadAllocation();}catch(e){alert(e.message);t.disabled=false;}}};
+}
 async function loadLineListing(){
   const box=$("llbox");if(!box)return;
   try{
@@ -11200,13 +11284,13 @@ function clientsHtml(){
 function stat(label,value,icon,warn){return '<div class="card tilt'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=(manager?["Overview","Dashboard","Planner","My Desk","Search & Pull","Library","My Queue","Screened","All Assignments","Clients","Synchrony","Line Listing","Batches","Watchlists","Team","Admin","Audit","Settings"]:["Dashboard","Planner","My Desk","Search & Pull","Library","My Queue","Screened","Synchrony","Line Listing","Watchlists"].concat(data.clientAdmin?["Clients"]:[])).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
+  const tabs=(manager?["Overview","Dashboard","Planner","My Desk","Search & Pull","Library","My Queue","Screened","Allocation","All Assignments","Clients","Synchrony","Line Listing","Batches","Watchlists","Team","Admin","Audit","Settings"]:["Dashboard","Planner","My Desk","Search & Pull","Library","My Queue","Screened","Synchrony","Line Listing","Watchlists"].concat(data.clientAdmin?["Clients"]:[])).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   libNumbers=null;
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
   const open=mine.filter(a=>a.status!=="Complete").length;
   $("identity").innerHTML="<b>"+esc(data.viewer.name)+"</b><small>"+esc(data.viewer.email)+" · "+esc(data.viewer.role)+"</small>";
-  const NAVG={Overview:0,Dashboard:0,Planner:0,"My Desk":0,"My Queue":0,Screened:0,"All Assignments":0,Clients:0,Synchrony:0,"Line Listing":0,"Search & Pull":1,Search:1,Discover:1,Library:1,Batches:1,Watchlists:1,Archive:1,Team:2,Admin:2,Audit:2,Settings:2,Account:2}, NAVL=["Work","Sources","Team"];
+  const NAVG={Overview:0,Dashboard:0,Planner:0,"My Desk":0,"My Queue":0,Screened:0,Allocation:0,"All Assignments":0,Clients:0,Synchrony:0,"Line Listing":0,"Search & Pull":1,Search:1,Discover:1,Library:1,Batches:1,Watchlists:1,Archive:1,Team:2,Admin:2,Audit:2,Settings:2,Account:2}, NAVL=["Work","Sources","Team"];
   const navTabs=tabs.map((x,i)=>[x,i]).sort((a,b)=>(NAVG[a[0]]||0)-(NAVG[b[0]]||0)||a[1]-b[1]).map(x=>x[0]);
   let lastG=-1;
   $("nav").innerHTML=navTabs.map(x=>{const g=NAVG[x]||0,head=g!==lastG?'<div class="navlabel">'+NAVL[g]+'</div>':"";lastG=g;return head+'<button class="navbtn" title="'+x+'" data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+ic(x)+'<span class="nl">'+x+'</span>'+(x==="My Queue"&&open?'<span class="n">'+open+"</span>":"")+'</button>';}).join("");
@@ -11374,6 +11458,7 @@ function render() {
   if(tab==="My Desk")html=deskHtml();
   if(tab==="Planner")html='<div id="plbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Dashboard")html='<div id="dbbox"><div class="skel"></div><div class="skel"></div></div>';
+  if(tab==="Allocation"&&manager)html='<div id="alcbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Screened")html='<div id="scbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Line Listing")html='<div id="llbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Team")html=teamHtml();
@@ -11403,6 +11488,7 @@ function render() {
   if(tab==="Batches"&&$("batchcov"))loadBatches();
   if(tab==="Batches"&&$("schedbox"))loadScheduler();
   if(tab==="Screened"&&$("scbox"))loadScreened();
+  if(tab==="Allocation"&&$("alcbox"))loadAllocation();
   if(tab==="Search & Pull"&&$("pabox"))loadPulled();
   if(tab==="Line Listing"&&$("llbox"))loadLineListing();
   if(tab==="Planner"&&$("plbox"))loadPlanner();
