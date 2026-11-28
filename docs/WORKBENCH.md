@@ -481,3 +481,20 @@ A medical reviewer who has neither the QC nor the screener role opens the Screen
 - **QC (QC queue):** use the same tick boxes and Select all, type one QC comment, then press **QC agree selected** or **Send back selected**. Send back needs a comment of at least 5 characters.
 - The Screened tab also has Select all and bulk actions for DE, QC and the medical reviewer.
 - Every bulk action is recorded in the audit trail and in each article's history.
+
+## Article counts per client (image)
+
+**Counts per client (image)** is available in two places:
+- **Search & Pull → Pulled articles**, which also shows the table on screen;
+- the **Screened** tab, using its IRD dates and client.
+
+It saves a PNG with one row per client and its drugs underneath, plus a total row. The columns are:
+- Articles
+- Not screened
+- Rejected
+- Safety present
+- Waiting for QC
+- QC agreed
+- Sent back
+
+The header shows the IRD range, who made it, and the date. The DE sees their articles. QC and medical reviewers see every article of the clients they work on.

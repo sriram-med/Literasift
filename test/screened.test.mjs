@@ -155,3 +155,12 @@ test("mass rejection: one reason and comment for many articles, each routed to Q
   assert.equal(q.done, 2);
   assert.deepEqual((await t.state()).assignments.filter(a => ["a1", "a2"].includes(a.id)).map(a => a.qc.status), ["approved", "approved"]);
 });
+
+test("counts per client: QC sees every article of their clients, with the screening and QC state of each", async () => {
+  const t = await makeEnv(team());
+  await t.call(MANAGER, "/api/membership-save", { email: QC, portfolio: "Navinta", role: "qc" });
+  await t.call(SCREENER, "/api/disposition", { id: "a1", value: "excluded", reason: "No adverse event" });
+  const q = (await t.call(QC, "/api/pulled-articles", {})).body;
+  assert.deepEqual(q.rows.map(r => [r.pmid, r.dispo, r.qc]).sort(), [["1", "excluded", "pending"], ["2", "", ""]], "both Navinta articles, not Laurus");
+  assert.deepEqual(q.clients.map(c => c.name), ["Navinta"]);
+});
