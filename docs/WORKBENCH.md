@@ -413,3 +413,33 @@ Every molecule has exactly one saved search: its own names (brands, salts, spell
   - **QC agree all** or **Send back all**: acts only on the selected items that are waiting for QC.
 
   Articles that can't take the action are skipped, and the app lists them. Every bulk action is recorded in the audit trail and in each article's history. Comments added in bulk appear in the Word document.
+
+## Overlapping searches
+
+One article can be found by two searches of a client: an article about calcium chloride matches both "Calcium" and "Calcium chloride". The app always keeps it as **one** work item. DE screens it once, QC checks it once, and medical review sees it once.
+
+Each client has a setting for how such an article is **counted**:
+- **Under every drug** (the default): it counts under each drug whose search found it, the way the client's separate alert emails count it.
+- **Once, under the most specific drug**: it counts only under the drug whose name contains the others (calcium chloride rather than calcium). If neither name contains the other, the first alphabetically is used.
+
+Where to set it:
+- Clients tab: the schedule row, "Overlapping searches".
+- Watchlists: the "Count overlaps once" / "Count overlaps under every drug" button.
+- Paste box: add `overlap: once` or `overlap: each` to the schedule line.
+
+Where it shows:
+- DE, QC and medical queues, and the Screened tab: an "also …" tag naming the other drugs that found the article. The queue groups the article under its counted drug.
+- Watchlists: each drug's count, with how many articles it shares and with which drugs.
+- Search & Pull: each drug's result notes how many articles another drug also found, and the summary line shows the unique total.
+- Drug counts on the Clients tab: each drug's count follows the setting, and the number shared is shown.
+
+## Pulled articles (Search & Pull → Pulled articles)
+
+This is a table of every pulled article you can see, filtered by IRD dates, client, and whether you pulled it, it is in your queue, or anyone pulled it. Managers can also filter by person.
+
+Columns: number, client, drug (following the overlap setting), also found by, PMID, title, journal, published date, IRD, pulled by, screener, status.
+
+Ways to export it:
+- **Copy table**: copies it as a table you can paste into Excel, Outlook or Word.
+- **Save as image**: a PNG of up to 400 rows.
+- **Excel** and **CSV**: every row.

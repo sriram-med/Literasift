@@ -165,7 +165,7 @@ function workItems(state, viewer) {
     const days = daysFor(state, watch, wf === "screening" ? "screen" : wf === "qc" ? "qc" : "medical"), override = a.timeline?.[wf] || null;
     const due = wf === "screening" ? (a.dueAt || addWorkingDays(start, days, tl)) : addWorkingDays(start, days, tl);
     const flags = [art.caseFacts?.minimum?.verdict === "Valid ICSR candidate" ? "icsr" : "", a.qc?.status === "returned" || a.returnedAt ? "returned" : ""].filter(Boolean);
-    out.push(finish({ kind:"article", id:a.id, ref:"PMID " + a.pmid, title:art.title || "PMID " + a.pmid, workflow:wf, owner:(wf === "screening" ? a.reviewer : wf === "qc" ? a.qc?.reviewer : a.medicalReviewer) || "", client:clientIdFor(state, a), molecule:(a.molecules || [])[0] || "", portfolio:a.portfolio, ird, start, due, status:a.status, flags, override }, watch));
+    out.push(finish({ kind:"article", id:a.id, ref:"PMID " + a.pmid, title:art.title || "PMID " + a.pmid, workflow:wf, owner:(wf === "screening" ? a.reviewer : wf === "qc" ? a.qc?.reviewer : a.medicalReviewer) || "", client:clientIdFor(state, a), molecule:(a.molecules || []).length > 1 && overlapOf(state, clientIdFor(state, a)) === "once" ? primaryMolecule(a.molecules) : (a.molecules || [])[0] || "", also:(a.molecules || []).length > 1 ? a.molecules.filter(m => m !== ((a.molecules || []).length > 1 && overlapOf(state, clientIdFor(state, a)) === "once" ? primaryMolecule(a.molecules) : a.molecules[0])) : [], portfolio:a.portfolio, ird, start, due, status:a.status, flags, override }, watch));
   }
   for (const c of state.cases || []) {
     if (c.archived || c.locked || ["Sent to PV Nexus", "Closed: not a valid ICSR"].includes(c.status) || !caseVisible(state, viewer, c)) continue;
@@ -1994,6 +1994,26 @@ function buildQuery(names, safetyOnly) {
 const keepOwner = (data, watch) => { const old = data.watches.find(w => watchKey(w) === watchKey(watch)); if (old?.owner && !watch.owner) watch.owner = old.owner; if (old?.client && !watch.client) watch.client = old.client; };
 // A client groups molecules. The link lives on the watchlist, so every article pulled for the molecule inherits it.
 const clientIdFor = (state, a) => { const mol = (a.molecules || [])[0] || ""; const w = state.watches.find(x => x.portfolio === a.portfolio && (x.molecule || "") === mol) || state.watches.find(x => x.portfolio === a.portfolio && x.molecule && (a.molecules || []).includes(x.molecule)) || state.watches.find(x => x.portfolio === a.portfolio && !x.molecule); return w?.client || ""; };
+// Overlapping searches: one article can be found by two searches of a client (Calcium and Calcium chloride). It is screened once either way.
+// "each" (default) counts it under every drug whose search found it, as the client's alert emails do; "once" counts it under the most specific drug only.
+const OVERLAP_LABEL = { each:"Under every matching drug (like alert emails)", once:"Once, under the most specific drug" };
+const overlapOf = (state, clientId) => (state.clients || []).find(c => c.id === clientId)?.overlap === "once" ? "once" : "each";
+function primaryMolecule(list) {
+  // The most specific name wins: one that no other name contains ("calcium chloride" over "calcium"); ties go alphabetically, so the choice is stable.
+  const names = uniq((list || []).filter(Boolean)), low = names.map(n => String(n).toLowerCase());
+  const specific = names.filter((n, i) => !low.some((m, k) => k !== i && m !== low[i] && m.includes(low[i])));
+  return (specific.length ? specific : names).slice().sort((a, b) => String(a).localeCompare(String(b)))[0] || "";
+}
+// Does this article count under this drug, given the client's overlap setting?
+const countsUnder = (state, a, molecule, clientId) => (a.molecules || []).includes(molecule) && (overlapOf(state, clientId ?? clientIdFor(state, a)) === "each" || primaryMolecule(a.molecules) === molecule);
+// For a list of drugs and the PMIDs each search found: how many each one shares with others, and how many count under it with the overlap setting.
+function overlapCounts(entries, mode) {
+  const owners = new Map(); for (const e of entries) for (const id of uniq(e.ids || [])) { if (!owners.has(id)) owners.set(id, []); owners.get(id).push(e.molecule); }
+  const out = new Map();
+  for (const e of entries) { const ids = uniq(e.ids || []), shared = ids.filter(id => owners.get(id).length > 1), others = uniq(shared.flatMap(id => owners.get(id))).filter(m => m !== e.molecule);
+    out.set(e.molecule, { shared:shared.length, sharedWith:others, counted:mode === "once" ? ids.filter(id => primaryMolecule(owners.get(id)) === e.molecule).length : ids.length }); }
+  return { per:out, unique:owners.size };
+}
 const watchKey = w => w.portfolio + "\u0000" + (w.molecule || "");
 const maxWatchesPerRun = 10;
 const pmcOrigin = "https://pmc-oa-opendata.s3.amazonaws.com";
@@ -4427,7 +4447,8 @@ function screenedRows(state, viewer, opts = {}) {
     const qs = a.qc?.status || "", pm = mgr || roles.has("manager");
     if (opts.qc && opts.qc !== "all" && (opts.qc === "none" ? qs : qs !== opts.qc)) continue;
     const canQc = qs === "pending" && a.reviewer !== me && (roles.has("qc") || a.qc.reviewer === me || pm) && (!a.qc.reviewer || a.qc.reviewer === me || pm);
-    rows.push({ id:a.id, pmid:a.pmid, client, molecule:(a.molecules || [])[0] || "", ird, title:state.articles?.[a.pmid]?.title || "PMID " + a.pmid, value:a.disposition.value,
+    const mainMol = (a.molecules || []).length > 1 && overlapOf(state, clientIdFor(state, a)) === "once" ? primaryMolecule(a.molecules) : (a.molecules || [])[0] || "";
+    rows.push({ id:a.id, pmid:a.pmid, client, molecule:mainMol, also:(a.molecules || []).filter(m => m !== mainMol), ird, title:state.articles?.[a.pmid]?.title || "PMID " + a.pmid, value:a.disposition.value,
       reason:a.disposition.reason || "", note:a.disposition.note || "", deBy:a.disposition.by || a.reviewer || "", deName:name(a.disposition.by || a.reviewer), deAt:a.disposition.at || "",
       qc:qs, qcLabel:QC_LABEL[qs] || "No QC", qcNote:a.qcComment?.note || a.qc?.note || "", qcBy:a.qcComment?.by || a.qc?.decidedBy || "", qcName:name(a.qcComment?.by || a.qc?.decidedBy), qcReviewer:a.qc?.reviewer || "", canQc,
       canDeComment:pm || a.reviewer === me || a.disposition.by === me, canQcComment:pm || ((isQc || a.qc?.reviewer === me) && a.reviewer !== me && a.disposition.by !== me), status:a.status });
@@ -5760,7 +5781,7 @@ async function apiCore(request, env, path) {
   const manager = viewer?.role === "manager";
   if (!viewer && !service) return json({ error:"Your account needs a Literature Bench profile." }, 403);
   if (request.method === "GET" && path === "/api/state") {
-    const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ird:irdOf(state, a), wdLeft:a.dueAt ? workingDaysBetween(day(), a.dueAt, timelines(state)) : null, ...(a.synchrony ? { synchrony:{ status:a.synchrony.status, mode:a.synchrony.mode, at:a.synchrony.at, issues:a.synchrony.issues, patients:a.synchrony.patients, created:a.synchrony.created, ai:a.synchrony.ai, shadowCount:a.synchrony.shadowCount, error:a.synchrony.error } } : {}), ...scoreArticle(state.articles[a.pmid], a.molecules), client:clientIdFor(state, a) }));
+    const assignments = state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => ({ ...a, ird:irdOf(state, a), wdLeft:a.dueAt ? workingDaysBetween(day(), a.dueAt, timelines(state)) : null, ...(a.synchrony ? { synchrony:{ status:a.synchrony.status, mode:a.synchrony.mode, at:a.synchrony.at, issues:a.synchrony.issues, patients:a.synchrony.patients, created:a.synchrony.created, ai:a.synchrony.ai, shadowCount:a.synchrony.shadowCount, error:a.synchrony.error } } : {}), ...scoreArticle(state.articles[a.pmid], a.molecules), client:clientIdFor(state, a), ...((a.molecules || []).length > 1 ? { countedUnder:primaryMolecule(a.molecules), overlap:overlapOf(state, clientIdFor(state, a)) } : {}) }));
     return json({ viewer, clients:(state.clients || []).map(c => ({ ...c, molecules:state.watches.filter(w => w.client === c.id).map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "" })) })), library:manager ? libraryLayout(state) : (() => { const ok = new Set(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => a.pmid)); return libraryLayout(state).filter(e => ok.has(e.pmid)); })(),
       cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, evidenceReviewPending:caseEvidenceDelta(state, c).changes.length>0, canEdit:canEditCase(state, viewer, c), signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
       dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], meddraInfo:state.meddra || null, stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c), triage:triageFor(state, c), ird:caseIrd(state, c), stageDue:caseStageDue(state, c), wdLeft:(() => { const d = caseStageDue(state, c); return d ? workingDaysBetween(day(), d, timelines(state)) : null; })(), client:watchFor(state, c.portfolio, c.molecule || "")?.client || "" }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set([...(state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role), ...(state.profiles.find(p => p.email === viewer?.email && p.role === "reviewer" && !p.roles && legacyScreens(state, p)) ? ["screener"] : [])])],
@@ -5906,6 +5927,34 @@ async function apiCore(request, env, path) {
     }
     await audit(env, { by:email, action:"screened.comment", target:as, detail:{ count:done.length, skipped:skipped.length, decision:decision || "comment", note:note.slice(0, 200) } });
     return json({ ok:true, done:done.length, skipped });
+  }
+  if (path === "/api/pulled-articles" && viewer) {
+    // Every article pulled into the app that this person may see, for an IRD range: a table to copy, save as a picture, or download for Excel.
+    const mgr = viewer.role === "manager", from = isDate(body.from) ? body.from : "", to = isDate(body.to) ? body.to : "", client = String(body.client || "all");
+    const who = ["me", "queue", "all"].includes(body.who) ? body.who : "all", person = mgr ? String(body.person || "") : "";
+    const cname = id => (state.clients || []).find(c => c.id === id)?.name || "No client", pname = e => state.profiles.find(p => p.email === e)?.name || e || "";
+    const rows = [];
+    for (const a of state.assignments || []) {
+      if (!mayAccess(state, viewer, a)) continue;
+      const ird = irdOf(state, a), cid = clientIdFor(state, a);
+      if ((from && ird < from) || (to && ird > to) || (client !== "all" && cid !== client)) continue;
+      if (who === "me" && a.pulledBy !== email) continue;
+      if (who === "queue" && a.reviewer !== email) continue;
+      if (person && a.pulledBy !== person && a.reviewer !== person) continue;
+      const art = state.articles?.[a.pmid] || {}, ms = a.molecules || [], main = ms.length > 1 && overlapOf(state, cid) === "once" ? primaryMolecule(ms) : ms[0] || "";
+      rows.push({ client:cname(cid), drug:main, also:ms.filter(m => m !== main).join(", "), pmid:a.pmid, title:art.title || "", journal:art.journal || "", published:String(art.date || art.pubDate || "").slice(0, 10), ird,
+        pulledBy:pname(a.pulledBy || ""), reviewer:pname(a.reviewer || ""), status:a.disposition ? (a.disposition.value === "excluded" ? "Rejected" : a.disposition.value === "potential_icsr" ? "Potential ICSR" : a.disposition.value === "aggregate_safety" ? "Aggregate safety" : "Full text needed") : a.status || "" });
+    }
+    rows.sort((p, q) => p.client.localeCompare(q.client) || p.drug.localeCompare(q.drug) || q.ird.localeCompare(p.ird) || p.pmid.localeCompare(q.pmid));
+    const head = ["No.", "Client", "Drug", "Also found by", "PMID", "Title", "Journal", "Published", "IRD", "Pulled by", "Screener", "Status"];
+    if (body.format === "xlsx") {
+      const file = xlsxFile("Pulled articles", head, rows.map((r, i) => [i + 1, r.client, r.drug, r.also, Number(r.pmid) || r.pmid, r.title, r.journal, r.published, r.ird, r.pulledBy, r.reviewer, r.status]));
+      return new Response(file, { headers:{ "Content-Type":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Content-Disposition":'attachment; filename="literasift-pulled' + (from ? "-" + from : "") + (to ? "-to-" + to : "") + '.xlsx"' } });
+    }
+    const byDrug = {}; for (const r of rows) { const k = r.client + "|" + r.drug; byDrug[k] = (byDrug[k] || 0) + 1; }
+    return json({ from, to, client, who, head, rows, total:rows.length, summary:Object.entries(byDrug).map(([k, n]) => ({ client:k.split("|")[0], drug:k.split("|")[1], count:n })),
+      clients:(state.clients || []).filter(c => state.assignments.some(a => clientIdFor(state, a) === c.id && mayAccess(state, viewer, a))).map(c => ({ id:c.id, name:c.name })),
+      people:mgr ? uniq(state.assignments.flatMap(a => [a.pulledBy, a.reviewer]).filter(Boolean)).map(e => ({ email:e, name:pname(e) })) : [] });
   }
   if (path === "/api/dashboard" && viewer) {
     const wf = ["screening", "qc", "medical"].includes(body.workflow) ? body.workflow : "screening", mgr = viewer.role === "manager";
@@ -6149,7 +6198,8 @@ async function apiCore(request, env, path) {
         if (!["daily", "weekly"].includes(every) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time) || weekday < 1) { out.push({ molecule:"schedule", ok:false, error:"Write it as: schedule | every: weekly | day: Monday | time: 09:00" }); continue; }
         const countBy = String(f.count || "").toLowerCase();
         await write(env, data => { const c = data.clients.find(x => x.id === clientId); c.schedule = scheduleOf({ every, weekday, time }); if (/alert|crdt|entry|added/.test(countBy)) c.dateBasis = "crdt"; else if (/pub|dp/.test(countBy)) delete c.dateBasis;
-          const irdRule = String(f.ird || "").toLowerCase(); if (/receipt|mail|email|schedule/.test(irdRule)) c.irdRule = "receipt"; else if (/pull/.test(irdRule)) delete c.irdRule; });
+          const irdRule = String(f.ird || "").toLowerCase(); if (/receipt|mail|email|schedule/.test(irdRule)) c.irdRule = "receipt"; else if (/pull/.test(irdRule)) delete c.irdRule;
+          const ov = String(f.overlap || "").toLowerCase(); if (/once|single|specific/.test(ov)) c.overlap = "once"; else if (/each|every|all|alert/.test(ov)) delete c.overlap; });
         const sl = scheduleSlots({ every, weekday, time });
         out.push({ molecule:"schedule", ok:true, mode:"schedule", query:(every === "weekly" ? "Every " + DAYS[weekday - 1][0].toUpperCase() + DAYS[weekday - 1].slice(1) : "Every day") + " at " + time + " (India time) · next pull " + sl.next, countries:[] });
         continue;
@@ -6332,8 +6382,11 @@ async function apiCore(request, env, path) {
     let nextSlot = 0; await Promise.all(Array.from({ length:Math.min(Math.max(1, Number(env.PULL_LANES ?? 1)), watches.length) }, async () => { while (nextSlot < watches.length) { const slot = nextSlot++; await one(watches[slot], slot); if (jobHook) await jobHook(); } }));
     if (aligned.size) await write(env, data => { for (const [k, q] of aligned) { const cur = data.watches.find(x => watchKey(x) === k); if (cur && cur.query !== q && q.length <= 1500) commitWatch(data, { ...cur, query:q }, email, "search uses the molecule and its own names only"); } }).catch(() => {});
     const name = clientId === "none" ? "No client" : state.clients.find(c => c.id === clientId).name;
+    // Overlapping searches: an article two drugs found is stored and screened once; the per-drug figure follows the client's setting.
+    const overlap = overlapOf(state, clientId), oc = overlapCounts(results.filter(r => r && r.storedIds).map(r => ({ molecule:r.molecule, ids:r.storedIds })), overlap);
+    for (const r of results) { const o = r && oc.per.get(r.molecule); if (!o) continue; r.shared = o.shared; r.sharedWith = o.sharedWith; r.counted = o.counted; }
     await audit(env, { by:email, action:"pull.client", target:name, detail:{ from:body.from, to:body.to, molecules:results.length, articles:results.reduce((n, r) => n + (r.count || 0), 0), failed:results.filter(r => r.error).length } });
-    return ({ client:name, from:allDates ? "" : body.from, to:allDates ? "" : body.to, allDates, results, complete:results.every(r => r.complete), total:results.reduce((n, r) => n + (r.count || 0), 0), added:results.reduce((n, r) => n + (r.added || 0), 0) });
+    return ({ client:name, overlap, overlapLabel:OVERLAP_LABEL[overlap], unique:oc.unique, from:allDates ? "" : body.from, to:allDates ? "" : body.to, allDates, results, complete:results.every(r => r.complete), total:results.reduce((n, r) => n + (r.count || 0), 0), added:results.reduce((n, r) => n + (r.added || 0), 0) });
     };
     if (body.background === true && env.DEFER_EVIDENCE === "1") {
       const id = crypto.randomUUID(), job = { id, by:email, state:"running", total:watches.length, results, progress, startedAt:Date.now() }; pullJobs.set(id, job);
@@ -7416,12 +7469,12 @@ async function apiCore(request, env, path) {
     if (path === "/api/scheduler-status") {
       const missed = state.watches.flatMap(w => missedWindows(state, w, through, fieldFor(state, w))).sort((a, b) => a.from.localeCompare(b.from));
       const age = h.lastBeatAt ? Math.round((Date.now() - Date.parse(h.lastBeatAt)) / 60000) : null;
-      const perWatch = state.watches.map(w => { const last = state.runs.filter(r => r.portfolio === w.portfolio && (r.molecule || "") === (w.molecule || "") && r.status === "Imported").map(r => r.time).sort().pop() || ""; return { watch:encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || ""), portfolio:w.portfolio, molecule:w.molecule || "", clientId:w.client || "", client:(state.clients || []).find(x => x.id === w.client)?.name || "", auto:w.auto !== false, names:ownNames(w).slice(1), hand:handQuery(w), startFrom:w.startFrom || "", until:w.until || "", effective:pullRange(state, w), missing:missedWindows(state, w, through, fieldFor(state, w)).filter(m => m.state === "missing").length, lastRunAt:last, articles:state.assignments.filter(a => a.portfolio === w.portfolio && (!w.molecule || (a.molecules || []).includes(w.molecule))).length }; });
+      const perWatch = state.watches.map(w => { const last = state.runs.filter(r => r.portfolio === w.portfolio && (r.molecule || "") === (w.molecule || "") && r.status === "Imported").map(r => r.time).sort().pop() || ""; const mine = w.molecule ? state.assignments.filter(a => samePf(w, a.portfolio) && (a.molecules || []).includes(w.molecule)) : []; return { watch:encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule || ""), portfolio:w.portfolio, molecule:w.molecule || "", clientId:w.client || "", counted:mine.filter(a => countsUnder(state, a, w.molecule, w.client || "")).length, shared:mine.filter(a => a.molecules.length > 1).length, sharedWith:uniq(mine.flatMap(a => a.molecules)).filter(m => m !== w.molecule).slice(0, 6), client:(state.clients || []).find(x => x.id === w.client)?.name || "", auto:w.auto !== false, names:ownNames(w).slice(1), hand:handQuery(w), startFrom:w.startFrom || "", until:w.until || "", effective:pullRange(state, w), missing:missedWindows(state, w, through, fieldFor(state, w)).filter(m => m.state === "missing").length, lastRunAt:last, articles:state.assignments.filter(a => a.portfolio === w.portfolio && (!w.molecule || (a.molecules || []).includes(w.molecule))).length }; });
       const slotInfo = cid => { const sl = scheduleSlots(groupSchedule(state, cid)), done = (state.autoSlots || {})[cid || "none"] || "", since = (done || sl.last).slice(0, 10);
         const arrived = a => String(state.articles?.[a.pmid]?.pullAt || a.createdAt || irdOf(state, a)).slice(0, 10);
         const items = state.assignments.filter(a => (clientIdFor(state, a) || "") === (cid || "") && arrived(a) >= since);
         return { schedule:sl.schedule, nextPull:sl.next, lastSlot:sl.last, lastSlotDone:done === sl.last, lastPulledSlot:done, newSinceLast:items.length }; };
-      const perClient = [...(state.clients || []).map(c => ({ id:c.id, name:c.name, auto:c.autoPull !== false, countBy:c.dateBasis === "crdt" ? "alerts" : "publication", irdRule:c.irdRule === "receipt" ? "receipt" : "pulled", searchMode:modeOf(c.searchMode) || "pubmed", startFrom:c.startFrom || "", until:c.until || "", ...slotInfo(c.id) })), { id:"", name:"No client", auto:true, ...slotInfo("") }].map(c => { const ws = perWatch.filter(w => w.clientId === c.id); return { ...c, molecules:ws.length, waiting:ws.reduce((n, w) => n + w.missing, 0), articles:ws.reduce((n, w) => n + w.articles, 0), lastRunAt:ws.map(w => w.lastRunAt).filter(Boolean).sort().pop() || "" }; }).filter(c => c.id || c.molecules);
+      const perClient = [...(state.clients || []).map(c => ({ id:c.id, name:c.name, auto:c.autoPull !== false, countBy:c.dateBasis === "crdt" ? "alerts" : "publication", irdRule:c.irdRule === "receipt" ? "receipt" : "pulled", overlap:c.overlap === "once" ? "once" : "each", searchMode:modeOf(c.searchMode) || "pubmed", startFrom:c.startFrom || "", until:c.until || "", ...slotInfo(c.id) })), { id:"", name:"No client", auto:true, ...slotInfo("") }].map(c => { const ws = perWatch.filter(w => w.clientId === c.id); return { ...c, molecules:ws.length, waiting:ws.reduce((n, w) => n + w.missing, 0), articles:ws.reduce((n, w) => n + w.articles, 0), lastRunAt:ws.map(w => w.lastRunAt).filter(Boolean).sort().pop() || "" }; }).filter(c => c.id || c.molecules);
       if (!manager) {
         // A screener sees, read-only, the automatic pull of the clients they work on: no other client and nothing to change.
         const mine = myPortfolios(state, viewer), mw = perWatch.filter(w => mine.includes(w.portfolio)), mc = new Set(mw.map(w => w.clientId));
@@ -7896,18 +7949,28 @@ async function apiCore(request, env, path) {
     const cfg = withSettings(env, state), rows = [];
     for (const w of watches) {
       const linked = state.assignments.filter(a => samePf(w, a.portfolio) && (a.molecules || []).includes(w.molecule)), inWeek = linked.filter(a => { const d = irdOf(state, a).slice(0, 10); return d >= body.from && d <= body.to; });
-      const row = { key:encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule), client:cname(w.client), molecule:w.molecule, pulled:inWeek.length, total:linked.length, auto:w.auto !== false };
+      const row = { key:encodeURIComponent(w.portfolio) + "|" + encodeURIComponent(w.molecule), client:cname(w.client), molecule:w.molecule, pulled:inWeek.length, total:linked.length, auto:w.auto !== false, _cid:w.client || "", _ids:inWeek.map(a => a.pmid) };
       if (by !== "ird") {
         // PubMed's own PMID list for the drug's saved search in the week, matched with what is stored and linked to the drug here.
         const spec = searchSpec(state, w, {}), term = asOfTerm(searchTerm(spec.query, body.from, body.to, basis), body.asOf), held = new Set(linked.filter(a => state.articles[a.pmid]).map(a => a.pmid));
         try { const { esearchresult: r } = await withRetry(cfg, () => pubmed(cfg, "esearch", { term, retmode:"json", retmax:"10000" }));
-          const ids = uniq((r?.idlist || []).map(String)); row.pulled = ids.filter(id => held.has(id)).length; row.pubmed = pubmedCount(r) ?? ids.length; row.notPulled = Math.max(0, row.pubmed - row.pulled); row.term = term; }
+          const ids = uniq((r?.idlist || []).map(String)); row._ids = ids.filter(id => held.has(id)); row._pm = ids; row.pulled = row._ids.length; row.pubmed = pubmedCount(r) ?? ids.length; row.notPulled = Math.max(0, row.pubmed - row.pulled); row.term = term; }
         catch (error) { row.pulled = null; row.error = String(error.message || error).slice(0, 120); }
       }
       if (body.pubmed === true) { const spec = searchSpec(state, w, {}), term = searchTerm(spec.query, body.from, body.to, basis), info = await esearchInfo(cfg, term);
         row.pubmed = info?.count ?? null; row.term = term; row.pubmedUrl = "https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(term); row.warnings = info?.warnings || []; }
       rows.push(row);
     }
+    // Overlapping searches, client by client: how many articles each drug shares with another drug, and the count under the client's setting.
+    let unique = 0;
+    for (const cid of uniq(rows.map(r => r._cid))) {
+      const mine = rows.filter(r => r._cid === cid), mode = overlapOf(state, cid), oc = overlapCounts(mine.map(r => ({ molecule:r.molecule, ids:r._ids })), mode); unique += oc.unique;
+      const pm = mine.some(r => r._pm) ? overlapCounts(mine.map(r => ({ molecule:r.molecule, ids:r._pm || [] })), mode) : null;
+      for (const r of mine) { const o = oc.per.get(r.molecule) || {}; r.overlap = mode; r.shared = o.shared || 0; r.sharedWith = o.sharedWith || [];
+        if (mode === "once" && r.pulled != null) r.pulled = o.counted;
+        if (pm && r._pm) { const q = pm.per.get(r.molecule) || {}; r.pubmedShared = q.shared || 0; if (mode === "once") { r.pubmedAll = r.pubmed; r.pubmed = q.counted; r.notPulled = Math.max(0, r.pubmed - (r.pulled || 0)); } } }
+    }
+    for (const r of rows) { delete r._ids; delete r._pm; delete r._cid; }
     if (body.format === "xlsx") {
       // Client by client: each drug with its count, and the client's total under its drugs.
       const out = [], names = uniq(rows.map(r => r.client));
@@ -7916,7 +7979,7 @@ async function apiCore(request, env, path) {
       return new Response(file, { headers:{ "Content-Type":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Content-Disposition":'attachment; filename="literasift-drugs-' + body.from + '-to-' + body.to + '.xlsx"' } });
     }
     return json({ from:body.from, to:body.to, client:clientId === "all" ? "All clients" : clientId === "none" ? "No client" : cname(clientId), dateField:basis, dateBasisLabel:DATE_BASIS_LABEL[basis], rows,
-      by, asOf:by !== "ird" && isDate(body.asOf) ? body.asOf : "", totals:{ pulled:rows.reduce((n, r) => n + (r.pulled || 0), 0), pubmed:body.pubmed === true ? rows.reduce((n, r) => n + (r.pubmed || 0), 0) : null } });
+      by, asOf:by !== "ird" && isDate(body.asOf) ? body.asOf : "", totals:{ unique, pulled:rows.reduce((n, r) => n + (r.pulled || 0), 0), pubmed:body.pubmed === true ? rows.reduce((n, r) => n + (r.pubmed || 0), 0) : null } });
   }
   if (path === "/api/client-auto" && viewer) {
     // Automatic options of a client: on or off, the day pulling starts, and the day it stops. Each is optional in the request.
@@ -7927,6 +7990,9 @@ async function apiCore(request, env, path) {
     if ("every" in body && !["daily", "weekly"].includes(body.every)) return json({ error:"Choose daily or weekly." }, 400);
     if ("time" in body && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(body.time))) return json({ error:"Enter the time as HH:MM." }, 400);
     if ("irdRule" in body) await write(env, data => { const c = data.clients.find(x => x.id === body.client); if (body.irdRule === "receipt") c.irdRule = "receipt"; else delete c.irdRule; });
+    if ("overlap" in body) { if (!["each", "once"].includes(body.overlap)) return json({ error:"Choose how overlapping searches count: each or once." }, 400);
+      await write(env, data => { const c = data.clients.find(x => x.id === body.client); if (body.overlap === "once") c.overlap = "once"; else delete c.overlap; });
+      await audit(env, { by:email, action:"client.overlap", target:(state.clients.find(c => c.id === body.client) || {}).name || body.client, detail:{ overlap:body.overlap } }); }
     if (body.applyIrd === true || body.applyIrd === "true") await write(env, data => {
       // Open items of the client not yet screened get the receipt-day IRD (from the pull window that found them) and a screening due date from it.
       for (const a of data.assignments) { if (a.status !== "Pending" || a.disposition || a.irdManual) continue; const w = watchFor(data, a.portfolio, (a.molecules || [])[0] || ""); if (w?.client !== body.client) continue;
@@ -8413,7 +8479,7 @@ details.tools{margin:0 0 14px}details.tools>summary{cursor:pointer;color:var(--b
 .lltable{border-collapse:separate;border-spacing:0 8px;width:100%}.lltable th{background:none;border:0;padding:4px 14px}.lltable td{background:var(--card);padding:14px;vertical-align:top;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}.lltable td:first-child{border-left:4px solid var(--border);border-radius:12px 0 0 12px}.lltable td:last-child{border-right:1px solid var(--border);border-radius:0 12px 12px 0}.lltable tr.ser td:first-child{border-left-color:var(--red)}.lltable tr:hover td{background:var(--accent)}
 .board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(250px,1fr);gap:14px;overflow-x:auto;padding-bottom:10px;align-items:start}.bcol{background:var(--accent);border-radius:16px;padding:12px;min-height:160px}.bcol h4{display:flex;justify-content:space-between;align-items:center;margin:0 4px 10px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}.bcol h4 b{background:var(--card);border-radius:999px;padding:1px 9px;font-size:12px;color:var(--fg)}.bcards{display:grid;gap:10px}.bempty{padding:14px 6px;text-align:center}
 .bcard{display:grid;gap:6px;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:12px;padding:12px 14px;color:inherit;text-decoration:none;transition:box-shadow .15s,transform .15s}.bcard:hover{box-shadow:0 8px 22px #0e6a5d22;transform:translateY(-1px)}.bcard.ser{border-left-color:var(--red)}.bcard.late{border-left-color:var(--amber)}.bc-top{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.bc-title{font-size:13.5px;font-weight:600;line-height:1.35;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.bc-foot{display:flex;justify-content:space-between;align-items:center;margin-top:2px}
-.sccard{border:1px solid var(--border);border-radius:12px;padding:10px 14px;margin:0 0 8px;background:var(--card);display:grid;gap:4px}.schead{display:flex;justify-content:space-between;gap:10px;align-items:start}.scde mark{background:#fff59d;color:#222;padding:1px 4px;border-radius:3px}.scqc{display:flex;gap:6px;margin-top:4px}.scqc input{flex:1;min-width:160px}.scclient{margin:16px 0 8px;font-size:15px}.scttl{display:flex;gap:8px;align-items:start}.scttl input{margin-top:3px}.scbulk{display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:var(--accent);border-radius:12px;padding:10px 12px;margin:0 0 10px}.scbulk #scbulknote{flex:1;min-width:220px}.scbulk .scall{display:flex!important;flex-direction:row!important;gap:6px;align-items:center;white-space:nowrap;font-size:13px;color:var(--muted);margin:0}.scbulk .scall input{width:auto;margin:0}
+.sccard{border:1px solid var(--border);border-radius:12px;padding:10px 14px;margin:0 0 8px;background:var(--card);display:grid;gap:4px}.schead{display:flex;justify-content:space-between;gap:10px;align-items:start}.scde mark{background:#fff59d;color:#222;padding:1px 4px;border-radius:3px}.scqc{display:flex;gap:6px;margin-top:4px}.scqc input{flex:1;min-width:160px}.scclient{margin:16px 0 8px;font-size:15px}.paacts{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 8px}.pasum{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}#patable td{font-size:13px;vertical-align:top}#patable td:nth-child(8),#patable td:nth-child(9),#patable td:nth-child(5){white-space:nowrap}#patable td:nth-child(6){min-width:260px}.scttl{display:flex;gap:8px;align-items:start}.scttl input{margin-top:3px}.scbulk{display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:var(--accent);border-radius:12px;padding:10px 12px;margin:0 0 10px}.scbulk #scbulknote{flex:1;min-width:220px}.scbulk .scall{display:flex!important;flex-direction:row!important;gap:6px;align-items:center;white-space:nowrap;font-size:13px;color:var(--muted);margin:0}.scbulk .scall input{width:auto;margin:0}
 .seg{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden;background:var(--card)}.segb{border:0;background:none;padding:6px 16px;cursor:pointer;font:inherit;font-size:13px;color:var(--muted)}.segb.on{background:var(--brand);color:#fff}
 .impgrid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.impgrid .wide{grid-column:1/-1}
 .clientgrid{grid-template-columns:minmax(0,1fr)!important}.clientcard{min-width:0}
@@ -8814,7 +8880,7 @@ function weekLabel(due,today){
 }
 function queueCard(i,today){
   const ageDays=Math.max(0,Math.round((Date.parse(today)-Date.parse(i.ird))/864e5)),act=i.kind==="case"?'<button type="button" class="btn sm" data-opencase="'+esc(i.id)+'">Open</button>':'<button type="button" class="btn sm" data-review="'+esc(i.id)+'">Open</button>';
-  return '<article class="acard mq'+(i.overdue?" r-red":i.daysLeft!==null&&i.daysLeft<=NEAR_DAYS?" r-amber":"")+'"><div class="ac-main"><div class="ac-meta" style="margin:0 0 6px">'+prioBadge(i.priority)+' <span class="agechip" title="Weeks since the IRD">In queue week '+(Math.floor(ageDays/7)+1)+'</span> '+(i.flags||[]).map(f=>'<span class="badge '+(f==="serious"||f==="returned"?"red":"blue")+'">'+({icsr:"Likely ICSR",serious:"Serious",returned:"Returned"})[f]+'</span>').join(" ")+'</div><div class="ac-title" style="-webkit-line-clamp:2">'+esc(i.title)+'</div><div class="ac-meta">'+esc(i.ref)+(i.clientName?' · '+esc(i.clientName):"")+(i.molecule?' · '+esc(i.molecule):"")+'</div>'+irdLine(i.ird,i.due,i.daysLeft,WF_NAME[i.workflow]+" due")+(i.override?'<div class="sub">Date set by a manager'+(i.override.reason?': '+esc(i.override.reason):"")+'</div>':"")+'</div><div class="ac-side"><div class="sub">'+dueText(i)+'</div>'+act+'</div></article>';
+  return '<article class="acard mq'+(i.overdue?" r-red":i.daysLeft!==null&&i.daysLeft<=NEAR_DAYS?" r-amber":"")+'"><div class="ac-main"><div class="ac-meta" style="margin:0 0 6px">'+prioBadge(i.priority)+' <span class="agechip" title="Weeks since the IRD">In queue week '+(Math.floor(ageDays/7)+1)+'</span> '+(i.also&&i.also.length?'<span class="badge blue" title="Also found by these searches. Screened once.">also '+esc(i.also.join(", "))+'</span> ':"")+(i.flags||[]).map(f=>'<span class="badge '+(f==="serious"||f==="returned"?"red":"blue")+'">'+({icsr:"Likely ICSR",serious:"Serious",returned:"Returned"})[f]+'</span>').join(" ")+'</div><div class="ac-title" style="-webkit-line-clamp:2">'+esc(i.title)+'</div><div class="ac-meta">'+esc(i.ref)+(i.clientName?' · '+esc(i.clientName):"")+(i.molecule?' · '+esc(i.molecule):"")+'</div>'+irdLine(i.ird,i.due,i.daysLeft,WF_NAME[i.workflow]+" due")+(i.override?'<div class="sub">Date set by a manager'+(i.override.reason?': '+esc(i.override.reason):"")+'</div>':"")+'</div><div class="ac-side"><div class="sub">'+dueText(i)+'</div>'+act+'</div></article>';
 }
 async function loadMyQueue(){
   const box=$("mqbox");if(!box)return;const allowed=wfAllowed();if(!allowed.includes(mqState.wf))mqState.wf=allowed[0];
@@ -9736,7 +9802,7 @@ async function loadScreened(){
         :qn;
       const pick=(x.canDeComment||x.canQcComment)?'<input type="checkbox" data-scpick="'+esc(x.id)+'"'+(scSel.has(x.id)?" checked":"")+' aria-label="Select for bulk comment">':"";
       return '<div class="sccard"><div class="schead"><span class="scttl">'+pick+'<a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(x.pmid)+'/" target="_blank" rel="noopener"><b>'+esc(x.title)+'</b></a></span><span class="badge '+qcTone(x.qc)+'">'+esc(x.qcLabel)+'</span></div>'
-        +'<div class="sub">IRD '+esc(x.ird)+' &middot; PMID '+esc(x.pmid)+(x.molecule?" &middot; "+esc(x.molecule):"")+'</div>'
+        +'<div class="sub">IRD '+esc(x.ird)+' &middot; PMID '+esc(x.pmid)+(x.molecule?" &middot; "+esc(x.molecule):"")+(x.also&&x.also.length?' <span class="badge blue" title="Also found by these searches; screened once">also '+esc(x.also.join(", "))+'</span>':"")+'</div>'
         +'<div class="scde"><b>DE'+(x.deName?" ("+esc(x.deName)+")":"")+':</b> <mark>'+esc(de||"no comment")+'</mark></div>'+qc+'</div>';};
     const list=groups.length?groups.map(g=>{const rs=r.rows.filter(x=>x.client===g);return '<h3 class="scclient">'+esc(g)+' <span class="sub">'+rs.length+'</span></h3>'+rs.map(card).join("");}).join(""):'<div class="empty">No '+(isRej?"rejected":"safety present")+' articles match these filters.</div>';
     const foot=isRej?'<p class="sub" style="margin-top:12px">'+(r.qcAllExcluded?"Every rejection goes to QC for a re-check.":"Rejections are sampled for QC (Settings).")+'</p>':"";
@@ -9766,6 +9832,61 @@ async function loadScreened(){
     if(t.dataset.scpick){if(t.checked)scSel.add(t.dataset.scpick);else scSel.delete(t.dataset.scpick);const c=$("scselct");if(c)c.innerHTML="<b>"+scSel.size+"</b> selected";return;}
     if(t.id==="scall"){box.querySelectorAll("[data-scpick]").forEach(c=>{c.checked=t.checked;if(t.checked)scSel.add(c.dataset.scpick);else scSel.delete(c.dataset.scpick);});const c=$("scselct");if(c)c.innerHTML="<b>"+scSel.size+"</b> selected";return;}
     if(t.id==="sccl")scState.client=t.value;else if(t.id==="scfrom")scState.from=t.value;else if(t.id==="scto")scState.to=t.value;else return;loadScreened();};
+}
+// Pulled articles: one table of everything pulled that the person may see, to copy (pastes as a table into Excel, Outlook or Word), save as a picture, or download.
+const paState={from:"",to:"",client:"all",who:"all",person:"",out:null};
+function paDefaults(){if(!paState.from){const t=new Date(Date.now()+5.5*3600000);paState.to=t.toISOString().slice(0,10);paState.from=new Date(t.getTime()-6*864e5).toISOString().slice(0,10);}}
+async function loadPulled(){
+  const box=$("pabox");if(!box)return;paDefaults();
+  box.innerHTML='<div class="skel"></div>';
+  try{
+    const r=await api("pulled-articles",{from:paState.from,to:paState.to,client:paState.client,who:paState.who,person:paState.person});paState.out=r;
+    const mgr=data.viewer.role==="manager";
+    const ctl='<div class="filters slim" style="border:0;padding:0 0 10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end">'+
+      '<label class="fl"><span class="sub">IRD from</span><input type="date" id="pafrom" value="'+esc(paState.from)+'"></label><label class="fl"><span class="sub">IRD to</span><input type="date" id="pato" value="'+esc(paState.to)+'"></label>'+
+      '<label class="fl"><span class="sub">Client</span><select id="paclient"><option value="all">All clients</option>'+r.clients.map(c=>'<option value="'+esc(c.id)+'"'+(paState.client===c.id?" selected":"")+'>'+esc(c.name)+'</option>').join("")+'</select></label>'+
+      '<label class="fl"><span class="sub">Articles</span><select id="pawho"><option value="all"'+(paState.who==="all"?" selected":"")+'>Everything I can see</option><option value="me"'+(paState.who==="me"?" selected":"")+'>Pulled by me</option><option value="queue"'+(paState.who==="queue"?" selected":"")+'>In my queue</option></select></label>'+
+      (mgr&&r.people.length?'<label class="fl"><span class="sub">Person</span><select id="paperson"><option value="">Anyone</option>'+r.people.map(p=>'<option value="'+esc(p.email)+'"'+(paState.person===p.email?" selected":"")+'>'+esc(p.name)+'</option>').join("")+'</select></label>':"")+'</div>';
+    const acts='<div class="paacts"><b>'+r.total+' article'+(r.total===1?"":"s")+'</b><span class="sub">'+(r.from||"start")+' to '+(r.to||"today")+'</span><span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">'+
+      '<button type="button" class="btn sm" data-pacopy="1">Copy table</button><button type="button" class="btn outline sm" data-papng="1">Save as image</button><button type="button" class="btn outline sm" data-paxlsx="1">Excel</button><button type="button" class="btn outline sm" data-pacsv="1">CSV</button></span></div>';
+    const sum=r.summary.length?'<div class="pasum">'+r.summary.map(x=>'<span class="badge">'+esc(x.client)+' &middot; '+esc(x.drug||"-")+' <b>'+x.count+'</b></span>').join(" ")+'</div>':"";
+    const shown=r.rows.slice(0,500);
+    const tbl=r.rows.length?'<div class="tablewrap"><table id="patable"><thead><tr>'+r.head.map(h=>'<th>'+esc(h)+'</th>').join("")+'</tr></thead><tbody>'+shown.map((x,i)=>'<tr><td>'+(i+1)+'</td><td>'+esc(x.client)+'</td><td>'+esc(x.drug)+'</td><td>'+esc(x.also)+'</td><td><a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(x.pmid)+'/" target="_blank" rel="noopener">'+esc(x.pmid)+'</a></td><td>'+esc(x.title)+'</td><td>'+esc(x.journal)+'</td><td>'+esc(x.published)+'</td><td>'+esc(x.ird)+'</td><td>'+esc(x.pulledBy)+'</td><td>'+esc(x.reviewer)+'</td><td>'+esc(x.status)+'</td></tr>').join("")+'</tbody></table></div>'+(r.rows.length>500?'<p class="sub">Showing 500 of '+r.rows.length+' on screen. Copy, CSV and Excel include all of them.</p>':""):'<div class="empty">No pulled articles in these dates.</div>';
+    box.innerHTML=ctl+acts+sum+tbl;
+  }catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>';}
+  box.onchange=ev=>{const t=ev.target,m={pafrom:"from",pato:"to",paclient:"client",pawho:"who",paperson:"person"}[t.id];if(!m)return;paState[m]=t.value;loadPulled();};
+  box.onclick=async ev=>{const t=ev.target.closest("[data-pacopy],[data-papng],[data-paxlsx],[data-pacsv]");if(!t||!paState.out)return;const r=paState.out;
+    const cells=x=>[x.client,x.drug,x.also,x.pmid,x.title,x.journal,x.published,x.ird,x.pulledBy,x.reviewer,x.status];
+    if(t.dataset.pacopy){
+      const tsv=[r.head].concat(r.rows.map((x,i)=>[i+1].concat(cells(x)))).map(row=>row.map(v=>String(v==null?"":v).split(String.fromCharCode(9)).join(" ").split(String.fromCharCode(10)).join(" ")).join(String.fromCharCode(9))).join(String.fromCharCode(10));
+      const td='style="border:1px solid #999;padding:3px 6px;font:11pt Calibri,Arial,sans-serif"';
+      const htmlT='<table style="border-collapse:collapse"><tr>'+r.head.map(h=>'<th '+td+' bgcolor="#e7f1ef">'+esc(h)+'</th>').join("")+'</tr>'+r.rows.map((x,i)=>'<tr><td '+td+'>'+(i+1)+'</td>'+cells(x).map(v=>'<td '+td+'>'+esc(v)+'</td>').join("")+'</tr>').join("")+'</table>';
+      try{if(window.ClipboardItem&&navigator.clipboard&&navigator.clipboard.write)await navigator.clipboard.write([new ClipboardItem({"text/html":new Blob([htmlT],{type:"text/html"}),"text/plain":new Blob([tsv],{type:"text/plain"})})]);else await navigator.clipboard.writeText(tsv);message("Table copied: paste it into Excel, Outlook or Word.");}
+      catch(e){const ta=document.createElement("textarea");ta.value=tsv;document.body.appendChild(ta);ta.select();try{document.execCommand("copy");message("Table copied.");}catch(_){message("Copy is blocked by the browser. Use Excel or CSV.",true);}ta.remove();}
+      return;}
+    if(t.dataset.pacsv){const q=v=>{const s=String(v==null?"":v);return (s.includes(String.fromCharCode(34))||s.includes(",")||s.includes(String.fromCharCode(10)))?'"'+s.split('"').join('""')+'"':s;};
+      const csv=[r.head].concat(r.rows.map((x,i)=>[i+1].concat(cells(x)))).map(row=>row.map(q).join(",")).join(String.fromCharCode(13,10));
+      const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([String.fromCharCode(65279)+csv],{type:"text/csv"}));a.download="literasift-pulled-"+(r.from||"all")+"-to-"+(r.to||"today")+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);return;}
+    if(t.dataset.paxlsx){t.disabled=true;try{await downloadPost("/api/pulled-articles",{from:paState.from,to:paState.to,client:paState.client,who:paState.who,person:paState.person,format:"xlsx"},"literasift-pulled.xlsx");}catch(e){message(e.message,true);}t.disabled=false;return;}
+    if(t.dataset.papng)paImage(r);};
+}
+function paImage(r){
+  // The table as a picture (PNG), in the order shown: number, client, drug, PMID, title, IRD, status. Up to 400 rows per picture.
+  const rows=r.rows.slice(0,400),sc=2,W=1400,pad=24,rowH=24,cols=[["No.",40],["Client",120],["Drug",230],["PMID",90],["Title",500],["IRD",95],["Pulled by",120],["Status",157]];
+  const H=pad*2+70+rowH*(rows.length+1)+(r.rows.length>400?24:0);
+  const c=document.createElement("canvas");c.width=W*sc;c.height=H*sc;const g=c.getContext("2d");g.scale(sc,sc);
+  g.fillStyle="#fff";g.fillRect(0,0,W,H);g.fillStyle="#0e6a5d";g.font="600 18px system-ui, sans-serif";g.fillText("Pulled articles",pad,pad+16);
+  g.fillStyle="#555";g.font="13px system-ui, sans-serif";g.fillText((r.from||"start")+" to "+(r.to||"today")+" (IRD) · "+r.total+" article"+(r.total===1?"":"s"),pad,pad+38);
+  const fit=(t,w)=>{t=String(t==null?"":t);if(g.measureText(t).width<=w)return t;while(t.length>1&&g.measureText(t+"…").width>w)t=t.slice(0,-1);return t+"…";};
+  let y=pad+58;g.fillStyle="#e7f1ef";g.fillRect(pad,y,W-pad*2,rowH);g.fillStyle="#0e3b35";g.font="600 12px system-ui, sans-serif";
+  let x=pad+6;for(const [h,w] of cols){g.fillText(h,x,y+16);x+=w;}y+=rowH;
+  g.font="12px system-ui, sans-serif";
+  rows.forEach((d,i)=>{if(i%2){g.fillStyle="#f7f9f9";g.fillRect(pad,y,W-pad*2,rowH);}g.fillStyle="#111";x=pad+6;
+    const vals=[i+1,d.client,d.drug+(d.also?" (+"+d.also+")":""),d.pmid,d.title,d.ird,d.pulledBy,d.status];
+    vals.forEach((v,k)=>{g.fillText(fit(v,cols[k][1]-10),x,y+16);x+=cols[k][1];});y+=rowH;});
+  g.strokeStyle="#ddd";g.strokeRect(pad,pad+58,W-pad*2,rowH*(rows.length+1));
+  if(r.rows.length>400){g.fillStyle="#a15c00";g.fillText("Showing 400 of "+r.rows.length+". Narrow the dates or client, or use Excel for all of them.",pad,y+18);}
+  c.toBlob(b=>{const a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="literasift-pulled-"+(r.from||"all")+"-to-"+(r.to||"today")+".png";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);},"image/png");
 }
 async function loadLineListing(){
   const box=$("llbox");if(!box)return;
@@ -9825,10 +9946,11 @@ function autoClientCard(c,ws,molTable){
     '<span class="sub">'+(alerts?badge("Like PubMed alerts","blue")+' by the date articles are added to PubMed':badge("Publication date","")+' with the alert check and the 60-day late-arrival sweep')+'</span></div>'+
     '<div class="ap-clock">'+(c.id&&!c.auto?'<b>Paused</b>':'<span class="sub">Next pull</span><b>'+esc(slotText(c.nextPull))+'</b><span class="ap-count" data-countdown="'+esc(c.nextPull||"")+'">'+esc(untilText(c.nextPull))+'</span>')+'</div></div>'+
     '<div class="ap-facts"><span><span class="sub">Schedule</span> '+esc(when)+' at '+esc(sc.time||"06:00")+'</span><span><span class="sub">Last scheduled pull</span> '+(c.lastPulledSlot?esc(slotText(c.lastPulledSlot)):'<span class="sub">not yet</span>')+'</span>'+
-      '<span><span class="sub">IRD</span> '+(c.irdRule==="receipt"?"weekly receipt day":"day pulled")+'</span><span><span class="sub">New since then</span> <b>'+(c.newSinceLast||0)+'</b> article'+(c.newSinceLast===1?"":"s")+'</span><span><span class="sub">Molecules</span> '+ws.length+(ws.filter(w=>w.missing).length?' · '+badge(ws.reduce((n,w)=>n+(w.missing||0),0)+" day-range"+(ws.reduce((n,w)=>n+(w.missing||0),0)===1?"":"s")+" waiting","amber"):' · '+badge("up to date","green"))+'</span></div>'+
+      '<span><span class="sub">IRD</span> '+(c.irdRule==="receipt"?"weekly receipt day":"day pulled")+'</span><span><span class="sub">Overlapping searches</span> '+(c.overlap==="once"?"counted once (most specific drug)":"counted under every drug")+'</span><span><span class="sub">New since then</span> <b>'+(c.newSinceLast||0)+'</b> article'+(c.newSinceLast===1?"":"s")+'</span><span><span class="sub">Molecules</span> '+ws.length+(ws.filter(w=>w.missing).length?' · '+badge(ws.reduce((n,w)=>n+(w.missing||0),0)+" day-range"+(ws.reduce((n,w)=>n+(w.missing||0),0)===1?"":"s")+" waiting","amber"):' · '+badge("up to date","green"))+'</span></div>'+
     '<div class="ap-actions"><button type="button" class="btn sm" data-clientpull="'+esc(cid)+'">Pull now</button>'+
       (c.id?'<button type="button" class="btn outline sm" data-alopen="'+esc(c.id)+'">Show what is new</button>'+(c.readOnly?"":
         '<form data-route="client-auto" style="margin:0"><input type="hidden" name="client" value="'+esc(c.id)+'"><input type="hidden" name="alerts" value="'+(alerts?"false":"true")+'"><button class="btn outline sm">'+(alerts?"Count by publication date":"Count like PubMed alerts")+'</button></form>'+
+        '<form data-route="client-auto" style="margin:0"><input type="hidden" name="client" value="'+esc(c.id)+'"><input type="hidden" name="overlap" value="'+(c.overlap==="once"?"each":"once")+'"><button class="btn outline sm" title="An article two searches find is screened once either way">'+(c.overlap==="once"?"Count overlaps under every drug":"Count overlaps once")+'</button></form>'+
         '<form data-route="client-auto" style="margin:0"><input type="hidden" name="client" value="'+esc(c.id)+'"><input type="hidden" name="on" value="'+(c.auto?"false":"true")+'"><button class="btn outline sm">'+(c.auto?"Pause client":"Resume client")+'</button></form>'):"")+
       (c.readOnly?'<span class="sub">Pull now brings in the last 7 days for your molecules.</span>':'<span class="sub">Change the day and time on the Clients tab.</span>')+'</div>'+
     '<details class="optrow2"><summary>Pull custom dates for this client</summary><div class="optrow" data-crbox="'+esc(cid)+'"><label>From<input type="date" data-crfrom></label><label>Through<input type="date" data-crto></label><button type="button" class="btn sm" data-clientrange="'+esc(cid)+'">Pull these dates</button><span class="sub" data-crout></span></div></details>'+
@@ -9841,7 +9963,7 @@ async function loadAutoPull(){
     if(s.readOnly){
       // Screener view: the automatic pull of their own clients, read-only, with Pull now, custom dates and Show what is new.
       const st=!s.autoPull?badge("Paused","amber"):!h.lastBeatAt?badge("Waiting for first run","amber"):s.stale?badge("Not running","red"):badge("On","green");
-      const rows=ws=>ws.length?table(["Molecule","Articles","Last pulled","Status"],ws.map(w=>['<b>'+esc(w.molecule||w.portfolio)+'</b>',esc(String(w.articles)),w.lastRunAt?esc(when(w.lastRunAt)):'<span class="sub">never</span>',w.missing?badge(w.missing+" day-range"+(w.missing===1?"":"s")+" waiting","amber"):badge("up to date","green")]),"",true):'<div class="empty">No molecules.</div>';
+      const rows=ws=>ws.length?table(["Molecule","Articles","Last pulled","Status"],ws.map(w=>['<b>'+esc(w.molecule||w.portfolio)+'</b>',esc(String(w.counted??w.articles))+(w.shared?' <span class="sub" title="Also found by '+esc((w.sharedWith||[]).join(", "))+'. Screened once.">('+w.shared+' shared with '+esc((w.sharedWith||[]).slice(0,2).join(", "))+')</span>':""),w.lastRunAt?esc(when(w.lastRunAt)):'<span class="sub">never</span>',w.missing?badge(w.missing+" day-range"+(w.missing===1?"":"s")+" waiting","amber"):badge("up to date","green")]),"",true):'<div class="empty">No molecules.</div>';
       box.innerHTML='<section><div class="body"><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b style="font-size:16px">Automatic PubMed pull</b>'+st+'<span class="ap-now"><span class="sub">India time</span> <b data-clock="1">'+esc(istStamp())+'</b></span></div><div class="sub" style="margin-top:4px">Your clients are pulled on their schedules. Last check <b>'+esc(when(h.lastBeatAt))+'</b>. A manager sets the schedules, searches and molecules; you can pull now or pull chosen dates into your own queue.</div></div></section>'+
         ((s.perClient||[]).map(c=>{const ws=s.perWatch.filter(w=>w.clientId===c.id);return autoClientCard({...c,readOnly:true},ws,rows(ws));}).join("")||'<div class="empty">You are not on any client yet. Ask a manager to add you.</div>');
       return;
@@ -10216,13 +10338,16 @@ function evidenceChips(item){
   chips.push(item.screenshotKey?'<a class="badge green" href="/api/screenshot/'+esc(item.id)+'">Screenshot</a>':badge(item.screenshotStatus||"Screenshot pending"));
   return '<div class="chips">'+chips.join("")+"</div>";
 }
+// One article found by two searches of a client (Calcium and Calcium chloride) is one work item; this tag says which other drugs found it.
+const molOf=a=>a.overlap==="once"&&a.countedUnder?a.countedUnder:((a.molecules||[])[0]||a.portfolio);
+const alsoTag=a=>{const ms=a.molecules||[];if(ms.length<2)return "";const main=molOf(a),o=ms.filter(m=>m!==main);return '<span class="badge blue" title="Found by the searches for '+esc(ms.join(", "))+'. Screened once; '+(a.overlap==="once"?"counted only under "+esc(main):"counted under each of these drugs")+'.">also '+esc(o.join(", "))+'</span>';};
 function queueRows(items){
   const people=data.people||data.profiles||[], RAIL={Complete:"green","QC returned":"red","Awaiting QC":"blue","Full text needed":"amber","In review":"blue"};
   const cards=items.slice(0,200).map(a=>{
     const item=data.articles[a.pmid]||{}; item._molecules=a.molecules;
     const rev=a.reviewer?((people.find(x=>x.email===a.reviewer)||{}).name||a.reviewer):"", late=isOpenItem(a)&&a.dueAt&&a.dueAt<todayStr();
     const first=(item.authors||[])[0]?item.authors[0]+((item.authors||[]).length>1?" et al.":""):"";
-    const ev=eventChips(item), key=[(isLikely(a)?tbadge("Likely case","green","A single patient with an event and a drug, from a case report"):""),(a.level?'<span class="badge '+(levelColor[a.level]||"")+'" title="'+esc((a.why||[]).join(" · "))+'">'+esc(a.level)+" "+(a.score??"")+'</span>':""),(a.disposition?'<span class="badge">'+esc(DISPO_LABEL[a.disposition.value]||a.disposition.value)+'</span>':"")].join("");
+    const ev=eventChips(item), key=[(isLikely(a)?tbadge("Likely case","green","A single patient with an event and a drug, from a case report"):""),(a.level?'<span class="badge '+(levelColor[a.level]||"")+'" title="'+esc((a.why||[]).join(" · "))+'">'+esc(a.level)+" "+(a.score??"")+'</span>':""),(a.disposition?'<span class="badge">'+esc(DISPO_LABEL[a.disposition.value]||a.disposition.value)+'</span>':""),alsoTag(a)].join("");
     return '<article class="acard r-'+(RAIL[a.status]||"")+'"><div class="ac-main">'+
       '<a class="ac-title" target="_blank" rel="noopener" href="'+esc(item.url)+'">'+esc(item.title||"PMID "+a.pmid)+'</a>'+
       '<div class="ac-meta">'+(libNumbers&&libNumbers[a.pmid]?'<b>No. '+esc(libNumbers[a.pmid])+'</b> · ':"")+[esc(item.journal||""),esc(item.date||""),esc(first),"PMID "+esc(a.pmid)].filter(Boolean).join(" · ")+'</div>'+irdLine(a.ird,a.dueAt,a.wdLeft,"Screen by")+
@@ -10240,7 +10365,7 @@ function queueRows(items){
 function queueBody(list){
   if(!list.length)return '<div class="empty">No articles match.</div>';
   const clients=data.clients||[], byC={};
-  list.forEach(a=>{const c=a.client||"", m=(a.molecules||[])[0]||a.portfolio;((byC[c]||={})[m]||=[]).push(a);});
+  list.forEach(a=>{const c=a.client||"", m=molOf(a);((byC[c]||={})[m]||=[]).push(a);});
   const order=clients.map(c=>c.id).filter(id=>byC[id]).concat(byC[""]?[""]:[]);
   return order.map(cid=>{
     const name=cid?((clients.find(c=>c.id===cid)||{}).name||"Client"):"No client assigned", mols=byC[cid], all=Object.values(mols).flat(), done=all.filter(a=>a.status==="Complete").length, pct=all.length?Math.round(done/all.length*100):0, open=all.length-done;
@@ -10554,7 +10679,7 @@ async function alCheck(btn){
   catch(err){$("alout").innerHTML='<div class="sub" style="color:var(--red)">'+esc(err.message)+'</div>';}btn.disabled=false;
 }
 function spTabsHtml(mgr){
-  const tabs=[["client","Saved searches","One search per molecule, by client"],["alerts","PubMed alerts","What is new this week, per client"],["molecule","One molecule","Look a drug up and pull it"],["query","PubMed query","Any PubMed search, or authors and topics"],...(mgr?[["pmids","PMID list","Articles you already have"]]:[]),["world","Other sources","Europe PMC, OpenAlex, trials, regulators"],...(mgr?[["posts","Patient posts","Forum and social posts, masked"]]:[])];
+  const tabs=[["client","Saved searches","One search per molecule, by client"],["alerts","PubMed alerts","What is new this week, per client"],["pulled","Pulled articles","Table to copy, picture or Excel"],["molecule","One molecule","Look a drug up and pull it"],["query","PubMed query","Any PubMed search, or authors and topics"],...(mgr?[["pmids","PMID list","Articles you already have"]]:[]),["world","Other sources","Europe PMC, OpenAlex, trials, regulators"],...(mgr?[["posts","Patient posts","Forum and social posts, masked"]]:[])];
   return '<div class="steptiles sptabs">'+tabs.map((x,i)=>'<button type="button" class="steptile'+(spState.tab===x[0]?" on":"")+'" data-sptab="'+x[0]+'"><span class="st-n">'+(i+1)+'</span><span class="st-t"><b>'+x[1]+'</b><span class="sub">'+x[2]+'</span></span></button>').join("")+'</div>';
 }
 function spDateHint(){const b={any:"created in PubMed or published",crdt:"added to PubMed (Create date [crdt], like PubMed alerts)",pdat:"published (Publication date [dp])"}[spState.basis||"pdat"];return spState.from||spState.to?"Articles "+b+" from "+(spState.from||"…")+" to "+(spState.to||"…")+", both days included.":"Every article PubMed has, whatever its dates.";}
@@ -10620,10 +10745,16 @@ async function runPullJobs(btn,list,bodyFor,route,done){
       (x.warnings&&x.warnings.length?'<div class="sub" style="color:var(--amber)">PubMed: '+esc(x.warnings.join("; "))+'</div>':"")+ssHint(x.warnings);};
   const draw=()=>{const fin=rows.filter(Boolean).length,late=rows.filter(x=>x&&!x.error&&!x.complete).length,bad=rows.filter(x=>x&&x.error).length,ids=new Set(),idsKnown=rows.every(x=>!x||x.error||Array.isArray(x.storedIds));
     rows.forEach(x=>{if(x&&Array.isArray(x.storedIds))x.storedIds.forEach(i=>ids.add(i));});
+    const own=new Map();rows.forEach(x=>{if(x&&Array.isArray(x.storedIds))x.storedIds.forEach(i=>{if(!own.has(i))own.set(i,[]);own.get(i).push(x.molecule);});});
+    const ovc=(data.clients||[]).find(c=>c.id===cpState.client), once=ovc&&ovc.overlap==="once";
+    const spec=a=>{const low=a.map(n=>String(n).toLowerCase());const sp=a.filter((n,i)=>!low.some((m,k)=>k!==i&&m!==low[i]&&m.includes(low[i])));return (sp.length?sp:a).slice().sort()[0];};
+    const shareNote=x=>{if(!x||!Array.isArray(x.storedIds))return "";const sh=x.storedIds.filter(i=>own.get(i).length>1);if(!sh.length)return "";const w=[...new Set(sh.flatMap(i=>own.get(i)))].filter(m=>m!==x.molecule);
+      const cnt=x.storedIds.filter(i=>spec(own.get(i))===x.molecule).length;
+      return '<div class="sub" style="color:var(--blue)">'+sh.length+' also found by '+esc(w.join(", "))+' (screened once)'+(once?' · counted here: '+cnt:'')+'</div>';};
     const runIds=rows.filter(x=>x&&x.runId).map(x=>x.runId);
     cpState.out='<div class="purgesum" style="margin-top:12px"><b>'+fin+' of '+list.length+' molecule'+(list.length===1?"":"s")+' done · '+(idsKnown?ids.size+' unique PMID'+(ids.size===1?"":"s")+' across them · ':'')+tot("retrieved")+' stored per molecule, '+tot("added")+' new this time</b><span class="sub">'+Math.round((Date.now()-started)/1000)+' s'+(late?' · '+late+' not complete: use Retry missing PMIDs':"")+(bad?' · '+bad+' failed: use Try again':"")+'</span>'+(runIds.length?'<span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap"><button type="button" class="btn outline sm" data-xlsx="'+esc(runIds.join(","))+'">Excel (.xlsx)</button><button type="button" class="btn outline sm" data-recocsv="'+esc(runIds.join(","))+'">Reconciliation (CSV)</button></span>':"")+'</div>'+
     table(["Molecule","PubMed matched","Citation stored","Linked to molecule","Unavailable","New this time","Check",""],list.map((it,i)=>{const x=rows[i];
-      if(x)return ['<b>'+esc(x.molecule||it.name)+'</b>'+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · +'+x.names+' approved name'+(x.names===1?"":"s"):"")+'</div>':"")+(x.modeLabel?'<div class="sub">'+esc(x.modeLabel)+' · '+esc(x.dateBasisLabel||"")+(x.from?' · '+esc(x.from)+' to '+esc(x.to)+' inclusive':' · all dates')+(x.queryVersion?' · query v'+esc(String(x.queryVersion)):"")+'</div>':"")+(x.term?'<details class="sub"><summary>Executed term</summary><code>'+esc(x.term)+'</code>'+(x.translation?'<div><b>PubMed read it as</b> <code>'+esc(x.translation)+'</code></div>':"")+'</details>':"")+(x.pubmedUrl?'<div class="sub"><a href="'+esc(x.pubmedUrl)+'" target="_blank" rel="noopener">Same search on PubMed</a></div>':""),
+      if(x)return ['<b>'+esc(x.molecule||it.name)+'</b>'+shareNote(x)+(x.portfolio?'<div class="sub">'+esc(x.portfolio)+(x.names?' · +'+x.names+' approved name'+(x.names===1?"":"s"):"")+'</div>':"")+(x.modeLabel?'<div class="sub">'+esc(x.modeLabel)+' · '+esc(x.dateBasisLabel||"")+(x.from?' · '+esc(x.from)+' to '+esc(x.to)+' inclusive':' · all dates')+(x.queryVersion?' · query v'+esc(String(x.queryVersion)):"")+'</div>':"")+(x.term?'<details class="sub"><summary>Executed term</summary><code>'+esc(x.term)+'</code>'+(x.translation?'<div><b>PubMed read it as</b> <code>'+esc(x.translation)+'</code></div>':"")+'</details>':"")+(x.pubmedUrl?'<div class="sub"><a href="'+esc(x.pubmedUrl)+'" target="_blank" rel="noopener">Same search on PubMed</a></div>':""),
         x.error?"-":num(x.expected),x.error?"-":num(x.withCitation!=null?x.withCitation:x.retrieved),x.error?"-":num(x.linked),x.error?"-":num(x.unavailable),x.error?"-":String(x.added),
         check(x)+(x.alertExtra?(x.alertExtra.error?'<div class="sub" style="color:var(--amber)">Alert check: '+esc(x.alertExtra.error)+'</div>':x.alertExtra.found?'<div class="sub" style="color:var(--blue)">Like PubMed alerts: '+x.alertExtra.found+' more added to PubMed in these dates ('+x.alertExtra.added+' pulled now'+(x.alertExtra.already?", "+x.alertExtra.already+" already in the app":"")+')</div>':'<div class="sub">Like PubMed alerts: nothing more</div>'):"")+(x.pmc?(x.pmc.error?'<div class="sub" style="color:var(--amber)">PubMed Central: '+esc(x.pmc.error)+'</div>':'<div class="sub">PubMed Central: '+x.pmc.found+' found, '+x.pmc.added+' new</div>'):"")+(x.mode==="precise"&&x.siteCount!=null&&x.siteCount>(x.retrieved||0)*1.15?'<div class="sub" style="color:var(--amber)">PubMed default finds '+x.siteCount+'.</div>':""),
         x.error?'<button type="button" class="btn outline sm" data-cpretry="'+i+'">Try again</button>':(!x.complete&&x.runId?'<button type="button" class="btn outline sm" data-runrepair="'+esc(x.runId)+'" data-row="'+i+'">Retry missing PMIDs</button>':"")];
@@ -10920,6 +11051,7 @@ function clientsHtml(){
           '<span class="sub">at</span><input type="time" class="cc-time" data-cctime="'+esc(c.id)+'" value="'+esc(sc.time)+'" aria-label="Time"><span class="sub">India time</span><button type="button" class="btn sm" data-ccsched="'+esc(c.id)+'">Save schedule</button>'+
           '<label class="check cc-alerts" title="Pull and count by the date articles are added to PubMed, as PubMed alert emails (What is new for ...) do, instead of by publication date"><input type="checkbox" data-ccalerts="'+esc(c.id)+'"'+(c.dateBasis==="crdt"?" checked":"")+'>&nbsp;Count like PubMed alerts</label>'+
           '<label class="check cc-alerts" title="IRD (Initial Receipt Date) = the client scheduled day after the week the article was found in, like the day the weekly email reaches the mailbox; never later than the day it was pulled"><input type="checkbox" data-ccird="'+esc(c.id)+'"'+(c.irdRule==="receipt"?" checked":"")+'>&nbsp;IRD = weekly receipt day</label>'+
+          '<label class="cc-alerts" title="One article can be found by two searches of this client, such as Calcium and Calcium chloride. It is always screened once; this only changes how it is counted per drug.">Overlapping searches <select data-ccoverlap="'+esc(c.id)+'"><option value="each"'+(c.overlap!=="once"?" selected":"")+'>count under every drug (like alert emails)</option><option value="once"'+(c.overlap==="once"?" selected":"")+'>count once, most specific drug</option></select></label>'+
           '<span class="sub">'+(on?'Next pull: <b>'+esc(ccNextText(c))+'</b>. Each pull brings in every day not yet pulled, '+(c.dateBasis==="crdt"?"by the date articles were added to PubMed (like PubMed alert emails)":"by publication date")+'.':"Paused: switch the client on to pull on this schedule.")+'</span></div>';})():"")+
         (mgr?ssBulkHtml(c.id,"cc"):"")+'<div class="bar" style="margin:4px 0 8px"><i style="width:'+pct+'%"></i></div><div data-cclist="'+esc(c.id)+'">'+ccMolRows(c,mols)+'</div></div>':"")+'</section>';
   }).join("");
@@ -10974,6 +11106,7 @@ function render() {
     else if(sp==="molecule")body=spSettingsHtml(true)+(manager?spMoleculeHtml():spMineHtml());
     else if(sp==="query")body=spSettingsHtml(false)+spQueryHtml(manager);
     else if(sp==="alerts")body=spAlertsHtml();
+    else if(sp==="pulled")body=panel("Pulled articles",'<div id="pabox"><div class="skel"></div></div>',"Every article pulled that you can see, by IRD. Copy pastes as a table into Excel, Outlook or Word.");
     else if(sp==="pmids"&&manager)body=panel("Batch by PMID list",'<form class="grid" data-route="pmid-batch"><label class="wide">PMIDs (one per line, optionally followed by a name; or comma separated)<textarea name="text" rows="5" required placeholder="123456  Smith_2020&#10;789012  Jones_2021&#10;345678,901234"></textarea></label><label>Client<input name="portfolio" required list="pfopts" placeholder="Choose, or type a new one" autocomplete="off"><datalist id="pfopts">'+[...new Set((data.watches||[]).map(w=>w.portfolio))].map(p=>'<option value="'+esc(p)+'">').join("")+'</datalist></label><label>Molecule (optional)<input name="molecule"></label><div><button class="btn">Add and fetch full texts</button></div></form>',"For lists of articles you already have: each PMID is read from PubMed, enters the screening queue and Synchrony like any other article, and its full text is looked up in every open source. Afterwards, Recent pulls offers a list of the PMIDs that could not be fetched, in the same format, to try again once you have the files.");
     else if(sp==="posts"&&manager)body=panel("Patient-reported posts",'<form class="grid" data-route="social-add"><label class="wide">Post text (several posts: separate with a line of three dashes)<textarea name="text" rows="5" required placeholder="Paste a patient or forum post that mentions a medicine and a problem"></textarea></label><label>Platform<select name="platform"><option>Reddit</option><option>X (Twitter)</option><option>Facebook</option><option>Patient forum</option><option>Other</option></select></label><label>Link to the post (optional)<input name="url" placeholder="https://"></label><label>Posted on (optional)<input name="postedAt" type="date"></label><label>Client<input name="portfolio" required list="pfopts" placeholder="Choose, or type a new one" autocomplete="off"></label><label>Molecule (optional)<input name="molecule"></label><div><button class="btn">Add posts</button></div></form>',"Names, e-mail addresses, phone numbers, handles, links and ID numbers are masked before anything is stored. Posts are added by hand, never collected automatically: platform terms and privacy law restrict that. Each post is screened for events like an article, with a confidence and the reasons for it, and can become a Synchrony case marked as a patient report. Social reports are unverified and the reporter cannot be contacted.");
     else body=worldPanelHtml();
@@ -11051,7 +11184,7 @@ function render() {
     }
   }
   if(tab==="My Queue"){
-    const groups={};mine.forEach(a=>{const k=(a.molecules||[]).length?a.molecules.join(", "):a.portfolio;(groups[k]||={n:0,d:0}).n++;if(a.status==="Complete")groups[k].d++;});
+    const groups={};mine.forEach(a=>{const k=molOf(a);(groups[k]||={n:0,d:0}).n++;if(a.status==="Complete")groups[k].d++;});
     const done=mine.filter(a=>a.status==="Complete").length;
     html=(mine.length?'<div class="covcard"><div class="cov-top"><div><b class="cov-n">'+Math.round(done/mine.length*100)+'%</b><span class="sub"> screened · '+done+' of '+mine.length+' articles</span></div><div class="chips">'+Object.entries(groups).sort((x,y)=>y[1].n-x[1].n).slice(0,8).map(([k,g])=>'<span class="badge mol">'+esc(k)+' '+g.d+'/'+g.n+'</span>').join("")+'</div></div><div class="bar"><i data-width="'+Math.round(done/mine.length*100)+'"></i></div></div>':"")+'<div class="mqtabs"><span class="seg" role="group" aria-label="View"><button type="button" class="segb'+(mqState.view==="timeline"?" on":"")+'" data-mqview="timeline">Timeline</button><button type="button" class="segb'+(mqState.view==="list"?" on":"")+'" data-mqview="list">Full list, filters and exports</button></span></div>'+(mqState.view==="list"?queueView(mine):'<div id="mqbox"><div class="skel"></div><div class="skel"></div></div>');
   }
@@ -11134,6 +11267,7 @@ function render() {
   if(tab==="Batches"&&$("batchcov"))loadBatches();
   if(tab==="Batches"&&$("schedbox"))loadScheduler();
   if(tab==="Screened"&&$("scbox"))loadScreened();
+  if(tab==="Search & Pull"&&$("pabox"))loadPulled();
   if(tab==="Line Listing"&&$("llbox"))loadLineListing();
   if(tab==="Planner"&&$("plbox"))loadPlanner();
   if(tab==="My Queue"&&$("mqbox"))loadMyQueue();
@@ -11397,7 +11531,7 @@ document.addEventListener("click",event=>{
   if(target.dataset.cppullsame){const c=cpState.compared;if(c&&$("cpclient")&&$("cpclient").value===c.client){document.querySelectorAll("[data-cpmol]").forEach(x=>{x.checked=c.sel.includes(x.dataset.cpmol);});if(JSON.stringify((()=>{const v=cpSavedSettings();delete v._lim;return v;})())+JSON.stringify(ssOwnMap(c.sel))!==c.st)return message("The settings changed after the comparison. Compare again, then pull.",true);}runClientPull(target);return;}
   if(target.dataset.ccopen){const id=target.dataset.ccopen;if(ccState.open.has(id))ccState.open.delete(id);else ccState.open.add(id);render();return;}
   const c0=id=>(data.clients||[]).find(x=>x.id===id)||{};
-  if(target.dataset.ccsched){const id=target.dataset.ccsched,q=k=>document.querySelector("[data-cc"+k+'="'+CSS.escape(id)+'"]'),every=q("every").value,body={client:id,every,time:q("time").value||"06:00"};if(every==="weekly")body.weekday=Number(q("weekday").value);body.alerts=!!(q("alerts")&&q("alerts").checked);if(q("ird")){const on=q("ird").checked;body.irdRule=on?"receipt":"pulled";if(on&&c0(id).irdRule!=="receipt"&&confirm("Also set the receipt-day IRD (and screening due dates) on this client open items that are not screened yet?"))body.applyIrd=true;}
+  if(target.dataset.ccsched){const id=target.dataset.ccsched,q=k=>document.querySelector("[data-cc"+k+'="'+CSS.escape(id)+'"]'),every=q("every").value,body={client:id,every,time:q("time").value||"06:00"};if(every==="weekly")body.weekday=Number(q("weekday").value);body.alerts=!!(q("alerts")&&q("alerts").checked);if(q("overlap"))body.overlap=q("overlap").value;if(q("ird")){const on=q("ird").checked;body.irdRule=on?"receipt":"pulled";if(on&&c0(id).irdRule!=="receipt"&&confirm("Also set the receipt-day IRD (and screening due dates) on this client open items that are not screened yet?"))body.applyIrd=true;}
     target.disabled=true;api("client-auto",body).then(async r=>{await refresh();const c=(data.clients||[]).find(x=>x.id===id);message("Schedule saved: "+ccSchedText(c)+". Next pull: "+ccNextText(c)+".");}).catch(err=>{message(err.message,true);target.disabled=false;});return;}
   if(target.dataset.ccdel){const d=target.dataset;if(!confirm("Remove "+d.ccname+" from "+d.ccclient+"? It is deleted and no longer searched. Its articles already pulled stay in the Library and queues."))return;target.disabled=true;
     api("delete-watch",{watch:d.ccdel}).then(async()=>{await refresh();render();message(d.ccname+" removed from "+d.ccclient+".");}).catch(err=>{target.disabled=false;message(err.message,true);});return;}
@@ -11812,7 +11946,7 @@ async function mcp(request, env) {
 }
 
 export default {
-  pdfToText, buildFullTextEvidence, autoAdvance, addWorkingDays, workingDaysBetween, workItems, timelines, dashboardFor, deskQueues, assessmentMatrix, formatAgreement, jobsBoard, evidenceKind, deadlineBasis, istStamp, extractInvestigations, extractClinical, zipFiles, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
+  primaryMolecule, overlapCounts, pdfToText, buildFullTextEvidence, autoAdvance, addWorkingDays, workingDaysBetween, workItems, timelines, dashboardFor, deskQueues, assessmentMatrix, formatAgreement, jobsBoard, evidenceKind, deadlineBasis, istStamp, extractInvestigations, extractClinical, zipFiles, stageOf, eventSeriousness, redactPhi, phiLeaks, prrStats, naranjoScore, whoUmcCategory, mergeDiscovered, buildUnits, segmentPatients, rolesIn, mayAccess, buildNarrative, validateE2b, assessMinimumCriteria, duplicateSignals, diffCaseData, execute, libraryLayout, maskPii, parsePmidList, captureFromPreprint, captureFromWiley, captureFromElsevier, captureFromCore, captureFromRxiv, applyDetection, seriesSummary, robustHikes, ciomsPdf, fhirBundle, lineListing, e2bBatch, caseNarrativeText, normalizeCase, readXlsx, parseImeWorkbook, audit, verifyAuditChain, auditAnchor,
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     if (path === "/mcp" && request.method === "POST") return mcp(request,env);
