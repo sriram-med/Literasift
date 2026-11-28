@@ -556,3 +556,22 @@ Each client card also shows that client's counts per DE and per QC as chips.
 - The Screened tab opens on **this week**: IRD from Monday to Sunday, India time. The article list, the counts and **Download Word** cover only this week's articles, so the Word file holds this week's DE and QC comments only.
 - The "This week" badge shows when you are on the current week. If you change the dates, "Back to this week" returns.
 - **Word documents sent to QC and medical review** lists only documents sent since Monday. Earlier weeks are hidden behind "N documents from earlier weeks hidden · Show them".
+
+## Allocation, rebuilt around teams (managers)
+
+1. **Week and totals.** The tab opens on this week (‹ › for earlier weeks). It shows how many articles are not screened, how many clients they belong to, and how many have no DE.
+2. **Teams.** A team is a DE and the QC who checks their rejections. Add a team with **+ Add team** and remove one with ×. Teams are saved, so you set them up once. Each team shows its articles to screen and the QC's allocated articles for the week. Each DE can be in only one team.
+3. **Share the week between teams.** This makes a plan that gives every team an equal share, with the remainder going to the first teams. It walks client by client and keeps each client's numbered articles together in blocks. The plan lists client, numbers, article count, DE and QC. Nothing changes until you press **Allocate**.
+4. **Client cards.** Each card shows the client's articles, who has them (with a colour bar), and how many have no DE. Then:
+   - **Give all N to…** gives the whole client to one team.
+   - **Split by numbers** opens the number ranges (from – to, DE, QC) for a custom split.
+   - **Articles** shows the numbered list.
+
+The rules are unchanged. Articles already screened keep their DE, the team's QC receives the DE's rejections, and every allocation is recorded in each article's history and in the audit trail.
+
+## More sources (Discover, and Search & Pull → Other sources)
+
+- **Crossref** was already a source.
+- **Springer Nature** searches Springer, Nature and BMC journals. **Adis journals** limits the same search to the Adis drug journals, including Reactions Weekly (adverse-reaction case reports) and Drug Safety. Both need a free Springer Nature Meta API key from dev.springernature.com, added in Settings → Publisher and aggregator access.
+- **Embase** uses the Elsevier API key in Settings. Elsevier enables Embase API access case by case, even for embase.com subscribers; without it, the search reports that Elsevier refused the key. Results that carry a PMID link to the PubMed record.
+- **AdisInsight** is a link to the AdisInsight search for the drug. AdisInsight's drug API and data feed need a separate Springer Nature subscription and login, so the app does not fetch its content, and the link cannot be imported as an article.

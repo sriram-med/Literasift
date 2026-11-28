@@ -69,3 +69,15 @@ test("allocation shows this week by default; rejections QC agrees with are archi
   await t.call(QC, "/api/qc-decision", { id: "a3", decision: "approve" });
   assert.equal((await t.state()).assignments.find(a => a.id === "a3").archived, undefined);
 });
+
+test("teams: saved DE + QC pairs for the weekly allocation", async () => {
+  const t = await makeEnv(seed());
+  assert.equal((await t.call(SCREENER, "/api/alloc-teams", { teams: [] })).status, 403);
+  assert.equal((await t.call(MANAGER, "/api/alloc-teams", { teams: [{ de: SCREENER, qc: SCREENER }] })).status, 400, "DE and QC differ");
+  assert.equal((await t.call(MANAGER, "/api/alloc-teams", { teams: [{ de: SCREENER, qc: QC }, { de: SCREENER, qc: QC2 }] })).status, 400, "one team per DE");
+  assert.equal((await t.call(MANAGER, "/api/alloc-teams", { teams: [{ qc: QC }] })).status, 400, "a team needs a DE");
+  const ok = (await t.call(MANAGER, "/api/alloc-teams", { teams: [{ de: SCREENER, qc: QC2 }, { de: SCREENER2, qc: QC }] })).body;
+  assert.equal(ok.teams.length, 2);
+  const list = (await t.call(MANAGER, "/api/allocation-list", { from: "", to: "" })).body;
+  assert.deepEqual(list.teams.map(x => [x.de, x.qc]), [[SCREENER, QC2], [SCREENER2, QC]]);
+});
