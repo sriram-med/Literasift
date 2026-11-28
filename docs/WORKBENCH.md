@@ -654,3 +654,13 @@ Managers now land on **This Week**: the week by IRD (‹ › for earlier weeks),
 - **Clients:** a table with progress bars, most unscreened first.
 - **Teams:** each team's DE and QC counts.
 - **Images:** **Counts per client (image)** and **Team counts (image)** save the week as pictures.
+
+## QC send-back codes and QC accuracy
+
+- When QC sends an article back (on a card, in bulk in Screened, or in My Queue), it picks a code: Missed adverse event, Missed single patient (ICSR), Wrong rejection reason, Wrong or missing suspect product, Not a safety article, Duplicate missed, or Other. The code is shown on the card and in the Word file ("Sent back to DE: …").
+- **This Week → QC accuracy** shows, per DE, over this week or the last 4 or 12 weeks:
+  - how many decisions QC checked, agreed with and sent back;
+  - the accuracy (green from 95%, amber from 85%, otherwise red);
+  - the codes and the reasons that were sent back most.
+
+The missed-article alarm now checks each client the way that client counts: alert clients by date added to PubMed, the others by publication date. Before this change, publication-date clients were checked by date added, which listed articles outside their scope as missed. Press **Check now** after deploying to replace the old list.

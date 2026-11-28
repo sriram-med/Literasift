@@ -207,3 +207,20 @@ test("rejection wording per client: the client's words in the lists and Word fil
   const doc = readZip(await (await t.raw(MANAGER, "/api/screened-docx", { kind: "rejected" })).arrayBuffer()).get("word/document.xml").toString("utf8");
   assert.match(doc, /No AE reported \(NAE\) - PK/);
 });
+
+test("QC send-back codes are stored, shown in the Word file and counted in QC accuracy", async () => {
+  const t = await makeEnv(team());
+  await t.call(MANAGER, "/api/membership-save", { email: QC, portfolio: "Navinta", role: "qc" });
+  await t.call(SCREENER, "/api/disposition", { id: "a1", value: "excluded", reason: "No adverse event" });
+  await t.call(SCREENER, "/api/disposition", { id: "a2", value: "excluded", reason: "No suspect product" });
+  await t.call(QC, "/api/qc-decision", { id: "a1", decision: "return", note: "Hepatotoxicity in table 2", code: "Missed adverse event" });
+  await t.call(QC, "/api/qc-decision", { id: "a2", decision: "approve", code: "Missed adverse event" });
+  const s = await t.state();
+  assert.equal(s.assignments.find(a => a.id === "a1").qc.code, "Missed adverse event"); assert.equal(s.assignments.find(a => a.id === "a2").qc.code, undefined, "agreed has no code");
+  const st = (await t.call(MANAGER, "/api/qc-stats", { weeks: 1 })).body;
+  const asha = st.des.find(x => x.name === "Asha"); assert.equal(asha.checked, 2); assert.equal(asha.returned, 1); assert.equal(asha.accuracy, 50);
+  assert.deepEqual(asha.codes, [{ label: "Missed adverse event", n: 1 }]); assert.equal(asha.reasons[0].label, "No adverse event");
+  assert.equal((await t.call(QC, "/api/qc-stats", {})).status, 403);
+  const doc = readZip(await (await t.raw(MANAGER, "/api/screened-docx", { kind: "rejected" })).arrayBuffer()).get("word/document.xml").toString("utf8");
+  assert.match(doc, /Sent back to DE: Missed adverse event/);
+});

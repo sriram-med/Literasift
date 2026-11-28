@@ -12,6 +12,11 @@ test("the alarm lists last week's articles the app does not hold; Pull brings th
   const ncbi = fakeNcbi([{ pmid: "7001", date: d }, { pmid: "7002", date: d }, { pmid: "7003", date: d }]);
   const r = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/missed-check", {}));
   assert.equal(r.body.articles, 2);
+  assert.ok(ncbi.calls.some(c => c.startsWith("esearch") && c.includes("[dp]")) && !ncbi.calls.some(c => c.startsWith("esearch") && c.includes("[crdt]")), "a publication-date client is checked by publication date");
+  const s0 = await t.state(); s0.clients[0].dateBasis = "crdt"; await t.BUCKET.put("bench.json", JSON.stringify(s0)); ncbi.calls.length = 0;
+  await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/missed-check", {}));
+  assert.ok(ncbi.calls.some(c => c.startsWith("esearch") && c.includes("[crdt]")), "an alert client is checked by date added");
+  s0.clients[0].dateBasis = undefined; await t.BUCKET.put("bench.json", JSON.stringify({ ...(await t.state()), clients: s0.clients }));
   let st = await (await t.get(MANAGER, "/api/state")).json();
   assert.deepEqual(st.missedAlerts[0].pmids.sort(), ["7002", "7003"]); assert.equal(st.missedAlerts[0].clientName, "Navinta");
   const p = await withFetch(ncbi.handler, () => t.call(MANAGER, "/api/missed-pull", { id: st.missedAlerts[0].id }));
