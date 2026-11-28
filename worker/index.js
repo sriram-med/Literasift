@@ -90,6 +90,87 @@ async function execute(env, watch, from, to, mode = "manual") {
     throw error;
   }
 }
+// Persist per-lane job leases and health in the existing CAS-protected R2 state.
+// Keep the existing article, assignment, evidence and authentication structures.
+const LANES = ["discovery","reconciliation","evidence","alerts"];
+async function runLane(env,lane,operation) {
+  const owner=crypto.randomUUID(), now=Date.now();
+  const claimed=await write(env,state=>{
+    state.workflowHealth ||= {};
+    const previous=state.workflowHealth[lane]||{};
+    if(previous.leaseUntil>now)return false;
+    state.workflowHealth[lane]={...previous,owner,leaseUntil:now+10*60000,lastStartedAt:new Date(now).toISOString()};
+    return true;
+  });
+  if(!claimed)return {lane,busy:true,results:[]};
+  try {
+    const result=await operation();
+    await write(env,state=>{
+      const job=state.workflowHealth?.[lane];
+      if(job?.owner!==owner)return;
+      const failed=Boolean(result.results?.some(row=>row.error)||result.failed||result.alerts?.failed);
+      Object.assign(job,{leaseUntil:0,lastFinishedAt:new Date().toISOString(),lastError:failed?"One or more jobs failed":null});
+      if(!failed)job.lastSuccessAt=job.lastFinishedAt;
+    });
+    return {lane,...result};
+  }catch(error){
+    await write(env,state=>{
+      const job=state.workflowHealth?.[lane];
+      if(job?.owner===owner)Object.assign(job,{leaseUntil:0,lastFinishedAt:new Date().toISOString(),lastError:String(error.message).slice(0,500)});
+    });
+    return {lane,results:[{error:String(error.message).slice(0,500)}]};
+  }
+}
+function watchHistory(state,watch){
+  return state.runs.filter(r=>r.portfolio===watch.portfolio&&r.query===watch.query);
+}
+function latestRunTime(rows,mode,status){
+  return rows.filter(r=>r.mode===mode&&(!status||r.status===status)).reduce((n,r)=>Math.max(n,Date.parse(r.time)||0),0);
+}
+function retryDue(rows,mode,now){
+  const latest=rows.find(r=>r.mode===mode);
+  if(!latest||latest.status!=="Failed")return true;
+  let failures=0;
+  for(const r of rows.filter(r=>r.mode===mode)){if(r.status!=="Failed")break;failures++;}
+  return now-(Date.parse(latest.time)||0)>=Math.min(3600000,60000*2**Math.min(failures,6));
+}
+async function discoveryLane(env){
+  const {state}=await load(env),today=day(),now=Date.now();
+  const candidates=state.watches.filter(w=>w.active!==false).map(w=>({w,rows:watchHistory(state,w)}))
+    .filter(x=>now-latestRunTime(x.rows,"continuous","Imported")>=15*60000&&retryDue(x.rows,"continuous",now))
+    .sort((a,b)=>latestRunTime(a.rows,"continuous")-latestRunTime(b.rows,"continuous"));
+  if(!candidates.length)return {results:[]};
+  const {w,rows}=candidates[0];
+  // Only continuous/manual imports advance the discovery cursor. A report or audit
+  // cannot jump over an unsearched gap. Historical catch-up is limited to 7 days.
+  const cursor=rows.filter(r=>r.status==="Imported"&&["continuous","manual",undefined].includes(r.mode))
+    .reduce((v,r)=>r.to>v?r.to:v,"");
+  const overlap=shiftDay(today,-2);
+  const from=cursor&&cursor<overlap?cursor:overlap;
+  const to=shiftDay(from,6)<today?shiftDay(from,6):today;
+  try{return {results:[await execute(env,w,from,to,"continuous")]};}
+  catch(error){return {results:[{portfolio:w.portfolio,error:error.message}]};}
+}
+async function reconciliationLane(env){
+  const {state}=await load(env),today=day(),now=Date.now();
+  const watches=state.watches.filter(w=>w.active!==false).map(w=>({w,rows:watchHistory(state,w)}))
+    .sort((a,b)=>Math.max(latestRunTime(a.rows,"weekly-report"),latestRunTime(a.rows,"audit30"),latestRunTime(a.rows,"reconciliation"))-
+      Math.max(latestRunTime(b.rows,"weekly-report"),latestRunTime(b.rows,"audit30"),latestRunTime(b.rows,"reconciliation")));
+  for(const {w,rows} of watches){
+    const history=rows.filter(r=>r.status==="Imported"),week=weeklyWindow(w,today);
+    try{
+      if(!history.some(r=>r.mode==="weekly-report"&&r.from===week.from&&r.to===week.to)&&retryDue(rows,"weekly-report",now))
+        return {results:[await execute(env,w,week.from,week.to,"weekly-report")]};
+      if(now-latestRunTime(rows,"reconciliation","Imported")>=86400000&&retryDue(rows,"reconciliation",now))
+        return {results:[await execute(env,w,shiftDay(today,-7),today,"reconciliation")]};
+      if(retryDue(rows,"audit30",now)){
+        const audit=await reconcileExtended(env,w,today,history);
+        if(audit)return {results:[audit]};
+      }
+    }catch(error){return {results:[{portfolio:w.portfolio,error:error.message}]};}
+  }
+  return {results:[]};
+}
 const pmcOrigin = "https://pmc-oa-opendata.s3.amazonaws.com";
 async function captureFullText(env, article) {
   if (!/^PMC[0-9]+$/.test(article.pmcid)) return { fullTextStatus:"No PMC record" };
@@ -148,14 +229,14 @@ async function captureCitationXml(env, article) {
   const abstract = [...xml.matchAll(/<AbstractText(?:\s[^>]*)?>([\s\S]*?)<\/AbstractText>/g)].map(m=>m[1].replace(/<[^>]+>/g," ")).join(" ");
   return {citationXmlKey:key,citationXmlStatus:"Captured",priority:safetyPriority(article.title,abstract)};
 }
-async function collectEvidence(env, ids) {
+async function collectEvidence(env, ids, limit = 4) {
   const {state} = await load(env);
   const articles = ids ? ids.map(id=>state.articles[id]).filter(Boolean) : Object.values(state.articles);
   const enabled = Boolean(env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN);
   const needsFullText = a => !a.fullTextStatus || a.fullTextStatus === "Retry needed";
   const needsScreen = a => enabled && !a.screenshotKey;
   const pending = articles.filter(a=>!a.citationXmlKey || !a.priority || needsFullText(a) || needsScreen(a))
-    .sort((a,b)=>String(a.evidenceAttempt || "").localeCompare(String(b.evidenceAttempt || ""))).slice(0,4);
+    .sort((a,b)=>String(a.evidenceAttempt || "").localeCompare(String(b.evidenceAttempt || ""))).slice(0,limit);
   for (const article of pending) {
     await new Promise(resolve => setTimeout(resolve,350));
     const status = {evidenceAttempt:new Date().toISOString()};
@@ -276,6 +357,7 @@ async function api(request, env, path) {
     const assignments = state.assignments.filter(a => manager || a.reviewer === email);
     return json({ viewer, profiles:manager ? state.profiles : [viewer], watches:manager ? state.watches : [],
       runs:manager ? state.runs : [], assignments,
+      workflowHealth:manager?(state.workflowHealth||{}):{},
       alertConfig:{gateway:Boolean(env.ALERT_GATEWAY_URL && env.ALERT_GATEWAY_TOKEN),vapidPublicKey:env.VAPID_PUBLIC_KEY||"",preferences:state.alertPreferences?.[email]?{...state.alertPreferences[email],subscription:undefined}:null},
       priorityAlerts:assignments.filter(a=>state.articles[a.pmid]?.priority?.level==="Priority review").map(a=>a.id),
       notifications: assignments.filter(a=>a.discoveredAt).map(a=>({id:a.id,pmid:a.pmid,portfolio:a.portfolio,at:a.discoveredAt,read:Boolean(a.notificationReadBy?.includes(email))})).sort((a,b)=>b.at.localeCompare(a.at)),
@@ -324,43 +406,20 @@ async function api(request, env, path) {
     return json({ ok:true });
   }
   if (path === "/api/scheduled" && (service || manager)) {
-    const results = [];
-    const today = day();
-    const now = Date.now();
-    for (const watch of state.watches) {
-      if (watch.active === false) continue;
-      const history = state.runs.filter(r => r.portfolio === watch.portfolio && r.query === watch.query && r.status === "Imported");
-      const last = history.filter(r => r.mode === "continuous").reduce((n,r)=>Math.max(n,Date.parse(r.time)||0),0);
-      if (now - last < 15 * 60000) continue;
-      const audit = history.filter(r => r.mode === "reconciliation").reduce((n,r)=>Math.max(n,Date.parse(r.time)||0),0);
-      const previous = history.reduce((latest,r)=>r.to > latest ? r.to : latest,"");
-      const reconcile = now - audit >= 86400000;
-      const from = shiftDay(today,reconcile ? -7 : -2);
-      const cursor = previous && previous < from ? previous : from;
-      try {
-        // Bound catch-up windows to avoid oversized searches and advance only on success.
-        const through = shiftDay(cursor, 7) < today ? shiftDay(cursor,7) : today;
-        results.push(await execute(env, watch, cursor, through, "continuous"));
-        if (reconcile && through === today) results.push(await execute(env, watch, shiftDay(today,-7), today, "reconciliation"));
-      } catch (error) { results.push({ portfolio:watch.portfolio, error:error.message }); }
-    }
-    // Formal report is an actual reconciliation of the previous seven complete days.
-    // Process at most one extra historical job per invocation to limit load.
-    const refreshed=(await load(env)).state;
-    for(const watch of refreshed.watches){
-      if(watch.active===false)continue;
-      const history=refreshed.runs.filter(r=>r.portfolio===watch.portfolio&&r.query===watch.query&&r.status==="Imported");
-      const week=weeklyWindow(watch,today);
-      try{
-        if(!history.some(r=>r.mode==="weekly-report"&&r.from===week.from&&r.to===week.to)){
-          results.push(await execute(env,watch,week.from,week.to,"weekly-report"));break;
-        }
-        const audit=await reconcileExtended(env,watch,today,history);
-        if(audit){results.push(audit);break;}
-      }catch(error){results.push({portfolio:watch.portfolio,error:error.message});break;}
-    }
-    const alerts=await deliverAlerts(env);
-    return json({ results, alerts, evidence:await collectEvidence(env) });
+    const selected=body.lane||"all";
+    if(selected!=="all"&&!LANES.includes(selected))return json({error:"Unknown workflow lane"},400);
+    const operations={
+      discovery:()=>discoveryLane(env),
+      reconciliation:()=>reconciliationLane(env),
+      evidence:async()=>({results:[],evidence:await collectEvidence(env,undefined,1)}),
+      alerts:async()=>({results:[],alerts:await deliverAlerts(env)})
+    };
+    // A lane failure is contained; the scheduler can invoke independent lanes
+    // concurrently or continue using the legacy no-argument endpoint.
+    const lanes=selected==="all"?LANES:[selected];
+    const outcomes=await Promise.all(lanes.map(lane=>runLane(env,lane,operations[lane])));
+    return json({results:outcomes.flatMap(o=>o.results||[]),lanes:outcomes,
+      evidence:outcomes.find(o=>o.evidence)?.evidence,alerts:outcomes.find(o=>o.alerts)?.alerts});
   }
   if (!manager) return json({ error:"Manager access required." },403);
   if (path === "/api/evidence") return json(await collectEvidence(env));
@@ -430,7 +489,7 @@ function queue(items) {
 }
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=manager?["Overview","My Queue","Notifications","Reports","Batches","Clients","Watchlists","Team"]:["My Queue","Notifications"];
+  const tabs=manager?["Overview","My Queue","Notifications","Reports","Batches","Clients","Watchlists","Team","System health"]:["My Queue","Notifications"];
   tab ||= tabs[0];
   $("identity").textContent=data.viewer.name+" · "+data.viewer.role+" · "+(data.notifications||[]).filter(n=>!n.read).length+" unread";
   $("nav").innerHTML=tabs.map(x=>'<button data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+x+'</button>').join("");
@@ -441,6 +500,7 @@ function render() {
     $("content").innerHTML='<div class="cards">'+metrics.map(([label,num])=>'<div class="card"><b>'+num+'</b><span>'+label+'</span></div>').join("")+'</div>'+panel("All assignments",queue(items));
   }
   if(tab==="My Queue") $("content").innerHTML=panel("My assignments",queue(items.filter(a=>a.reviewer===data.viewer.email)));
+  if(tab==="System health") $("content").innerHTML=panel("Independent workflow lanes",table(["Workflow","State","Last started","Last healthy run","Error"],["discovery","reconciliation","evidence","alerts"].map(l=>{const h=data.workflowHealth?.[l]||{};return [esc(l),h.leaseUntil>Date.now()?"Running":h.lastError?"Needs attention":h.lastSuccessAt?"Idle":"Not run",esc(h.lastStartedAt||"—"),esc(h.lastSuccessAt||"—"),esc(h.lastError||"—")]}),"No workflow activity."));
   if(tab==="Reports") $("content").innerHTML=panel("Weekly reconciliation reports",table(["Portfolio","Coverage","Retrieved","New assignments","Generated","Export"],data.runs.filter(r=>r.mode==="weekly-report"&&r.status==="Imported").map(r=>[esc(r.portfolio),esc(r.from)+" to "+esc(r.to),r.count,r.newAssignments||0,esc(new Date(r.time).toLocaleString()),'<button data-export="'+esc(r.id)+'">CSV</button>']),"No completed weekly reports."))+panel("30-day reconciliation slices",table(["Portfolio","From","Through","Status"],data.runs.filter(r=>r.mode==="audit30").map(r=>[esc(r.portfolio),esc(r.from),esc(r.to),esc(r.error||r.status)]),"No audit slices yet."));
   if(tab==="Notifications") $("content").innerHTML=panel("Alert preferences",'<p>'+ (data.alertConfig.gateway?"Delivery gateway configured.":"External delivery is not configured; in-app alerts remain available.") +'</p><form data-route="alert-preferences"><label>Email alerts<select name="email"><option value="false">Off</option><option value="true" '+(data.alertConfig.preferences?.email?'selected':'')+'>On</option></select></label><label>Mobile alerts<select name="mobile"><option value="false">Off</option><option value="true" '+(data.alertConfig.preferences?.mobile?'selected':'')+'>On</option></select></label><label>Mobile number<input name="mobileDestination" value="'+esc(data.alertConfig.preferences?.mobileDestination||"")+'" placeholder="+91..."></label><label>Browser push<select name="push"><option value="false">Off</option><option value="true" '+(data.alertConfig.preferences?.push?'selected':'')+'>On</option></select></label><button>Save alert preferences</button></form>')+panel("New article alerts",'<form data-route="notification-read"><input type="hidden" name="all" value="true"><button>Mark all as read</button></form>'+table(["Article","Portfolio","Priority","Detected","Status"],(data.notifications||[]).map(n=>['<a target="_blank" rel="noopener" href="https://pubmed.ncbi.nlm.nih.gov/'+esc(n.pmid)+'/">'+esc(data.articles[n.pmid]?.title||n.pmid)+'</a>',esc(n.portfolio),esc(data.articles[n.pmid]?.priority?.level||"Awaiting screening"),esc(new Date(n.at).toLocaleString()),n.read?"Read":"New"]),"No new article alerts."));
   if(tab==="Clients") $("content").innerHTML=panel("Client portfolios",table(["Client","Portfolio","Surveillance"],data.watches.map(w=>[esc(w.client||"Unassigned"),esc(w.portfolio),w.active===false?"Paused":"Every 15 min"]),"No clients yet. Set a client on a watchlist."));
@@ -504,7 +564,7 @@ document.addEventListener("submit",async event=>{
   finally{button.disabled=false;}
 });
 refresh().catch(error=>message(error.message,true));
-setInterval(async()=>{if(document.hidden||$("dialog").open||document.activeElement?.closest("form"))return;try{const next=await api("state");data=next;if(tab==="Notifications"||tab==="Overview"||tab==="My Queue")render();else $("identity").textContent=data.viewer.name+" · "+data.viewer.role+" · "+(data.notifications||[]).filter(n=>!n.read).length+" unread";}catch{}},60000);
+setInterval(async()=>{if(document.hidden||$("dialog").open||document.activeElement?.closest("form"))return;try{const next=await api("state");data=next;if(tab==="Notifications"||tab==="Overview"||tab==="My Queue"||tab==="System health")render();else $("identity").textContent=data.viewer.name+" · "+data.viewer.role+" · "+(data.notifications||[]).filter(n=>!n.read).length+" unread";}catch{}},60000);
 </script></html>`;
 
 const importTool = {
