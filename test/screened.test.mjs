@@ -192,3 +192,18 @@ test("the Word documents list is fresh every week: earlier weeks are hidden unle
   assert.deepEqual(wk.docs.map(d => d.id), [now.id]); assert.equal(wk.earlier, 1);
   assert.deepEqual((await t.call(QC, "/api/screened-docs", { all: true })).body.docs.map(d => d.id).sort(), [now.id, "old"].sort());
 });
+
+test("rejection wording per client: the client's words in the lists and Word file, and reasons of its own", async () => {
+  const t = await makeEnv(team());
+  await t.call(MANAGER, "/api/membership-save", { email: QC, portfolio: "Navinta", role: "qc" });
+  assert.equal((await t.call(SCREENER, "/api/client-reasons", { client: "c1", words: {} })).status, 403);
+  const r = (await t.call(MANAGER, "/api/client-reasons", { client: "c1", words: { "No adverse event": "No AE reported (NAE)", "Made up": "x" }, extra: ["Non-company product", "No adverse event", ""] })).body;
+  assert.deepEqual(r.words, { "No adverse event": "No AE reported (NAE)" }); assert.deepEqual(r.extra, ["Non-company product"]);
+  assert.equal((await t.call(SCREENER, "/api/disposition", { id: "a1", value: "excluded", reason: "Non-company product" })).status, 200, "the client's own reason is accepted");
+  assert.equal((await t.call(SCREENER2, "/api/disposition", { id: "a3", value: "excluded", reason: "Non-company product" })).status, 400, "but not for another client");
+  await t.call(SCREENER, "/api/disposition", { id: "a2", value: "excluded", reason: "No adverse event", note: "PK" });
+  const rows = (await t.call(MANAGER, "/api/screened", { kind: "rejected", client: "Navinta" })).body.rows;
+  assert.deepEqual(rows.map(x => x.deText).sort(), ["No AE reported (NAE) - PK", "Non-company product"]);
+  const doc = readZip(await (await t.raw(MANAGER, "/api/screened-docx", { kind: "rejected" })).arrayBuffer()).get("word/document.xml").toString("utf8");
+  assert.match(doc, /No AE reported \(NAE\) - PK/);
+});

@@ -640,3 +640,9 @@ Every **Dashboard** (manager, DE, QC, medical reviewer) also has **Team counts (
   | **Esc** | Close |
 
   Keys are ignored while typing a comment. Decisions follow the usual rules: rejections go to QC.
+
+## Rejection wording per client (Clients tab → client → Rejection wording)
+
+- **Client wording.** Each standard rejection reason can have the client's own wording, for example "No adverse event" → "No AE reported (NAE)". The Word files, the Screened tab and the Archive show the client's wording. The decision itself keeps the standard reason, so counts and reports stay comparable across clients.
+- **Own reasons.** A client can also have reasons of its own, one per line (for example "Non-company product"). They appear in the reason lists for that client's articles only.
+- Changes are recorded in the audit trail.
