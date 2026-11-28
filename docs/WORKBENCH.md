@@ -510,16 +510,18 @@ The header shows the IRD range, who made it, and the date. The DE sees their art
 
 Allocation is a manager-only tab for sharing articles out between DE and QC pairs.
 
-**How articles are numbered.** The articles are numbered 1, 2, 3 … in a fixed order: client, then drug, then IRD, then PMID. You can filter by client and IRD dates, and choose which articles to number:
+**Client cards.** There is one card per client, showing how many articles it has and how many already have a DE.
+
+**How articles are numbered.** Within each card, the articles are numbered from 1 in a fixed order: drug, then IRD, then PMID. "Show articles" opens the numbered list, coloured by range. At the top you can filter by IRD dates and choose which articles to number:
 - not screened yet (the default);
 - without a DE;
 - all.
 
 **Ranges.** Each range is a pair of numbers (for example 1 to 20) with a **DE** and a **QC**. To build them:
-- use **Add range** for one at a time, or **Split into N equal ranges** to divide the list evenly;
+- use **+ range** for one at a time, or **Split** (1 to 6) to divide the client's list evenly;
 - each range is coloured in the table, so you can see which articles it covers.
 
-**Allocate.** Press **Allocate** to apply the ranges. For each article:
+**Allocate.** Press **Allocate** on a card to apply that client's ranges. For each article:
 - **DE:** the DE becomes its screener. Articles already screened keep their DE, unless QC sent them back.
 - **QC:** the QC is used when the DE finishes it. Articles already waiting for QC move to that QC straight away.
 
