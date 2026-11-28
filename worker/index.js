@@ -224,6 +224,15 @@ const isScreenerFor = (state, p, portfolio) => {
   if (!p.roles) return legacyScreens(state, p) && (!p.portfolio || p.portfolio.toLowerCase() === pf);
   return p.roles.includes("screener") && (state.memberships || []).some(m => m.email === p.email && m.role === "screener" && (m.portfolio === "*" || m.portfolio.toLowerCase() === pf));
 };
+// IRD as the client's mailbox sees it. With the "receipt day" rule, an article's Initial Receipt Date is the client's scheduled day after the week it was found in
+// (for a weekly Sunday client: the Sunday its alert email arrives), and never later than the day the app pulled it, so a timeline is never started late.
+function receiptIrd(state, portfolio, molecule, windowTo) {
+  const w = watchFor(state, portfolio, molecule), c = (state.clients || []).find(x => x.id === w?.client);
+  if (!c || c.irdRule !== "receipt") return "";
+  const sched = scheduleOf(c.schedule), today = day(); let d = addDays(isDate(windowTo) ? windowTo : today, 1);
+  if (sched.every === "weekly") for (let i = 0; i < 7 && weekdayOf(d) !== sched.weekday; i++) d = addDays(d, 1);
+  return d < today ? d : today;
+}
 function allocate(state, item) {
   // A molecule owner (set by a manager) receives every article for that molecule, regardless of capacity.
   const owned = state.watches.find(w => w.owner && w.portfolio === item.portfolio && (!w.molecule || (item.molecules || []).includes(w.molecule)));
@@ -333,6 +342,7 @@ async function importPmidList(env, list, portfolio, molecule) {
       const existing = state.assignments.find(a => a.pmid === id && a.portfolio === portfolio);
       if (existing) { if (molecule && !(existing.molecules || []).includes(molecule)) (existing.molecules ||= []).push(molecule); continue; }
       const item = { id:crypto.randomUUID(), pmid:id, portfolio, molecules:molecule ? [molecule] : [], reviewer:"", status:"Pending" };
+      const rIrd = receiptIrd(state, portfolio, molecule || "", ""); if (rIrd) item.ird = rIrd;
       allocate(state, item);
       state.assignments.push(item);
     }
@@ -521,6 +531,7 @@ async function processWindow(env, runId, index) {
         const existing = data.assignments.find(a => a.pmid === id && a.portfolio === r.portfolio);
         if (existing) { if (watch.molecule && !(existing.molecules || []).includes(watch.molecule)) (existing.molecules ||= []).push(watch.molecule); continue; }
         const item = { id:crypto.randomUUID(), pmid:id, portfolio:r.portfolio, molecules:watch.molecule ? [watch.molecule] : [], reviewer:"", status:"Pending" };
+        const rIrd = receiptIrd(data, r.portfolio, watch.molecule || "", w.to); if (rIrd) item.ird = rIrd;
         allocate(data, item); data.assignments.push(item);
       }
       r.ids = uniq([...(r.ids || []), ...ids.filter(id => data.articles[id])]);
@@ -6039,7 +6050,8 @@ async function apiCore(request, env, path) {
         const weekday = /^\d$/.test(dayName) ? Number(dayName) : DAYS.findIndex(d => d.startsWith(dayName.slice(0, 3))) + 1;
         if (!["daily", "weekly"].includes(every) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time) || weekday < 1) { out.push({ molecule:"schedule", ok:false, error:"Write it as: schedule | every: weekly | day: Monday | time: 09:00" }); continue; }
         const countBy = String(f.count || "").toLowerCase();
-        await write(env, data => { const c = data.clients.find(x => x.id === clientId); c.schedule = scheduleOf({ every, weekday, time }); if (/alert|crdt|entry|added/.test(countBy)) c.dateBasis = "crdt"; else if (/pub|dp/.test(countBy)) delete c.dateBasis; });
+        await write(env, data => { const c = data.clients.find(x => x.id === clientId); c.schedule = scheduleOf({ every, weekday, time }); if (/alert|crdt|entry|added/.test(countBy)) c.dateBasis = "crdt"; else if (/pub|dp/.test(countBy)) delete c.dateBasis;
+          const irdRule = String(f.ird || "").toLowerCase(); if (/receipt|mail|email|schedule/.test(irdRule)) c.irdRule = "receipt"; else if (/pull/.test(irdRule)) delete c.irdRule; });
         const sl = scheduleSlots({ every, weekday, time });
         out.push({ molecule:"schedule", ok:true, mode:"schedule", query:(every === "weekly" ? "Every " + DAYS[weekday - 1][0].toUpperCase() + DAYS[weekday - 1].slice(1) : "Every day") + " at " + time + " (India time) · next pull " + sl.next, countries:[] });
         continue;
@@ -7310,7 +7322,7 @@ async function apiCore(request, env, path) {
       const slotInfo = cid => { const sl = scheduleSlots(groupSchedule(state, cid)), done = (state.autoSlots || {})[cid || "none"] || "", since = (done || sl.last).slice(0, 10);
         const items = state.assignments.filter(a => (clientIdFor(state, a) || "") === (cid || "") && irdOf(state, a).slice(0, 10) >= since);
         return { schedule:sl.schedule, nextPull:sl.next, lastSlot:sl.last, lastSlotDone:done === sl.last, lastPulledSlot:done, newSinceLast:items.length }; };
-      const perClient = [...(state.clients || []).map(c => ({ id:c.id, name:c.name, auto:c.autoPull !== false, countBy:c.dateBasis === "crdt" ? "alerts" : "publication", searchMode:modeOf(c.searchMode) || "pubmed", startFrom:c.startFrom || "", until:c.until || "", ...slotInfo(c.id) })), { id:"", name:"No client", auto:true, ...slotInfo("") }].map(c => { const ws = perWatch.filter(w => w.clientId === c.id); return { ...c, molecules:ws.length, waiting:ws.reduce((n, w) => n + w.missing, 0), articles:ws.reduce((n, w) => n + w.articles, 0), lastRunAt:ws.map(w => w.lastRunAt).filter(Boolean).sort().pop() || "" }; }).filter(c => c.id || c.molecules);
+      const perClient = [...(state.clients || []).map(c => ({ id:c.id, name:c.name, auto:c.autoPull !== false, countBy:c.dateBasis === "crdt" ? "alerts" : "publication", irdRule:c.irdRule === "receipt" ? "receipt" : "pulled", searchMode:modeOf(c.searchMode) || "pubmed", startFrom:c.startFrom || "", until:c.until || "", ...slotInfo(c.id) })), { id:"", name:"No client", auto:true, ...slotInfo("") }].map(c => { const ws = perWatch.filter(w => w.clientId === c.id); return { ...c, molecules:ws.length, waiting:ws.reduce((n, w) => n + w.missing, 0), articles:ws.reduce((n, w) => n + w.articles, 0), lastRunAt:ws.map(w => w.lastRunAt).filter(Boolean).sort().pop() || "" }; }).filter(c => c.id || c.molecules);
       return json({ perClient, autoPull:state.settings?.autoPull !== false, autoPullFrom:state.settings?.autoPullFrom || "", everyMinutes:Number(env.SCHEDULE_MINUTES || 60), perWatch, expectedThrough:through, heartbeat:{ lastBeatAt:h.lastBeatAt || null, lastFinishedAt:h.lastFinishedAt || null, lastSuccessAt:h.lastSuccessAt || null, running:Boolean(h.running), lastError:h.lastError || "", consecutiveFailures:h.consecutiveFailures || 0, ageMinutes:age, recent:(h.beats || []).slice(0, 12) }, stale:age === null || age > staleMin, staleAfterMinutes:staleMin, lastBatch:h.lastBatch || null, missed, watches:state.watches.length });
     }
     const watch = state.watches.find(w => w.portfolio === body.portfolio && (w.molecule || "") === (body.molecule || ""));
@@ -7809,6 +7821,12 @@ async function apiCore(request, env, path) {
     if (isDate(body.startFrom) && isDate(body.until) && body.startFrom > body.until) return json({ error:"The start date must be before the stop date." }, 400);
     if ("every" in body && !["daily", "weekly"].includes(body.every)) return json({ error:"Choose daily or weekly." }, 400);
     if ("time" in body && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(body.time))) return json({ error:"Enter the time as HH:MM." }, 400);
+    if ("irdRule" in body) await write(env, data => { const c = data.clients.find(x => x.id === body.client); if (body.irdRule === "receipt") c.irdRule = "receipt"; else delete c.irdRule; });
+    if (body.applyIrd === true || body.applyIrd === "true") await write(env, data => {
+      // Open items of the client not yet screened get the receipt-day IRD (from the pull window that found them) and a screening due date from it.
+      for (const a of data.assignments) { if (a.status !== "Pending" || a.disposition || a.irdManual) continue; const w = watchFor(data, a.portfolio, (a.molecules || [])[0] || ""); if (w?.client !== body.client) continue;
+        const run = (data.runs || []).find(r => (r.ids || []).includes(a.pmid) && r.portfolio === a.portfolio), win = (run?.windows || []).find(x => (x.pmids || []).includes(a.pmid));
+        const ird = receiptIrd(data, a.portfolio, (a.molecules || [])[0] || "", win?.to || run?.to || ""); if (ird) { a.ird = ird; a.dueAt = screenDueFor(data, a); } } });
     if ("alerts" in body) await write(env, data => { const c = data.clients.find(x => x.id === body.client); if (body.alerts === true || body.alerts === "true") c.dateBasis = "crdt"; else delete c.dateBasis; });
     if (["every", "weekday", "time"].some(k => k in body)) await write(env, data => { const c = data.clients.find(x => x.id === body.client); const cur = scheduleOf(c.schedule);
       c.schedule = scheduleOf({ every:body.every ?? cur.every, weekday:body.weekday ?? cur.weekday, time:body.time ?? cur.time }); });
@@ -9646,7 +9664,7 @@ function autoClientCard(c,ws,molTable){
     '<span class="sub">'+(alerts?badge("Like PubMed alerts","blue")+' by the date articles are added to PubMed':badge("Publication date","")+' with the alert check and the 60-day late-arrival sweep')+'</span></div>'+
     '<div class="ap-clock">'+(c.id&&!c.auto?'<b>Paused</b>':'<span class="sub">Next pull</span><b>'+esc(slotText(c.nextPull))+'</b><span class="ap-count" data-countdown="'+esc(c.nextPull||"")+'">'+esc(untilText(c.nextPull))+'</span>')+'</div></div>'+
     '<div class="ap-facts"><span><span class="sub">Schedule</span> '+esc(when)+' at '+esc(sc.time||"06:00")+'</span><span><span class="sub">Last scheduled pull</span> '+(c.lastPulledSlot?esc(slotText(c.lastPulledSlot)):'<span class="sub">not yet</span>')+'</span>'+
-      '<span><span class="sub">New since then</span> <b>'+(c.newSinceLast||0)+'</b> article'+(c.newSinceLast===1?"":"s")+'</span><span><span class="sub">Molecules</span> '+ws.length+(ws.filter(w=>w.missing).length?' · '+badge(ws.reduce((n,w)=>n+(w.missing||0),0)+" day-range"+(ws.reduce((n,w)=>n+(w.missing||0),0)===1?"":"s")+" waiting","amber"):' · '+badge("up to date","green"))+'</span></div>'+
+      '<span><span class="sub">IRD</span> '+(c.irdRule==="receipt"?"weekly receipt day":"day pulled")+'</span><span><span class="sub">New since then</span> <b>'+(c.newSinceLast||0)+'</b> article'+(c.newSinceLast===1?"":"s")+'</span><span><span class="sub">Molecules</span> '+ws.length+(ws.filter(w=>w.missing).length?' · '+badge(ws.reduce((n,w)=>n+(w.missing||0),0)+" day-range"+(ws.reduce((n,w)=>n+(w.missing||0),0)===1?"":"s")+" waiting","amber"):' · '+badge("up to date","green"))+'</span></div>'+
     '<div class="ap-actions"><button type="button" class="btn sm" data-clientpull="'+esc(cid)+'">Pull now</button>'+
       (c.id?'<button type="button" class="btn outline sm" data-alopen="'+esc(c.id)+'">Show what is new</button>'+
         '<form data-route="client-auto" style="margin:0"><input type="hidden" name="client" value="'+esc(c.id)+'"><input type="hidden" name="alerts" value="'+(alerts?"false":"true")+'"><button class="btn outline sm">'+(alerts?"Count by publication date":"Count like PubMed alerts")+'</button></form>'+
@@ -10732,6 +10750,7 @@ function clientsHtml(){
           '<select data-ccweekday="'+esc(c.id)+'" aria-label="Weekday"'+(sc.every==="weekly"?"":" hidden")+'>'+WEEKDAYS.map((w,i)=>'<option value="'+(i+1)+'"'+(sc.weekday===i+1?" selected":"")+'>'+w+'</option>').join("")+'</select>'+
           '<span class="sub">at</span><input type="time" class="cc-time" data-cctime="'+esc(c.id)+'" value="'+esc(sc.time)+'" aria-label="Time"><span class="sub">India time</span><button type="button" class="btn sm" data-ccsched="'+esc(c.id)+'">Save schedule</button>'+
           '<label class="check cc-alerts" title="Pull and count by the date articles are added to PubMed, as PubMed alert emails (What is new for ...) do, instead of by publication date"><input type="checkbox" data-ccalerts="'+esc(c.id)+'"'+(c.dateBasis==="crdt"?" checked":"")+'>&nbsp;Count like PubMed alerts</label>'+
+          '<label class="check cc-alerts" title="IRD (Initial Receipt Date) = the client scheduled day after the week the article was found in, like the day the weekly email reaches the mailbox; never later than the day it was pulled"><input type="checkbox" data-ccird="'+esc(c.id)+'"'+(c.irdRule==="receipt"?" checked":"")+'>&nbsp;IRD = weekly receipt day</label>'+
           '<span class="sub">'+(on?'Next pull: <b>'+esc(ccNextText(c))+'</b>. Each pull brings in every day not yet pulled, '+(c.dateBasis==="crdt"?"by the date articles were added to PubMed (like PubMed alert emails)":"by publication date")+'.':"Paused: switch the client on to pull on this schedule.")+'</span></div>';})():"")+
         (mgr?ssBulkHtml(c.id,"cc"):"")+'<div class="bar" style="margin:4px 0 8px"><i style="width:'+pct+'%"></i></div><div data-cclist="'+esc(c.id)+'">'+ccMolRows(c,mols)+'</div></div>':"")+'</section>';
   }).join("");
@@ -11203,7 +11222,8 @@ document.addEventListener("click",event=>{
   if(target.dataset.recocsv){downloadPost("/api/reconciliation-csv",{runIds:target.dataset.recocsv.split(",")},"literasift-reconciliation.csv").catch(e=>message(e.message,true));return;}
   if(target.dataset.cppullsame){const c=cpState.compared;if(c&&$("cpclient")&&$("cpclient").value===c.client){document.querySelectorAll("[data-cpmol]").forEach(x=>{x.checked=c.sel.includes(x.dataset.cpmol);});if(JSON.stringify((()=>{const v=cpSavedSettings();delete v._lim;return v;})())+JSON.stringify(ssOwnMap(c.sel))!==c.st)return message("The settings changed after the comparison. Compare again, then pull.",true);}runClientPull(target);return;}
   if(target.dataset.ccopen){const id=target.dataset.ccopen;if(ccState.open.has(id))ccState.open.delete(id);else ccState.open.add(id);render();return;}
-  if(target.dataset.ccsched){const id=target.dataset.ccsched,q=k=>document.querySelector("[data-cc"+k+'="'+CSS.escape(id)+'"]'),every=q("every").value,body={client:id,every,time:q("time").value||"06:00"};if(every==="weekly")body.weekday=Number(q("weekday").value);body.alerts=!!(q("alerts")&&q("alerts").checked);
+  const c0=id=>(data.clients||[]).find(x=>x.id===id)||{};
+  if(target.dataset.ccsched){const id=target.dataset.ccsched,q=k=>document.querySelector("[data-cc"+k+'="'+CSS.escape(id)+'"]'),every=q("every").value,body={client:id,every,time:q("time").value||"06:00"};if(every==="weekly")body.weekday=Number(q("weekday").value);body.alerts=!!(q("alerts")&&q("alerts").checked);if(q("ird")){const on=q("ird").checked;body.irdRule=on?"receipt":"pulled";if(on&&c0(id).irdRule!=="receipt"&&confirm("Also set the receipt-day IRD (and screening due dates) on this client open items that are not screened yet?"))body.applyIrd=true;}
     target.disabled=true;api("client-auto",body).then(async r=>{await refresh();const c=(data.clients||[]).find(x=>x.id===id);message("Schedule saved: "+ccSchedText(c)+". Next pull: "+ccNextText(c)+".");}).catch(err=>{message(err.message,true);target.disabled=false;});return;}
   if(target.dataset.ccdel){const d=target.dataset;if(!confirm("Remove "+d.ccname+" from "+d.ccclient+"? It is deleted and no longer searched. Its articles already pulled stay in the Library and queues."))return;target.disabled=true;
     api("delete-watch",{watch:d.ccdel}).then(async()=>{await refresh();render();message(d.ccname+" removed from "+d.ccclient+".");}).catch(err=>{target.disabled=false;message(err.message,true);});return;}

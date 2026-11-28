@@ -441,3 +441,21 @@ test("a publication-date pull also pulls the articles added to PubMed in the sam
   const off = await wf(handler, () => t.call(M, "/api/pull-client", { client: "n", from: ago(7), to: ago(0), dateField: "pdat", alertCheck: false }));
   assert.equal(off.body.results[0].alertExtra, null);
 });
+
+test("IRD = the client's weekly receipt day: the scheduled weekday after the week an article was found in, never later than the day it was pulled", async () => {
+  const { makeEnv: mk, MANAGER: M, fakeNcbi: fk, withFetch: wf } = await import("./helpers.mjs");
+  const today = new Date(Date.now() + 5.5 * 3600000).toISOString().slice(0, 10), add = (d, n) => new Date(Date.parse(d + "T00:00:00Z") + n * 864e5).toISOString().slice(0, 10);
+  const wd = d => ((new Date(d + "T00:00:00Z").getUTCDay() + 6) % 7) + 1;
+  // a past week ending on a Saturday at least a week ago
+  let sat = add(today, -8); while (wd(sat) !== 6) sat = add(sat, -1); const sun = add(sat, 1), mon = add(sat, -5);
+  const t = await mk({ clients: [{ id: "n", name: "Navinta", dateBasis: "crdt", schedule: { every: "weekly", weekday: 7, time: "06:00" } }], schema: { grouping: "client" },
+    watches: [{ portfolio: "Navinta", molecule: "carmustine", query: "((carmustine))", names: [], client: "n" }] });
+  const r = await t.call(M, "/api/client-auto", { client: "n", irdRule: "receipt" }); assert.equal(r.status, 200);
+  const ncbi = fk([{ pmid: "61", date: add(sat, -2) }, { pmid: "62", date: add(today, -1) }]);
+  await wf(ncbi.handler, () => t.call(M, "/api/pull-client", { client: "n", from: mon, to: sat }));
+  let st = await t.state(); assert.equal(st.assignments.find(a => a.pmid === "61").ird, sun, "IRD is the Sunday after that week");
+  await wf(ncbi.handler, () => t.call(M, "/api/pull-client", { client: "n", from: add(today, -3), to: today }));
+  st = await t.state(); assert.equal(st.assignments.find(a => a.pmid === "62").ird, today, "a mid-week pull keeps the earlier, pulled day");
+  // switched off: the day pulled
+  await t.call(M, "/api/client-auto", { client: "n", irdRule: "pulled" }); assert.equal((await t.state()).clients[0].irdRule, undefined);
+});
