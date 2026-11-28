@@ -8,7 +8,7 @@ services:
     init: true
     shm_size: 256mb
     restart: unless-stopped
-  scheduler:
+  scheduler: &scheduler
     image: node:24-bookworm-slim
     environment:
       BENCH_URL: ${BENCH_URL:?set BENCH_URL}
@@ -16,8 +16,17 @@ services:
       RUN_TOKEN: ${RUN_TOKEN:?set RUN_TOKEN}
     volumes:
       - ./scripts/run-watchlists.mjs:/app/run-watchlists.mjs:ro
-    command: ["sh", "-c", "while true; do node /app/run-watchlists.mjs; sleep 60; done"]
+    command: ["sh", "-c", "while true; do node /app/run-watchlists.mjs discovery; sleep 60; done"]
     restart: unless-stopped
+  scheduler-reconciliation:
+    <<: *scheduler
+    command: ["sh", "-c", "while true; do node /app/run-watchlists.mjs reconciliation; sleep 60; done"]
+  scheduler-evidence:
+    <<: *scheduler
+    command: ["sh", "-c", "while true; do node /app/run-watchlists.mjs evidence; sleep 60; done"]
+  scheduler-alerts:
+    <<: *scheduler
+    command: ["sh", "-c", "while true; do node /app/run-watchlists.mjs alerts; sleep 60; done"]
   alerts:
     profiles: ["alerts"]
     build: ./alerts
