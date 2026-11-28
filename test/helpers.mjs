@@ -44,7 +44,7 @@ export async function makeEnv(state = {}, extra = {}) {
   const dir = await mkdtemp(join(tmpdir(), "ls-p1-")), BUCKET = new FileBucket(dir + "/objects");
   const base = { profiles: [{ email: MANAGER, name: "Boss", role: "manager", active: true }, { email: SCREENER, name: "Asha", role: "reviewer", active: true, capacity: 99 }], watches: [], settings: { qcPotentialIcsr: true }, runs: [], articles: {}, assignments: [], ...state };
   await BUCKET.put("bench.json", JSON.stringify(base));
-  const env = { BUCKET, RUN_TOKEN: "x".repeat(40), HOST_ACCOUNTS: true, RETRY_BASE_MS: 1, NCBI_GAP_MS: 0, AUDIT_ANCHOR_KEY: "k".repeat(32), ...extra };
+  const env = { BUCKET, RUN_TOKEN: "x".repeat(40), HOST_ACCOUNTS: true, MISSED_CHECK: "off", RETRY_BASE_MS: 1, NCBI_GAP_MS: 0, AUDIT_ANCHOR_KEY: "k".repeat(32), ...extra };
   const call = async (who, path, body = {}, headers = {}) => { const r = await worker.fetch(new Request("http://localhost" + path, { method: "POST", headers: { "oai-authenticated-user-email": who, "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) }), env); return { status: r.status, body: await r.json().catch(() => ({})), response: r }; };
   const raw = (who, path, body = {}) => worker.fetch(new Request("http://localhost" + path, { method: "POST", headers: { "oai-authenticated-user-email": who, "Content-Type": "application/json" }, body: JSON.stringify(body) }), env);
   const get = async (who, path) => { const r = await worker.fetch(new Request("http://localhost" + path, { headers: { "oai-authenticated-user-email": who } }), env); return r; };

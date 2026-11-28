@@ -605,3 +605,9 @@ Every **Dashboard** (manager, DE, QC, medical reviewer) also has **Team counts (
 
   **Excel** downloads the same table to send with the weekly email.
 - Uploaded emails are kept (search, date sent, PMIDs), so later reconciliations use them. Every upload, pull and reconciliation is recorded in the audit trail.
+
+## Missed-article alarm (Dashboard)
+
+- Once a day the scheduler searches **last week** (Monday to Sunday, India time) again, by date added to PubMed, for every molecule of every active client. Any article PubMed now has that the app does not hold is listed at the top of the Dashboard, by client and molecule, with its PMIDs.
+- **Pull** brings those articles in. **Dismiss** clears the alert and asks for a reason for the audit trail. Managers can press **Check now** at any time.
+- DE and QC users see the alerts for the clients they work on. Pulls, dismissals and checks are recorded in the audit trail.
