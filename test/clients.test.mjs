@@ -273,3 +273,15 @@ test("the compare suggests the set of terms that finds the client's articles wit
   assert.ok(g.terms.includes("CASE REPORT") && !g.terms.includes("SAFETY"), g.terms.join(","));
   assert.ok(g.extra <= 2, "at most the two articles that share a word with the client's"); assert.ok(g.line.startsWith("metformin | countries: | query: (\"Metformin\"[All Fields]) AND ("));
 });
+
+test("a screener's Library and Watchlists hold only the clients they work on", async () => {
+  const t = await makeEnv({ clients: [{ id: "u", name: "USV" }, { id: "n", name: "Navinta" }], schema: { grouping: "client" },
+    watches: [{ portfolio: "USV", molecule: "metformin", query: "m", client: "u" }, { portfolio: "Navinta", molecule: "carmustine", query: "c", client: "n" }],
+    memberships: [{ email: SCREENER, portfolio: "USV", role: "screener" }],
+    articles: { 1: { pmid: "1", pullAt: "2026-11-20T00:00:00Z" }, 2: { pmid: "2", pullAt: "2026-11-20T00:00:00Z" } },
+    assignments: [{ id: "a", pmid: "1", portfolio: "USV", molecules: ["metformin"], reviewer: SCREENER, status: "Pending" }, { id: "b", pmid: "2", portfolio: "Navinta", molecules: ["carmustine"], status: "Pending" }] });
+  const st = await t.get(SCREENER, "/api/state"), body = await st.json();
+  assert.ok(body.library.length > 0 && body.library.every(e => e.pmid === "1"), "only their own client's articles in the Library");
+  const s = await t.call(SCREENER, "/api/scheduler-status", {});
+  assert.equal(s.status, 200); assert.deepEqual(s.body.perClient.map(c => c.name), ["USV"]); assert.deepEqual(s.body.perWatch.map(w => w.molecule), ["metformin"]);
+});

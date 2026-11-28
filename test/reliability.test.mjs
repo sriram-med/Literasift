@@ -48,7 +48,8 @@ test("every scheduler tick leaves a heartbeat; a silent scheduler is reported as
   assert.deepEqual([s.lastBatch.from, s.lastBatch.to, s.lastBatch.coverage, s.lastBatch.retrieved], [D1, D1, "reconciled", 2]); assert.deepEqual(s.missed, []);
   const old = await t.state(); old.scheduler.lastBeatAt = new Date(Date.now() - 5 * 3600000).toISOString(); await t.BUCKET.put("bench.json", JSON.stringify(old));
   s = await status(t); assert.equal(s.stale, true); assert.ok(s.heartbeat.ageMinutes >= 290);
-  assert.equal((await t.call(SCREENER, "/api/scheduler-status", {})).status, 403);
+  const ro = await t.call(SCREENER, "/api/scheduler-status", {}); assert.equal(ro.status, 200); assert.equal(ro.body.readOnly, true, "a screener sees the automatic pull read-only"); assert.equal(ro.body.missed, undefined);
+  assert.equal((await t.call(SCREENER, "/api/missed-retry", {})).status, 403, "and cannot retry or change it");
 });
 
 test("overlapping runs share one run per window, and give one assignment per portfolio and PMID", async () => {
