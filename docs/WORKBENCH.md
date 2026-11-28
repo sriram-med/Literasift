@@ -406,3 +406,10 @@ Every molecule has exactly one saved search: its own names (brands, salts, spell
 - People see only articles they may access: the DE sees their own, and QC sees the items routed to QC for their clients.
 - **QC re-check.** Use the filter chips All / Waiting for QC / QC agreed / Sent back. On an item waiting for you, type a comment and press **Agree**, or press **Send back**, which needs a comment of at least 5 characters. A sent-back item returns to the DE's queue; the DE's new decision goes to QC again.
 - **Word document.** "Download Word" builds a `.docx` with the current filters (client, IRD range, QC status). It has a section per client; under each article are its IRD and PMID, the DE comment highlighted yellow, and the QC comment. Every download is recorded in the audit trail.
+- **QC sees all safety present articles** of their clients, whether or not they were routed to QC. QC can comment on any of them.
+- **Bulk comments.** Tick articles, or use "Select all shown", and type one comment. Then choose:
+  - **Add as DE comment**: DE only, on their own articles. It replaces the DE comment; the rejection reason stays.
+  - **Add as QC comment**: QC only, never on their own articles.
+  - **QC agree all** or **Send back all**: acts only on the selected items that are waiting for QC.
+
+  Articles that can't take the action are skipped, and the app lists them. Every bulk action is recorded in the audit trail and in each article's history. Comments added in bulk appear in the Word document.

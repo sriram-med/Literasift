@@ -69,3 +69,27 @@ test("Word document: title, IRD and the DE comment highlighted yellow, with the 
     else assert.doesNotMatch(doc, /Levetiracetam review/, "other clients' articles stay out");
   }
 });
+
+test("QC sees every safety present article of their clients, and one comment can be added to many articles as DE or QC", async () => {
+  const t = await makeEnv(team());
+  await t.call(MANAGER, "/api/membership-save", { email: QC, portfolio: "Navinta", role: "qc" });
+  await t.call(SCREENER, "/api/disposition", { id: "a1", value: "excluded", reason: "No adverse event" });
+  await t.call(SCREENER, "/api/disposition", { id: "a2", value: "aggregate_safety", note: "Cohort" });
+  await t.call(SCREENER2, "/api/disposition", { id: "a3", value: "excluded", reason: "No adverse event" });
+  const saf = (await t.call(QC, "/api/screened", { kind: "safety" })).body.rows;
+  assert.deepEqual(saf.map(r => [r.pmid, r.qc, r.canQcComment]), [["2", "", true]], "not routed to QC, still visible to QC");
+  assert.equal((await t.call(QC, "/api/screened", { kind: "rejected" })).body.rows.length, 1, "other clients stay hidden");
+  // DE bulk comment on their own articles; someone else's is skipped
+  const de = (await t.call(SCREENER, "/api/screened-comment", { ids: ["a1", "a2", "a3"], as: "de", note: "Checked against the full text" })).body;
+  assert.equal(de.done, 2); assert.equal(de.skipped.length, 1);
+  assert.equal((await t.call(SCREENER, "/api/screened-comment", { ids: ["a1"], as: "qc", note: "Self check" })).body.skipped[0].why, "you cannot QC your own article");
+  // QC bulk: comment on the safety article, agree the waiting rejection
+  assert.equal((await t.call(QC, "/api/screened-comment", { ids: ["a2"], as: "qc", note: "Agree, aggregate only" })).body.done, 1);
+  assert.equal((await t.call(QC, "/api/screened-comment", { ids: ["a1"], as: "qc", decision: "return", note: "no" })).status, 400);
+  assert.equal((await t.call(QC, "/api/screened-comment", { ids: ["a1", "a2"], as: "qc", decision: "approve", note: "Agreed in bulk" })).body.done, 1, "only items waiting for QC take a decision");
+  const s = await t.state(), a1 = s.assignments.find(a => a.id === "a1"), a2 = s.assignments.find(a => a.id === "a2");
+  assert.equal(a1.disposition.note, "Checked against the full text"); assert.equal(a1.disposition.reason, "No adverse event"); assert.equal(a1.qc.status, "approved"); assert.equal(a1.status, "Complete");
+  assert.equal(a2.qcComment.note, "Agree, aggregate only"); assert.equal(a2.qcComment.by, QC);
+  const doc = readZip(await (await t.raw(QC, "/api/screened-docx", { kind: "safety" })).arrayBuffer()).get("word/document.xml").toString("utf8");
+  assert.match(doc, /Agree, aggregate only/); assert.match(doc, /Checked against the full text/);
+});

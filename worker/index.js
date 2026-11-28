@@ -4418,15 +4418,19 @@ function screenedRows(state, viewer, opts = {}) {
   const name = e => state.profiles.find(p => p.email === e)?.name || e || "";
   const rows = [];
   for (const a of state.assignments || []) {
-    if (!a.disposition || !values.includes(a.disposition.value) || !mayAccess(state, viewer, a)) continue;
+    if (!a.disposition || !values.includes(a.disposition.value)) continue;
+    const roles = rolesIn(state, me, a.portfolio), isQc = roles.has("qc");
+    // QC sees every rejected and safety present article of their clients, not only the ones routed to them.
+    if (!mayAccess(state, viewer, a) && !isQc) continue;
     const ird = irdOf(state, a), client = clientOf(a);
     if ((opts.from && ird < opts.from) || (opts.to && ird > opts.to) || (opts.client && opts.client !== "all" && client !== opts.client)) continue;
-    const qs = a.qc?.status || "", roles = rolesIn(state, me, a.portfolio), pm = mgr || roles.has("manager");
+    const qs = a.qc?.status || "", pm = mgr || roles.has("manager");
     if (opts.qc && opts.qc !== "all" && (opts.qc === "none" ? qs : qs !== opts.qc)) continue;
     const canQc = qs === "pending" && a.reviewer !== me && (roles.has("qc") || a.qc.reviewer === me || pm) && (!a.qc.reviewer || a.qc.reviewer === me || pm);
     rows.push({ id:a.id, pmid:a.pmid, client, molecule:(a.molecules || [])[0] || "", ird, title:state.articles?.[a.pmid]?.title || "PMID " + a.pmid, value:a.disposition.value,
       reason:a.disposition.reason || "", note:a.disposition.note || "", deBy:a.disposition.by || a.reviewer || "", deName:name(a.disposition.by || a.reviewer), deAt:a.disposition.at || "",
-      qc:qs, qcLabel:QC_LABEL[qs] || "No QC", qcNote:a.qc?.note || "", qcBy:a.qc?.decidedBy || "", qcName:name(a.qc?.decidedBy), qcReviewer:a.qc?.reviewer || "", canQc, status:a.status });
+      qc:qs, qcLabel:QC_LABEL[qs] || "No QC", qcNote:a.qcComment?.note || a.qc?.note || "", qcBy:a.qcComment?.by || a.qc?.decidedBy || "", qcName:name(a.qcComment?.by || a.qc?.decidedBy), qcReviewer:a.qc?.reviewer || "", canQc,
+      canDeComment:pm || a.reviewer === me || a.disposition.by === me, canQcComment:pm || ((isQc || a.qc?.reviewer === me) && a.reviewer !== me && a.disposition.by !== me), status:a.status });
   }
   return rows.sort((p, q) => p.client.localeCompare(q.client) || q.ird.localeCompare(p.ird) || String(p.title).localeCompare(String(q.title)));
 }
@@ -5874,6 +5878,34 @@ async function apiCore(request, env, path) {
     const all = screenedRows(state, viewer, { kind:opts.kind });
     return json({ ...opts, rows, clients:uniq(all.map(r => r.client)), counts:{ all:all.length, pending:all.filter(r => r.qc === "pending").length, approved:all.filter(r => r.qc === "approved").length, returned:all.filter(r => r.qc === "returned").length, mine:all.filter(r => r.canQc).length },
       other:screenedRows(state, viewer, { kind:opts.kind === "safety" ? "rejected" : "safety" }).length, qcAllExcluded:state.settings?.qcAllExcluded !== false });
+  }
+  if (path === "/api/screened-comment" && viewer) {
+    // One comment applied to many screened articles at once: as the DE comment, or as the QC comment (optionally with Agree / Send back for those waiting for QC).
+    const ids = uniq((Array.isArray(body.ids) ? body.ids : []).map(String)).slice(0, 500), as = body.as === "qc" ? "qc" : "de", note = String(body.note || "").trim().slice(0, 1000);
+    const decision = as === "qc" && ["approve", "return"].includes(body.decision) ? body.decision : "";
+    if (!ids.length) return json({ error:"Select at least one article." }, 400);
+    if (!decision && note.length < 3) return json({ error:"Write a comment of at least 3 characters." }, 400);
+    if (decision === "return" && note.length < 5) return json({ error:"Sending back needs a comment of at least 5 characters." }, 400);
+    const rows = new Map([...screenedRows(state, viewer, { kind:"rejected" }), ...screenedRows(state, viewer, { kind:"safety" })].map(r => [r.id, r]));
+    const at = new Date().toISOString(), done = [], skipped = [];
+    for (const id of ids) {
+      const r = rows.get(id);
+      if (!r) { skipped.push({ id, why:"not found" }); continue; }
+      if (as === "de" ? !r.canDeComment : !r.canQcComment) { skipped.push({ id, pmid:r.pmid, why:as === "de" ? "not your article" : "you cannot QC your own article" }); continue; }
+      if (decision) {
+        if (r.qc !== "pending") { skipped.push({ id, pmid:r.pmid, why:"not waiting for QC" }); continue; }
+        const res = await apiCore(new Request("http://local/api/qc-decision", { method:"POST", headers:{ "oai-authenticated-user-email":email, "content-type":"application/json" }, body:JSON.stringify({ id, decision, note }) }), env, "/api/qc-decision");
+        if (!res.ok) { skipped.push({ id, pmid:r.pmid, why:((await res.json().catch(() => ({}))).error || "QC decision failed") }); continue; }
+        if (note) await write(env, data => { const a = data.assignments.find(x => x.id === id); if (a) a.qcComment = { note, by:email, at }; });
+        done.push(id); continue;
+      }
+      await write(env, data => { const a = data.assignments.find(x => x.id === id); if (!a) return;
+        if (as === "de") { (a.history ||= []).push({ status:a.status, note:"DE comment: " + note, by:email, at }); a.disposition = { ...a.disposition, note, commentBy:email, commentAt:at }; }
+        else { (a.history ||= []).push({ status:a.status, note:"QC comment: " + note, by:email, at }); a.qcComment = { note, by:email, at }; } });
+      done.push(id);
+    }
+    await audit(env, { by:email, action:"screened.comment", target:as, detail:{ count:done.length, skipped:skipped.length, decision:decision || "comment", note:note.slice(0, 200) } });
+    return json({ ok:true, done:done.length, skipped });
   }
   if (path === "/api/dashboard" && viewer) {
     const wf = ["screening", "qc", "medical"].includes(body.workflow) ? body.workflow : "screening", mgr = viewer.role === "manager";
@@ -8381,7 +8413,7 @@ details.tools{margin:0 0 14px}details.tools>summary{cursor:pointer;color:var(--b
 .lltable{border-collapse:separate;border-spacing:0 8px;width:100%}.lltable th{background:none;border:0;padding:4px 14px}.lltable td{background:var(--card);padding:14px;vertical-align:top;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}.lltable td:first-child{border-left:4px solid var(--border);border-radius:12px 0 0 12px}.lltable td:last-child{border-right:1px solid var(--border);border-radius:0 12px 12px 0}.lltable tr.ser td:first-child{border-left-color:var(--red)}.lltable tr:hover td{background:var(--accent)}
 .board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(250px,1fr);gap:14px;overflow-x:auto;padding-bottom:10px;align-items:start}.bcol{background:var(--accent);border-radius:16px;padding:12px;min-height:160px}.bcol h4{display:flex;justify-content:space-between;align-items:center;margin:0 4px 10px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}.bcol h4 b{background:var(--card);border-radius:999px;padding:1px 9px;font-size:12px;color:var(--fg)}.bcards{display:grid;gap:10px}.bempty{padding:14px 6px;text-align:center}
 .bcard{display:grid;gap:6px;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:12px;padding:12px 14px;color:inherit;text-decoration:none;transition:box-shadow .15s,transform .15s}.bcard:hover{box-shadow:0 8px 22px #0e6a5d22;transform:translateY(-1px)}.bcard.ser{border-left-color:var(--red)}.bcard.late{border-left-color:var(--amber)}.bc-top{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.bc-title{font-size:13.5px;font-weight:600;line-height:1.35;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.bc-foot{display:flex;justify-content:space-between;align-items:center;margin-top:2px}
-.sccard{border:1px solid var(--border);border-radius:12px;padding:10px 14px;margin:0 0 8px;background:var(--card);display:grid;gap:4px}.schead{display:flex;justify-content:space-between;gap:10px;align-items:start}.scde mark{background:#fff59d;color:#222;padding:1px 4px;border-radius:3px}.scqc{display:flex;gap:6px;margin-top:4px}.scqc input{flex:1;min-width:160px}.scclient{margin:16px 0 8px;font-size:15px}
+.sccard{border:1px solid var(--border);border-radius:12px;padding:10px 14px;margin:0 0 8px;background:var(--card);display:grid;gap:4px}.schead{display:flex;justify-content:space-between;gap:10px;align-items:start}.scde mark{background:#fff59d;color:#222;padding:1px 4px;border-radius:3px}.scqc{display:flex;gap:6px;margin-top:4px}.scqc input{flex:1;min-width:160px}.scclient{margin:16px 0 8px;font-size:15px}.scttl{display:flex;gap:8px;align-items:start}.scttl input{margin-top:3px}.scbulk{display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:var(--accent);border-radius:12px;padding:10px 12px;margin:0 0 10px}.scbulk #scbulknote{flex:1;min-width:220px}.scbulk .scall{display:flex!important;flex-direction:row!important;gap:6px;align-items:center;white-space:nowrap;font-size:13px;color:var(--muted);margin:0}.scbulk .scall input{width:auto;margin:0}
 .seg{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden;background:var(--card)}.segb{border:0;background:none;padding:6px 16px;cursor:pointer;font:inherit;font-size:13px;color:var(--muted)}.segb.on{background:var(--brand);color:#fff}
 .impgrid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.impgrid .wide{grid-column:1/-1}
 .clientgrid{grid-template-columns:minmax(0,1fr)!important}.clientcard{min-width:0}
@@ -9685,7 +9717,7 @@ async function loadDashboard(){
   }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
 }
 // Screened: Rejected and Safety present articles by client, with the DE comment highlighted, and a minimal QC re-check (Agree / Send back with a comment).
-const scState={kind:"rejected",qc:"all",client:"all",from:"",to:""};
+const scState={kind:"rejected",qc:"all",client:"all",from:"",to:""}, scSel=new Set();
 async function loadScreened(){
   const box=$("scbox");if(!box)return;
   try{
@@ -9699,23 +9731,41 @@ async function loadScreened(){
     const qcTone=s=>s==="approved"?"green":s==="returned"?"red":s==="pending"?"amber":"";
     const groups=[...new Set(r.rows.map(x=>x.client))];
     const card=x=>{const de=isRej?(x.reason+(x.note?" - "+x.note:"")):((x.value==="potential_icsr"?"Potential ICSR":"Aggregate safety")+(x.note?": "+x.note:""));
-      const qc=x.canQc?'<div class="scqc"><input type="text" data-scnote="'+esc(x.id)+'" placeholder="QC comment (needed to send back)" aria-label="QC comment"><button type="button" class="btn sm" data-scok="'+esc(x.id)+'">Agree</button><button type="button" class="btn outline sm" data-scback="'+esc(x.id)+'">Send back</button></div>'
-        :(x.qcNote?'<div class="sub"><b>QC'+(x.qcName?" ("+esc(x.qcName)+")":"")+':</b> '+esc(x.qcNote)+'</div>':"");
-      return '<div class="sccard"><div class="schead"><a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(x.pmid)+'/" target="_blank" rel="noopener"><b>'+esc(x.title)+'</b></a><span class="badge '+qcTone(x.qc)+'">'+esc(x.qcLabel)+'</span></div>'
+      const qn=x.qcNote?'<div class="sub"><b>QC'+(x.qcName?" ("+esc(x.qcName)+")":"")+':</b> '+esc(x.qcNote)+'</div>':"";
+      const qc=x.canQc?qn+'<div class="scqc"><input type="text" data-scnote="'+esc(x.id)+'" placeholder="QC comment (needed to send back)" aria-label="QC comment"><button type="button" class="btn sm" data-scok="'+esc(x.id)+'">Agree</button><button type="button" class="btn outline sm" data-scback="'+esc(x.id)+'">Send back</button></div>'
+        :qn;
+      const pick=(x.canDeComment||x.canQcComment)?'<input type="checkbox" data-scpick="'+esc(x.id)+'"'+(scSel.has(x.id)?" checked":"")+' aria-label="Select for bulk comment">':"";
+      return '<div class="sccard"><div class="schead"><span class="scttl">'+pick+'<a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(x.pmid)+'/" target="_blank" rel="noopener"><b>'+esc(x.title)+'</b></a></span><span class="badge '+qcTone(x.qc)+'">'+esc(x.qcLabel)+'</span></div>'
         +'<div class="sub">IRD '+esc(x.ird)+' &middot; PMID '+esc(x.pmid)+(x.molecule?" &middot; "+esc(x.molecule):"")+'</div>'
         +'<div class="scde"><b>DE'+(x.deName?" ("+esc(x.deName)+")":"")+':</b> <mark>'+esc(de||"no comment")+'</mark></div>'+qc+'</div>';};
     const list=groups.length?groups.map(g=>{const rs=r.rows.filter(x=>x.client===g);return '<h3 class="scclient">'+esc(g)+' <span class="sub">'+rs.length+'</span></h3>'+rs.map(card).join("");}).join(""):'<div class="empty">No '+(isRej?"rejected":"safety present")+' articles match these filters.</div>';
     const foot=isRej?'<p class="sub" style="margin-top:12px">'+(r.qcAllExcluded?"Every rejection goes to QC for a re-check.":"Rejections are sampled for QC (Settings).")+'</p>':"";
-    box.innerHTML='<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">'+kinds+'</div>'+bar+chips+mineNote+list+foot;
+    const ids=new Set(r.rows.map(x=>x.id));for(const id of [...scSel])if(!ids.has(id))scSel.delete(id);
+    const canDe=r.rows.some(x=>x.canDeComment), canQ=r.rows.some(x=>x.canQcComment), pickable=r.rows.filter(x=>x.canDeComment||x.canQcComment).length;
+    const bulk=pickable?'<div class="scbulk"><label class="scall"><input type="checkbox" id="scall"'+(scSel.size&&scSel.size===pickable?" checked":"")+'> Select all shown ('+pickable+')</label><span class="sub" id="scselct"><b>'+scSel.size+'</b> selected</span>'
+      +'<input type="text" id="scbulknote" placeholder="One comment for all selected articles" aria-label="Bulk comment">'
+      +(canDe?'<button type="button" class="btn sm" data-scbulk="de">Add as DE comment</button>':"")
+      +(canQ?'<button type="button" class="btn sm" data-scbulk="qc">Add as QC comment</button><button type="button" class="btn sm" data-scbulk="approve">QC agree all</button><button type="button" class="btn outline sm" data-scbulk="return">Send back all</button>':"")+'</div>':"";
+    box.innerHTML='<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">'+kinds+'</div>'+bar+chips+mineNote+bulk+list+foot;
   }catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>';}
-  box.onclick=async ev=>{const t=ev.target.closest("[data-sckind],[data-scqc],[data-scok],[data-scback],[data-scdoc]");if(!t)return;
-    if(t.dataset.sckind){scState.kind=t.dataset.sckind;scState.qc="all";return loadScreened();}
+  box.onclick=async ev=>{const t=ev.target.closest("[data-sckind],[data-scqc],[data-scok],[data-scback],[data-scdoc],[data-scbulk]");if(!t)return;
+    if(t.dataset.scbulk){const k=t.dataset.scbulk, nt=($("scbulknote")||{}).value||"", note=nt.trim();
+      if(!scSel.size){alert("Tick the articles first, or use Select all shown.");return;}
+      if(k==="return"&&note.length<5){alert("Sending back needs a comment of at least 5 characters.");return;}
+      if((k==="de"||k==="qc")&&note.length<3){alert("Write the comment first.");return;}
+      if(!confirm((k==="approve"?"QC agree":k==="return"?"Send back":"Add this comment to")+" "+scSel.size+" article"+(scSel.size===1?"":"s")+"?"))return;
+      t.disabled=true;try{const res=await api("screened-comment",{ids:[...scSel],as:k==="de"?"de":"qc",decision:k==="approve"||k==="return"?k:"",note});scSel.clear();await loadScreened();
+        if(res.skipped&&res.skipped.length)alert(res.done+" done. Skipped "+res.skipped.length+": "+res.skipped.slice(0,8).map(x=>(x.pmid?"PMID "+x.pmid:x.id)+" ("+x.why+")").join(", "));}catch(e){alert(e.message);t.disabled=false;}return;}
+    if(t.dataset.sckind){scState.kind=t.dataset.sckind;scState.qc="all";scSel.clear();return loadScreened();}
     if(t.dataset.scqc){scState.qc=t.dataset.scqc;return loadScreened();}
     if(t.dataset.scdoc){t.disabled=true;try{await downloadPost("/api/screened-docx",{kind:scState.kind,client:scState.client,from:scState.from,to:scState.to,qc:scState.qc},"literasift-"+scState.kind+".docx");}catch(e){alert(e.message);}t.disabled=false;return;}
     const id=t.dataset.scok||t.dataset.scback, inp=box.querySelector('[data-scnote="'+id+'"]'), note=inp?inp.value.trim():"";
     if(t.dataset.scback&&note.length<5){alert("Write why you are sending it back (at least 5 characters).");if(inp)inp.focus();return;}
     t.disabled=true;try{await api("qc-decision",{id,decision:t.dataset.scok?"approve":"return",note});await loadScreened();}catch(e){alert(e.message);t.disabled=false;}};
-  box.onchange=ev=>{const t=ev.target;if(t.id==="sccl")scState.client=t.value;else if(t.id==="scfrom")scState.from=t.value;else if(t.id==="scto")scState.to=t.value;else return;loadScreened();};
+  box.onchange=ev=>{const t=ev.target;
+    if(t.dataset.scpick){if(t.checked)scSel.add(t.dataset.scpick);else scSel.delete(t.dataset.scpick);const c=$("scselct");if(c)c.innerHTML="<b>"+scSel.size+"</b> selected";return;}
+    if(t.id==="scall"){box.querySelectorAll("[data-scpick]").forEach(c=>{c.checked=t.checked;if(t.checked)scSel.add(c.dataset.scpick);else scSel.delete(c.dataset.scpick);});const c=$("scselct");if(c)c.innerHTML="<b>"+scSel.size+"</b> selected";return;}
+    if(t.id==="sccl")scState.client=t.value;else if(t.id==="scfrom")scState.from=t.value;else if(t.id==="scto")scState.to=t.value;else return;loadScreened();};
 }
 async function loadLineListing(){
   const box=$("llbox");if(!box)return;
