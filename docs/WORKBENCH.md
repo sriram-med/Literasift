@@ -537,3 +537,16 @@ Each article's history records the allocation, and the audit trail records each 
 - **QC:** each QC's **allocated** articles, with how many are **waiting** and **done**.
 
 Each client card also shows that client's counts per DE and per QC as chips.
+
+**A fresh list every week.** Allocation opens on **this week**: articles whose IRD falls between Monday and Sunday, India time. Older articles are not listed. The ‹ › arrows step back to earlier weeks, and "Back to this week" returns. The DE and QC counts at the top follow the week shown.
+
+## Rejections QC agrees with are archived
+
+- When QC **agrees** with a rejection, singly or in bulk, the article is archived automatically. It leaves the queues, Library, My Queue and Allocation.
+- It still counts in the Screened tab, the Word files, the counts per client and the reports.
+- **Archive tab → Archived articles** lists them by client, with the IRD, title, the DE comment (yellow), and the QC name and comment.
+  - **Restore** (QC or a manager) brings an article back.
+  - **Archive older agreed rejections** (managers) archives agreed rejections that existed before this change.
+- QC users now see the Archive tab too.
+- Settings → "Archive rejections QC agrees with" switches the automatic archiving off.
+- Articles QC sends back stay active.
