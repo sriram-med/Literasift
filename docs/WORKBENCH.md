@@ -611,3 +611,32 @@ Every **Dashboard** (manager, DE, QC, medical reviewer) also has **Team counts (
 - Once a day the scheduler searches **last week** (Monday to Sunday, India time) again, by date added to PubMed, for every molecule of every active client. Any article PubMed now has that the app does not hold is listed at the top of the Dashboard, by client and molecule, with its PMIDs.
 - **Pull** brings those articles in. **Dismiss** clears the alert and asks for a reason for the audit trail. Managers can press **Check now** at any time.
 - DE and QC users see the alerts for the clients they work on. Pulls, dismissals and checks are recorded in the audit trail.
+
+## Suggested decisions and one-by-one screening (My Queue)
+
+- **Suggestions.** Each unscreened article shows a grey "Suggests: …" badge. Hover it to see why. The suggestion comes from the title, abstract, publication type and the events the app detected:
+  - drug not named → reject, No suspect product;
+  - editorial, comment or news → reject, Not a drug safety report;
+  - animal or laboratory study → reject, No individual patient;
+  - review without safety findings → reject, Not a drug safety report;
+  - single patient → Potential ICSR (always: a single-patient report is never suggested for rejection);
+  - study with safety findings → Safety (aggregate);
+  - otherwise → reject, No adverse event.
+
+  A suggestion is only a hint: nothing is decided until the DE decides. A decision taken from a suggestion records "suggested: …; confirmed by the DE" in its note.
+- **Bulk.** **Tick suggested rejections** ticks them for you to check. **Reject ticked with suggested reasons** rejects each with its own suggested reason. Potential ICSR and safety suggestions are never applied in bulk.
+- **Screen one by one.** This opens a large view of one article: title and abstract with the drug highlighted, the suggestion, and the decision buttons. Keys:
+
+  | Key | Action |
+  |---|---|
+  | **A** | Accept the suggestion |
+  | **R** | Reject with the chosen reason (the last reason used is remembered) |
+  | **I** | Potential ICSR |
+  | **S** | Safety (aggregate) |
+  | **F** | Full text needed |
+  | **J / →** | Next article |
+  | **K / ←** | Previous article |
+  | **O** | Open PubMed |
+  | **Esc** | Close |
+
+  Keys are ignored while typing a comment. Decisions follow the usual rules: rejections go to QC.
