@@ -181,3 +181,14 @@ test("an article waiting for QC needs Agree or Send back: a comment alone does n
   const xml = readZip(await (await t.raw(QC, "/api/screened-docx", { doc: doc.id })).arrayBuffer()).get("word/document.xml").toString("utf8");
   assert.match(xml, /Other: this article is rejected/); assert.doesNotMatch(xml, /Waiting for QC\]/); assert.match(xml, /QC agreed/);
 });
+
+test("the Word documents list is fresh every week: earlier weeks are hidden unless asked for", async () => {
+  const t = await makeEnv(team());
+  await t.call(MANAGER, "/api/membership-save", { email: QC, portfolio: "Navinta", role: "qc" });
+  await t.call(SCREENER, "/api/disposition", { id: "a1", value: "excluded", reason: "No adverse event" });
+  const now = (await t.call(SCREENER, "/api/screened-send", { kind: "rejected" })).body.doc;
+  const s = await t.state(); s.screenedDocs.push({ ...s.screenedDocs[0], id: "old", at: "2026-01-05T06:00:00.000Z" }); await t.BUCKET.put("bench.json", JSON.stringify(s));
+  const wk = (await t.call(QC, "/api/screened-docs", {})).body;
+  assert.deepEqual(wk.docs.map(d => d.id), [now.id]); assert.equal(wk.earlier, 1);
+  assert.deepEqual((await t.call(QC, "/api/screened-docs", { all: true })).body.docs.map(d => d.id).sort(), [now.id, "old"].sort());
+});

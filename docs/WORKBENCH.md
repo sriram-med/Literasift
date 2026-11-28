@@ -550,3 +550,9 @@ Each client card also shows that client's counts per DE and per QC as chips.
 - QC users now see the Archive tab too.
 - Settings → "Archive rejections QC agrees with" switches the automatic archiving off.
 - Articles QC sends back stay active.
+
+### Fresh every week (Screened and its Word files)
+
+- The Screened tab opens on **this week**: IRD from Monday to Sunday, India time. The article list, the counts and **Download Word** cover only this week's articles, so the Word file holds this week's DE and QC comments only.
+- The "This week" badge shows when you are on the current week. If you change the dates, "Back to this week" returns.
+- **Word documents sent to QC and medical review** lists only documents sent since Monday. Earlier weeks are hidden behind "N documents from earlier weeks hidden · Show them".
