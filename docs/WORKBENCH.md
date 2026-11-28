@@ -471,3 +471,13 @@ In the Word file, each article has:
 3. the QC comment, if the article also went through QC.
 
 A medical reviewer who has neither the QC nor the screener role opens the Screened tab on Safety present.
+
+## Mass rejection and mass QC (My Queue)
+
+- **DE (Screening queue):** each article has a tick box, and there is a **Select all shown** box, which follows the search and client filters. Choose the **rejection reason** and type one **DE comment**, then press **Reject selected**.
+  - "Other" needs a comment.
+  - Each article goes through the same rules as a single rejection: only your own articles (or any, for a manager), and each goes to QC for a re-check.
+  - Articles that can't be rejected are skipped and listed.
+- **QC (QC queue):** use the same tick boxes and Select all, type one QC comment, then press **QC agree selected** or **Send back selected**. Send back needs a comment of at least 5 characters.
+- The Screened tab also has Select all and bulk actions for DE, QC and the medical reviewer.
+- Every bulk action is recorded in the audit trail and in each article's history.

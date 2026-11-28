@@ -140,3 +140,18 @@ test("DE sends the safety present list to the medical reviewer, whose comment si
   assert.ok(de > 0 && mr > de && doc.slice(de, mr).includes("Medical reviewer comment (Meera)"), "medical comment right under the DE comment");
   assert.equal((await t.state()).assignments.find(a => a.id === "a2").mrComment.by, MR);
 });
+
+test("mass rejection: one reason and comment for many articles, each routed to QC; QC agrees them together", async () => {
+  const t = await makeEnv(team());
+  await t.call(MANAGER, "/api/membership-save", { email: QC, portfolio: "Navinta", role: "qc" });
+  assert.equal((await t.call(SCREENER, "/api/disposition-bulk", { ids: ["a1", "a2"] })).status, 400, "a reason is needed");
+  assert.equal((await t.call(SCREENER, "/api/disposition-bulk", { ids: ["a1", "a2"], reason: "Other (explain in the note)" })).status, 400, "Other needs a comment");
+  const r = (await t.call(SCREENER, "/api/disposition-bulk", { ids: ["a1", "a2", "a3"], reason: "No adverse event", note: "Bulk: PK and cohort papers" })).body;
+  assert.equal(r.done, 2); assert.equal(r.skipped.length, 1, "another DE's article is skipped"); assert.equal(r.skipped[0].pmid, "3");
+  const s = await t.state();
+  for (const id of ["a1", "a2"]) { const a = s.assignments.find(x => x.id === id); assert.equal(a.disposition.reason, "No adverse event"); assert.equal(a.disposition.note, "Bulk: PK and cohort papers"); assert.equal(a.status, "Awaiting QC"); }
+  assert.equal(s.assignments.find(x => x.id === "a3").disposition, undefined);
+  const q = (await t.call(QC, "/api/screened-comment", { ids: ["a1", "a2"], as: "qc", decision: "approve", note: "Agreed" })).body;
+  assert.equal(q.done, 2);
+  assert.deepEqual((await t.state()).assignments.filter(a => ["a1", "a2"].includes(a.id)).map(a => a.qc.status), ["approved", "approved"]);
+});
