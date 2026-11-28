@@ -116,7 +116,7 @@ test("two portfolios review the same citation independently, each seeing only it
   assert.equal((await t.call(SCREENER, "/api/disposition", { id: "a1", value: "excluded", reason: "No suspect product" })).status, 200);
   assert.equal((await t.call(SCREENER2, "/api/disposition", { id: "a2", value: "aggregate_safety", note: "Cohort in the discussion" })).status, 200);
   const s = await t.state(), a1 = s.assignments.find(a => a.id === "a1"), a2 = s.assignments.find(a => a.id === "a2");
-  assert.equal(a1.disposition.value, "excluded"); assert.equal(a1.disposition.reason, "No suspect product"); assert.equal(a2.disposition.value, "aggregate_safety"); assert.equal(a1.status, "Complete"); assert.equal(a2.status, "Complete");
+  assert.equal(a1.disposition.value, "excluded"); assert.equal(a1.disposition.reason, "No suspect product"); assert.equal(a2.disposition.value, "aggregate_safety"); assert.equal(a1.status, "Awaiting QC", "every rejection is re-checked by QC"); assert.equal(a1.qc.status, "pending"); assert.equal(a2.status, "Complete");
   assert.equal(Object.keys(s.articles).length, 1, "one shared article record");
   // downloads and exports follow the same access rules as the interface
   const dl = who => t.get(who, "/api/full-text/1");

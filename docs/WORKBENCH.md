@@ -395,3 +395,14 @@ Every molecule has exactly one saved search: its own names (brands, salts, spell
 - A client is pulled at the first scheduler tick (about hourly) after its slot; the pull brings in every day not yet pulled. Each client row shows its next pull. "Run now" (force) ignores the schedule.
 - **Count like PubMed alerts** (per client, Clients tab → schedule row): the client's automatic pull and its default counts use the date articles are added to PubMed (Create date [crdt]), as My NCBI "What's new" alert emails do. Other clients use publication date with the 60-day late-arrival sweep. In the paste box: `schedule | every: weekly | day: Sunday | time: 06:00 | count: alerts`.
 - **IRD = weekly receipt day** (per client, Clients tab → schedule row): an article's IRD is the client's scheduled weekday after the week it was found in (the day the weekly email reaches the mailbox), never later than the day it was pulled; screening due dates follow. When switched on, open unscreened items can be updated too. Paste line: `schedule | every: weekly | day: Sunday | time: 06:00 | count: alerts | ird: receipt`.
+
+## Screened articles and the QC re-check
+
+- **Every rejection goes to QC.** When a DE excludes an article, it moves to "Awaiting QC". To go back to sampling rejections at the QC rate, use Settings: "Send every rejected article to QC".
+- **Screened tab** (DE, QC and managers). It has two lists:
+  - **Rejected**: excluded articles.
+  - **Safety present**: potential ICSRs and aggregate safety.
+- Both lists are grouped by client. Each row shows the IRD, the title (with a PubMed link), the DE reason and comment highlighted yellow, the QC status and the QC comment.
+- People see only articles they may access: the DE sees their own, and QC sees the items routed to QC for their clients.
+- **QC re-check.** Use the filter chips All / Waiting for QC / QC agreed / Sent back. On an item waiting for you, type a comment and press **Agree**, or press **Send back**, which needs a comment of at least 5 characters. A sent-back item returns to the DE's queue; the DE's new decision goes to QC again.
+- **Word document.** "Download Word" builds a `.docx` with the current filters (client, IRD range, QC status). It has a section per client; under each article are its IRD and PMID, the DE comment highlighted yellow, and the QC comment. Every download is recorded in the audit trail.

@@ -4394,6 +4394,60 @@ function xlsxFile(sheetName, header, rows) {
     f("xl/worksheets/sheet1.xml", sheet)
   ]);
 }
+// A minimal Word (.docx) file: paragraphs made of runs; a run can be bold, larger, or highlighted (yellow marks the DE's comment).
+function docxFile(paragraphs) {
+  const enc = new TextEncoder(), f = (name, text) => ({ name, data:enc.encode(text) });
+  const x = v => String(v ?? "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const run = r => { const o = typeof r === "string" ? { text:r } : r, pr = (o.bold ? "<w:b/>" : "") + (o.color ? '<w:color w:val="' + o.color + '"/>' : "") + (o.size ? '<w:sz w:val="' + o.size + '"/>' : "") + (o.highlight ? '<w:highlight w:val="' + o.highlight + '"/>' : "");
+    return "<w:r>" + (pr ? "<w:rPr>" + pr + "</w:rPr>" : "") + '<w:t xml:space="preserve">' + x(o.text) + "</w:t></w:r>"; };
+  const para = p => { const o = Array.isArray(p) ? { runs:p } : p, sp = '<w:pPr><w:spacing w:before="' + (o.before || 0) + '" w:after="' + (o.after ?? 60) + '"/></w:pPr>';
+    return "<w:p>" + sp + (o.runs || []).map(run).join("") + "</w:p>"; };
+  const body = paragraphs.map(para).join("");
+  return zipFiles([
+    f("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'),
+    f("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>'),
+    f("word/document.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' + body + '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>')
+  ]);
+}
+// Screened articles for the DE and QC: rejected (excluded) or safety present (potential ICSR or aggregate safety), with the DE's reason and the QC comment, by client.
+const SCREEN_KIND = { rejected:["excluded"], safety:["potential_icsr", "aggregate_safety"] };
+const QC_LABEL = { pending:"Waiting for QC", approved:"QC agreed", returned:"Sent back to DE" };
+function screenedRows(state, viewer, opts = {}) {
+  const kind = SCREEN_KIND[opts.kind] ? opts.kind : "rejected", values = SCREEN_KIND[kind], me = viewer?.email, mgr = viewer?.role === "manager";
+  const clientOf = a => { const w = (state.watches || []).find(w => samePf(w, a.portfolio) && w.client); return (w && (state.clients || []).find(c => c.id === w.client)?.name) || a.portfolio || "No client"; };
+  const name = e => state.profiles.find(p => p.email === e)?.name || e || "";
+  const rows = [];
+  for (const a of state.assignments || []) {
+    if (!a.disposition || !values.includes(a.disposition.value) || !mayAccess(state, viewer, a)) continue;
+    const ird = irdOf(state, a), client = clientOf(a);
+    if ((opts.from && ird < opts.from) || (opts.to && ird > opts.to) || (opts.client && opts.client !== "all" && client !== opts.client)) continue;
+    const qs = a.qc?.status || "", roles = rolesIn(state, me, a.portfolio), pm = mgr || roles.has("manager");
+    if (opts.qc && opts.qc !== "all" && (opts.qc === "none" ? qs : qs !== opts.qc)) continue;
+    const canQc = qs === "pending" && a.reviewer !== me && (roles.has("qc") || a.qc.reviewer === me || pm) && (!a.qc.reviewer || a.qc.reviewer === me || pm);
+    rows.push({ id:a.id, pmid:a.pmid, client, molecule:(a.molecules || [])[0] || "", ird, title:state.articles?.[a.pmid]?.title || "PMID " + a.pmid, value:a.disposition.value,
+      reason:a.disposition.reason || "", note:a.disposition.note || "", deBy:a.disposition.by || a.reviewer || "", deName:name(a.disposition.by || a.reviewer), deAt:a.disposition.at || "",
+      qc:qs, qcLabel:QC_LABEL[qs] || "No QC", qcNote:a.qc?.note || "", qcBy:a.qc?.decidedBy || "", qcName:name(a.qc?.decidedBy), qcReviewer:a.qc?.reviewer || "", canQc, status:a.status });
+  }
+  return rows.sort((p, q) => p.client.localeCompare(q.client) || q.ird.localeCompare(p.ird) || String(p.title).localeCompare(String(q.title)));
+}
+function screenedDocx(rows, kind, range) {
+  const head = kind === "safety" ? "Safety present articles" : "Rejected articles", P = [];
+  P.push({ runs:[{ text:"LiteraSift - " + head, bold:true, size:32 }], after:80 });
+  P.push({ runs:[{ text:(range.from || range.to ? "IRD " + (range.from || "start") + " to " + (range.to || "today") + " - " : "") + rows.length + " article" + (rows.length === 1 ? "" : "s") + " - generated " + new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC", color:"666666", size:18 }], after:200 });
+  for (const c of uniq(rows.map(r => r.client))) {
+    const mine = rows.filter(r => r.client === c);
+    P.push({ runs:[{ text:c + " (" + mine.length + ")", bold:true, size:28, color:"1F3A5F" }], before:240, after:120 });
+    mine.forEach((r, i) => {
+      P.push({ runs:[{ text:(i + 1) + ". ", bold:true }, { text:r.title, bold:true }], before:120, after:40 });
+      P.push({ runs:[{ text:"IRD " + r.ird + "   PMID " + r.pmid + (r.molecule ? "   " + r.molecule : ""), color:"555555", size:18 }], after:40 });
+      const de = (kind === "safety" ? (r.value === "potential_icsr" ? "Potential ICSR" : "Aggregate safety") + (r.note ? ": " + r.note : "") : r.reason + (r.note ? " - " + r.note : ""));
+      P.push({ runs:[{ text:"DE comment" + (r.deName ? " (" + r.deName + ")" : "") + ": ", bold:true }, { text:de || "no comment", highlight:"yellow" }], after:40 });
+      P.push({ runs:[{ text:"QC comment" + (r.qcName ? " (" + r.qcName + ")" : "") + ": ", bold:true }, { text:r.qcNote || (r.qc === "pending" ? "waiting for QC" : r.qc === "approved" ? "agreed" : r.qc ? r.qcLabel : "not sent to QC"), color:r.qcNote ? "000000" : "888888" }, ...(r.qc ? [{ text:"   [" + r.qcLabel + "]", color:"888888", size:18 }] : [])], after:80 });
+    });
+  }
+  if (!rows.length) P.push(["No articles match these filters."]);
+  return docxFile(P);
+}
 function zipFiles(files) {
   const encoder = new TextEncoder(), now = new Date(), parts = [], central = [];
   const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1), dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
@@ -5707,7 +5761,7 @@ async function apiCore(request, env, path) {
       cases:await Promise.all((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(async c => { const a = localAssessment(c.data); return { ...c, evidenceReviewPending:caseEvidenceDelta(state, c).changes.length>0, canEdit:canEditCase(state, viewer, c), signature_intact:await signatureIntact("case", c, state.articles[c.pmid]), assessment:{ valid:a.validity.valid_icsr, missing:a.validity.missing, score:a.qc.score, ready:a.qc.ready_for_medical_review } }; })),
       dictionaries:manager ? (state.dictionaries || {}) : {}, memberships:manager ? (state.memberships || []) : [], meddraInfo:state.meddra || null, stages:STAGE_LABEL, caseMeta:Object.fromEntries((state.cases || []).filter(c => caseVisible(state, viewer, c)).map(c => [c.id, { timeline:caseTimeline(state, c), clinical:clinicalSummary(c), triage:triageFor(state, c), ird:caseIrd(state, c), stageDue:caseStageDue(state, c), wdLeft:(() => { const d = caseStageDue(state, c); return d ? workingDaysBetween(day(), d, timelines(state)) : null; })(), client:watchFor(state, c.portfolio, c.molecule || "")?.client || "" }])), assignmentStages:Object.fromEntries(state.assignments.filter(a => mayAccess(state, viewer, a)).map(a => [a.id, stageOf(a)])), caseFolders:state.caseFolders || [], standardTags:STANDARD_TAGS, archiveReasons:ARCHIVE_REASONS, deletedCases:manager ? (state.deletedCases || []).slice(-200) : [], viewerRoles:[...new Set([...(state.memberships || []).filter(m => m.email === viewer?.email).map(m => m.role), ...(state.profiles.find(p => p.email === viewer?.email && p.role === "reviewer" && !p.roles && legacyScreens(state, p)) ? ["screener"] : [])])],
       monitoring:monitoringCounts(state, viewer),
-      series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ syncAiAuthorizedText:manager && state.settings?.syncAiAuthorizedText === true, timelines:timelines(state), myPortfolios:myPortfolios(state, viewer), syncAutoScreen:state.settings?.syncAutoScreen !== false, syncActivePortfolios:state.settings?.syncActivePortfolios || [], syncMode:syncMode(state), syncAiPortfolios:manager ? (state.settings?.syncAiPortfolios || []) : [], automation:{ submit:state.settings?.automation?.submit !== false, auto:state.settings?.automation?.auto !== false, smpc:state.settings?.automation?.smpc !== false, ai:state.settings?.automation?.ai === true }, ai:(() => { const c = aiConfig(env, state); return { available:c.enabled && c.hasKey && c.monthlyTokens > 0, paused:c.paused, ...(manager ? { enabled:state.settings?.ai?.enabled === true, model:c.model, monthlyTokens:c.monthlyTokens, perCaseTokens:c.perCaseTokens, hasKey:c.hasKey, keySource:c.keySource, used:aiUsed(state), month:aiMonth() } : {}) }; })(), retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
+      series:seriesSummary((state.cases || []).filter(c => caseVisible(state, viewer, c) && !c.archived)), config:{ syncAiAuthorizedText:manager && state.settings?.syncAiAuthorizedText === true, timelines:timelines(state), myPortfolios:myPortfolios(state, viewer), syncAutoScreen:state.settings?.syncAutoScreen !== false, syncActivePortfolios:state.settings?.syncActivePortfolios || [], syncMode:syncMode(state), syncAiPortfolios:manager ? (state.settings?.syncAiPortfolios || []) : [], automation:{ submit:state.settings?.automation?.submit !== false, auto:state.settings?.automation?.auto !== false, smpc:state.settings?.automation?.smpc !== false, ai:state.settings?.automation?.ai === true }, ai:(() => { const c = aiConfig(env, state); return { available:c.enabled && c.hasKey && c.monthlyTokens > 0, paused:c.paused, ...(manager ? { enabled:state.settings?.ai?.enabled === true, model:c.model, monthlyTokens:c.monthlyTokens, perCaseTokens:c.perCaseTokens, hasKey:c.hasKey, keySource:c.keySource, used:aiUsed(state), month:aiMonth() } : {}) }; })(), retrievalKeys:{ core:Boolean(env.CORE_API_KEY || state.settings?.coreApiKey), wiley:Boolean(env.WILEY_TDM_TOKEN || state.settings?.wileyTdmToken), elsevier:Boolean(env.ELSEVIER_API_KEY || state.settings?.elsevierApiKey), elsevierInst:Boolean(env.ELSEVIER_INSTTOKEN || state.settings?.elsevierInsttoken) }, sender:{ org:state.settings?.senderOrg || "", name:state.settings?.senderName || "", email:state.settings?.senderEmail || "", phone:state.settings?.senderPhone || "", country:state.settings?.senderCountry || "", type:state.settings?.senderType || "" }, whoUmc:WHO_UMC, ageGroups:AGE_GROUPS, proxyPrefix:state.settings?.proxyPrefix || "", autoIcsr:state.settings?.autoIcsr !== false, qcAllExcluded:state.settings?.qcAllExcluded !== false, autoAssignCases:state.settings?.autoAssignCases !== false, e2b:{ sender:state.settings?.senderId || "", receiver:state.settings?.receiverId || "" }, esign:{ approvers:state.settings?.esignApprovers || "manager", fourEyes:state.settings?.esignFourEyes === true, reauth:Boolean(env.HOST_ACCOUNTS) }, ime:await loadIme(env).then(v => v?.info?.count ? { loaded:true, ...v.info } : { loaded:false }), imePromotions:manager ? state.settings?.imePromotions || [] : [], ma:state.settings?.marketAuth || [], countries:COUNTRIES.map(c => c[0]), caseStatuses, pvNexus:{ url:manager ? state.settings?.pvNexusUrl || "" : "", urlFromEnv:Boolean(env.PV_NEXUS_URL), tokenSet:Boolean(env.PV_NEXUS_TOKEN || state.settings?.pvNexusToken), configured:Boolean(env.PV_NEXUS_URL || state.settings?.pvNexusUrl) }, ncbi:{ email:state.settings?.ncbiEmail || "", emailFromEnv:Boolean(env.NCBI_EMAIL), keySet:Boolean(env.NCBI_API_KEY || state.settings?.ncbiApiKey), keyFromEnv:Boolean(env.NCBI_API_KEY) }, sources:sourceRegistry, libraryPath:env.LIBRARY_PATH || "", storeRestricted:state.settings?.storeRestricted !== false, grobid:Boolean(env.GROBID_URL), terms:safetyTerms, accounts:Boolean(env.HOST_ACCOUNTS), screenshots:Boolean(env.SCREENSHOT_FN || (env.SCREENSHOT_ENDPOINT && env.SCREENSHOT_TOKEN)), unpaywall:Boolean(env.UNPAYWALL_EMAIL || state.settings?.unpaywallEmail), unpaywallFromEnv:Boolean(env.UNPAYWALL_EMAIL),
       unpaywallEmail:manager ? state.settings?.unpaywallEmail || "" : "" },
       profiles:manager ? state.profiles : [viewer], people:state.profiles.filter(p => p.active).map(p => ({ email:p.email, name:p.name, role:p.role, active:true })), clientAdmin:manager || viewer.canManageClients === true, watches:manager ? state.watches : (viewer.canManageClients === true ? state.watches : state.watches.filter(w => myPortfolios(state, viewer).includes(w.portfolio))).map(w => ({ portfolio:w.portfolio, molecule:w.molecule || "", client:w.client || "" })),
       runs:manager ? state.runs : [], assignments,
@@ -5808,6 +5862,18 @@ async function apiCore(request, env, path) {
     for (const { watch, names } of toSave) await audit(env, { by:email, action:"molecule.added", target:watch.portfolio + " · " + watch.molecule, detail:{ client:body.client || "", names:names.slice(0, 20).join(", ") } });
     const first = results.find(r => r.status === "added");
     return json({ ok:true, added:toSave.length, results, portfolio:first.portfolio, molecule:first.molecule, auto:first.auto, classification:first.classification });
+  }
+  if ((path === "/api/screened" || path === "/api/screened-docx") && viewer) {
+    const opts = { kind:body.kind === "safety" ? "safety" : "rejected", client:String(body.client || "all"), from:isDate(body.from) ? body.from : "", to:isDate(body.to) ? body.to : "", qc:["pending", "approved", "returned", "none"].includes(body.qc) ? body.qc : "all" };
+    const rows = screenedRows(state, viewer, opts);
+    if (path === "/api/screened-docx") {
+      await audit(env, { by:email, action:"screened.export", target:opts.kind, detail:{ ...opts, count:rows.length } });
+      const name = "literasift-" + opts.kind + (opts.client !== "all" ? "-" + opts.client.replace(/[^A-Za-z0-9]+/g, "_") : "") + (opts.from ? "-" + opts.from : "") + (opts.to ? "-to-" + opts.to : "") + ".docx";
+      return new Response(screenedDocx(rows, opts.kind, opts), { headers:{ "Content-Type":"application/vnd.openxmlformats-officedocument.wordprocessingml.document", "Content-Disposition":'attachment; filename="' + name + '"' } });
+    }
+    const all = screenedRows(state, viewer, { kind:opts.kind });
+    return json({ ...opts, rows, clients:uniq(all.map(r => r.client)), counts:{ all:all.length, pending:all.filter(r => r.qc === "pending").length, approved:all.filter(r => r.qc === "approved").length, returned:all.filter(r => r.qc === "returned").length, mine:all.filter(r => r.canQc).length },
+      other:screenedRows(state, viewer, { kind:opts.kind === "safety" ? "rejected" : "safety" }).length, qcAllExcluded:state.settings?.qcAllExcluded !== false });
   }
   if (path === "/api/dashboard" && viewer) {
     const wf = ["screening", "qc", "medical"].includes(body.workflow) ? body.workflow : "screening", mgr = viewer.role === "manager";
@@ -6918,13 +6984,13 @@ async function apiCore(request, env, path) {
       if (!["potential_icsr", "full_text_needed", "aggregate_safety", "excluded"].includes(value)) return json({ error:"Choose potential ICSR, full text needed, aggregate safety relevance, or exclude." }, 400);
       if (value === "excluded" && (!EXCLUSION_REASONS.includes(reason) || (reason.startsWith("Other") && note.length < 3))) return json({ error:"Choose a reason for the exclusion" + (reason.startsWith("Other") ? " and explain it in the note." : "."), reasons:EXCLUSION_REASONS }, 400);
       const rate = Number(state.settings?.qcRate ?? 10), hash = [...(item.pmid + "|" + item.portfolio)].reduce((n, c) => (n * 31 + c.charCodeAt(0)) >>> 0, 7) % 100;
-      const needsQc = value === "potential_icsr" ? state.settings?.qcPotentialIcsr === true : value === "full_text_needed" ? false : hash < rate;
+      const allRejected = value === "excluded" && state.settings?.qcAllExcluded !== false, needsQc = value === "potential_icsr" ? state.settings?.qcPotentialIcsr === true : value === "full_text_needed" ? false : allRejected || hash < rate;
       const qcReviewer = needsQc ? pickArticleQc(state,item) : "";
       await write(env, data => { const a = data.assignments.find(x => x.id === item.id);
         (a.history ||= []).push({ status:a.status, note:"Disposition: " + value + (reason ? " (" + reason + ")" : "") + (note ? " - " + note : ""), by:email, at });
         a.disposition = { value, reason, note, by:email, at, evidence:evidenceRef(data.articles[a.pmid]) };
         a.status = value === "full_text_needed" ? "Full text needed" : needsQc ? "Awaiting QC" : "Complete";
-        a.qc = needsQc ? { status:"pending", reviewer:qcReviewer, requestedAt:at, rounds:(a.qc?.rounds || 0) + (a.qc?.status === "returned" ? 1 : 0), reason:value === "potential_icsr" ? "all potential ICSRs are checked" : "sampled" } : undefined;
+        a.qc = needsQc ? { status:"pending", reviewer:qcReviewer, requestedAt:at, rounds:(a.qc?.rounds || 0) + (a.qc?.status === "returned" ? 1 : 0), reason:value === "potential_icsr" ? "all potential ICSRs are checked" : allRejected ? "every rejection is re-checked by QC" : "sampled" } : undefined;
         delete a.stage; delete a.routedToMedical;
         if (!needsQc && value === "potential_icsr") { a.medicalReviewer = pickMedical(data, a.portfolio, a.reviewer, (a.molecules || [])[0] || "") || a.medicalReviewer || undefined; a.history.push({ status:a.status, note:"Routed to medical review" + (a.medicalReviewer ? ": " + a.medicalReviewer : " (no medical reviewer available)"), by:"routing", at }); } });
       await audit(env, { by:email, action:"review.disposition", entityType:"Assignment", entityId:"PMID " + item.pmid, detail:{ portfolio:item.portfolio, value, reason, qc:needsQc ? (qcReviewer || "no QC reviewer available") : "not required" } });
@@ -7899,6 +7965,7 @@ async function apiCore(request, env, path) {
       if ("syncAiAuthorizedText" in body) settings.syncAiAuthorizedText = body.syncAiAuthorizedText === "on" || body.syncAiAuthorizedText === true;
       if ("syncAiPortfolios" in body) settings.syncAiPortfolios = uniq(String(body.syncAiPortfolios || "").split(/\r?\n/).map(x=>x.trim()).filter(x=>x&&x.length<=100)).slice(0,100);
       if ("autoIcsr" in body) settings.autoIcsr = body.autoIcsr !== "off" && body.autoIcsr !== false;
+      if ("qcAllExcluded" in body) settings.qcAllExcluded = body.qcAllExcluded !== "off" && body.qcAllExcluded !== false;
       if ("autoPullFrom" in body) settings.autoPullFrom = String(body.autoPullFrom || "").trim();
       if ("autoPull" in body) settings.autoPull = body.autoPull !== "off" && body.autoPull !== false;
       if ("autoRun" in body || "autoSmpc" in body || "autoAi" in body || "autoSubmit" in body) { const a = settings.automation ||= {}; if ("autoSubmit" in body) a.submit = body.autoSubmit !== "off"; if ("autoRun" in body) a.auto = body.autoRun !== "off"; if ("autoSmpc" in body) a.smpc = body.autoSmpc !== "off"; if ("autoAi" in body) a.ai = body.autoAi === "on"; }
@@ -8314,6 +8381,7 @@ details.tools{margin:0 0 14px}details.tools>summary{cursor:pointer;color:var(--b
 .lltable{border-collapse:separate;border-spacing:0 8px;width:100%}.lltable th{background:none;border:0;padding:4px 14px}.lltable td{background:var(--card);padding:14px;vertical-align:top;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}.lltable td:first-child{border-left:4px solid var(--border);border-radius:12px 0 0 12px}.lltable td:last-child{border-right:1px solid var(--border);border-radius:0 12px 12px 0}.lltable tr.ser td:first-child{border-left-color:var(--red)}.lltable tr:hover td{background:var(--accent)}
 .board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(250px,1fr);gap:14px;overflow-x:auto;padding-bottom:10px;align-items:start}.bcol{background:var(--accent);border-radius:16px;padding:12px;min-height:160px}.bcol h4{display:flex;justify-content:space-between;align-items:center;margin:0 4px 10px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}.bcol h4 b{background:var(--card);border-radius:999px;padding:1px 9px;font-size:12px;color:var(--fg)}.bcards{display:grid;gap:10px}.bempty{padding:14px 6px;text-align:center}
 .bcard{display:grid;gap:6px;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:12px;padding:12px 14px;color:inherit;text-decoration:none;transition:box-shadow .15s,transform .15s}.bcard:hover{box-shadow:0 8px 22px #0e6a5d22;transform:translateY(-1px)}.bcard.ser{border-left-color:var(--red)}.bcard.late{border-left-color:var(--amber)}.bc-top{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.bc-title{font-size:13.5px;font-weight:600;line-height:1.35;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.bc-foot{display:flex;justify-content:space-between;align-items:center;margin-top:2px}
+.sccard{border:1px solid var(--border);border-radius:12px;padding:10px 14px;margin:0 0 8px;background:var(--card);display:grid;gap:4px}.schead{display:flex;justify-content:space-between;gap:10px;align-items:start}.scde mark{background:#fff59d;color:#222;padding:1px 4px;border-radius:3px}.scqc{display:flex;gap:6px;margin-top:4px}.scqc input{flex:1;min-width:160px}.scclient{margin:16px 0 8px;font-size:15px}
 .seg{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden;background:var(--card)}.segb{border:0;background:none;padding:6px 16px;cursor:pointer;font:inherit;font-size:13px;color:var(--muted)}.segb.on{background:var(--brand);color:#fff}
 .impgrid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.impgrid .wide{grid-column:1/-1}
 .clientgrid{grid-template-columns:minmax(0,1fr)!important}.clientcard{min-width:0}
@@ -8500,6 +8568,7 @@ const paths = {
   "My Desk":'<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>',
   Dashboard:'<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
   Planner:'<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/>',
+  Screened:'<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
   "Line Listing":'<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/><path d="M3 3v18" opacity=".0"/>',
   Admin:'<rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
   Archive:'<path d="M3 4h18v4H3zM5 8v12h14V8M10 12h4"/>',
@@ -8508,7 +8577,7 @@ const paths = {
   alert:'<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
 };
 const ic = name => '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+paths[name]+'</svg>';
-const subtitles = {Dashboard:"Your workload by workflow: what is open, late and coming up, and for which clients and molecules.",Planner:"A calendar of what to screen, check or review, and when each is due. Dates run from the IRD.","My Desk":"Your work in three steps: data entry, QC, medical review. Each has its own list and its own actions.","Line Listing":"Every case in one table, built automatically from the cases and kept up to date. Download it any time.",Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across clients.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Pull by client or by molecule from PubMed and PubMed Central, with or without dates.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"People, their roles and clients, availability and sign-in access.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
+const subtitles = {Screened:"Rejected and safety present articles by client, with the DE comment and the QC re-check. Download them as a Word file.",Dashboard:"Your workload by workflow: what is open, late and coming up, and for which clients and molecules.",Planner:"A calendar of what to screen, check or review, and when each is due. Dates run from the IRD.","My Desk":"Your work in three steps: data entry, QC, medical review. Each has its own list and its own actions.","Line Listing":"Every case in one table, built automatically from the cases and kept up to date. Download it any time.",Clients:"Add clients, assign molecules to them, and see each client's workload.",Discover:"Search PubMed, Europe PMC, Crossref and DOAJ together, with open-access links from Unpaywall.",Search:"Find any citation or case, with seriousness, listedness, tag and folder filters.",Archive:"Archived cases: restore, search and (managers) delete.",Admin:"People, allocation and routing for the whole team.",Overview:"Screening progress across clients.","My Queue":"Citations assigned to you.","All Assignments":"Every citation across the team.","Search & Pull":"Pull by client or by molecule from PubMed and PubMed Central, with or without dates.",Batches:"Imports and evidence processing.",Watchlists:"Molecules and PubMed queries that feed the screening queue.",Team:"People, their roles and clients, availability and sign-in access.",Settings:"Integrations and open-access checks.",Account:"Your sign-in and password.",Library:"A folder per molecule, with a subfolder for each pull's date range.",Audit:"Who did what and when. Tamper-evident and read-only.",Synchrony:"The ICSR workbench: track, assign, code, sign and export case safety reports from LiteraSift articles."};
 async function exportPdf(pmids,title,subtitle){
   pmids=[...new Set(pmids)];
   if(!pmids.length)throw new Error("Nothing to export.");
@@ -9615,6 +9684,39 @@ async function loadDashboard(){
     box.innerHTML=tabs+who+strip+'<p class="sub" style="margin:0 0 12px">'+esc(r.label)+': '+r.timeline.days+' working days from the IRD'+(r.workflow==="screening"?" to screen and route to QC":"")+'. Managers can change the days per molecule on the Clients page.</p>'+casesMixHtml(r)+'<div class="dgrid">'+bars+clSec+'</div>'+ppl+nx;
   }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
 }
+// Screened: Rejected and Safety present articles by client, with the DE comment highlighted, and a minimal QC re-check (Agree / Send back with a comment).
+const scState={kind:"rejected",qc:"all",client:"all",from:"",to:""};
+async function loadScreened(){
+  const box=$("scbox");if(!box)return;
+  try{
+    const r=await api("screened",{kind:scState.kind,qc:scState.qc,client:scState.client,from:scState.from,to:scState.to}), c=r.counts;
+    const isRej=scState.kind==="rejected", other=r.other;
+    const kinds='<span class="seg" role="group" aria-label="Which articles"><button type="button" class="segb'+(isRej?" on":"")+'" data-sckind="rejected">Rejected'+(isRej?" ("+c.all+")":" ("+other+")")+'</button><button type="button" class="segb'+(!isRej?" on":"")+'" data-sckind="safety">Safety present'+(!isRej?" ("+c.all+")":" ("+other+")")+'</button></span>';
+    const F=[["all","All",c.all],["pending","Waiting for QC",c.pending],["approved","QC agreed",c.approved],["returned","Sent back",c.returned]];
+    const chips='<div class="fbar">'+F.map(f=>'<button type="button" class="fchip'+(scState.qc===f[0]?" on":"")+'" data-scqc="'+f[0]+'">'+f[1]+'<b>'+f[2]+'</b></button>').join("")+'</div>';
+    const bar='<div class="filters slim" style="border:0;padding:8px 0 10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end"><label class="fl"><span class="sub">Client</span><select id="sccl"><option value="all">All clients</option>'+r.clients.map(x=>'<option'+(scState.client===x?" selected":"")+'>'+esc(x)+'</option>').join("")+'</select></label><label class="fl"><span class="sub">IRD from</span><input type="date" id="scfrom" value="'+esc(scState.from)+'"></label><label class="fl"><span class="sub">IRD to</span><input type="date" id="scto" value="'+esc(scState.to)+'"></label><button type="button" class="btn" data-scdoc="1">Download Word</button></div>';
+    const mineNote=c.mine?'<p class="sub" style="margin:0 0 8px"><b>'+c.mine+'</b> waiting for your QC.</p>':"";
+    const qcTone=s=>s==="approved"?"green":s==="returned"?"red":s==="pending"?"amber":"";
+    const groups=[...new Set(r.rows.map(x=>x.client))];
+    const card=x=>{const de=isRej?(x.reason+(x.note?" - "+x.note:"")):((x.value==="potential_icsr"?"Potential ICSR":"Aggregate safety")+(x.note?": "+x.note:""));
+      const qc=x.canQc?'<div class="scqc"><input type="text" data-scnote="'+esc(x.id)+'" placeholder="QC comment (needed to send back)" aria-label="QC comment"><button type="button" class="btn sm" data-scok="'+esc(x.id)+'">Agree</button><button type="button" class="btn outline sm" data-scback="'+esc(x.id)+'">Send back</button></div>'
+        :(x.qcNote?'<div class="sub"><b>QC'+(x.qcName?" ("+esc(x.qcName)+")":"")+':</b> '+esc(x.qcNote)+'</div>':"");
+      return '<div class="sccard"><div class="schead"><a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(x.pmid)+'/" target="_blank" rel="noopener"><b>'+esc(x.title)+'</b></a><span class="badge '+qcTone(x.qc)+'">'+esc(x.qcLabel)+'</span></div>'
+        +'<div class="sub">IRD '+esc(x.ird)+' &middot; PMID '+esc(x.pmid)+(x.molecule?" &middot; "+esc(x.molecule):"")+'</div>'
+        +'<div class="scde"><b>DE'+(x.deName?" ("+esc(x.deName)+")":"")+':</b> <mark>'+esc(de||"no comment")+'</mark></div>'+qc+'</div>';};
+    const list=groups.length?groups.map(g=>{const rs=r.rows.filter(x=>x.client===g);return '<h3 class="scclient">'+esc(g)+' <span class="sub">'+rs.length+'</span></h3>'+rs.map(card).join("");}).join(""):'<div class="empty">No '+(isRej?"rejected":"safety present")+' articles match these filters.</div>';
+    const foot=isRej?'<p class="sub" style="margin-top:12px">'+(r.qcAllExcluded?"Every rejection goes to QC for a re-check.":"Rejections are sampled for QC (Settings).")+'</p>':"";
+    box.innerHTML='<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">'+kinds+'</div>'+bar+chips+mineNote+list+foot;
+  }catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>';}
+  box.onclick=async ev=>{const t=ev.target.closest("[data-sckind],[data-scqc],[data-scok],[data-scback],[data-scdoc]");if(!t)return;
+    if(t.dataset.sckind){scState.kind=t.dataset.sckind;scState.qc="all";return loadScreened();}
+    if(t.dataset.scqc){scState.qc=t.dataset.scqc;return loadScreened();}
+    if(t.dataset.scdoc){t.disabled=true;try{await downloadPost("/api/screened-docx",{kind:scState.kind,client:scState.client,from:scState.from,to:scState.to,qc:scState.qc},"literasift-"+scState.kind+".docx");}catch(e){alert(e.message);}t.disabled=false;return;}
+    const id=t.dataset.scok||t.dataset.scback, inp=box.querySelector('[data-scnote="'+id+'"]'), note=inp?inp.value.trim():"";
+    if(t.dataset.scback&&note.length<5){alert("Write why you are sending it back (at least 5 characters).");if(inp)inp.focus();return;}
+    t.disabled=true;try{await api("qc-decision",{id,decision:t.dataset.scok?"approve":"return",note});await loadScreened();}catch(e){alert(e.message);t.disabled=false;}};
+  box.onchange=ev=>{const t=ev.target;if(t.id==="sccl")scState.client=t.value;else if(t.id==="scfrom")scState.from=t.value;else if(t.id==="scto")scState.to=t.value;else return;loadScreened();};
+}
 async function loadLineListing(){
   const box=$("llbox");if(!box)return;
   try{
@@ -10151,7 +10253,7 @@ function syncSettingsHtml(){
   const hero='<div class="syn-hero"><div><b>Synchrony is '+({off:"off",shadow:"in Shadow mode",active:"active"})[mode]+'</b><div class="sub">'+(mode==="active"?((c.syncActivePortfolios||[]).length?"for "+esc(c.syncActivePortfolios.join(", ")):"for every client"):mode==="shadow"?"It prepares and measures, and creates no cases yet.":"Switch it on below to start.")+' · AI '+(st.ready?'<b style="color:var(--green)">connected</b>':'<b style="color:var(--amber)">not ready</b>')+' · '+[au.auto,au.smpc,au.submit,c.syncAutoScreen,c.autoIcsr,c.autoAssignCases].filter(Boolean).length+' of 6 automation steps on</div></div><div class="syn-run"><button type="button" class="btn outline sm" data-sync-act="run">Run preparation now</button>'+(au.smpc?'<button type="button" class="btn outline sm" data-sync-act="reference_check">Check safety references</button>':"")+'</div></div>';
   const modeSel='<div class="modecards">'+modes.map(m=>'<button type="button" class="modecard'+(mode===m[0]?" on":"")+'" data-syncmode="'+m[0]+'"><b>'+m[1]+'</b><span class="sub">'+m[2]+'</span></button>').join("")+'</div>';
   const step=(n,t,sub,body)=>'<div class="synstep"><div class="ss-h"><span class="ss-n">'+n+'</span><div><b>'+t+'</b><div class="sub">'+sub+'</div></div></div>'+body+'</div>';
-  const s1=step(1,"Intake","Which articles reach Synchrony",tog("autoIcsr",c.autoIcsr,"Add full-text articles automatically","When QC selects an article with stored full text and detected events")+tog("syncAutoScreen",c.syncAutoScreen,"Screen articles automatically in Active mode","Flag evidence-backed potential ICSRs without waiting for a decision"));
+  const s1=step(1,"Intake","Which articles reach Synchrony",tog("autoIcsr",c.autoIcsr,"Add full-text articles automatically","When QC selects an article with stored full text and detected events")+tog("qcAllExcluded",c.qcAllExcluded,"Send every rejected article to QC","QC re-checks each rejection in the Screened tab. Off: rejections are sampled at the QC rate")+tog("syncAutoScreen",c.syncAutoScreen,"Screen articles automatically in Active mode","Flag evidence-backed potential ICSRs without waiting for a decision"));
   const s2=step(2,"Prepare drafts","One draft per patient and client",'<div class="sub" style="margin-bottom:6px">Mode</div>'+modeSel+'<form data-route="settings" class="pfrow"><b>Pilot portfolios for Active mode</b><div class="sub">Only these create drafts; the rest stay in Shadow. Choose none for every portfolio.</div>'+pfPicker("syncActivePortfolios",c.syncActivePortfolios)+'<button class="btn sm">Save pilot portfolios</button></form>'+tog("autoAssignCases",c.autoAssignCases,"Assign new cases automatically","Molecule owner first, then the person with the fewest open cases"));
   const s3=step(3,"Enrich","What the rules fill in, with no tokens",tog("autoRun",au.auto,"Run on every new case","Events, IME flags, MedDRA matches, seriousness and the narrative")+tog("autoSmpc",au.smpc,"Look up the product label online","Listedness from the FDA label, with follow-up when the label changes"));
   const s4=step(4,"AI","Optional, capped, redacted",'<div class="ai-card">'+st.html+(st.ready?'<div class="ai-ok">Ready. Background AI also needs a portfolio ticked under Limits and portfolios.</div>':'<div class="ai-missing"><b>Not ready:</b> '+esc(st.missing?st.missing[0]+" - "+st.missing[2]:"")+'</div>')+
@@ -10780,13 +10882,13 @@ function clientsHtml(){
 function stat(label,value,icon,warn){return '<div class="card tilt'+(warn&&value?" warn":"")+'"><div class="lbl">'+label+ic(icon)+'</div><b data-count="'+value+'">0</b></div>';}
 function render() {
   const manager=data.viewer.role==="manager";
-  const tabs=(manager?["Overview","Dashboard","Planner","My Desk","Search & Pull","Library","My Queue","All Assignments","Clients","Synchrony","Line Listing","Batches","Watchlists","Team","Admin","Audit","Settings"]:["Dashboard","Planner","My Desk","Search & Pull","Library","My Queue","Synchrony","Line Listing","Watchlists"].concat(data.clientAdmin?["Clients"]:[])).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
+  const tabs=(manager?["Overview","Dashboard","Planner","My Desk","Search & Pull","Library","My Queue","Screened","All Assignments","Clients","Synchrony","Line Listing","Batches","Watchlists","Team","Admin","Audit","Settings"]:["Dashboard","Planner","My Desk","Search & Pull","Library","My Queue","Screened","Synchrony","Line Listing","Watchlists"].concat(data.clientAdmin?["Clients"]:[])).concat(["Search","Discover"]).concat(canMedical()?["Archive"]:[]).concat(data.config.accounts?["Account"]:[]);
   if(!tabs.includes(tab))tab=tabs[0];
   libNumbers=null;
   const items=data.assignments, mine=items.filter(a=>a.reviewer===data.viewer.email);
   const open=mine.filter(a=>a.status!=="Complete").length;
   $("identity").innerHTML="<b>"+esc(data.viewer.name)+"</b><small>"+esc(data.viewer.email)+" · "+esc(data.viewer.role)+"</small>";
-  const NAVG={Overview:0,Dashboard:0,Planner:0,"My Desk":0,"My Queue":0,"All Assignments":0,Clients:0,Synchrony:0,"Line Listing":0,"Search & Pull":1,Search:1,Discover:1,Library:1,Batches:1,Watchlists:1,Archive:1,Team:2,Admin:2,Audit:2,Settings:2,Account:2}, NAVL=["Work","Sources","Team"];
+  const NAVG={Overview:0,Dashboard:0,Planner:0,"My Desk":0,"My Queue":0,Screened:0,"All Assignments":0,Clients:0,Synchrony:0,"Line Listing":0,"Search & Pull":1,Search:1,Discover:1,Library:1,Batches:1,Watchlists:1,Archive:1,Team:2,Admin:2,Audit:2,Settings:2,Account:2}, NAVL=["Work","Sources","Team"];
   const navTabs=tabs.map((x,i)=>[x,i]).sort((a,b)=>(NAVG[a[0]]||0)-(NAVG[b[0]]||0)||a[1]-b[1]).map(x=>x[0]);
   let lastG=-1;
   $("nav").innerHTML=navTabs.map(x=>{const g=NAVG[x]||0,head=g!==lastG?'<div class="navlabel">'+NAVL[g]+'</div>':"";lastG=g;return head+'<button class="navbtn" title="'+x+'" data-tab="'+x+'" '+(x===tab?'aria-current="page"':'')+'>'+ic(x)+'<span class="nl">'+x+'</span>'+(x==="My Queue"&&open?'<span class="n">'+open+"</span>":"")+'</button>';}).join("");
@@ -10953,6 +11055,7 @@ function render() {
   if(tab==="My Desk")html=deskHtml();
   if(tab==="Planner")html='<div id="plbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Dashboard")html='<div id="dbbox"><div class="skel"></div><div class="skel"></div></div>';
+  if(tab==="Screened")html='<div id="scbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Line Listing")html='<div id="llbox"><div class="skel"></div><div class="skel"></div></div>';
   if(tab==="Team")html=teamHtml();
   if(tab==="Batches") html=clientPullHtml("Backfill a client","Import a date range for every molecule of a client. Tick the molecules to include.","pdat")+
@@ -10980,6 +11083,7 @@ function render() {
   if(tab==="Clients"&&$("pullstats"))loadPullStats();
   if(tab==="Batches"&&$("batchcov"))loadBatches();
   if(tab==="Batches"&&$("schedbox"))loadScheduler();
+  if(tab==="Screened"&&$("scbox"))loadScreened();
   if(tab==="Line Listing"&&$("llbox"))loadLineListing();
   if(tab==="Planner"&&$("plbox"))loadPlanner();
   if(tab==="My Queue"&&$("mqbox"))loadMyQueue();
