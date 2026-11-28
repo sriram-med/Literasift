@@ -443,3 +443,16 @@ Ways to export it:
 - **Copy table**: copies it as a table you can paste into Excel, Outlook or Word.
 - **Save as image**: a PNG of up to 400 rows.
 - **Excel** and **CSV**: every row.
+
+## Sending the Word file to QC
+
+1. In **Screened**, the DE sets the filters (client, IRD dates) and presses **Send to QC**, adding an optional note. Only the DE's own articles in the list are sent.
+2. QC sees the document under **Word documents sent to QC** at the top of the Screened tab and presses **Open for QC**. Only that document's articles are listed.
+3. QC types a comment under each DE comment:
+   - for articles waiting for QC: **Agree** or **Send back**;
+   - for any other article: **Save QC comment**.
+   Bulk comments work here too.
+4. **Word** (or "Download Word with QC comments") gives the file with each DE comment highlighted yellow and the QC comment on the line right below it. The header says who sent it and when, and whether QC is done.
+5. QC presses **Mark QC done**, and **Reopen** reverses it. The DE sees the status change on their copy of the list. The DE cannot mark their own document done.
+
+The document keeps its list of articles; the comments are always the current ones. Sending, downloading and marking done are all recorded in the audit trail.

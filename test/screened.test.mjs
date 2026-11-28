@@ -93,3 +93,27 @@ test("QC sees every safety present article of their clients, and one comment can
   const doc = readZip(await (await t.raw(QC, "/api/screened-docx", { kind: "safety" })).arrayBuffer()).get("word/document.xml").toString("utf8");
   assert.match(doc, /Agree, aggregate only/); assert.match(doc, /Checked against the full text/);
 });
+
+test("DE sends the rejected list to QC as a Word document; QC comments under each DE comment and downloads it with both", async () => {
+  const t = await makeEnv(team());
+  await t.call(MANAGER, "/api/membership-save", { email: QC, portfolio: "Navinta", role: "qc" });
+  await t.call(SCREENER, "/api/disposition", { id: "a1", value: "excluded", reason: "No adverse event", note: "PK only" });
+  await t.call(SCREENER2, "/api/disposition", { id: "a3", value: "excluded", reason: "No adverse event" });
+  assert.equal((await t.call(QC, "/api/screened-send", { kind: "rejected" })).status, 400, "QC has no DE articles of their own to send");
+  const sent = (await t.call(SCREENER, "/api/screened-send", { kind: "rejected", note: "Week 47 rejections" })).body;
+  assert.equal(sent.doc.count, 1); assert.equal(sent.doc.status, "sent"); assert.equal(sent.doc.byName, "Asha");
+  const qdocs = (await t.call(QC, "/api/screened-docs", {})).body.docs;
+  assert.deepEqual(qdocs.map(d => [d.id, d.mine, d.note]), [[sent.doc.id, false, "Week 47 rejections"]]);
+  assert.deepEqual((await t.call(SCREENER2, "/api/screened-docs", {})).body.docs, [], "other DEs and clients do not see it");
+  const view = (await t.call(QC, "/api/screened", { doc: sent.doc.id })).body;
+  assert.deepEqual(view.rows.map(r => r.pmid), ["1"]); assert.equal(view.doc.id, sent.doc.id);
+  await t.call(QC, "/api/qc-decision", { id: "a1", decision: "approve", note: "Agree, PK study with no AE" });
+  assert.equal((await t.call(SCREENER, "/api/screened-doc-done", { id: sent.doc.id })).status, 409, "the DE cannot close their own document");
+  assert.equal((await t.call(QC, "/api/screened-doc-done", { id: sent.doc.id })).status, 200);
+  const r = await t.raw(SCREENER, "/api/screened-docx", { doc: sent.doc.id });
+  const doc = readZip(await r.arrayBuffer()).get("word/document.xml").toString("utf8");
+  assert.match(doc, /Sent to QC by Asha/); assert.match(doc, /QC done by Quinn/);
+  const de = doc.indexOf("No adverse event - PK only"), qc = doc.indexOf("Agree, PK study with no AE");
+  assert.ok(de > 0 && qc > de, "QC comment comes right after the DE comment"); assert.doesNotMatch(doc, /Levetiracetam review/);
+  assert.equal((await t.call(SCREENER, "/api/screened-docs", {})).body.docs[0].status, "reviewed");
+});

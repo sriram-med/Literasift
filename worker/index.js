@@ -4438,7 +4438,7 @@ function screenedRows(state, viewer, opts = {}) {
   const name = e => state.profiles.find(p => p.email === e)?.name || e || "";
   const rows = [];
   for (const a of state.assignments || []) {
-    if (!a.disposition || !values.includes(a.disposition.value)) continue;
+    if (!a.disposition || !values.includes(a.disposition.value) || (opts.ids && !opts.ids.has(a.id))) continue;
     const roles = rolesIn(state, me, a.portfolio), isQc = roles.has("qc");
     // QC sees every rejected and safety present article of their clients, not only the ones routed to them.
     if (!mayAccess(state, viewer, a) && !isQc) continue;
@@ -4455,9 +4455,10 @@ function screenedRows(state, viewer, opts = {}) {
   }
   return rows.sort((p, q) => p.client.localeCompare(q.client) || q.ird.localeCompare(p.ird) || String(p.title).localeCompare(String(q.title)));
 }
-function screenedDocx(rows, kind, range) {
+function screenedDocx(rows, kind, range, sent) {
   const head = kind === "safety" ? "Safety present articles" : "Rejected articles", P = [];
   P.push({ runs:[{ text:"LiteraSift - " + head, bold:true, size:32 }], after:80 });
+  if (sent) P.push({ runs:[{ text:"Sent to QC by " + sent.byName + " on " + sent.at.slice(0, 16).replace("T", " ") + " UTC" + (sent.status === "reviewed" ? " - QC done by " + (sent.qcName || "") + " on " + String(sent.reviewedAt || "").slice(0, 10) : " - waiting for QC"), color:"0E6A5D", size:18 }], after:40 });
   P.push({ runs:[{ text:(range.from || range.to ? "IRD " + (range.from || "start") + " to " + (range.to || "today") + " - " : "") + rows.length + " article" + (rows.length === 1 ? "" : "s") + " - generated " + new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC", color:"666666", size:18 }], after:200 });
   for (const c of uniq(rows.map(r => r.client))) {
     const mine = rows.filter(r => r.client === c);
@@ -5888,16 +5889,44 @@ async function apiCore(request, env, path) {
     const first = results.find(r => r.status === "added");
     return json({ ok:true, added:toSave.length, results, portfolio:first.portfolio, molecule:first.molecule, auto:first.auto, classification:first.classification });
   }
-  if ((path === "/api/screened" || path === "/api/screened-docx") && viewer) {
+  // Word files the DE sends to QC: the list of articles is kept, the comments are read live, so the QC comment appears under each DE comment.
+  const pname0 = e => state.profiles.find(p => p.email === e)?.name || e || "";
+  const docView = d => ({ ...d, ids:undefined, count:d.ids.length, byName:pname0(d.by), qcName:pname0(d.qcBy), mine:d.by === email });
+  const docVisible = d => viewer.role === "manager" || d.by === email || screenedRows(state, viewer, { kind:d.kind, ids:new Set(d.ids) }).length > 0;
+  if (path === "/api/screened-send" && viewer) {
     const opts = { kind:body.kind === "safety" ? "safety" : "rejected", client:String(body.client || "all"), from:isDate(body.from) ? body.from : "", to:isDate(body.to) ? body.to : "", qc:["pending", "approved", "returned", "none"].includes(body.qc) ? body.qc : "all" };
+    const rows = screenedRows(state, viewer, opts).filter(r => r.canDeComment);
+    if (!rows.length) return json({ error:"There are no articles of yours in this list to send." }, 400);
+    const doc = { id:crypto.randomUUID(), kind:opts.kind, client:opts.client === "all" ? uniq(rows.map(r => r.client)).join(", ") : opts.client, from:opts.from, to:opts.to, by:email, at:new Date().toISOString(), ids:rows.map(r => r.id), note:String(body.note || "").trim().slice(0, 500), status:"sent" };
+    await write(env, data => { (data.screenedDocs ||= []).unshift(doc); data.screenedDocs = data.screenedDocs.slice(0, 500); });
+    await audit(env, { by:email, action:"screened.sent_to_qc", target:doc.client, detail:{ kind:doc.kind, count:doc.ids.length, from:doc.from, to:doc.to } });
+    return json({ ok:true, doc:docView(doc) });
+  }
+  if (path === "/api/screened-docs" && viewer) {
+    return json({ docs:(state.screenedDocs || []).filter(docVisible).slice(0, 60).map(docView) });
+  }
+  if (path === "/api/screened-doc-done" && viewer) {
+    const d = (state.screenedDocs || []).find(x => x.id === body.id);
+    if (!d || !docVisible(d)) return json({ error:"Document not found." }, 404);
+    if (d.by === email && viewer.role !== "manager") return json({ error:"QC must be done by someone other than the DE." }, 409);
+    if (viewer.role !== "manager" && !screenedRows(state, viewer, { kind:d.kind, ids:new Set(d.ids) }).some(r => r.canQcComment)) return json({ error:"Only QC can mark this document done." }, 403);
+    await write(env, data => { const x = data.screenedDocs.find(y => y.id === d.id); x.status = body.undo === true ? "sent" : "reviewed"; x.qcBy = email; x.reviewedAt = new Date().toISOString(); });
+    await audit(env, { by:email, action:"screened.qc_document", target:d.client, detail:{ id:d.id, status:body.undo === true ? "sent" : "reviewed" } });
+    return json({ ok:true });
+  }
+  if ((path === "/api/screened" || path === "/api/screened-docx") && viewer) {
+    const sentDoc = body.doc ? (state.screenedDocs || []).find(x => x.id === body.doc) : null;
+    if (body.doc && (!sentDoc || !docVisible(sentDoc))) return json({ error:"Document not found." }, 404);
+    const opts = sentDoc ? { kind:sentDoc.kind, client:"all", from:"", to:"", qc:"all", ids:new Set(sentDoc.ids) } : { kind:body.kind === "safety" ? "safety" : "rejected", client:String(body.client || "all"), from:isDate(body.from) ? body.from : "", to:isDate(body.to) ? body.to : "", qc:["pending", "approved", "returned", "none"].includes(body.qc) ? body.qc : "all" };
+    if (sentDoc && ["pending", "approved", "returned", "none"].includes(body.qc)) opts.qc = body.qc;
     const rows = screenedRows(state, viewer, opts);
     if (path === "/api/screened-docx") {
-      await audit(env, { by:email, action:"screened.export", target:opts.kind, detail:{ ...opts, count:rows.length } });
-      const name = "literasift-" + opts.kind + (opts.client !== "all" ? "-" + opts.client.replace(/[^A-Za-z0-9]+/g, "_") : "") + (opts.from ? "-" + opts.from : "") + (opts.to ? "-to-" + opts.to : "") + ".docx";
-      return new Response(screenedDocx(rows, opts.kind, opts), { headers:{ "Content-Type":"application/vnd.openxmlformats-officedocument.wordprocessingml.document", "Content-Disposition":'attachment; filename="' + name + '"' } });
+      await audit(env, { by:email, action:"screened.export", target:opts.kind, detail:{ ...opts, ids:undefined, doc:sentDoc?.id || "", count:rows.length } });
+      const name = "literasift-" + opts.kind + (sentDoc ? "-" + String(sentDoc.client).replace(/[^A-Za-z0-9]+/g, "_") + "-" + sentDoc.at.slice(0, 10) : (opts.client !== "all" ? "-" + opts.client.replace(/[^A-Za-z0-9]+/g, "_") : "") + (opts.from ? "-" + opts.from : "") + (opts.to ? "-to-" + opts.to : "")) + ".docx";
+      return new Response(screenedDocx(rows, opts.kind, sentDoc ? { from:sentDoc.from, to:sentDoc.to } : opts, sentDoc ? docView(sentDoc) : null), { headers:{ "Content-Type":"application/vnd.openxmlformats-officedocument.wordprocessingml.document", "Content-Disposition":'attachment; filename="' + name + '"' } });
     }
-    const all = screenedRows(state, viewer, { kind:opts.kind });
-    return json({ ...opts, rows, clients:uniq(all.map(r => r.client)), counts:{ all:all.length, pending:all.filter(r => r.qc === "pending").length, approved:all.filter(r => r.qc === "approved").length, returned:all.filter(r => r.qc === "returned").length, mine:all.filter(r => r.canQc).length },
+    const all = sentDoc ? rows : screenedRows(state, viewer, { kind:opts.kind });
+    return json({ ...opts, ids:undefined, doc:sentDoc ? docView(sentDoc) : null, rows, clients:uniq(all.map(r => r.client)), counts:{ all:all.length, pending:all.filter(r => r.qc === "pending").length, approved:all.filter(r => r.qc === "approved").length, returned:all.filter(r => r.qc === "returned").length, mine:all.filter(r => r.canQc).length },
       other:screenedRows(state, viewer, { kind:opts.kind === "safety" ? "rejected" : "safety" }).length, qcAllExcluded:state.settings?.qcAllExcluded !== false });
   }
   if (path === "/api/screened-comment" && viewer) {
@@ -8479,7 +8508,7 @@ details.tools{margin:0 0 14px}details.tools>summary{cursor:pointer;color:var(--b
 .lltable{border-collapse:separate;border-spacing:0 8px;width:100%}.lltable th{background:none;border:0;padding:4px 14px}.lltable td{background:var(--card);padding:14px;vertical-align:top;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}.lltable td:first-child{border-left:4px solid var(--border);border-radius:12px 0 0 12px}.lltable td:last-child{border-right:1px solid var(--border);border-radius:0 12px 12px 0}.lltable tr.ser td:first-child{border-left-color:var(--red)}.lltable tr:hover td{background:var(--accent)}
 .board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(250px,1fr);gap:14px;overflow-x:auto;padding-bottom:10px;align-items:start}.bcol{background:var(--accent);border-radius:16px;padding:12px;min-height:160px}.bcol h4{display:flex;justify-content:space-between;align-items:center;margin:0 4px 10px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}.bcol h4 b{background:var(--card);border-radius:999px;padding:1px 9px;font-size:12px;color:var(--fg)}.bcards{display:grid;gap:10px}.bempty{padding:14px 6px;text-align:center}
 .bcard{display:grid;gap:6px;background:var(--card);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:12px;padding:12px 14px;color:inherit;text-decoration:none;transition:box-shadow .15s,transform .15s}.bcard:hover{box-shadow:0 8px 22px #0e6a5d22;transform:translateY(-1px)}.bcard.ser{border-left-color:var(--red)}.bcard.late{border-left-color:var(--amber)}.bc-top{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.bc-title{font-size:13.5px;font-weight:600;line-height:1.35;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.bc-foot{display:flex;justify-content:space-between;align-items:center;margin-top:2px}
-.sccard{border:1px solid var(--border);border-radius:12px;padding:10px 14px;margin:0 0 8px;background:var(--card);display:grid;gap:4px}.schead{display:flex;justify-content:space-between;gap:10px;align-items:start}.scde mark{background:#fff59d;color:#222;padding:1px 4px;border-radius:3px}.scqc{display:flex;gap:6px;margin-top:4px}.scqc input{flex:1;min-width:160px}.scclient{margin:16px 0 8px;font-size:15px}.paacts{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 8px}.pasum{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}#patable td{font-size:13px;vertical-align:top}#patable td:nth-child(8),#patable td:nth-child(9),#patable td:nth-child(5){white-space:nowrap}#patable td:nth-child(6){min-width:260px}.scttl{display:flex;gap:8px;align-items:start}.scttl input{margin-top:3px}.scbulk{display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:var(--accent);border-radius:12px;padding:10px 12px;margin:0 0 10px}.scbulk #scbulknote{flex:1;min-width:220px}.scbulk .scall{display:flex!important;flex-direction:row!important;gap:6px;align-items:center;white-space:nowrap;font-size:13px;color:var(--muted);margin:0}.scbulk .scall input{width:auto;margin:0}
+.sccard{border:1px solid var(--border);border-radius:12px;padding:10px 14px;margin:0 0 8px;background:var(--card);display:grid;gap:4px}.schead{display:flex;justify-content:space-between;gap:10px;align-items:start}.scde mark{background:#fff59d;color:#222;padding:1px 4px;border-radius:3px}.scqc{display:flex;gap:6px;margin-top:4px}.scqc input{flex:1;min-width:160px}.scclient{margin:16px 0 8px;font-size:15px}.scdocs{border:1px solid var(--border);border-radius:12px;background:var(--card);padding:8px 12px;margin:0 0 12px}.scdocs summary{cursor:pointer}.scdocrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0;border-top:1px solid var(--border)}.scdocrow.on{background:var(--accent)}.scbanner{background:var(--accent);border-radius:10px;padding:10px 12px;margin:0 0 10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.paacts{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 8px}.pasum{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}#patable td{font-size:13px;vertical-align:top}#patable td:nth-child(8),#patable td:nth-child(9),#patable td:nth-child(5){white-space:nowrap}#patable td:nth-child(6){min-width:260px}.scttl{display:flex;gap:8px;align-items:start}.scttl input{margin-top:3px}.scbulk{display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:var(--accent);border-radius:12px;padding:10px 12px;margin:0 0 10px}.scbulk #scbulknote{flex:1;min-width:220px}.scbulk .scall{display:flex!important;flex-direction:row!important;gap:6px;align-items:center;white-space:nowrap;font-size:13px;color:var(--muted);margin:0}.scbulk .scall input{width:auto;margin:0}
 .seg{display:inline-flex;border:1px solid var(--border);border-radius:999px;overflow:hidden;background:var(--card)}.segb{border:0;background:none;padding:6px 16px;cursor:pointer;font:inherit;font-size:13px;color:var(--muted)}.segb.on{background:var(--brand);color:#fff}
 .impgrid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}.impgrid .wide{grid-column:1/-1}
 .clientgrid{grid-template-columns:minmax(0,1fr)!important}.clientcard{min-width:0}
@@ -9783,23 +9812,24 @@ async function loadDashboard(){
   }catch(e){box.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}
 }
 // Screened: Rejected and Safety present articles by client, with the DE comment highlighted, and a minimal QC re-check (Agree / Send back with a comment).
-const scState={kind:"rejected",qc:"all",client:"all",from:"",to:""}, scSel=new Set();
+const scState={kind:"rejected",qc:"all",client:"all",from:"",to:"",doc:""}, scSel=new Set();
 async function loadScreened(){
   const box=$("scbox");if(!box)return;
   try{
-    const r=await api("screened",{kind:scState.kind,qc:scState.qc,client:scState.client,from:scState.from,to:scState.to}), c=r.counts;
+    const [r,dl]=await Promise.all([api("screened",{kind:scState.kind,qc:scState.qc,client:scState.client,from:scState.from,to:scState.to,doc:scState.doc||undefined}),api("screened-docs",{}).catch(()=>({docs:[]}))]), c=r.counts;
+    if(r.doc)scState.kind=r.kind;
     const isRej=scState.kind==="rejected", other=r.other;
     const kinds='<span class="seg" role="group" aria-label="Which articles"><button type="button" class="segb'+(isRej?" on":"")+'" data-sckind="rejected">Rejected'+(isRej?" ("+c.all+")":" ("+other+")")+'</button><button type="button" class="segb'+(!isRej?" on":"")+'" data-sckind="safety">Safety present'+(!isRej?" ("+c.all+")":" ("+other+")")+'</button></span>';
     const F=[["all","All",c.all],["pending","Waiting for QC",c.pending],["approved","QC agreed",c.approved],["returned","Sent back",c.returned]];
     const chips='<div class="fbar">'+F.map(f=>'<button type="button" class="fchip'+(scState.qc===f[0]?" on":"")+'" data-scqc="'+f[0]+'">'+f[1]+'<b>'+f[2]+'</b></button>').join("")+'</div>';
-    const bar='<div class="filters slim" style="border:0;padding:8px 0 10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end"><label class="fl"><span class="sub">Client</span><select id="sccl"><option value="all">All clients</option>'+r.clients.map(x=>'<option'+(scState.client===x?" selected":"")+'>'+esc(x)+'</option>').join("")+'</select></label><label class="fl"><span class="sub">IRD from</span><input type="date" id="scfrom" value="'+esc(scState.from)+'"></label><label class="fl"><span class="sub">IRD to</span><input type="date" id="scto" value="'+esc(scState.to)+'"></label><button type="button" class="btn" data-scdoc="1">Download Word</button></div>';
+    const bar='<div class="filters slim" style="border:0;padding:8px 0 10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end"><label class="fl"><span class="sub">Client</span><select id="sccl"><option value="all">All clients</option>'+r.clients.map(x=>'<option'+(scState.client===x?" selected":"")+'>'+esc(x)+'</option>').join("")+'</select></label><label class="fl"><span class="sub">IRD from</span><input type="date" id="scfrom" value="'+esc(scState.from)+'"></label><label class="fl"><span class="sub">IRD to</span><input type="date" id="scto" value="'+esc(scState.to)+'"></label><button type="button" class="btn" data-scdoc="1">Download Word</button>'+(r.rows.some(x=>x.canDeComment)&&!r.doc?'<button type="button" class="btn outline" data-scsend="1" title="QC gets this list as a document, comments under each of your comments, and can download it with both">Send to QC</button>':"")+'</div>';
     const mineNote=c.mine?'<p class="sub" style="margin:0 0 8px"><b>'+c.mine+'</b> waiting for your QC.</p>':"";
     const qcTone=s=>s==="approved"?"green":s==="returned"?"red":s==="pending"?"amber":"";
     const groups=[...new Set(r.rows.map(x=>x.client))];
     const card=x=>{const de=isRej?(x.reason+(x.note?" - "+x.note:"")):((x.value==="potential_icsr"?"Potential ICSR":"Aggregate safety")+(x.note?": "+x.note:""));
       const qn=x.qcNote?'<div class="sub"><b>QC'+(x.qcName?" ("+esc(x.qcName)+")":"")+':</b> '+esc(x.qcNote)+'</div>':"";
       const qc=x.canQc?qn+'<div class="scqc"><input type="text" data-scnote="'+esc(x.id)+'" placeholder="QC comment (needed to send back)" aria-label="QC comment"><button type="button" class="btn sm" data-scok="'+esc(x.id)+'">Agree</button><button type="button" class="btn outline sm" data-scback="'+esc(x.id)+'">Send back</button></div>'
-        :qn;
+        :qn+(x.canQcComment?'<div class="scqc"><input type="text" data-scnote="'+esc(x.id)+'" placeholder="'+(x.qcNote?"Change the QC comment":"QC comment")+'" aria-label="QC comment"><button type="button" class="btn outline sm" data-scqcsave="'+esc(x.id)+'">Save QC comment</button></div>':"");
       const pick=(x.canDeComment||x.canQcComment)?'<input type="checkbox" data-scpick="'+esc(x.id)+'"'+(scSel.has(x.id)?" checked":"")+' aria-label="Select for bulk comment">':"";
       return '<div class="sccard"><div class="schead"><span class="scttl">'+pick+'<a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(x.pmid)+'/" target="_blank" rel="noopener"><b>'+esc(x.title)+'</b></a></span><span class="badge '+qcTone(x.qc)+'">'+esc(x.qcLabel)+'</span></div>'
         +'<div class="sub">IRD '+esc(x.ird)+' &middot; PMID '+esc(x.pmid)+(x.molecule?" &middot; "+esc(x.molecule):"")+(x.also&&x.also.length?' <span class="badge blue" title="Also found by these searches; screened once">also '+esc(x.also.join(", "))+'</span>':"")+'</div>'
@@ -9812,9 +9842,22 @@ async function loadScreened(){
       +'<input type="text" id="scbulknote" placeholder="One comment for all selected articles" aria-label="Bulk comment">'
       +(canDe?'<button type="button" class="btn sm" data-scbulk="de">Add as DE comment</button>':"")
       +(canQ?'<button type="button" class="btn sm" data-scbulk="qc">Add as QC comment</button><button type="button" class="btn sm" data-scbulk="approve">QC agree all</button><button type="button" class="btn outline sm" data-scbulk="return">Send back all</button>':"")+'</div>':"";
-    box.innerHTML='<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">'+kinds+'</div>'+bar+chips+mineNote+bulk+list+foot;
+    const docs=(dl.docs||[]);
+    const dcard=d=>'<div class="scdocrow'+(r.doc&&r.doc.id===d.id?" on":"")+'"><span class="badge '+(d.status==="reviewed"?"green":"amber")+'">'+(d.status==="reviewed"?"QC done":"Waiting for QC")+'</span><b>'+(d.kind==="safety"?"Safety present":"Rejected")+' &middot; '+esc(d.client)+'</b><span class="sub">'+d.count+' article'+(d.count===1?"":"s")+(d.from||d.to?" &middot; IRD "+esc(d.from||"start")+" to "+esc(d.to||"today"):"")+' &middot; from '+esc(d.byName)+' &middot; '+esc(d.at.slice(0,10))+(d.status==="reviewed"&&d.qcName?" &middot; QC "+esc(d.qcName):"")+'</span>'+(d.note?'<span class="sub">"'+esc(d.note)+'"</span>':"")+
+      '<span style="margin-left:auto;display:flex;gap:6px"><button type="button" class="btn sm" data-scdocopen="'+esc(d.id)+'">'+(d.mine?"Open":"Open for QC")+'</button><button type="button" class="btn outline sm" data-scdocword="'+esc(d.id)+'">Word</button>'+(!d.mine?(d.status==="reviewed"?'<button type="button" class="btn outline sm" data-scdocundo="'+esc(d.id)+'">Reopen</button>':'<button type="button" class="btn outline sm" data-scdocdone="'+esc(d.id)+'">Mark QC done</button>'):"")+'</span></div>';
+    const docsBox=docs.length?'<details class="scdocs"'+(docs.some(d=>!d.mine&&d.status!=="reviewed")||r.doc?" open":"")+'><summary><b>Word documents sent to QC</b> <span class="sub">'+docs.filter(d=>d.status!=="reviewed").length+' waiting</span></summary>'+docs.map(dcard).join("")+'</details>':"";
+    const docBanner=r.doc?'<div class="scbanner">Showing the document '+esc(r.doc.byName)+' sent on '+esc(r.doc.at.slice(0,10))+' ('+r.doc.count+' articles). Add the QC comment under each DE comment, then use Word to download it with both. <button type="button" class="btn outline sm" data-scdocclose="1">Back to all articles</button></div>':"";
+    box.innerHTML=docsBox+docBanner+'<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">'+(r.doc?"":kinds)+'</div>'+(r.doc?'<div style="margin:6px 0"><button type="button" class="btn" data-scdocword="'+esc(r.doc.id)+'">Download Word with QC comments</button></div>':bar)+chips+mineNote+bulk+list+foot;
   }catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>';}
-  box.onclick=async ev=>{const t=ev.target.closest("[data-sckind],[data-scqc],[data-scok],[data-scback],[data-scdoc],[data-scbulk]");if(!t)return;
+  box.onclick=async ev=>{const t=ev.target.closest("[data-sckind],[data-scqc],[data-scok],[data-scback],[data-scdoc],[data-scbulk],[data-scsend],[data-scdocopen],[data-scdocword],[data-scdocdone],[data-scdocundo],[data-scdocclose],[data-scqcsave]");if(!t)return;
+    if(t.dataset.scdocopen){scState.doc=t.dataset.scdocopen;scState.qc="all";scSel.clear();return loadScreened();}
+    if(t.dataset.scdocclose){scState.doc="";scSel.clear();return loadScreened();}
+    if(t.dataset.scdocword){t.disabled=true;try{await downloadPost("/api/screened-docx",{doc:t.dataset.scdocword},"literasift-screened.docx");}catch(e){alert(e.message);}t.disabled=false;return;}
+    if(t.dataset.scdocdone||t.dataset.scdocundo){t.disabled=true;try{await api("screened-doc-done",{id:t.dataset.scdocdone||t.dataset.scdocundo,undo:!!t.dataset.scdocundo});await loadScreened();}catch(e){alert(e.message);t.disabled=false;}return;}
+    if(t.dataset.scsend){const note=prompt("Send this list to QC as a Word document. Optional note for QC:","");if(note===null)return;t.disabled=true;
+      try{const res=await api("screened-send",{kind:scState.kind,client:scState.client,from:scState.from,to:scState.to,qc:scState.qc,note});message("Sent to QC: "+res.doc.count+" article"+(res.doc.count===1?"":"s")+".");await loadScreened();}catch(e){alert(e.message);t.disabled=false;}return;}
+    if(t.dataset.scqcsave){const id=t.dataset.scqcsave,inp=box.querySelector('[data-scnote="'+id+'"]'),note=inp?inp.value.trim():"";if(note.length<3){alert("Write the QC comment first.");if(inp)inp.focus();return;}
+      t.disabled=true;try{const res=await api("screened-comment",{ids:[id],as:"qc",note});if(res.skipped&&res.skipped.length)alert(res.skipped[0].why);await loadScreened();}catch(e){alert(e.message);t.disabled=false;}return;}
     if(t.dataset.scbulk){const k=t.dataset.scbulk, nt=($("scbulknote")||{}).value||"", note=nt.trim();
       if(!scSel.size){alert("Tick the articles first, or use Select all shown.");return;}
       if(k==="return"&&note.length<5){alert("Sending back needs a comment of at least 5 characters.");return;}
