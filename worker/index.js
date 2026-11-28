@@ -1996,6 +1996,19 @@ const keepOwner = (data, watch) => { const old = data.watches.find(w => watchKey
 // A client groups molecules. The link lives on the watchlist, so every article pulled for the molecule inherits it.
 const clientIdFor = (state, a) => { const mol = (a.molecules || [])[0] || ""; const w = state.watches.find(x => x.portfolio === a.portfolio && (x.molecule || "") === mol) || state.watches.find(x => x.portfolio === a.portfolio && x.molecule && (a.molecules || []).includes(x.molecule)) || state.watches.find(x => x.portfolio === a.portfolio && !x.molecule); return w?.client || ""; };
 // Archived articles (rejections QC agreed with): who may see them, and the fields the Archive tab shows.
+// How many articles each person holds, as DE and as QC, for an IRD range (whatever their screening state), in total and per client.
+function teamLoad(state, from, to) {
+  const pname = e => state.profiles.find(p => p.email === e)?.name || e || "", cname = id => (state.clients || []).find(c => c.id === id)?.name || "No client";
+  const load = {}, P = e => (load[e] ||= { email:e, name:pname(e), deOpen:0, deDone:0, qcPlanned:0, qcWaiting:0, qcDone:0, byClient:{} }), C = (e, c) => (P(e).byClient[c] ||= { de:0, qc:0 });
+  for (const a of state.assignments || []) {
+    const ird = irdOf(state, a); if ((from && ird < from) || (to && ird > to)) continue;
+    const c = cname(clientIdFor(state, a)), screened = Boolean(a.disposition) && a.status !== "QC returned";
+    if (a.reviewer) { const x = P(a.reviewer); if (screened) x.deDone++; else x.deOpen++; C(a.reviewer, c).de++; }
+    const q = a.qc?.reviewer || a.qcPlanned;
+    if (q) { const x = P(q); if (a.qc?.status === "pending") x.qcWaiting++; else if (a.qc?.status === "approved" || a.qc?.status === "returned") x.qcDone++; else x.qcPlanned++; C(q, c).qc++; }
+  }
+  return Object.values(load).sort((p, q) => p.name.localeCompare(q.name));
+}
 // The Monday-to-Sunday week in India time, `offset` weeks from this one.
 function weekRange(offset = 0) {
   const now = new Date(Date.now() + 5.5 * 3600000), dow = (now.getUTCDay() + 6) % 7, mon = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - dow + 7 * offset));
@@ -6107,15 +6120,8 @@ async function apiCore(request, env, path) {
       const seq = {}; rows.forEach(r => { r.no = (seq[r.client] = (seq[r.client] || 0) + 1); });
       const people = state.profiles.filter(p => p.active).map(p => ({ email:p.email, name:p.name || p.email, de:p.role === "manager" || (state.memberships || []).some(m => m.email === p.email && m.role === "screener") || state.assignments.some(a => a.reviewer === p.email) || p.role === "reviewer", qc:(state.memberships || []).some(m => m.email === p.email && m.role === "qc") }));
       // How many articles each person holds, as DE and as QC, in the same IRD dates (whatever the Articles filter), in total and per client.
-      const load = {}, P = e => (load[e] ||= { email:e, name:pname(e), deOpen:0, deDone:0, qcPlanned:0, qcWaiting:0, qcDone:0, byClient:{} }), C = (e, c) => (P(e).byClient[c] ||= { de:0, qc:0 });
-      for (const a of state.assignments || []) {
-        const ird = irdOf(state, a); if ((from && ird < from) || (to && ird > to)) continue;
-        const c = cname(clientIdFor(state, a)), screened = Boolean(a.disposition) && a.status !== "QC returned";
-        if (a.reviewer) { const x = P(a.reviewer); if (screened) x.deDone++; else x.deOpen++; C(a.reviewer, c).de++; }
-        const q = a.qc?.reviewer || a.qcPlanned;
-        if (q) { const x = P(q); if (a.qc?.status === "pending") x.qcWaiting++; else if (a.qc?.status === "approved" || a.qc?.status === "returned") x.qcDone++; else x.qcPlanned++; C(q, c).qc++; }
-      }
-      return json({ from, to, rows, people, teams:state.allocTeams || [], load:Object.values(load).sort((p, q) => p.name.localeCompare(q.name)), clients:(state.clients || []).map(c => ({ id:c.id, name:c.name })) });
+      const load = teamLoad(state, from, to);
+      return json({ from, to, rows, people, teams:state.allocTeams || [], load, clients:(state.clients || []).map(c => ({ id:c.id, name:c.name })) });
     }
     const groups = (Array.isArray(body.groups) ? body.groups : []).slice(0, 50), at = new Date().toISOString(), active = e => !e || state.profiles.some(p => p.email === e && p.active);
     if (!groups.length) return json({ error:"Add at least one range." }, 400);
@@ -6177,6 +6183,17 @@ async function apiCore(request, env, path) {
       return json({ ok:true });
     }
     return json({ error:"Choose all molecules or one molecule." }, 400);
+  }
+  if (path === "/api/team-counts" && viewer) {
+    // Team counts for every role's Dashboard: the teams and each person's article counts for the dates. Others see per-client rows only for the clients they work on.
+    const from = isDate(body.from) ? body.from : weekRange(0).from, to = isDate(body.to) ? body.to : weekRange(0).to, mgr = viewer.role === "manager";
+    let load = teamLoad(state, from, to);
+    if (!mgr) { const mine = new Set(myPortfolios(state, viewer).map(pf => { const w = state.watches.find(x => x.portfolio === pf && x.client); return (state.clients || []).find(c => c.id === w?.client)?.name || pf; }));
+      load = load.map(p => ({ ...p, email:undefined, byClient:Object.fromEntries(Object.entries(p.byClient).filter(([c]) => mine.has(c))) })); }
+    const people = state.profiles.filter(p => p.active).map(p => ({ email:mgr ? p.email : undefined, name:p.name || p.email }));
+    const teams = (state.allocTeams || []).map(t => ({ de:t.de, qc:t.qc }));
+    if (!mgr) { const nm = e => state.profiles.find(p => p.email === e)?.name || e || ""; return json({ from, to, teams:teams.map(t => ({ de:nm(t.de), qc:t.qc ? nm(t.qc) : "" })), people:[], load:load.map(p => ({ ...p, email:p.name })), byName:true }); }
+    return json({ from, to, teams, people, load });
   }
   if (path === "/api/dashboard" && viewer) {
     const wf = ["screening", "qc", "medical"].includes(body.workflow) ? body.workflow : "screening", mgr = viewer.role === "manager";
@@ -10028,11 +10045,11 @@ function casesMixHtml(r){
 // Article counts per client on the Dashboard, for every role: a table on screen and the same as a picture.
 const dbcState={from:"",to:"",open:false};
 function dbCountsHtml(){if(!dbcState.from){const t=new Date(Date.now()+5.5*3600000);dbcState.to=t.toISOString().slice(0,10);dbcState.from=new Date(t.getTime()-6*864e5).toISOString().slice(0,10);}
-  return '<section class="dbcounts"><div class="body"><div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap"><b style="margin-right:auto">Article counts per client</b><label class="fl"><span class="sub">IRD from</span><input type="date" id="dbcfrom" value="'+esc(dbcState.from)+'"></label><label class="fl"><span class="sub">IRD to</span><input type="date" id="dbcto" value="'+esc(dbcState.to)+'"></label><button type="button" class="btn outline sm" id="dbcshow">'+(dbcState.open?"Refresh table":"Show table")+'</button><button type="button" class="btn sm" id="dbcimg">Save as image</button>'+(data.viewer.role==="manager"?'<button type="button" class="btn outline sm" id="dbcteam" title="Articles per team (DE + QC), with each client under its team">Team counts (image)</button>':"")+'</div><div id="dbcout"></div></div></section>';}
+  return '<section class="dbcounts"><div class="body"><div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap"><b style="margin-right:auto">Article counts per client</b><label class="fl"><span class="sub">IRD from</span><input type="date" id="dbcfrom" value="'+esc(dbcState.from)+'"></label><label class="fl"><span class="sub">IRD to</span><input type="date" id="dbcto" value="'+esc(dbcState.to)+'"></label><button type="button" class="btn outline sm" id="dbcshow">'+(dbcState.open?"Refresh table":"Show table")+'</button><button type="button" class="btn sm" id="dbcimg">Save as image</button>'+'<button type="button" class="btn outline sm" id="dbcteam" title="Articles per team (DE + QC), with each client under its team">Team counts (image)</button>'+'</div><div id="dbcout"></div></div></section>';}
 function dbCountsWire(){const f=$("dbcfrom"),t=$("dbcto");if(!f)return;f.onchange=()=>{dbcState.from=f.value;if(dbcState.open)dbCountsShow();};t.onchange=()=>{dbcState.to=t.value;if(dbcState.open)dbCountsShow();};
   $("dbcshow").onclick=()=>{dbcState.open=true;dbCountsShow();};
   $("dbcimg").onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{paCountsImage(await api("pulled-articles",{from:dbcState.from,to:dbcState.to,client:"all"}));}catch(err){message(err.message,true);}b.disabled=false;};
-  const tb=$("dbcteam");if(tb)tb.onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await api("allocation-list",{from:dbcState.from,to:dbcState.to,only:"all"});if(!(r.teams||[]).length)message("No teams yet: add them on the Allocation tab. The image lists everyone under Not in a team.");alcTeamImage(r,{from:dbcState.from,to:dbcState.to});}catch(err){message(err.message,true);}b.disabled=false;};
+  const tb=$("dbcteam");if(tb)tb.onclick=async e=>{const b=e.currentTarget;b.disabled=true;try{const r=await api("team-counts",{from:dbcState.from,to:dbcState.to});if(!(r.teams||[]).length)message("No teams yet: a manager adds them on the Allocation tab. The image lists everyone under Not in a team.");alcTeamImage(r,{from:dbcState.from,to:dbcState.to});}catch(err){message(err.message,true);}b.disabled=false;};
   if(dbcState.open)dbCountsShow();}
 async function dbCountsShow(){const o=$("dbcout");if(!o)return;o.innerHTML='<div class="sub">Counting…</div>';try{const r=await api("pulled-articles",{from:dbcState.from,to:dbcState.to,client:"all"});o.innerHTML=paCountsTable(r)||'<div class="sub">No articles in these dates.</div>';}catch(e){o.innerHTML='<div class="sub">'+esc(e.message)+'</div>';}}
 async function loadDashboard(){
@@ -10217,7 +10234,7 @@ function paImage(r){
 const alcState={week:0,only:"open",rc:{},open:{},custom:{},plan:null,out:null,teamDraft:null,sel:"",pick:new Set(),q:""};
 // Team-wise article counts as a picture: each team (DE + QC) with the DE's articles to screen and screened, the QC's allocated, waiting and done, and each client under it.
 function alcTeamImage(r,w){
-  const teams=r.teams||[],pn=e=>((r.people.find(p=>p.email===e)||{}).name||e||""),ld=e=>(r.load||[]).find(p=>p.email===e)||{deOpen:0,deDone:0,qcPlanned:0,qcWaiting:0,qcDone:0,byClient:{}};
+  const teams=r.teams||[],pn=e=>(((r.people||[]).find(p=>p.email===e)||{}).name||e||""),ld=e=>(r.load||[]).find(p=>p.email===e)||{deOpen:0,deDone:0,qcPlanned:0,qcWaiting:0,qcDone:0,byClient:{}};
   const cols=["To screen","Screened","QC allocated","QC waiting","QC done"],rows=[];
   teams.forEach((t,i)=>{const a=ld(t.de),q=t.qc?ld(t.qc):null;rows.push({kind:"team",label:"Team "+(i+1)+": "+pn(t.de)+(t.qc?" + "+pn(t.qc):""),v:[a.deOpen,a.deDone,q?q.qcPlanned+q.qcWaiting:"-",q?q.qcWaiting:"-",q?q.qcDone:"-"]});
     Object.keys(a.byClient||{}).sort().forEach(c=>{const qq=q&&q.byClient&&q.byClient[c]?q.byClient[c].qc:0;rows.push({kind:"client",label:c,v:[a.byClient[c].de,"",qq||"","",""]});});});

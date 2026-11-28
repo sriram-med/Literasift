@@ -81,3 +81,16 @@ test("teams: saved DE + QC pairs for the weekly allocation", async () => {
   const list = (await t.call(MANAGER, "/api/allocation-list", { from: "", to: "" })).body;
   assert.deepEqual(list.teams.map(x => [x.de, x.qc]), [[SCREENER, QC2], [SCREENER2, QC]]);
 });
+
+test("team counts for every role's Dashboard: names and counts only, no emails for non-managers", async () => {
+  const t = await makeEnv(seed());
+  await t.call(MANAGER, "/api/alloc-teams", { teams: [{ de: SCREENER, qc: QC2 }, { de: SCREENER2, qc: QC }] });
+  const list = (await t.call(MANAGER, "/api/allocation-list", { from: "", to: "" })).body;
+  await t.call(MANAGER, "/api/allocation-apply", { groups: [{ ids: list.rows.slice(0, 3).map(r => r.id), de: SCREENER, qc: QC2 }, { ids: list.rows.slice(3).map(r => r.id), de: SCREENER2, qc: QC }] });
+  const de = (await t.call(SCREENER, "/api/team-counts", { from: "2026-11-01", to: "2026-11-30" })).body;
+  assert.deepEqual(de.teams, [{ de: "Sravan", qc: "Venu" }, { de: "Ravi", qc: "Quinn" }]);
+  const sr = de.load.find(p => p.name === "Sravan"); assert.equal(sr.deOpen, 3); assert.equal(sr.email, "Sravan");
+  assert.ok(!JSON.stringify(de).includes("@example.org"), "no email addresses for non-managers");
+  assert.equal((await t.call(QC, "/api/team-counts", { from: "2026-11-01", to: "2026-11-30" })).body.load.find(p => p.name === "Quinn").qcPlanned, 3);
+  assert.equal((await t.call(MANAGER, "/api/team-counts", { from: "2026-11-01", to: "2026-11-30" })).body.teams[0].de, SCREENER);
+});

@@ -588,4 +588,4 @@ The rules are unchanged. Articles already screened keep their DE, the team's QC 
 
 For example, everything can count under every drug (like the alert emails) while calcium alone counts once, so its shared articles go to calcium chloride. The per-drug counts in Watchlists, Search & Pull results and the Clients tab follow these settings. Each change is recorded in the audit trail.
 
-The **Dashboard** of managers also has **Team counts (image)** next to the article counts. It uses the Dashboard's IRD dates and shows the same per-team picture as the Allocation tab.
+Every **Dashboard** (manager, DE, QC, medical reviewer) also has **Team counts (image)** next to the article counts. It uses the Dashboard's IRD dates and shows the same per-team picture as the Allocation tab. Non-managers get names and counts only, with no email addresses, and client rows only for the clients they work on.
