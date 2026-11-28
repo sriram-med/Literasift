@@ -117,3 +117,26 @@ test("DE sends the rejected list to QC as a Word document; QC comments under eac
   assert.ok(de > 0 && qc > de, "QC comment comes right after the DE comment"); assert.doesNotMatch(doc, /Levetiracetam review/);
   assert.equal((await t.call(SCREENER, "/api/screened-docs", {})).body.docs[0].status, "reviewed");
 });
+
+test("DE sends the safety present list to the medical reviewer, whose comment sits under the DE comment in the Word file", async () => {
+  const t = await makeEnv({ ...team(), profiles: [...team().profiles, { email: "meera@example.org", name: "Meera", role: "reviewer", portfolio: "Navinta", active: true, capacity: 20 }] });
+  const MR = "meera@example.org";
+  await t.call(MANAGER, "/api/membership-save", { email: MR, portfolio: "Navinta", role: "medical_reviewer" });
+  await t.call(SCREENER, "/api/disposition", { id: "a2", value: "aggregate_safety", note: "Hepatotoxicity in a cohort" });
+  await t.call(SCREENER, "/api/disposition", { id: "a1", value: "excluded", reason: "No adverse event" });
+  const mrView = (await t.call(MR, "/api/screened", { kind: "safety" })).body.rows;
+  assert.deepEqual(mrView.map(r => [r.pmid, r.canMrComment]), [["2", true]], "the medical reviewer sees safety present articles of their client");
+  assert.equal((await t.call(MR, "/api/screened", { kind: "rejected" })).body.rows.length, 0, "but not rejections");
+  const sent = (await t.call(SCREENER, "/api/screened-send", { kind: "safety", note: "Please review" })).body.doc;
+  assert.equal(sent.sendTo, "medical"); assert.equal(sent.to, "");
+  assert.deepEqual((await t.call(MR, "/api/screened-docs", {})).body.docs.map(d => d.id), [sent.id]);
+  assert.equal((await t.call(SCREENER, "/api/screened-comment", { ids: ["a2"], as: "mr", note: "self" })).body.skipped.length, 1, "the DE cannot write the medical comment");
+  assert.equal((await t.call(MR, "/api/screened-comment", { ids: ["a2"], as: "mr", note: "Aggregate only, no ICSR; include in PSUR" })).body.done, 1);
+  assert.equal((await t.call(QC, "/api/screened-doc-done", { id: sent.id })).status, 404);
+  assert.equal((await t.call(MR, "/api/screened-doc-done", { id: sent.id })).status, 200);
+  const doc = readZip(await (await t.raw(SCREENER, "/api/screened-docx", { doc: sent.id })).arrayBuffer()).get("word/document.xml").toString("utf8");
+  assert.match(doc, /Sent to medical review by Asha/); assert.match(doc, /Medical review done by Meera/);
+  const de = doc.indexOf("Hepatotoxicity in a cohort"), mr = doc.indexOf("Aggregate only, no ICSR; include in PSUR");
+  assert.ok(de > 0 && mr > de && doc.slice(de, mr).includes("Medical reviewer comment (Meera)"), "medical comment right under the DE comment");
+  assert.equal((await t.state()).assignments.find(a => a.id === "a2").mrComment.by, MR);
+});

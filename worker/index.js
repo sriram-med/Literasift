@@ -4439,9 +4439,9 @@ function screenedRows(state, viewer, opts = {}) {
   const rows = [];
   for (const a of state.assignments || []) {
     if (!a.disposition || !values.includes(a.disposition.value) || (opts.ids && !opts.ids.has(a.id))) continue;
-    const roles = rolesIn(state, me, a.portfolio), isQc = roles.has("qc");
-    // QC sees every rejected and safety present article of their clients, not only the ones routed to them.
-    if (!mayAccess(state, viewer, a) && !isQc) continue;
+    const roles = rolesIn(state, me, a.portfolio), isQc = roles.has("qc"), isMr = kind === "safety" && (roles.has("medical_reviewer") || a.medicalReviewer === me);
+    // QC sees every rejected and safety present article of their clients, not only the ones routed to them; the medical reviewer sees every safety present one.
+    if (!mayAccess(state, viewer, a) && !isQc && !isMr) continue;
     const ird = irdOf(state, a), client = clientOf(a);
     if ((opts.from && ird < opts.from) || (opts.to && ird > opts.to) || (opts.client && opts.client !== "all" && client !== opts.client)) continue;
     const qs = a.qc?.status || "", pm = mgr || roles.has("manager");
@@ -4451,14 +4451,16 @@ function screenedRows(state, viewer, opts = {}) {
     rows.push({ id:a.id, pmid:a.pmid, client, molecule:mainMol, also:(a.molecules || []).filter(m => m !== mainMol), ird, title:state.articles?.[a.pmid]?.title || "PMID " + a.pmid, value:a.disposition.value,
       reason:a.disposition.reason || "", note:a.disposition.note || "", deBy:a.disposition.by || a.reviewer || "", deName:name(a.disposition.by || a.reviewer), deAt:a.disposition.at || "",
       qc:qs, qcLabel:QC_LABEL[qs] || "No QC", qcNote:a.qcComment?.note || a.qc?.note || "", qcBy:a.qcComment?.by || a.qc?.decidedBy || "", qcName:name(a.qcComment?.by || a.qc?.decidedBy), qcReviewer:a.qc?.reviewer || "", canQc,
-      canDeComment:pm || a.reviewer === me || a.disposition.by === me, canQcComment:pm || ((isQc || a.qc?.reviewer === me) && a.reviewer !== me && a.disposition.by !== me), status:a.status });
+      canDeComment:pm || a.reviewer === me || a.disposition.by === me, canQcComment:pm || ((isQc || a.qc?.reviewer === me) && a.reviewer !== me && a.disposition.by !== me),
+      canMrComment:kind === "safety" && (pm || (isMr && a.reviewer !== me && a.disposition.by !== me)), mrNote:a.mrComment?.note || "", mrName:name(a.mrComment?.by), mrAt:a.mrComment?.at || "", status:a.status });
   }
   return rows.sort((p, q) => p.client.localeCompare(q.client) || q.ird.localeCompare(p.ird) || String(p.title).localeCompare(String(q.title)));
 }
 function screenedDocx(rows, kind, range, sent) {
   const head = kind === "safety" ? "Safety present articles" : "Rejected articles", P = [];
   P.push({ runs:[{ text:"LiteraSift - " + head, bold:true, size:32 }], after:80 });
-  if (sent) P.push({ runs:[{ text:"Sent to QC by " + sent.byName + " on " + sent.at.slice(0, 16).replace("T", " ") + " UTC" + (sent.status === "reviewed" ? " - QC done by " + (sent.qcName || "") + " on " + String(sent.reviewedAt || "").slice(0, 10) : " - waiting for QC"), color:"0E6A5D", size:18 }], after:40 });
+  const who = sent && sent.sendTo === "medical" ? "medical review" : "QC";
+  if (sent) P.push({ runs:[{ text:"Sent to " + who + " by " + sent.byName + " on " + sent.at.slice(0, 16).replace("T", " ") + " UTC" + (sent.status === "reviewed" ? " - " + (who === "QC" ? "QC" : "Medical review") + " done by " + (sent.qcName || "") + " on " + String(sent.reviewedAt || "").slice(0, 10) : " - waiting for " + who), color:"0E6A5D", size:18 }], after:40 });
   P.push({ runs:[{ text:(range.from || range.to ? "IRD " + (range.from || "start") + " to " + (range.to || "today") + " - " : "") + rows.length + " article" + (rows.length === 1 ? "" : "s") + " - generated " + new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC", color:"666666", size:18 }], after:200 });
   for (const c of uniq(rows.map(r => r.client))) {
     const mine = rows.filter(r => r.client === c);
@@ -4468,6 +4470,8 @@ function screenedDocx(rows, kind, range, sent) {
       P.push({ runs:[{ text:"IRD " + r.ird + "   PMID " + r.pmid + (r.molecule ? "   " + r.molecule : ""), color:"555555", size:18 }], after:40 });
       const de = (kind === "safety" ? (r.value === "potential_icsr" ? "Potential ICSR" : "Aggregate safety") + (r.note ? ": " + r.note : "") : r.reason + (r.note ? " - " + r.note : ""));
       P.push({ runs:[{ text:"DE comment" + (r.deName ? " (" + r.deName + ")" : "") + ": ", bold:true }, { text:de || "no comment", highlight:"yellow" }], after:40 });
+      if (kind === "safety") P.push({ runs:[{ text:"Medical reviewer comment" + (r.mrName ? " (" + r.mrName + ")" : "") + ": ", bold:true }, { text:r.mrNote || "waiting for the medical reviewer", color:r.mrNote ? "000000" : "888888" }], after:40 });
+      if (kind === "safety" && !r.qc && !r.qcNote) return;
       P.push({ runs:[{ text:"QC comment" + (r.qcName ? " (" + r.qcName + ")" : "") + ": ", bold:true }, { text:r.qcNote || (r.qc === "pending" ? "waiting for QC" : r.qc === "approved" ? "agreed" : r.qc ? r.qcLabel : "not sent to QC"), color:r.qcNote ? "000000" : "888888" }, ...(r.qc ? [{ text:"   [" + r.qcLabel + "]", color:"888888", size:18 }] : [])], after:80 });
     });
   }
@@ -5891,15 +5895,15 @@ async function apiCore(request, env, path) {
   }
   // Word files the DE sends to QC: the list of articles is kept, the comments are read live, so the QC comment appears under each DE comment.
   const pname0 = e => state.profiles.find(p => p.email === e)?.name || e || "";
-  const docView = d => ({ ...d, ids:undefined, count:d.ids.length, byName:pname0(d.by), qcName:pname0(d.qcBy), mine:d.by === email });
+  const docView = d => ({ ...d, sendTo:d.sendTo || (d.kind === "safety" ? "medical" : "qc"), ids:undefined, count:d.ids.length, byName:pname0(d.by), qcName:pname0(d.qcBy), mine:d.by === email });
   const docVisible = d => viewer.role === "manager" || d.by === email || screenedRows(state, viewer, { kind:d.kind, ids:new Set(d.ids) }).length > 0;
   if (path === "/api/screened-send" && viewer) {
     const opts = { kind:body.kind === "safety" ? "safety" : "rejected", client:String(body.client || "all"), from:isDate(body.from) ? body.from : "", to:isDate(body.to) ? body.to : "", qc:["pending", "approved", "returned", "none"].includes(body.qc) ? body.qc : "all" };
     const rows = screenedRows(state, viewer, opts).filter(r => r.canDeComment);
     if (!rows.length) return json({ error:"There are no articles of yours in this list to send." }, 400);
-    const doc = { id:crypto.randomUUID(), kind:opts.kind, client:opts.client === "all" ? uniq(rows.map(r => r.client)).join(", ") : opts.client, from:opts.from, to:opts.to, by:email, at:new Date().toISOString(), ids:rows.map(r => r.id), note:String(body.note || "").trim().slice(0, 500), status:"sent" };
+    const doc = { id:crypto.randomUUID(), kind:opts.kind, client:opts.client === "all" ? uniq(rows.map(r => r.client)).join(", ") : opts.client, from:opts.from, to:opts.to, by:email, at:new Date().toISOString(), ids:rows.map(r => r.id), note:String(body.note || "").trim().slice(0, 500), status:"sent", sendTo:opts.kind === "safety" ? "medical" : "qc" };
     await write(env, data => { (data.screenedDocs ||= []).unshift(doc); data.screenedDocs = data.screenedDocs.slice(0, 500); });
-    await audit(env, { by:email, action:"screened.sent_to_qc", target:doc.client, detail:{ kind:doc.kind, count:doc.ids.length, from:doc.from, to:doc.to } });
+    await audit(env, { by:email, action:doc.sendTo === "medical" ? "screened.sent_to_medical" : "screened.sent_to_qc", target:doc.client, detail:{ kind:doc.kind, count:doc.ids.length, from:doc.from, to:doc.to } });
     return json({ ok:true, doc:docView(doc) });
   }
   if (path === "/api/screened-docs" && viewer) {
@@ -5908,8 +5912,9 @@ async function apiCore(request, env, path) {
   if (path === "/api/screened-doc-done" && viewer) {
     const d = (state.screenedDocs || []).find(x => x.id === body.id);
     if (!d || !docVisible(d)) return json({ error:"Document not found." }, 404);
-    if (d.by === email && viewer.role !== "manager") return json({ error:"QC must be done by someone other than the DE." }, 409);
-    if (viewer.role !== "manager" && !screenedRows(state, viewer, { kind:d.kind, ids:new Set(d.ids) }).some(r => r.canQcComment)) return json({ error:"Only QC can mark this document done." }, 403);
+    const toMr = d.sendTo === "medical" || (!d.sendTo && d.kind === "safety");
+    if (d.by === email && viewer.role !== "manager") return json({ error:(toMr ? "Medical review" : "QC") + " must be done by someone other than the DE." }, 409);
+    if (viewer.role !== "manager" && !screenedRows(state, viewer, { kind:d.kind, ids:new Set(d.ids) }).some(r => toMr ? r.canMrComment : r.canQcComment)) return json({ error:"Only " + (toMr ? "the medical reviewer" : "QC") + " can mark this document done." }, 403);
     await write(env, data => { const x = data.screenedDocs.find(y => y.id === d.id); x.status = body.undo === true ? "sent" : "reviewed"; x.qcBy = email; x.reviewedAt = new Date().toISOString(); });
     await audit(env, { by:email, action:"screened.qc_document", target:d.client, detail:{ id:d.id, status:body.undo === true ? "sent" : "reviewed" } });
     return json({ ok:true });
@@ -5931,7 +5936,7 @@ async function apiCore(request, env, path) {
   }
   if (path === "/api/screened-comment" && viewer) {
     // One comment applied to many screened articles at once: as the DE comment, or as the QC comment (optionally with Agree / Send back for those waiting for QC).
-    const ids = uniq((Array.isArray(body.ids) ? body.ids : []).map(String)).slice(0, 500), as = body.as === "qc" ? "qc" : "de", note = String(body.note || "").trim().slice(0, 1000);
+    const ids = uniq((Array.isArray(body.ids) ? body.ids : []).map(String)).slice(0, 500), as = body.as === "qc" ? "qc" : body.as === "mr" ? "mr" : "de", note = String(body.note || "").trim().slice(0, 1000);
     const decision = as === "qc" && ["approve", "return"].includes(body.decision) ? body.decision : "";
     if (!ids.length) return json({ error:"Select at least one article." }, 400);
     if (!decision && note.length < 3) return json({ error:"Write a comment of at least 3 characters." }, 400);
@@ -5941,7 +5946,7 @@ async function apiCore(request, env, path) {
     for (const id of ids) {
       const r = rows.get(id);
       if (!r) { skipped.push({ id, why:"not found" }); continue; }
-      if (as === "de" ? !r.canDeComment : !r.canQcComment) { skipped.push({ id, pmid:r.pmid, why:as === "de" ? "not your article" : "you cannot QC your own article" }); continue; }
+      if (as === "de" ? !r.canDeComment : as === "mr" ? !r.canMrComment : !r.canQcComment) { skipped.push({ id, pmid:r.pmid, why:as === "de" ? "not your article" : as === "mr" ? "not a safety article you review" : "you cannot QC your own article" }); continue; }
       if (decision) {
         if (r.qc !== "pending") { skipped.push({ id, pmid:r.pmid, why:"not waiting for QC" }); continue; }
         const res = await apiCore(new Request("http://local/api/qc-decision", { method:"POST", headers:{ "oai-authenticated-user-email":email, "content-type":"application/json" }, body:JSON.stringify({ id, decision, note }) }), env, "/api/qc-decision");
@@ -5951,6 +5956,7 @@ async function apiCore(request, env, path) {
       }
       await write(env, data => { const a = data.assignments.find(x => x.id === id); if (!a) return;
         if (as === "de") { (a.history ||= []).push({ status:a.status, note:"DE comment: " + note, by:email, at }); a.disposition = { ...a.disposition, note, commentBy:email, commentAt:at }; }
+        else if (as === "mr") { (a.history ||= []).push({ status:a.status, note:"Medical review comment: " + note, by:email, at }); a.mrComment = { note, by:email, at }; }
         else { (a.history ||= []).push({ status:a.status, note:"QC comment: " + note, by:email, at }); a.qcComment = { note, by:email, at }; } });
       done.push(id);
     }
@@ -9815,6 +9821,7 @@ async function loadDashboard(){
 const scState={kind:"rejected",qc:"all",client:"all",from:"",to:"",doc:""}, scSel=new Set();
 async function loadScreened(){
   const box=$("scbox");if(!box)return;
+  if(!scState.init){scState.init=1;const ro=data.viewerRoles||[];if(ro.includes("medical_reviewer")&&!ro.includes("qc")&&!ro.includes("screener"))scState.kind="safety";}
   try{
     const [r,dl]=await Promise.all([api("screened",{kind:scState.kind,qc:scState.qc,client:scState.client,from:scState.from,to:scState.to,doc:scState.doc||undefined}),api("screened-docs",{}).catch(()=>({docs:[]}))]), c=r.counts;
     if(r.doc)scState.kind=r.kind;
@@ -9822,48 +9829,51 @@ async function loadScreened(){
     const kinds='<span class="seg" role="group" aria-label="Which articles"><button type="button" class="segb'+(isRej?" on":"")+'" data-sckind="rejected">Rejected'+(isRej?" ("+c.all+")":" ("+other+")")+'</button><button type="button" class="segb'+(!isRej?" on":"")+'" data-sckind="safety">Safety present'+(!isRej?" ("+c.all+")":" ("+other+")")+'</button></span>';
     const F=[["all","All",c.all],["pending","Waiting for QC",c.pending],["approved","QC agreed",c.approved],["returned","Sent back",c.returned]];
     const chips='<div class="fbar">'+F.map(f=>'<button type="button" class="fchip'+(scState.qc===f[0]?" on":"")+'" data-scqc="'+f[0]+'">'+f[1]+'<b>'+f[2]+'</b></button>').join("")+'</div>';
-    const bar='<div class="filters slim" style="border:0;padding:8px 0 10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end"><label class="fl"><span class="sub">Client</span><select id="sccl"><option value="all">All clients</option>'+r.clients.map(x=>'<option'+(scState.client===x?" selected":"")+'>'+esc(x)+'</option>').join("")+'</select></label><label class="fl"><span class="sub">IRD from</span><input type="date" id="scfrom" value="'+esc(scState.from)+'"></label><label class="fl"><span class="sub">IRD to</span><input type="date" id="scto" value="'+esc(scState.to)+'"></label><button type="button" class="btn" data-scdoc="1">Download Word</button>'+(r.rows.some(x=>x.canDeComment)&&!r.doc?'<button type="button" class="btn outline" data-scsend="1" title="QC gets this list as a document, comments under each of your comments, and can download it with both">Send to QC</button>':"")+'</div>';
+    const bar='<div class="filters slim" style="border:0;padding:8px 0 10px;display:flex;gap:8px;flex-wrap:wrap;align-items:end"><label class="fl"><span class="sub">Client</span><select id="sccl"><option value="all">All clients</option>'+r.clients.map(x=>'<option'+(scState.client===x?" selected":"")+'>'+esc(x)+'</option>').join("")+'</select></label><label class="fl"><span class="sub">IRD from</span><input type="date" id="scfrom" value="'+esc(scState.from)+'"></label><label class="fl"><span class="sub">IRD to</span><input type="date" id="scto" value="'+esc(scState.to)+'"></label><button type="button" class="btn" data-scdoc="1">Download Word</button>'+(r.rows.some(x=>x.canDeComment)&&!r.doc?'<button type="button" class="btn outline" data-scsend="1" title="'+(isRej?"QC":"The medical reviewer")+' gets this list as a document, comments under each of your comments, and can download it with both">'+(isRej?"Send to QC":"Send to medical reviewer")+'</button>':"")+'</div>';
     const mineNote=c.mine?'<p class="sub" style="margin:0 0 8px"><b>'+c.mine+'</b> waiting for your QC.</p>':"";
     const qcTone=s=>s==="approved"?"green":s==="returned"?"red":s==="pending"?"amber":"";
     const groups=[...new Set(r.rows.map(x=>x.client))];
     const card=x=>{const de=isRej?(x.reason+(x.note?" - "+x.note:"")):((x.value==="potential_icsr"?"Potential ICSR":"Aggregate safety")+(x.note?": "+x.note:""));
+      const mr=isRej?"":(x.mrNote?'<div class="sub"><b>Medical reviewer'+(x.mrName?" ("+esc(x.mrName)+")":"")+':</b> '+esc(x.mrNote)+'</div>':"")+(x.canMrComment?'<div class="scqc"><input type="text" data-scmrnote="'+esc(x.id)+'" placeholder="'+(x.mrNote?"Change the medical review comment":"Medical review comment")+'" aria-label="Medical review comment"><button type="button" class="btn sm" data-scmrsave="'+esc(x.id)+'">Save medical comment</button></div>':"");
       const qn=x.qcNote?'<div class="sub"><b>QC'+(x.qcName?" ("+esc(x.qcName)+")":"")+':</b> '+esc(x.qcNote)+'</div>':"";
       const qc=x.canQc?qn+'<div class="scqc"><input type="text" data-scnote="'+esc(x.id)+'" placeholder="QC comment (needed to send back)" aria-label="QC comment"><button type="button" class="btn sm" data-scok="'+esc(x.id)+'">Agree</button><button type="button" class="btn outline sm" data-scback="'+esc(x.id)+'">Send back</button></div>'
         :qn+(x.canQcComment?'<div class="scqc"><input type="text" data-scnote="'+esc(x.id)+'" placeholder="'+(x.qcNote?"Change the QC comment":"QC comment")+'" aria-label="QC comment"><button type="button" class="btn outline sm" data-scqcsave="'+esc(x.id)+'">Save QC comment</button></div>':"");
-      const pick=(x.canDeComment||x.canQcComment)?'<input type="checkbox" data-scpick="'+esc(x.id)+'"'+(scSel.has(x.id)?" checked":"")+' aria-label="Select for bulk comment">':"";
+      const pick=(x.canDeComment||x.canQcComment||x.canMrComment)?'<input type="checkbox" data-scpick="'+esc(x.id)+'"'+(scSel.has(x.id)?" checked":"")+' aria-label="Select for bulk comment">':"";
       return '<div class="sccard"><div class="schead"><span class="scttl">'+pick+'<a href="https://pubmed.ncbi.nlm.nih.gov/'+esc(x.pmid)+'/" target="_blank" rel="noopener"><b>'+esc(x.title)+'</b></a></span><span class="badge '+qcTone(x.qc)+'">'+esc(x.qcLabel)+'</span></div>'
         +'<div class="sub">IRD '+esc(x.ird)+' &middot; PMID '+esc(x.pmid)+(x.molecule?" &middot; "+esc(x.molecule):"")+(x.also&&x.also.length?' <span class="badge blue" title="Also found by these searches; screened once">also '+esc(x.also.join(", "))+'</span>':"")+'</div>'
-        +'<div class="scde"><b>DE'+(x.deName?" ("+esc(x.deName)+")":"")+':</b> <mark>'+esc(de||"no comment")+'</mark></div>'+qc+'</div>';};
+        +'<div class="scde"><b>DE'+(x.deName?" ("+esc(x.deName)+")":"")+':</b> <mark>'+esc(de||"no comment")+'</mark></div>'+mr+qc+'</div>';};
     const list=groups.length?groups.map(g=>{const rs=r.rows.filter(x=>x.client===g);return '<h3 class="scclient">'+esc(g)+' <span class="sub">'+rs.length+'</span></h3>'+rs.map(card).join("");}).join(""):'<div class="empty">No '+(isRej?"rejected":"safety present")+' articles match these filters.</div>';
     const foot=isRej?'<p class="sub" style="margin-top:12px">'+(r.qcAllExcluded?"Every rejection goes to QC for a re-check.":"Rejections are sampled for QC (Settings).")+'</p>':"";
     const ids=new Set(r.rows.map(x=>x.id));for(const id of [...scSel])if(!ids.has(id))scSel.delete(id);
-    const canDe=r.rows.some(x=>x.canDeComment), canQ=r.rows.some(x=>x.canQcComment), pickable=r.rows.filter(x=>x.canDeComment||x.canQcComment).length;
+    const canDe=r.rows.some(x=>x.canDeComment), canQ=r.rows.some(x=>x.canQcComment), canM=r.rows.some(x=>x.canMrComment), pickable=r.rows.filter(x=>x.canDeComment||x.canQcComment||x.canMrComment).length;
     const bulk=pickable?'<div class="scbulk"><label class="scall"><input type="checkbox" id="scall"'+(scSel.size&&scSel.size===pickable?" checked":"")+'> Select all shown ('+pickable+')</label><span class="sub" id="scselct"><b>'+scSel.size+'</b> selected</span>'
       +'<input type="text" id="scbulknote" placeholder="One comment for all selected articles" aria-label="Bulk comment">'
       +(canDe?'<button type="button" class="btn sm" data-scbulk="de">Add as DE comment</button>':"")
-      +(canQ?'<button type="button" class="btn sm" data-scbulk="qc">Add as QC comment</button><button type="button" class="btn sm" data-scbulk="approve">QC agree all</button><button type="button" class="btn outline sm" data-scbulk="return">Send back all</button>':"")+'</div>':"";
+      +(canM?'<button type="button" class="btn sm" data-scbulk="mr">Add as medical comment</button>':"")+(canQ?'<button type="button" class="btn sm" data-scbulk="qc">Add as QC comment</button><button type="button" class="btn sm" data-scbulk="approve">QC agree all</button><button type="button" class="btn outline sm" data-scbulk="return">Send back all</button>':"")+'</div>':"";
     const docs=(dl.docs||[]);
-    const dcard=d=>'<div class="scdocrow'+(r.doc&&r.doc.id===d.id?" on":"")+'"><span class="badge '+(d.status==="reviewed"?"green":"amber")+'">'+(d.status==="reviewed"?"QC done":"Waiting for QC")+'</span><b>'+(d.kind==="safety"?"Safety present":"Rejected")+' &middot; '+esc(d.client)+'</b><span class="sub">'+d.count+' article'+(d.count===1?"":"s")+(d.from||d.to?" &middot; IRD "+esc(d.from||"start")+" to "+esc(d.to||"today"):"")+' &middot; from '+esc(d.byName)+' &middot; '+esc(d.at.slice(0,10))+(d.status==="reviewed"&&d.qcName?" &middot; QC "+esc(d.qcName):"")+'</span>'+(d.note?'<span class="sub">"'+esc(d.note)+'"</span>':"")+
-      '<span style="margin-left:auto;display:flex;gap:6px"><button type="button" class="btn sm" data-scdocopen="'+esc(d.id)+'">'+(d.mine?"Open":"Open for QC")+'</button><button type="button" class="btn outline sm" data-scdocword="'+esc(d.id)+'">Word</button>'+(!d.mine?(d.status==="reviewed"?'<button type="button" class="btn outline sm" data-scdocundo="'+esc(d.id)+'">Reopen</button>':'<button type="button" class="btn outline sm" data-scdocdone="'+esc(d.id)+'">Mark QC done</button>'):"")+'</span></div>';
-    const docsBox=docs.length?'<details class="scdocs"'+(docs.some(d=>!d.mine&&d.status!=="reviewed")||r.doc?" open":"")+'><summary><b>Word documents sent to QC</b> <span class="sub">'+docs.filter(d=>d.status!=="reviewed").length+' waiting</span></summary>'+docs.map(dcard).join("")+'</details>':"";
-    const docBanner=r.doc?'<div class="scbanner">Showing the document '+esc(r.doc.byName)+' sent on '+esc(r.doc.at.slice(0,10))+' ('+r.doc.count+' articles). Add the QC comment under each DE comment, then use Word to download it with both. <button type="button" class="btn outline sm" data-scdocclose="1">Back to all articles</button></div>':"";
-    box.innerHTML=docsBox+docBanner+'<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">'+(r.doc?"":kinds)+'</div>'+(r.doc?'<div style="margin:6px 0"><button type="button" class="btn" data-scdocword="'+esc(r.doc.id)+'">Download Word with QC comments</button></div>':bar)+chips+mineNote+bulk+list+foot;
+    const dcard=d=>'<div class="scdocrow'+(r.doc&&r.doc.id===d.id?" on":"")+'"><span class="badge '+(d.status==="reviewed"?"green":"amber")+'">'+(d.status==="reviewed"?(d.sendTo==="medical"?"Medical review done":"QC done"):(d.sendTo==="medical"?"Waiting for medical review":"Waiting for QC"))+'</span><b>'+(d.kind==="safety"?"Safety present":"Rejected")+' &middot; '+esc(d.client)+'</b><span class="sub">'+d.count+' article'+(d.count===1?"":"s")+(d.from||d.to?" &middot; IRD "+esc(d.from||"start")+" to "+esc(d.to||"today"):"")+' &middot; from '+esc(d.byName)+' &middot; '+esc(d.at.slice(0,10))+(d.status==="reviewed"&&d.qcName?" &middot; "+(d.sendTo==="medical"?"reviewed by ":"QC ")+esc(d.qcName):"")+'</span>'+(d.note?'<span class="sub">"'+esc(d.note)+'"</span>':"")+
+      '<span style="margin-left:auto;display:flex;gap:6px"><button type="button" class="btn sm" data-scdocopen="'+esc(d.id)+'">'+(d.mine?"Open":d.sendTo==="medical"?"Open for review":"Open for QC")+'</button><button type="button" class="btn outline sm" data-scdocword="'+esc(d.id)+'">Word</button>'+(!d.mine?(d.status==="reviewed"?'<button type="button" class="btn outline sm" data-scdocundo="'+esc(d.id)+'">Reopen</button>':'<button type="button" class="btn outline sm" data-scdocdone="'+esc(d.id)+'">'+(d.sendTo==="medical"?"Mark review done":"Mark QC done")+'</button>'):"")+'</span></div>';
+    const docsBox=docs.length?'<details class="scdocs"'+(docs.some(d=>!d.mine&&d.status!=="reviewed")||r.doc?" open":"")+'><summary><b>Word documents sent to QC and medical review</b> <span class="sub">'+docs.filter(d=>d.status!=="reviewed").length+' waiting</span></summary>'+docs.map(dcard).join("")+'</details>':"";
+    const docBanner=r.doc?'<div class="scbanner">Showing the document '+esc(r.doc.byName)+' sent on '+esc(r.doc.at.slice(0,10))+' ('+r.doc.count+' articles). '+(r.doc.sendTo==="medical"?"Add the medical review comment":"Add the QC comment")+' under each DE comment, then use Word to download it with both. <button type="button" class="btn outline sm" data-scdocclose="1">Back to all articles</button></div>':"";
+    box.innerHTML=docsBox+docBanner+'<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">'+(r.doc?"":kinds)+'</div>'+(r.doc?'<div style="margin:6px 0"><button type="button" class="btn" data-scdocword="'+esc(r.doc.id)+'">Download Word with '+(r.doc.sendTo==="medical"?"medical review":"QC")+' comments</button></div>':bar)+chips+mineNote+bulk+list+foot;
   }catch(e){box.innerHTML='<div class="empty">'+esc(e.message)+'</div>';}
-  box.onclick=async ev=>{const t=ev.target.closest("[data-sckind],[data-scqc],[data-scok],[data-scback],[data-scdoc],[data-scbulk],[data-scsend],[data-scdocopen],[data-scdocword],[data-scdocdone],[data-scdocundo],[data-scdocclose],[data-scqcsave]");if(!t)return;
+  box.onclick=async ev=>{const t=ev.target.closest("[data-sckind],[data-scqc],[data-scok],[data-scback],[data-scdoc],[data-scbulk],[data-scsend],[data-scmrsave],[data-scdocopen],[data-scdocword],[data-scdocdone],[data-scdocundo],[data-scdocclose],[data-scqcsave]");if(!t)return;
     if(t.dataset.scdocopen){scState.doc=t.dataset.scdocopen;scState.qc="all";scSel.clear();return loadScreened();}
     if(t.dataset.scdocclose){scState.doc="";scSel.clear();return loadScreened();}
     if(t.dataset.scdocword){t.disabled=true;try{await downloadPost("/api/screened-docx",{doc:t.dataset.scdocword},"literasift-screened.docx");}catch(e){alert(e.message);}t.disabled=false;return;}
     if(t.dataset.scdocdone||t.dataset.scdocundo){t.disabled=true;try{await api("screened-doc-done",{id:t.dataset.scdocdone||t.dataset.scdocundo,undo:!!t.dataset.scdocundo});await loadScreened();}catch(e){alert(e.message);t.disabled=false;}return;}
-    if(t.dataset.scsend){const note=prompt("Send this list to QC as a Word document. Optional note for QC:","");if(note===null)return;t.disabled=true;
-      try{const res=await api("screened-send",{kind:scState.kind,client:scState.client,from:scState.from,to:scState.to,qc:scState.qc,note});message("Sent to QC: "+res.doc.count+" article"+(res.doc.count===1?"":"s")+".");await loadScreened();}catch(e){alert(e.message);t.disabled=false;}return;}
+    if(t.dataset.scsend){const note=prompt("Send this list to "+(scState.kind==="safety"?"the medical reviewer":"QC")+" as a Word document. Optional note:","");if(note===null)return;t.disabled=true;
+      try{const res=await api("screened-send",{kind:scState.kind,client:scState.client,from:scState.from,to:scState.to,qc:scState.qc,note});message("Sent to "+(res.doc.sendTo==="medical"?"the medical reviewer":"QC")+": "+res.doc.count+" article"+(res.doc.count===1?"":"s")+".");await loadScreened();}catch(e){alert(e.message);t.disabled=false;}return;}
+    if(t.dataset.scmrsave){const id=t.dataset.scmrsave,inp=box.querySelector('[data-scmrnote="'+id+'"]'),note=inp?inp.value.trim():"";if(note.length<3){alert("Write the medical review comment first.");if(inp)inp.focus();return;}
+      t.disabled=true;try{const res=await api("screened-comment",{ids:[id],as:"mr",note});if(res.skipped&&res.skipped.length)alert(res.skipped[0].why);await loadScreened();}catch(e){alert(e.message);t.disabled=false;}return;}
     if(t.dataset.scqcsave){const id=t.dataset.scqcsave,inp=box.querySelector('[data-scnote="'+id+'"]'),note=inp?inp.value.trim():"";if(note.length<3){alert("Write the QC comment first.");if(inp)inp.focus();return;}
       t.disabled=true;try{const res=await api("screened-comment",{ids:[id],as:"qc",note});if(res.skipped&&res.skipped.length)alert(res.skipped[0].why);await loadScreened();}catch(e){alert(e.message);t.disabled=false;}return;}
     if(t.dataset.scbulk){const k=t.dataset.scbulk, nt=($("scbulknote")||{}).value||"", note=nt.trim();
       if(!scSel.size){alert("Tick the articles first, or use Select all shown.");return;}
       if(k==="return"&&note.length<5){alert("Sending back needs a comment of at least 5 characters.");return;}
-      if((k==="de"||k==="qc")&&note.length<3){alert("Write the comment first.");return;}
+      if((k==="de"||k==="qc"||k==="mr")&&note.length<3){alert("Write the comment first.");return;}
       if(!confirm((k==="approve"?"QC agree":k==="return"?"Send back":"Add this comment to")+" "+scSel.size+" article"+(scSel.size===1?"":"s")+"?"))return;
-      t.disabled=true;try{const res=await api("screened-comment",{ids:[...scSel],as:k==="de"?"de":"qc",decision:k==="approve"||k==="return"?k:"",note});scSel.clear();await loadScreened();
+      t.disabled=true;try{const res=await api("screened-comment",{ids:[...scSel],as:k==="de"?"de":k==="mr"?"mr":"qc",decision:k==="approve"||k==="return"?k:"",note});scSel.clear();await loadScreened();
         if(res.skipped&&res.skipped.length)alert(res.done+" done. Skipped "+res.skipped.length+": "+res.skipped.slice(0,8).map(x=>(x.pmid?"PMID "+x.pmid:x.id)+" ("+x.why+")").join(", "));}catch(e){alert(e.message);t.disabled=false;}return;}
     if(t.dataset.sckind){scState.kind=t.dataset.sckind;scState.qc="all";scSel.clear();return loadScreened();}
     if(t.dataset.scqc){scState.qc=t.dataset.scqc;return loadScreened();}

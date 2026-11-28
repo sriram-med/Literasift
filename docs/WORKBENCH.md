@@ -456,3 +456,18 @@ Ways to export it:
 5. QC presses **Mark QC done**, and **Reopen** reverses it. The DE sees the status change on their copy of the list. The DE cannot mark their own document done.
 
 The document keeps its list of articles; the comments are always the current ones. Sending, downloading and marking done are all recorded in the audit trail.
+
+### Safety present articles go to the medical reviewer
+
+This works the same way as the rejected list going to QC:
+- On the **Safety present** tab, the DE presses **Send to medical reviewer**.
+- The medical reviewer sees all safety present articles of their clients, along with the documents sent to them.
+- They **Open for review** and type a **medical review comment** under each DE comment. Bulk "Add as medical comment" also works.
+- They press **Mark review done** when finished.
+
+In the Word file, each article has:
+1. the DE comment (yellow);
+2. "Medical reviewer comment (name)" on the line right below;
+3. the QC comment, if the article also went through QC.
+
+A medical reviewer who has neither the QC nor the screener role opens the Screened tab on Safety present.
