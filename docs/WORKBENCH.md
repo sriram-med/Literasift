@@ -577,3 +577,15 @@ The rules are unchanged. Articles already screened keep their DE, the team's QC 
 - **Springer Nature** searches Springer, Nature and BMC journals. **Adis journals** limits the same search to the Adis drug journals, including Reactions Weekly (adverse-reaction case reports) and Drug Safety. Both need a free Springer Nature Meta API key from dev.springernature.com, added in Settings → Publisher and aggregator access.
 - **Embase** uses the Elsevier API key in Settings. Elsevier enables Embase API access case by case, even for embase.com subscribers; without it, the search reports that Elsevier refused the key. Results that carry a PMID link to the PubMed record.
 - **AdisInsight** is a link to the AdisInsight search for the drug. AdisInsight's drug API and data feed need a separate Springer Nature subscription and login, so the app does not fetch its content, and the link cannot be imported as an article.
+
+### Overlapping searches at three levels
+
+**Search & Pull → Saved searches → Overlapping searches** (managers) sets how an article found by two searches is counted. There are three levels, and the most specific one wins:
+
+1. **All molecules, every client:** the default.
+2. **The client, all its molecules:** "default" follows level 1. This is also on the Clients tab.
+3. **Each molecule:** "client" follows level 2.
+
+For example, everything can count under every drug (like the alert emails) while calcium alone counts once, so its shared articles go to calcium chloride. The per-drug counts in Watchlists, Search & Pull results and the Clients tab follow these settings. Each change is recorded in the audit trail.
+
+The **Dashboard** of managers also has **Team counts (image)** next to the article counts. It uses the Dashboard's IRD dates and shows the same per-team picture as the Allocation tab.

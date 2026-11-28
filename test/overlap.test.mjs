@@ -52,3 +52,22 @@ test("pulled articles: a table by IRD with the drug per the overlap setting, and
   const sheet = readZip(await x.arrayBuffer()).get("xl/worksheets/sheet1.xml").toString("utf8");
   assert.match(sheet, /Calcium chloride burns/); assert.match(sheet, /Dietary calcium/);
 });
+
+test("overlap at three levels: all molecules, a client, one molecule; the most specific wins", async () => {
+  const t = await makeEnv(seed());
+  const stats = async () => Object.fromEntries((await t.call(MANAGER, "/api/drug-week-stats", { client: "c1", from: "2026-11-01", to: "2026-11-30", by: "ird" })).body.rows.map(r => [r.molecule, r.pulled]));
+  assert.deepEqual(await stats(), { calcium: 3, "calcium chloride": 2 });
+  assert.equal((await t.call(SCREENER, "/api/overlap-set", { scope: "all", value: "once" })).status, 403);
+  assert.equal((await t.call(MANAGER, "/api/overlap-set", { scope: "all", value: "once" })).status, 200);
+  assert.deepEqual(await stats(), { calcium: 1, "calcium chloride": 2 }, "default for all molecules: once");
+  await t.call(MANAGER, "/api/client-auto", { client: "c1", overlap: "each" });
+  assert.deepEqual(await stats(), { calcium: 3, "calcium chloride": 2 }, "the client overrides the default");
+  assert.equal((await t.call(MANAGER, "/api/overlap-set", { scope: "molecule", watch: "Navinta|calcium", value: "once" })).status, 200);
+  assert.deepEqual(await stats(), { calcium: 1, "calcium chloride": 2 }, "the molecule overrides the client");
+  await t.call(MANAGER, "/api/overlap-set", { scope: "molecule", watch: "Navinta|calcium", value: "default" });
+  await t.call(MANAGER, "/api/client-auto", { client: "c1", overlap: "default" });
+  assert.deepEqual(await stats(), { calcium: 1, "calcium chloride": 2 }, "back to the default for all molecules");
+  assert.equal((await t.call(MANAGER, "/api/overlap-set", { scope: "molecule", watch: "Navinta|nothing", value: "once" })).status, 404);
+  const st = await (await t.get(MANAGER, "/api/state")).json();
+  assert.equal(st.config.overlapDefault, "once");
+});
