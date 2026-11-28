@@ -531,3 +531,9 @@ Allocation is a manager-only tab for sharing articles out between DE and QC pair
 - Leave the DE empty to keep the current DE, or the QC as "automatic QC" to keep the usual QC routing.
 
 Each article's history records the allocation, and the audit trail records each allocation with its ranges.
+
+**Counts per person.** At the top of Allocation there are two lists, one for DE and one for QC, counted over the same IRD dates:
+- **DE:** each DE's articles **to screen** and **screened**.
+- **QC:** each QC's **allocated** articles, with how many are **waiting** and **done**.
+
+Each client card also shows that client's counts per DE and per QC as chips.

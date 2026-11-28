@@ -33,6 +33,10 @@ test("ranges of numbered articles go to a DE and a QC; the chosen QC receives th
   assert.equal(s2.assignments.find(a => a.id === "a5").qc.reviewer, QC, "range 4-6 goes to Quinn");
   // the open list no longer shows screened ones; changing QC later moves items already waiting
   assert.equal((await t.call(MANAGER, "/api/allocation-list", { only: "open" })).body.rows.length, 4);
+  const load = Object.fromEntries((await t.call(MANAGER, "/api/allocation-list", { only: "open" })).body.load.map(p => [p.name, [p.deOpen, p.deDone, p.qcPlanned, p.qcWaiting, p.qcDone, p.byClient.Square]]));
+  assert.deepEqual(load.Sravan, [2, 1, 0, 0, 0, { de: 3, qc: 0 }]); assert.deepEqual(load.Ravi, [2, 1, 0, 0, 0, { de: 3, qc: 0 }]);
+  assert.deepEqual(load.Venu, [0, 0, 2, 1, 0, { de: 0, qc: 3 }], "Venu: 2 allocated, 1 waiting");
+  assert.deepEqual(load.Quinn, [0, 0, 2, 1, 0, { de: 0, qc: 3 }]);
   await t.call(MANAGER, "/api/allocation-apply", { groups: [{ ids: ["a1"], qc: QC }] });
   assert.equal((await t.state()).assignments.find(a => a.id === "a1").qc.reviewer, QC);
   assert.equal((await t.call(MANAGER, "/api/allocation-apply", { groups: [{ ids: ["a1"], de: SCREENER2 }] })).body.skipped[0].why, "already screened");
