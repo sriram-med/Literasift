@@ -498,3 +498,10 @@ It saves a PNG with one row per client and its drugs underneath, plus a total ro
 - Sent back
 
 The header shows the IRD range, who made it, and the date. The DE sees their articles. QC and medical reviewers see every article of the clients they work on.
+- The **Dashboard** of every role (manager, DE, QC, medical reviewer) starts with "Article counts per client": choose the IRD dates, then **Show table** or **Save as image**.
+
+### QC decisions in the Word file
+- A comment alone does not finish QC. An article waiting for QC needs **Agree** or **Send back**, with the comment typed in the same box. "Add as QC comment" skips articles waiting for QC and says so; use **QC agree all** or **Send back all** instead.
+- **Mark QC done** is refused while any article in the document is still waiting for QC.
+- In the Word file, an article that has a QC comment but no decision is marked "[QC decision (Agree or Send back) still needed]".
+- When the DE's reason is "Other", the DE comment shows as "Other: <the explanation>".

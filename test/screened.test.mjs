@@ -164,3 +164,20 @@ test("counts per client: QC sees every article of their clients, with the screen
   assert.deepEqual(q.rows.map(r => [r.pmid, r.dispo, r.qc]).sort(), [["1", "excluded", "pending"], ["2", "", ""]], "both Navinta articles, not Laurus");
   assert.deepEqual(q.clients.map(c => c.name), ["Navinta"]);
 });
+
+test("an article waiting for QC needs Agree or Send back: a comment alone does not leave it waiting, and the document cannot be closed while one waits", async () => {
+  const t = await makeEnv(team());
+  await t.call(MANAGER, "/api/membership-save", { email: QC, portfolio: "Navinta", role: "qc" });
+  await t.call(SCREENER, "/api/disposition", { id: "a1", value: "excluded", reason: "Other (explain in the note)", note: "this article is rejected" });
+  const row = (await t.call(QC, "/api/screened", { kind: "rejected" })).body.rows[0];
+  assert.equal(row.deText, "Other: this article is rejected", "Other shows only the explanation");
+  const c = (await t.call(QC, "/api/screened-comment", { ids: ["a1"], as: "qc", note: "this article is rejected" })).body;
+  assert.equal(c.done, 0); assert.match(c.skipped[0].why, /Agree or Send back/);
+  const doc = (await t.call(SCREENER, "/api/screened-send", { kind: "rejected" })).body.doc;
+  const blocked = await t.call(QC, "/api/screened-doc-done", { id: doc.id });
+  assert.equal(blocked.status, 409); assert.match(blocked.body.error, /still waiting for QC/);
+  await t.call(QC, "/api/screened-comment", { ids: ["a1"], as: "qc", decision: "approve", note: "this article is rejected" });
+  assert.equal((await t.call(QC, "/api/screened-doc-done", { id: doc.id })).status, 200);
+  const xml = readZip(await (await t.raw(QC, "/api/screened-docx", { doc: doc.id })).arrayBuffer()).get("word/document.xml").toString("utf8");
+  assert.match(xml, /Other: this article is rejected/); assert.doesNotMatch(xml, /Waiting for QC\]/); assert.match(xml, /QC agreed/);
+});
