@@ -562,10 +562,12 @@ Each client card also shows that client's counts per DE and per QC as chips.
 1. **Week and totals.** The tab opens on this week (‹ › for earlier weeks). It shows how many articles are not screened, how many clients they belong to, and how many have no DE.
 2. **Teams.** A team is a DE and the QC who checks their rejections. Add a team with **+ Add team** and remove one with ×. Teams are saved, so you set them up once. Each team shows its articles to screen and the QC's allocated articles for the week. Each DE can be in only one team.
 3. **Share the week between teams.** This makes a plan that gives every team an equal share, with the remainder going to the first teams. It walks client by client and keeps each client's numbered articles together in blocks. The plan lists client, numbers, article count, DE and QC. Nothing changes until you press **Allocate**.
-4. **Client cards.** Each card shows the client's articles, who has them (with a colour bar), and how many have no DE. Then:
-   - **Give all N to…** gives the whole client to one team.
-   - **Split by numbers** opens the number ranges (from – to, DE, QC) for a custom split.
-   - **Articles** shows the numbered list.
+4. **Clients.** A client list sits on the left: each entry has the article count, who has its articles, and a colour bar. The chosen client's articles fill a large panel on the right, with room to read the titles. The panel shows each article's number, title (linked to PubMed), PMID, drug, IRD, DE, QC and status. You can:
+   - search titles, PMIDs and drugs;
+   - tick articles (or tick all shown);
+   - choose **Give all / the ticked to Team N**, then press **Allocate**;
+   - use **Split by numbers**, which still opens the number ranges.
+5. **Team counts (image)** saves a PNG with one row per team (DE + QC). It shows the DE's articles to screen and screened, and the QC's allocated, waiting and done. Each team's clients are listed under it, people not in a team come next, and a total row ends the table.
 
 The rules are unchanged. Articles already screened keep their DE, the team's QC receives the DE's rejections, and every allocation is recorded in each article's history and in the audit trail.
 
