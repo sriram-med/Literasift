@@ -589,3 +589,19 @@ The rules are unchanged. Articles already screened keep their DE, the team's QC 
 For example, everything can count under every drug (like the alert emails) while calcium alone counts once, so its shared articles go to calcium chloride. The per-drug counts in Watchlists, Search & Pull results and the Clients tab follow these settings. Each change is recorded in the audit trail.
 
 Every **Dashboard** (manager, DE, QC, medical reviewer) also has **Team counts (image)** next to the article counts. It uses the Dashboard's IRD dates and shows the same per-team picture as the Allocation tab. Non-managers get names and counts only, with no email addresses, and client rows only for the clients they work on.
+
+## Client alert emails and weekly reconciliation (Search & Pull → PubMed alerts)
+
+- **Upload the emails.** Choose one or more `.eml` files: the client's My NCBI "What's new for … in PubMed" emails. For each email the app reads:
+  - the saved search, the sender's message (product name) and the day it was sent;
+  - its PMIDs, taken from the email's own result list rather than loose links.
+
+  It then matches the email to the client's molecule with the same search, or named in it, and shows how many PMIDs the app already holds and which are missing. **Pull N** brings the missing ones into that molecule. An email that stops at 200 is flagged: the real total is higher. If the saved search differs from the email's search, that is flagged too.
+- **Weekly reconciliation.** Choose the week and press **Reconcile**. For each drug of the client it shows:
+  - the uploaded email's count;
+  - the PubMed count for the week, by the client's date basis;
+  - the app's count;
+  - every PMID that differs, with the reason: not pulled yet, outside the dates because of the date basis, or the 200 limit.
+
+  **Excel** downloads the same table to send with the weekly email.
+- Uploaded emails are kept (search, date sent, PMIDs), so later reconciliations use them. Every upload, pull and reconciliation is recorded in the audit trail.
