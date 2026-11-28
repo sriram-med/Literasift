@@ -646,3 +646,11 @@ Every **Dashboard** (manager, DE, QC, medical reviewer) also has **Team counts (
 - **Client wording.** Each standard rejection reason can have the client's own wording, for example "No adverse event" → "No AE reported (NAE)". The Word files, the Screened tab and the Archive show the client's wording. The decision itself keeps the standard reason, so counts and reports stay comparable across clients.
 - **Own reasons.** A client can also have reasons of its own, one per line (for example "Non-company product"). They appear in the reason lists for that client's articles only.
 - Changes are recorded in the audit trail.
+
+## This Week (managers' home screen)
+
+Managers now land on **This Week**: the week by IRD (‹ › for earlier weeks), on one screen. It has:
+- **Tiles:** pulled, screened (% done), not screened, overdue, rejected (and archived after QC), safety present (and potential ICSRs), waiting for QC (agreed, sent back), missed in PubMed, and Word files sent (and reviewed).
+- **Clients:** a table with progress bars, most unscreened first.
+- **Teams:** each team's DE and QC counts.
+- **Images:** **Counts per client (image)** and **Team counts (image)** save the week as pictures.

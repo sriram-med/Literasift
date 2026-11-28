@@ -94,3 +94,16 @@ test("team counts for every role's Dashboard: names and counts only, no emails f
   assert.equal((await t.call(QC, "/api/team-counts", { from: "2026-11-01", to: "2026-11-30" })).body.load.find(p => p.name === "Quinn").qcPlanned, 3);
   assert.equal((await t.call(MANAGER, "/api/team-counts", { from: "2026-11-01", to: "2026-11-30" })).body.teams[0].de, SCREENER);
 });
+
+test("this week: totals and per client by IRD, managers only", async () => {
+  const st = seed(); const d = new Date(Date.now() + 5.5 * 3600000).toISOString().slice(0, 10);
+  st.assignments.forEach((a, i) => { a.ird = i < 4 ? d : "2026-01-05"; a.reviewer = i % 2 ? SCREENER2 : SCREENER; });
+  const t = await makeEnv(st);
+  await t.call(SCREENER, "/api/disposition", { id: "a1", value: "excluded", reason: "No adverse event" });
+  await t.call(SCREENER2, "/api/disposition", { id: "a2", value: "potential_icsr", note: "case" });
+  assert.equal((await t.call(SCREENER, "/api/this-week", {})).status, 403);
+  const r = (await t.call(MANAGER, "/api/this-week", {})).body;
+  assert.equal(r.totals.pulled, 4); assert.equal(r.totals.screened, 2); assert.equal(r.totals.open, 2); assert.equal(r.totals.rejected, 1); assert.equal(r.totals.safety, 1); assert.equal(r.totals.icsr, 1);
+  assert.equal(r.clients[0].name, "Square"); assert.equal(r.clients[0].pulled, 4);
+  assert.equal((await t.call(MANAGER, "/api/this-week", { week: -1 })).body.totals.pulled, 0);
+});
